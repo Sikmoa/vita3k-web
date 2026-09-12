@@ -56,7 +56,10 @@ int main() {
     CHECK(m.set_permission(P, P, MemoryPermission::Write));
     CHECK(!m.read(P, &output, 1) && m.write(P, &value, 1));
     CHECK(m.set_permission(P, P, MemoryPermission::ReadWrite));
-    CHECK(!m.set_permission(P, P, static_cast<MemoryPermission>(4)));
+    CHECK(m.set_permission(P, P, MemoryPermission::Execute));
+    CHECK(!m.read(P, &output, 1) && !m.write(P, &value, 1));
+    CHECK(m.set_permission(P, P, MemoryPermission::ReadExecute));
+    CHECK(m.read(P, &output, 1));
     CHECK(!m.read(P, nullptr, 1));
     CHECK(!m.write(P, nullptr, 1));
     CHECK(m.release(P + 3));

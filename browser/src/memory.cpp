@@ -79,7 +79,7 @@ bool Memory::release(std::uint32_t address) {
 }
 
 bool Memory::set_permission(std::uint32_t address, std::uint32_t size_bytes, MemoryPermission permission_value) {
-    if (static_cast<unsigned>(permission_value) > 3 || !valid_range(address, size_bytes))
+    if (static_cast<unsigned>(permission_value) > 7 || !valid_range(address, size_bytes))
         return false;
     const auto first = address / page_size;
     const auto last = static_cast<std::uint32_t>((static_cast<std::uint64_t>(address) + size_bytes + page_size - 1) / page_size);

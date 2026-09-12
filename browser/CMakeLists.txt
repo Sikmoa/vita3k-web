@@ -7,6 +7,28 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+find_program(VITA3K_ARM_CLANG NAMES clang REQUIRED)
+find_program(VITA3K_ARM_LLD NAMES ld.lld-19 ld.lld REQUIRED)
+
+set(VITA3K_GUEST_PROBE_ELF "${CMAKE_CURRENT_BINARY_DIR}/guest_probe.elf")
+add_custom_command(
+    OUTPUT "${VITA3K_GUEST_PROBE_ELF}"
+    COMMAND "${VITA3K_ARM_CLANG}"
+        --target=armv7-none-eabi
+        -mthumb
+        -nostdlib
+        "-fuse-ld=${VITA3K_ARM_LLD}"
+        "-Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/tests/guest_probe/guest.ld"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/guest_probe/guest.S"
+        -o "${VITA3K_GUEST_PROBE_ELF}"
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/guest_probe/guest.S"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/guest_probe/guest.ld"
+    COMMENT "Building ARM guest ELF probe"
+    VERBATIM
+)
+add_custom_target(vita3k_guest_probe_elf ALL DEPENDS "${VITA3K_GUEST_PROBE_ELF}")
+
 add_executable(vita3k_web
     src/main.cpp
     src/memory.cpp
@@ -14,6 +36,7 @@ add_executable(vita3k_web
     src/guest.cpp
 )
 
+add_dependencies(vita3k_web vita3k_guest_probe_elf)
 target_compile_definitions(vita3k_web PRIVATE VITA3K_WEB=1)
 
 add_executable(vita3k_web_memory_tests
@@ -34,11 +57,20 @@ add_executable(vita3k_web_guest_tests
     tests/guest_tests.cpp
 )
 
+add_executable(vita3k_web_generated_elf_tests
+    src/memory.cpp
+    src/interpreter.cpp
+    src/guest.cpp
+    tests/guest_probe/guest_probe_tests.cpp
+)
+add_dependencies(vita3k_web_generated_elf_tests vita3k_guest_probe_elf)
+
 if(NOT EMSCRIPTEN)
     enable_testing()
     add_test(NAME vita3k_web_memory COMMAND vita3k_web_memory_tests)
     add_test(NAME vita3k_web_interpreter COMMAND vita3k_web_interpreter_tests)
     add_test(NAME vita3k_web_guest COMMAND vita3k_web_guest_tests)
+    add_test(NAME vita3k_web_generated_elf COMMAND vita3k_web_generated_elf_tests "${VITA3K_GUEST_PROBE_ELF}")
 endif()
 
 target_link_options(vita3k_web PRIVATE
@@ -60,6 +92,9 @@ set_target_properties(vita3k_web PROPERTIES
 
 add_custom_command(TARGET vita3k_web POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dist"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${VITA3K_GUEST_PROBE_ELF}"
+        "${CMAKE_BINARY_DIR}/dist/guest.elf"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/web/index.html"
         "${CMAKE_BINARY_DIR}/dist/index.html"

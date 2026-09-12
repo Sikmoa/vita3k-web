@@ -60,6 +60,7 @@ else()
 endif()
 
 option(FORCE_BUILD_OPENSSL_MAC OFF)
+option(VITA3K_INTERPRETER_CPU "Use the cooperative ARM interpreter CPU backend" OFF)
 
 if("${CMAKE_CXX_COMPILER_LAUNCHER}" STREQUAL "")
 	find_program(CCACHE_PROGRAM ccache)

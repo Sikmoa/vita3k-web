@@ -24,6 +24,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 struct AllocMemPage {
     uint32_t allocated : 4;
@@ -67,6 +68,8 @@ struct MemState {
     std::mutex protect_mutex;
 
     uint32_t host_page_size = 0;
+    // Wasm uses sparse page-table backing; native targets retain the contiguous mapping.
+    bool sparse_host_memory = false;
     Memory memory;
     AllocPageTable alloc_table;
     BitmapAllocator allocator;
@@ -76,5 +79,6 @@ struct MemState {
 
     bool use_page_table = false;
     PageTable page_table;
+    std::vector<std::unique_ptr<uint8_t[]>> sparse_pages;
     std::map<uint64_t, MemExternalMapping, std::greater<>> external_mapping;
 };

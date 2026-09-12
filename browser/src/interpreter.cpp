@@ -63,6 +63,12 @@ bool arm_step(InterpreterState &s, Memory &memory) {
         return false;
     s.registers[15] = pc + 4;
 
+    // SVC uses the immediate as the browser bring-up service number.
+    if ((instruction & 0x0f000000u) == 0x0f000000u) {
+        s.trap = InterpreterState::Trap { s.registers[7] };
+        return true;
+    }
+
     // B / BL, with an ARM PC-relative signed word offset.
     if ((instruction & 0x0e000000u) == 0x0a000000u) {
         if (!condition_passed(s, instruction >> 28))
@@ -134,6 +140,12 @@ bool thumb_step(InterpreterState &s, Memory &memory) {
     if (!memory.read(pc, &instruction, sizeof(instruction)))
         return false;
     s.registers[15] = pc + 2;
+
+    // Thumb SVC uses the low byte as the browser bring-up service number.
+    if ((instruction & 0xff00u) == 0xdf00u) {
+        s.trap = InterpreterState::Trap { s.registers[7] };
+        return true;
+    }
 
     // MOVS Rd, #imm8.
     if ((instruction & 0xf800u) == 0x2000u) {
@@ -357,12 +369,13 @@ bool Interpreter::step() {
         state_.last_result = StepResult::MemoryFault;
         return false;
     }
+    state_.trap.reset();
     const bool result = state_.thumb ? thumb_step(state_, *memory_) : arm_step(state_, *memory_);
     if (!result) {
         state_.halted = true;
         state_.last_result = StepResult::Unsupported;
     } else {
-        state_.last_result = StepResult::Executed;
+        state_.last_result = state_.trap ? StepResult::Trap : StepResult::Executed;
     }
     return result;
 }

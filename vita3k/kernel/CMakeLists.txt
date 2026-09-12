@@ -31,3 +31,11 @@ if(TRACY_ENABLE_ON_CORE_COMPONENTS)
 	target_link_libraries(kernel PRIVATE tracy)
 endif()
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${SOURCE_LIST})
+
+if(VITA3K_INTERPRETER_CPU AND NOT ANDROID)
+    add_executable(vita3k_interpreter_runtime_tests
+        ../cpu/tests/interpreter_runtime_tests.cpp
+    )
+    target_link_libraries(vita3k_interpreter_runtime_tests PRIVATE kernel)
+    add_test(NAME vita3k_interpreter_runtime COMMAND vita3k_interpreter_runtime_tests)
+endif()

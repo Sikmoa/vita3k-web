@@ -18,6 +18,9 @@ enum class MemoryPermission : std::uint8_t {
     Read = 1,
     Write = 2,
     ReadWrite = 3,
+    Execute = 4,
+    ReadExecute = 5,
+    ReadWriteExecute = 7,
 };
 
 constexpr std::uint32_t page_size = 4096;

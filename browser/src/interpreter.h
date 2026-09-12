@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 namespace vita3k::web {
 
@@ -11,10 +12,19 @@ enum class StepResult {
     Executed,
     MemoryFault,
     Unsupported,
+    Trap,
     Halted,
 };
 
 struct InterpreterState {
+    static constexpr std::uint32_t test_exit_service = 0;
+
+    struct Trap {
+        std::uint32_t number = 0;
+    };
+
+    std::optional<Trap> trap;
+
     std::uint32_t registers[16]{};
     std::uint32_t cpsr = 0;
     bool thumb = false;

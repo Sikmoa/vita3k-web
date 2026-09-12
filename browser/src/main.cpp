@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <string>
+#include <span>
 
 namespace {
 
@@ -20,18 +21,21 @@ int vita3k_web_initialize() {
 }
 
 EMSCRIPTEN_KEEPALIVE
-int vita3k_web_run_guest_probe() {
+int vita3k_web_run_elf_probe(const std::uint8_t *bytes, std::uint32_t size) {
+    if (!bytes || size == 0) return -1;
     vita3k::web::Memory memory(4 * vita3k::web::page_size);
-    const std::uint32_t program[] = { 0xe3a0002au, 0xef000001u };
-    vita3k::web::GuestImage image;
-    image.code.assign(reinterpret_cast<const std::uint8_t *>(program),
-        reinterpret_cast<const std::uint8_t *>(program) + sizeof(program));
+    vita3k::web::ElfLoadResult loaded;
     std::string error;
-    if (!vita3k::web::load_guest_image(memory, image, vita3k::web::page_size, error))
+    if (!vita3k::web::load_elf32(memory, std::span<const std::uint8_t>(bytes, size), loaded, error))
         return -1;
-    const auto result = vita3k::web::run_guest(memory, vita3k::web::page_size, false, 8);
+    const auto result = vita3k::web::run_guest(memory, loaded.entry, loaded.thumb, 8);
     return result.status == vita3k::web::GuestResult::Status::Exited ? result.exit_code : -1;
 }
+
+// Browser callers provide bytes through vita3k_web_run_elf_probe. This
+// compatibility export intentionally has no embedded or virtual-FS fallback.
+EMSCRIPTEN_KEEPALIVE
+int vita3k_web_run_guest_probe() { return -1; }
 
 EMSCRIPTEN_KEEPALIVE
 int vita3k_web_shutdown() {

@@ -1,4 +1,7 @@
 // M4 worker lifecycle shell. The generated Emscripten module is loaded here.
+import { createWebStorage } from './storage.js';
+
+const storage = createWebStorage('./');
 const post = (message) => self.postMessage({ ...message, timestamp: performance.now() });
 let module = null;
 let lifecycle = 'starting';
@@ -25,7 +28,7 @@ try {
   post({ type: 'error', state: lifecycle, message: String(error) });
 }
 
-self.onmessage = ({ data }) => {
+self.onmessage = async ({ data }) => {
   if (!data || lifecycle === 'error') return;
   switch (data.type) {
   case 'status':
@@ -38,8 +41,30 @@ self.onmessage = ({ data }) => {
     if (lifecycle === 'paused') transition('ready');
     break;
   case 'run-guest': {
-    const exitCode = module?._vita3k_web_run_guest_probe?.() ?? -1;
-    post({ type: 'guest-exit', exitCode, ok: exitCode >= 0 });
+    try {
+      const path = data.path || 'guest.elf';
+      let input;
+      if (data.bytes instanceof Uint8Array) {
+        input = data.bytes;
+      } else if (data.bytes instanceof ArrayBuffer) {
+        input = new Uint8Array(data.bytes);
+      } else if (data.file instanceof Blob) {
+        input = new Uint8Array(await data.file.arrayBuffer());
+      } else {
+        input = await storage.read(path);
+      }
+      const allocation = module._malloc(input.byteLength);
+      if (!allocation) throw new Error('unable to allocate ELF input buffer');
+      try {
+        module.HEAPU8.set(input, allocation);
+        const exitCode = module._vita3k_web_run_elf_probe(allocation, input.byteLength);
+        post({ type: 'guest-exit', path, size: input.byteLength, exitCode, ok: exitCode >= 0 });
+      } finally {
+        module._free(allocation);
+      }
+    } catch (error) {
+      post({ type: 'guest-exit', exitCode: -1, ok: false, message: String(error) });
+    }
     break;
   }
   case 'shutdown':

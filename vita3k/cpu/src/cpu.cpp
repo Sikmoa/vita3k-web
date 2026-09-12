@@ -17,7 +17,11 @@
 
 #include <cpu/disasm/functions.h>
 #include <cpu/functions.h>
+#ifdef VITA3K_INTERPRETER_CPU
+#include <cpu/impl/interpreter_cpu.h>
+#else
 #include <cpu/impl/dynarmic_cpu.h>
+#endif
 #include <cpu/impl/interface.h>
 #include <cpu/state.h>
 #include <mem/ptr.h>
@@ -42,12 +46,18 @@ CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, M
     CPUStatePtr state(new CPUState(), delete_cpu_state);
     state->mem = &mem;
     state->thread_id = thread_id;
+    state->svc_called = false;
+    state->svc = 0;
 
     if (!init(state->disasm)) {
         return CPUStatePtr();
     }
 
+#ifdef VITA3K_INTERPRETER_CPU
+    state->cpu = std::make_unique<InterpreterCPU>(state.get(), processor_id);
+#else
     state->cpu = std::make_unique<DynarmicCPU>(state.get(), processor_id, cpu_opt);
+#endif
 
     return state;
 }

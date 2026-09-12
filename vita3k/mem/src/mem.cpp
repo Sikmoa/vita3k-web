@@ -63,7 +63,23 @@ static std::string get_error_msg() {
 #endif
 
 bool init(MemState &state, const bool use_page_table) {
-#ifdef _WIN32
+#ifdef __EMSCRIPTEN__
+    state.host_page_size = STANDARD_PAGE_SIZE;
+    state.sparse_host_memory = true;
+    state.memory = Memory(nullptr, [](uint8_t *) {});
+    const size_t table_length = TOTAL_MEM_SIZE / STANDARD_PAGE_SIZE;
+    state.alloc_table = AllocPageTable(new AllocMemPage[table_length]);
+    memset(state.alloc_table.get(), 0, sizeof(AllocMemPage) * table_length);
+    state.allocator.set_maximum(table_length);
+    state.use_page_table = true;
+    state.page_table = PageTable(new PagePtr[table_length]);
+    state.sparse_pages.resize(table_length);
+    std::fill_n(state.page_table.get(), table_length, nullptr);
+    const Address null_address = alloc_inner(state, 0, 1, "null", true);
+    if (null_address != 0)
+        return false;
+    return true;
+#elif defined(_WIN32)
     SYSTEM_INFO system_info = {};
     GetSystemInfo(&system_info);
     state.host_page_size = system_info.dwPageSize;
@@ -173,17 +189,29 @@ static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_c
     const Address commit_start = align_down(addr, state.host_page_size);
     const Address commit_end = align(addr + size, state.host_page_size);
     const uint32_t commit_size = commit_end - commit_start;
-    uint8_t *const commit_ptr = &state.memory[commit_start];
+    uint8_t *const commit_ptr = state.sparse_host_memory ? nullptr : &state.memory[commit_start];
 
-    // Make memory chunk available to access
-#ifdef _WIN32
-    const void *const ret = VirtualAlloc(commit_ptr, commit_size, MEM_COMMIT, PAGE_READWRITE);
-    LOG_CRITICAL_IF(!ret, "VirtualAlloc failed: {}", get_error_msg());
-#else
-    const int ret = mprotect(commit_ptr, commit_size, PROT_READ | PROT_WRITE);
-    LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
+#ifdef __EMSCRIPTEN__
+    if (state.sparse_host_memory) {
+        for (uint32_t page = static_cast<uint32_t>(page_num); page < static_cast<uint32_t>(page_num) + page_count; ++page) {
+            state.sparse_pages[page] = std::make_unique<uint8_t[]>(STANDARD_PAGE_SIZE);
+            std::fill_n(state.sparse_pages[page].get(), STANDARD_PAGE_SIZE, uint8_t { 0 });
+            state.page_table[page] = state.sparse_pages[page].get();
+        }
+    } else
 #endif
-    std::memset(&state.memory[addr], 0, size);
+    {
+        // Make memory chunk available to access on native hosts.
+#ifdef _WIN32
+        const void *const ret = VirtualAlloc(commit_ptr, commit_size, MEM_COMMIT, PAGE_READWRITE);
+        LOG_CRITICAL_IF(!ret, "VirtualAlloc failed: {}", get_error_msg());
+#else
+        const int ret = mprotect(commit_ptr, commit_size, PROT_READ | PROT_WRITE);
+        LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
+#endif
+    }
+    if (!state.sparse_host_memory)
+        std::memset(&state.memory[addr], 0, size);
 
     AllocMemPage &page = state.alloc_table[page_num];
     assert(!page.allocated);
@@ -228,6 +256,10 @@ static void align_to_page(MemState &state, Address &addr, Address &size) {
 }
 
 void unprotect_inner(MemState &state, Address addr, uint32_t size) {
+#ifdef __EMSCRIPTEN__
+    if (state.sparse_host_memory)
+        return;
+#endif
     if (LOG_PROTECT) {
         fmt::print("Unprotect: {} {}\n", log_hex(addr), size);
     }
@@ -250,6 +282,10 @@ void unprotect_inner(MemState &state, Address addr, uint32_t size) {
 }
 
 void protect_inner(MemState &state, Address addr, uint32_t size, const MemPerm perm) {
+#ifdef __EMSCRIPTEN__
+    if (state.sparse_host_memory)
+        return;
+#endif
     uint8_t *addr_ptr = state.use_page_table ? state.page_table[addr / KiB(4)] : state.memory.get();
 
     uint8_t *target = &addr_ptr[addr];
@@ -498,9 +534,16 @@ void free(MemState &state, Address address) {
         state.page_name_map.erase(page_num);
     }
 
-    assert(!state.use_page_table || state.page_table[address / KiB(4)] == state.memory.get());
     const Address region_start = page_num * STANDARD_PAGE_SIZE;
     const Address region_end = region_start + page.size * STANDARD_PAGE_SIZE;
+
+    if (state.sparse_host_memory) {
+        for (uint32_t page_index = page_num; page_index < page_num + page.size; ++page_index) {
+            state.sparse_pages[page_index].reset();
+            state.page_table[page_index] = nullptr;
+        }
+        return;
+    }
 
     Address host_page = align_down(region_start, state.host_page_size);
     Address batch_start = 0;
@@ -564,6 +607,8 @@ void deinit_mem(MemState &state) {
         state.protect_tree.clear();
     }
 
+    state.sparse_pages.clear();
+    state.sparse_host_memory = false;
     state.memory.reset();
     state.alloc_table.reset();
     state.allocator.reset();
