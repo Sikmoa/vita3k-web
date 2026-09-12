@@ -202,6 +202,36 @@ bool thumb_step(InterpreterState &s, Memory &memory) {
             return memory.read(address, &s.registers[rd], sizeof(s.registers[rd]));
         return memory.write(address, &s.registers[rd], sizeof(s.registers[rd]));
     }
+    // PUSH {low registers, LR} and POP {low registers, PC}.
+    if ((instruction & 0xfe00u) == 0xb400u || (instruction & 0xfe00u) == 0xbc00u) {
+        const bool pop = (instruction & 0x0800u) != 0;
+        const bool special = (instruction & 0x0100u) != 0;
+        const auto list = instruction & 0xffu;
+        auto sp = s.registers[13];
+        if (!pop) {
+            const auto count = static_cast<std::uint32_t>(__builtin_popcount(list) + (special ? 1 : 0));
+            sp -= count * 4;
+            auto address = sp;
+            for (std::uint32_t reg = 0; reg < 8; ++reg)
+                if (list & (1u << reg)) { if (!memory.write(address, &s.registers[reg], 4)) return false; address += 4; }
+            if (special && !memory.write(address, &s.registers[14], 4)) return false;
+        } else {
+            auto address = sp;
+            for (std::uint32_t reg = 0; reg < 8; ++reg)
+                if (list & (1u << reg)) { if (!memory.read(address, &s.registers[reg], 4)) return false; address += 4; }
+            if (special) {
+                std::uint32_t target = 0;
+                if (!memory.read(address, &target, 4)) return false;
+                s.thumb = (target & 1) != 0;
+                s.cpsr = s.thumb ? s.cpsr | 0x20 : s.cpsr & ~0x20u;
+                s.registers[15] = target & (s.thumb ? ~1u : ~3u);
+                address += 4;
+            }
+            sp = address;
+        }
+        s.registers[13] = sp;
+        return true;
+    }
     // Conditional B, 8-bit signed halfword offset.
     if ((instruction & 0xf000u) == 0xd000u && (instruction & 0x0f00u) != 0x0f00u) {
         if (condition_passed(s, (instruction >> 8) & 0xf)) {

@@ -93,7 +93,21 @@ int main() {
     CHECK(cpu.run(2) == 2 && cpu.state().registers[15] == page_size + 6);
     CHECK(cpu.step() && cpu.state().registers[2] == 2);
 
-    // Unsupported instructions and memory faults halt execution explicitly. and memory faults halt execution explicitly.
+    // Thumb: PUSH {r0,r1,lr}; POP {r0,r1,pc} restores registers and branches.
+    const std::uint16_t thumb_stack[] = { 0xb503u, 0xbd03u };
+    CHECK(memory.write(page_size, thumb_stack, sizeof(thumb_stack)));
+    cpu.reset(page_size | 1, true);
+    cpu.state().registers[13] = page_size + 0x800;
+    cpu.state().registers[0] = 0x11111111u;
+    cpu.state().registers[1] = 0x22222222u;
+    cpu.state().registers[14] = page_size | 1;
+    CHECK(cpu.step() && cpu.state().registers[13] == page_size + 0x7f4);
+    cpu.state().registers[0] = 0;
+    cpu.state().registers[1] = 0;
+    CHECK(cpu.step() && cpu.state().registers[0] == 0x11111111u);
+    CHECK(cpu.state().registers[1] == 0x22222222u && cpu.state().registers[15] == page_size);
+
+    // Unsupported instructions and memory faults halt execution explicitly.
     cpu.reset(0);
     CHECK(!cpu.step() && cpu.state().halted);
     CHECK(!cpu.step());

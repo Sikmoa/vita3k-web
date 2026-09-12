@@ -183,7 +183,9 @@ faults are explicit and testable rather than host signal handlers. ARM condition
 codes (EQ/NE and the remaining standard conditions) are evaluated, and
 arithmetic instructions update N/Z/C/V for the supported immediate forms.
 Thumb immediate shifts (LSL/LSR/ASR) and conditional branches are also
-covered, including carry updates from shifts.
+covered, including carry updates from shifts. Thumb PUSH/POP is now covered
+for low registers plus LR/PC, with checked stack memory and Thumb-state
+updates on PC restores.
 
 ## Next inspection targets before code changes
 
