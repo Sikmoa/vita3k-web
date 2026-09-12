@@ -23,6 +23,15 @@ int main() {
     CHECK(cpu.state().registers[2] == 10 && (cpu.state().cpsr & (1u << 30)));
     CHECK(cpu.step());
     CHECK(cpu.state().registers[15] == page_size + 16);
+    // EQ is taken after CMP, while NE skips without changing the register.
+    const std::uint32_t conditional[] = { 0x02833001u, 0x12833001u };
+    CHECK(memory.write(page_size + 0x20, conditional, sizeof(conditional)));
+    cpu.reset(page_size + 0x20);
+    cpu.state().registers[3] = 9;
+    cpu.state().cpsr |= 1u << 30;
+    CHECK(cpu.step() && cpu.state().registers[3] == 10);
+    cpu.state().cpsr |= 1u << 30;
+    CHECK(cpu.step() && cpu.state().registers[3] == 10);
 
     // ARM: str r0,[r3,#0]; mov r0,#0; ldr r0,[r3,#0].
     const std::uint32_t arm_memory[] = { 0xe5830000u, 0xe3a00000u, 0xe5930000u };

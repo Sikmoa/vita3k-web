@@ -178,7 +178,9 @@ The native Dynarmic path remains unchanged. The next interpreter increment
 should expand instruction coverage and add differential tests before adapting
 `CPUInterface`; it should not yet attempt full Vita process/thread integration.
 The memory operations use `Memory::read`/`write`, so permission and bounds
-faults are explicit and testable rather than host signal handlers.
+faults are explicit and testable rather than host signal handlers. ARM condition
+codes (EQ/NE and the remaining standard conditions) are evaluated, and
+arithmetic instructions update N/Z/C/V for the supported immediate forms.
 
 ## Next inspection targets before code changes
 

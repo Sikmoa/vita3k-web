@@ -7,10 +7,53 @@ namespace vita3k::web {
 namespace {
 constexpr std::uint32_t n_flag = 1u << 31;
 constexpr std::uint32_t z_flag = 1u << 30;
+constexpr std::uint32_t c_flag = 1u << 29;
+constexpr std::uint32_t v_flag = 1u << 28;
+
+bool condition_passed(const InterpreterState &s, std::uint32_t condition) {
+    const bool n = (s.cpsr & n_flag) != 0;
+    const bool z = (s.cpsr & z_flag) != 0;
+    const bool c = (s.cpsr & c_flag) != 0;
+    const bool v = (s.cpsr & v_flag) != 0;
+    switch (condition) {
+    case 0x0: return z;
+    case 0x1: return !z;
+    case 0x2: return c;
+    case 0x3: return !c;
+    case 0x4: return n;
+    case 0x5: return !n;
+    case 0x6: return v;
+    case 0x7: return !v;
+    case 0x8: return c && !z;
+    case 0x9: return !c || z;
+    case 0xa: return n == v;
+    case 0xb: return n != v;
+    case 0xc: return !z && n == v;
+    case 0xd: return z || n != v;
+    case 0xe: return true;
+    default: return false;
+    }
+}
+
 void set_nz(InterpreterState &s, std::uint32_t value) {
     s.cpsr = (s.cpsr & ~(n_flag | z_flag))
         | (value & n_flag ? n_flag : 0)
         | (value == 0 ? z_flag : 0);
+}
+
+void set_add_flags(InterpreterState &s, std::uint32_t lhs, std::uint32_t rhs, std::uint32_t result) {
+    set_nz(s, result);
+    const auto wide = static_cast<std::uint64_t>(lhs) + rhs;
+    if (wide >> 32) s.cpsr |= c_flag; else s.cpsr &= ~c_flag;
+    const bool overflow = ((~(lhs ^ rhs) & (lhs ^ result)) & n_flag) != 0;
+    if (overflow) s.cpsr |= v_flag; else s.cpsr &= ~v_flag;
+}
+
+void set_sub_flags(InterpreterState &s, std::uint32_t lhs, std::uint32_t rhs, std::uint32_t result) {
+    set_nz(s, result);
+    if (lhs >= rhs) s.cpsr |= c_flag; else s.cpsr &= ~c_flag;
+    const bool overflow = (((lhs ^ rhs) & (lhs ^ result)) & n_flag) != 0;
+    if (overflow) s.cpsr |= v_flag; else s.cpsr &= ~v_flag;
 }
 
 bool arm_step(InterpreterState &s, Memory &memory) {
@@ -22,6 +65,8 @@ bool arm_step(InterpreterState &s, Memory &memory) {
 
     // B / BL, with an ARM PC-relative signed word offset.
     if ((instruction & 0x0e000000u) == 0x0a000000u) {
+        if (!condition_passed(s, instruction >> 28))
+            return true;
         const auto offset = static_cast<std::int32_t>(instruction << 8) >> 6;
         if (instruction & 0x01000000u)
             s.registers[14] = pc + 4;
@@ -29,23 +74,26 @@ bool arm_step(InterpreterState &s, Memory &memory) {
         return true;
     }
 
-    // LDR/STR with a positive, pre-indexed immediate word offset (condition AL).
-    if ((instruction >> 28) == 0xe && (instruction & 0x0e500000u) == 0x04100000u) {
+    // LDR/STR with a positive, pre-indexed immediate word offset.
+    if ((instruction & 0x0e500000u) == 0x04100000u) {
+        if (!condition_passed(s, instruction >> 28)) return true;
         const auto rn = (instruction >> 16) & 0xf;
         const auto rd = (instruction >> 12) & 0xf;
         const auto address = s.registers[rn] + (instruction & 0xfffu);
         return memory.read(address, &s.registers[rd], sizeof(s.registers[rd]));
     }
-    if ((instruction >> 28) == 0xe && (instruction & 0x0e500000u) == 0x04000000u) {
+    if ((instruction & 0x0e500000u) == 0x04000000u) {
+        if (!condition_passed(s, instruction >> 28)) return true;
         const auto rn = (instruction >> 16) & 0xf;
         const auto rd = (instruction >> 12) & 0xf;
         const auto address = s.registers[rn] + (instruction & 0xfffu);
         return memory.write(address, &s.registers[rd], sizeof(s.registers[rd]));
     }
 
-    // MOV, ADD, SUB and CMP with an immediate operand (condition AL only).
-    if ((instruction >> 28) != 0xe || !(instruction & (1u << 25)))
+    // MOV, ADD, SUB and CMP with an immediate operand.
+    if (!(instruction & (1u << 25)))
         return false;
+    if (!condition_passed(s, instruction >> 28)) return true;
     const auto opcode = (instruction >> 21) & 0xf;
     const auto set_flags = (instruction & (1u << 20)) != 0;
     const auto rd = (instruction >> 12) & 0xf;
@@ -64,16 +112,16 @@ bool arm_step(InterpreterState &s, Memory &memory) {
     case 0x4: // ADD
         result = lhs + operand;
         s.registers[rd] = result;
-        if (set_flags) set_nz(s, result);
+        if (set_flags) set_add_flags(s, lhs, operand, result);
         return true;
     case 0x2: // SUB
         result = lhs - operand;
         s.registers[rd] = result;
-        if (set_flags) set_nz(s, result);
+        if (set_flags) set_sub_flags(s, lhs, operand, result);
         return true;
     case 0xa: // CMP
         result = lhs - operand;
-        if (set_flags || true) set_nz(s, result);
+        set_sub_flags(s, lhs, operand, result);
         return true;
     default:
         return false;
