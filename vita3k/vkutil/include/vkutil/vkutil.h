@@ -1,0 +1,213 @@
+// Vita3K emulator project
+// Copyright (C) 2026 Vita3K team
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+#pragma once
+
+#include <util/warning.h>
+
+#ifdef __ANDROID__
+#define VK_USE_PLATFORM_ANDROID_KHR
+#elif defined(__APPLE__)
+#define VK_ENABLE_BETA_EXTENSIONS
+#define VK_USE_PLATFORM_METAL_EXT
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#define VK_USE_PLATFORM_WIN32_KHR
+#else
+#if defined(HAVE_X11)
+#define VK_USE_PLATFORM_XLIB_KHR
+#endif
+#if defined(HAVE_WAYLAND)
+#define VK_USE_PLATFORM_WAYLAND_KHR
+#endif
+#endif
+#define VK_NO_PROTOTYPES
+#define VULKAN_HPP_NO_CONSTRUCTORS
+#define VULKAN_HPP_NO_SPACESHIP_OPERATOR
+#include <vulkan/vulkan.hpp>
+
+#undef VK_USE_PLATFORM_ANDROID_KHR
+#undef VK_USE_PLATFORM_METAL_EXT
+#undef VK_USE_PLATFORM_WIN32_KHR
+#undef VK_USE_PLATFORM_XLIB_KHR
+#undef VK_USE_PLATFORM_WAYLAND_KHR
+#undef VK_ENABLE_BETA_EXTENSIONS
+
+#ifdef None
+#undef None
+#endif
+#ifdef Bool
+#undef Bool
+#endif
+#ifdef Status
+#undef Status
+#endif
+#ifdef Success
+#undef Success
+#endif
+#ifdef True
+#undef True
+#endif
+#ifdef False
+#undef False
+#endif
+#ifdef KeyPress
+#undef KeyPress
+#endif
+#ifdef KeyRelease
+#undef KeyRelease
+#endif
+#ifdef FocusIn
+#undef FocusIn
+#endif
+#ifdef FocusOut
+#undef FocusOut
+#endif
+#ifdef Expose
+#undef Expose
+#endif
+#ifdef GrayScale
+#undef GrayScale
+#endif
+#ifdef CursorShape
+#undef CursorShape
+#endif
+
+namespace VULKAN_HPP_NAMESPACE {
+class ValidationFailedEXTError : public SystemError {
+public:
+    ValidationFailedEXTError(std::string const &message)
+        : SystemError(make_error_code(Result::eErrorValidationFailedEXT), message) {}
+
+    ValidationFailedEXTError(char const *message)
+        : SystemError(make_error_code(Result::eErrorValidationFailedEXT), message) {}
+};
+} // namespace VULKAN_HPP_NAMESPACE
+
+#define VMA_STATIC_VULKAN_FUNCTIONS 0
+#define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
+
+DISABLE_CLANG_WARNING_BEGIN("-Wnullability-completeness")
+#include <vk_mem_alloc.hpp>
+DISABLE_CLANG_WARNING_END
+
+#include <util/fs.h>
+
+namespace vkutil {
+
+static constexpr vk::ImageSubresourceRange color_subresource_range = {
+    .aspectMask = vk::ImageAspectFlagBits::eColor,
+    .baseMipLevel = 0,
+    .levelCount = 1,
+    .baseArrayLayer = 0,
+    .layerCount = 1
+};
+
+static constexpr vk::ImageSubresourceRange ds_subresource_range = {
+    .aspectMask = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
+    .baseMipLevel = 0,
+    .levelCount = 1,
+    .baseArrayLayer = 0,
+    .layerCount = 1
+};
+
+static constexpr vk::ImageSubresourceRange d_subresource_range = {
+    .aspectMask = vk::ImageAspectFlagBits::eDepth,
+    .baseMipLevel = 0,
+    .levelCount = 1,
+    .baseArrayLayer = 0,
+    .layerCount = 1
+};
+
+static constexpr vk::ImageSubresourceLayers color_subresource_layer = {
+    .aspectMask = vk::ImageAspectFlagBits::eColor,
+    .mipLevel = 0,
+    .baseArrayLayer = 0,
+    .layerCount = 1
+};
+
+static constexpr vk::ComponentMapping default_comp_mapping = {
+    vk::ComponentSwizzle::eIdentity,
+    vk::ComponentSwizzle::eIdentity,
+    vk::ComponentSwizzle::eIdentity,
+    vk::ComponentSwizzle::eIdentity
+};
+
+static constexpr vk::ComponentMapping rgba_mapping = {
+    vk::ComponentSwizzle::eR,
+    vk::ComponentSwizzle::eG,
+    vk::ComponentSwizzle::eB,
+    vk::ComponentSwizzle::eA
+};
+
+static constexpr vk::ColorComponentFlags default_color_mask = vk::ColorComponentFlagBits::eR
+    | vk::ColorComponentFlagBits::eG
+    | vk::ColorComponentFlagBits::eB
+    | vk::ColorComponentFlagBits::eA;
+
+static constexpr vma::AllocationCreateInfo vma_auto_alloc = {
+    .usage = vma::MemoryUsage::eAuto
+};
+
+static constexpr vma::AllocationCreateInfo vma_mapped_alloc = {
+    .flags = vma::AllocationCreateFlagBits::eHostAccessSequentialWrite | vma::AllocationCreateFlagBits::eMapped,
+    .usage = vma::MemoryUsage::eAuto,
+    .preferredFlags = vk::MemoryPropertyFlagBits::eHostCoherent
+};
+
+static constexpr vma::AllocationCreateInfo vma_host_visible = {
+    .flags = vma::AllocationCreateFlagBits::eHostAccessSequentialWrite,
+    .usage = vma::MemoryUsage::eAuto,
+    .requiredFlags = vk::MemoryPropertyFlagBits::eHostVisible,
+};
+
+vk::CommandBuffer create_single_time_command(vk::Device device, vk::CommandPool cmd_pool);
+void end_single_time_command(vk::Device device, vk::Queue queue, vk::CommandPool cmd_pool, vk::CommandBuffer cmd_buffer);
+
+vk::ShaderModule load_shader(vk::Device device, const fs::path &shader_path);
+vk::ShaderModule load_shader(vk::Device device, const void *data, const uint32_t size);
+
+void copy_buffer(vk::Device device, vk::CommandPool cmd_pool, vk::Queue queue, vk::Buffer src, vk::Buffer dst, vk::DeviceSize size);
+
+enum struct ImageLayout {
+    Undefined,
+    TransferSrc,
+    TransferDst,
+    ColorAttachment,
+    DepthStencilAttachment,
+    ColorAttachmentReadWrite,
+    SampledImage,
+    StorageImage,
+    DepthStencilReadOnly
+};
+void transition_image_layout(vk::CommandBuffer cmd_buffer, vk::Image image, ImageLayout src_layout, ImageLayout dst_layout, const vk::ImageSubresourceRange &range = color_subresource_range);
+// transition image layout assuming you don't care about the former image content
+void transition_image_layout_discard(vk::CommandBuffer cmd_buffer, vk::Image image, ImageLayout src_layout, ImageLayout dst_layout, const vk::ImageSubresourceRange &range = color_subresource_range);
+// Return the vulkan layout associated with ImageLayout
+vk::ImageLayout get_underlying_layout(ImageLayout layout);
+
+// given the swizzle of the color surface (which was written as rgba because vulkan doesn't support swizzle on framebuffers)
+// and the swizzle of the texture that's reading from the color surface
+// return the swizzle the texture should to make it like the color actually had a swizzle applied to it
+vk::ComponentMapping color_to_texture_swizzle(const vk::ComponentMapping &swizzle_color, const vk::ComponentMapping &swizzle_texture);
+
+} // namespace vkutil
