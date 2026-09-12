@@ -192,6 +192,31 @@ updates on PC restores. Thumb byte and halfword transfers are also covered:
 register-offset STRH/LDRH/STRB/LDRB/LDSB/LDSH plus immediate STRB/LDRB and
 STRH/LDRH forms, all routed through checked browser memory.
 
+## M4-M7 browser host seams
+
+M4 adds an explicit Worker lifecycle (`loading`, `ready`, `paused`, `stopped`,
+and `error`) with timestamped events, status/pause/resume/shutdown commands,
+and module diagnostics. M5 adds `browser/web/storage.js`, a logical-path Fetch
+read bridge; writes intentionally require an application upload endpoint rather
+than pretending that HTTP is writable storage. M6 adds `browser/web/webgpu.js`,
+which reports WebGPU support and can request a device without coupling the
+native renderer to browser APIs. M7 adds `browser/web/audio_input.js`, with a
+queued input API and block-oriented Float32 audio validation; actual
+AudioWorklet output and SDL/HLE integration remain future work.
+
+All three host bridges are staged by the browser CMake target and are exposed
+through `globalThis.vita3kWeb`. Validate the assembled browser target with:
+
+```sh
+cmake --build build/web --verbose
+(cd build/web/dist && python3 -m http.server 8080 --bind 127.0.0.1)
+```
+
+Playwright validation must observe the lifecycle loading/ready messages, the
+existing `Vita3K WebAssembly bootstrap ready.` status, and no page errors. These
+milestones establish host-facing seams only; they do not claim OPFS persistence,
+full WebGPU rendering, AudioWorklet playback, or emulator-core integration.
+
 ## Next inspection targets before code changes
 
 * Enumerate all `cpu::init_cpu` call paths and thread run-loop/SVC handling to define interpreter ownership.
