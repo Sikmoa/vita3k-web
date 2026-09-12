@@ -202,6 +202,35 @@ bool thumb_step(InterpreterState &s, Memory &memory) {
             return memory.read(address, &s.registers[rd], sizeof(s.registers[rd]));
         return memory.write(address, &s.registers[rd], sizeof(s.registers[rd]));
     }
+    // Conditional B, 8-bit signed halfword offset.
+    if ((instruction & 0xf000u) == 0xd000u && (instruction & 0x0f00u) != 0x0f00u) {
+        if (condition_passed(s, (instruction >> 8) & 0xf)) {
+            const auto offset = static_cast<std::int32_t>(static_cast<std::int8_t>(instruction & 0xff)) << 1;
+            s.registers[15] = static_cast<std::uint32_t>(pc + 2 + offset);
+        }
+        return true;
+    }
+    // Shift immediate: LSLS/LSRS/ASRS Rd, Rm, #imm5.
+    if ((instruction & 0xe000u) == 0x0000u) {
+        const auto opcode = (instruction >> 11) & 3;
+        const auto rd = instruction & 7;
+        const auto rm = (instruction >> 3) & 7;
+        const auto shift = (instruction >> 6) & 0x1f;
+        const auto value = s.registers[rm];
+        if (opcode == 0) {
+            if (shift) s.cpsr = (s.cpsr & ~c_flag) | ((value >> (32 - shift) & 1) << 29);
+            s.registers[rd] = shift ? value << shift : value;
+        } else if (opcode == 1) {
+            if (shift) s.cpsr = (s.cpsr & ~c_flag) | (((value >> (shift - 1)) & 1) << 29);
+            s.registers[rd] = shift ? value >> shift : 0;
+        } else if (opcode == 2) {
+            if (shift) s.cpsr = (s.cpsr & ~c_flag) | (((value >> (shift - 1)) & 1) << 29);
+            s.registers[rd] = shift ? static_cast<std::uint32_t>(static_cast<std::int32_t>(value) >> shift)
+                                    : (value & n_flag ? 0xffffffffu : 0u);
+        } else return false;
+        set_nz(s, s.registers[rd]);
+        return true;
+    }
     // B, unconditional, 11-bit signed halfword offset.
     if ((instruction & 0xf800u) == 0xe000u) {
         const auto offset = static_cast<std::int32_t>(static_cast<std::int16_t>((instruction & 0x07ffu) << 5)) >> 4;

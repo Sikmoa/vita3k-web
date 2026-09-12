@@ -73,7 +73,27 @@ int main() {
     CHECK(cpu.run(1) == 1 && cpu.state().registers[0] == 4);
     CHECK(cpu.run(1) == 1 && cpu.state().registers[0] == 1);
 
-    // Unsupported instructions and memory faults halt execution explicitly.
+    // Thumb: LSLS r0,r1,#1; LSRS r0,r1,#1; ASRS r0,r1,#1.
+    const std::uint16_t thumb_shifts[] = { 0x0048u, 0x0848u, 0x1048u };
+    CHECK(memory.write(page_size, thumb_shifts, sizeof(thumb_shifts)));
+    cpu.reset(page_size | 1, true);
+    cpu.state().registers[1] = 0x80000002u;
+    CHECK(cpu.run(1) == 1 && cpu.state().registers[0] == 4);
+    cpu.state().registers[1] = 0x80000002u;
+    CHECK(cpu.run(1) == 1 && cpu.state().registers[0] == 0x40000001u);
+    cpu.state().registers[1] = 0x80000002u;
+    CHECK(cpu.run(1) == 1 && cpu.state().registers[0] == 0xc0000001u);
+
+    // Thumb: CMP r0,r1; BEQ +2; MOVS r2,#1; MOVS r2,#2.
+    const std::uint16_t thumb_branch[] = { 0x4288u, 0xd001u, 0x2201u, 0x2202u };
+    CHECK(memory.write(page_size, thumb_branch, sizeof(thumb_branch)));
+    cpu.reset(page_size | 1, true);
+    cpu.state().registers[0] = 7;
+    cpu.state().registers[1] = 7;
+    CHECK(cpu.run(2) == 2 && cpu.state().registers[15] == page_size + 6);
+    CHECK(cpu.step() && cpu.state().registers[2] == 2);
+
+    // Unsupported instructions and memory faults halt execution explicitly. and memory faults halt execution explicitly.
     cpu.reset(0);
     CHECK(!cpu.step() && cpu.state().halted);
     CHECK(!cpu.step());
