@@ -223,9 +223,12 @@ The browser target now has a small end-to-end execution probe in
 `browser/src/guest.*`. A versioned-independent synthetic guest image is loaded
 into `browser::Memory`, executed by the standalone ARM/Thumb interpreter, and
 can terminate through the reserved ARM `0xef000001` or Thumb `0xdf01` probe
-instruction. The exit value is read from guest `r0` and reported as a
-`GuestResult`, making the execution observable without pulling the native
-loader, `KernelState`, or HLE graph into the minimal Wasm target.
+instruction. The Worker invokes this path through the exported
+`vita3k_web_run_guest_probe` function and reports the guest exit code (42 in
+the deterministic probe) back to the page. The exit value is read from guest
+`r0` and reported as a `GuestResult`, making the execution observable without
+pulling the native loader, `KernelState`, or HLE graph into the minimal Wasm
+target.
 
 This is deliberately not a Vita ELF/SELF loader and the probe instruction is
 not wired to the native `sceKernelExitProcess` implementation. It proves the
@@ -242,6 +245,10 @@ clang++ -std=c++23 -Wall -Wextra -Werror \
 cmake --build build/web --verbose
 node build/web/browser/vita3k_web_guest_tests.js
 ```
+
+The browser-level check should also log `guest exit: 42` after the Worker
+reaches `ready`. This catches runtime-lifetime errors that standalone Node
+execution cannot catch.
 
 ## Next inspection targets before code changes
 

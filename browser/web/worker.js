@@ -37,6 +37,11 @@ self.onmessage = ({ data }) => {
   case 'resume':
     if (lifecycle === 'paused') transition('ready');
     break;
+  case 'run-guest': {
+    const exitCode = module?._vita3k_web_run_guest_probe?.() ?? -1;
+    post({ type: 'guest-exit', exitCode, ok: exitCode >= 0 });
+    break;
+  }
   case 'shutdown':
     if (module?._vita3k_web_shutdown) module._vita3k_web_shutdown();
     transition('stopped');

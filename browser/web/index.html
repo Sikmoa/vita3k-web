@@ -35,6 +35,11 @@
       if (data.type === 'ready') {
         status.textContent = 'Vita3K WebAssembly bootstrap ready.';
         console.log('[vita3k-web] bridges:', { storage, webgpu, audioInput });
+        worker.postMessage({ type: 'run-guest' });
+      }
+      if (data.type === 'guest-exit') {
+        console.log('[vita3k-web] guest exit:', data.exitCode);
+        if (!data.ok) status.textContent = 'Guest execution probe failed.';
       }
       if (data.type === 'log') console.log('[vita3k-web]', data.message);
       if (data.type === 'error') status.textContent = `Error: ${data.message}`;
