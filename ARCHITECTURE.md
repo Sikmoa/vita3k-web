@@ -134,6 +134,24 @@ ready.` and logs the M1 initialization message. The current target produces
 and `vita3k_web.wasm`. Browser automation is optional; static artifact inspection
 and an HTTP smoke check are useful when no headless browser is installed.
 
+## M2 browser memory progress
+
+M2 now includes a standalone `browser::web::Memory` model in
+`browser/src/memory.{h,cpp}`. It uses a configurable byte vector with 4 KiB
+allocation metadata instead of native `mmap`, `mprotect`, or fault handlers.
+Allocations reserve guest pages, keep page zero unavailable, zero newly
+allocated storage, support fixed-address allocation and release, and expose
+explicit validity, permission, checked translation, read, and write APIs.
+
+The focused `vita3k_web_memory_tests` executable is built as part of the
+browser graph and runs without Qt, SDL, Vulkan, Dynarmic, or Emscripten APIs in
+the memory implementation. The current smoke tests cover allocation/release,
+zero-page reservation, fixed-address conflicts, names, read/write translation,
+read-only permissions, and invalid access. This is an incremental M2 seam; the
+native `MemState` and `Ptr<T>` paths remain unchanged, and protection callbacks,
+aligned allocation, broader parity tests, and interpreter integration remain
+later work.
+
 ## Next inspection targets before code changes
 
 * Enumerate all `cpu::init_cpu` call paths and thread run-loop/SVC handling to define interpreter ownership.

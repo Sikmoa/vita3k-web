@@ -9,9 +9,20 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(vita3k_web
     src/main.cpp
+    src/memory.cpp
 )
 
 target_compile_definitions(vita3k_web PRIVATE VITA3K_WEB=1)
+
+add_executable(vita3k_web_memory_tests
+    src/memory.cpp
+    tests/memory_tests.cpp
+)
+
+if(NOT EMSCRIPTEN)
+    enable_testing()
+    add_test(NAME vita3k_web_memory COMMAND vita3k_web_memory_tests)
+endif()
 
 target_link_options(vita3k_web PRIVATE
     "SHELL:-sMODULARIZE=1"
