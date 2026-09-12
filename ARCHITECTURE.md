@@ -112,6 +112,28 @@ A browser build must therefore be an explicit target graph, not merely `-DEMSCRI
 
 Each step must retain a functioning native build. Commercial software and Persona 4 Golden are integration milestones, not bring-up tests.
 
+## M1 browser bootstrap validation
+
+The M1 target is a deliberately separate Emscripten lifecycle probe; it does not
+compile the emulator core or native frontend dependencies. Validate it with:
+
+```sh
+emcmake cmake -S . -B build/web -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/web --verbose
+find build/web -maxdepth 3 -type f | sort
+cd build/web/dist
+python3 -m http.server 8080
+```
+
+Open `http://127.0.0.1:8080/` from a browser with WebAssembly and Worker
+support. The page and Worker must be served over HTTP (not `file://`), and the
+Worker must be able to fetch `vita3k_web.js` and the adjacent
+`vita3k_web.wasm`. A successful page reports `Vita3K WebAssembly bootstrap
+ready.` and logs the M1 initialization message. The current target produces
+`build/web/dist/index.html`, `worker.js`, `vita3k_web.js`, and
+`vita3k_web.wasm`. Browser automation is optional; static artifact inspection
+and an HTTP smoke check are useful when no headless browser is installed.
+
 ## Next inspection targets before code changes
 
 * Enumerate all `cpu::init_cpu` call paths and thread run-loop/SVC handling to define interpreter ownership.
