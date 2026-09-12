@@ -217,6 +217,32 @@ existing `Vita3K WebAssembly bootstrap ready.` status, and no page errors. These
 milestones establish host-facing seams only; they do not claim OPFS persistence,
 full WebGPU rendering, AudioWorklet playback, or emulator-core integration.
 
+## Guest execution vertical slice
+
+The browser target now has a small end-to-end execution probe in
+`browser/src/guest.*`. A versioned-independent synthetic guest image is loaded
+into `browser::Memory`, executed by the standalone ARM/Thumb interpreter, and
+can terminate through the reserved ARM `0xef000001` or Thumb `0xdf01` probe
+instruction. The exit value is read from guest `r0` and reported as a
+`GuestResult`, making the execution observable without pulling the native
+loader, `KernelState`, or HLE graph into the minimal Wasm target.
+
+This is deliberately not a Vita ELF/SELF loader and the probe instruction is
+not wired to the native `sceKernelExitProcess` implementation. It proves the
+browser memory -> guest instruction -> host syscall boundary and provides a
+place to add a real image format and HLE dispatch incrementally.
+
+Validate it with:
+
+```sh
+clang++ -std=c++23 -Wall -Wextra -Werror \
+  browser/src/memory.cpp browser/src/interpreter.cpp browser/src/guest.cpp \
+  browser/tests/guest_tests.cpp -o /tmp/vita3k_web_guest_tests
+/tmp/vita3k_web_guest_tests
+cmake --build build/web --verbose
+node build/web/browser/vita3k_web_guest_tests.js
+```
+
 ## Next inspection targets before code changes
 
 * Enumerate all `cpu::init_cpu` call paths and thread run-loop/SVC handling to define interpreter ownership.

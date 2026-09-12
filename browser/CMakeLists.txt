@@ -11,6 +11,7 @@ add_executable(vita3k_web
     src/main.cpp
     src/memory.cpp
     src/interpreter.cpp
+    src/guest.cpp
 )
 
 target_compile_definitions(vita3k_web PRIVATE VITA3K_WEB=1)
@@ -26,10 +27,18 @@ add_executable(vita3k_web_interpreter_tests
     tests/interpreter_tests.cpp
 )
 
+add_executable(vita3k_web_guest_tests
+    src/memory.cpp
+    src/interpreter.cpp
+    src/guest.cpp
+    tests/guest_tests.cpp
+)
+
 if(NOT EMSCRIPTEN)
     enable_testing()
     add_test(NAME vita3k_web_memory COMMAND vita3k_web_memory_tests)
     add_test(NAME vita3k_web_interpreter COMMAND vita3k_web_interpreter_tests)
+    add_test(NAME vita3k_web_guest COMMAND vita3k_web_guest_tests)
 endif()
 
 target_link_options(vita3k_web PRIVATE
