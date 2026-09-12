@@ -15,6 +15,7 @@ target_compile_definitions(vita3k_web PRIVATE VITA3K_WEB=1)
 
 target_link_options(vita3k_web PRIVATE
     "SHELL:-sMODULARIZE=1"
+    "SHELL:-sEXPORT_ES6=1"
     "SHELL:-sEXPORT_NAME=Vita3KWeb"
     "SHELL:-sENVIRONMENT=web,worker"
     "SHELL:-sEXIT_RUNTIME=1"
