@@ -152,6 +152,31 @@ native `MemState` and `Ptr<T>` paths remain unchanged, and protection callbacks,
 aligned allocation, broader parity tests, and interpreter integration remain
 later work.
 
+## M3 interpreter bring-up slice
+
+The browser target now includes a standalone `vita3k::web::Interpreter` over
+`browser::Memory`. This is an execution probe, not yet the production
+`CPUInterface` backend. It deliberately supports only a small deterministic
+subset: ARM immediate MOV/ADD/SUB/CMP and B/BL, plus Thumb-1 immediate
+MOVS/ADDS/SUBS, unconditional B, and BX. It tracks the PC, general registers,
+Thumb state, and the CPSR N/Z flags. Unsupported instructions and checked
+memory faults halt the probe instead of being silently treated as successful.
+
+Validate the slice with:
+
+```sh
+clang++ -std=c++23 -Wall -Wextra -Werror \
+  browser/src/memory.cpp browser/src/interpreter.cpp \
+  browser/tests/interpreter_tests.cpp -o /tmp/vita3k_web_interpreter_tests
+/tmp/vita3k_web_interpreter_tests
+cmake --build build/web --verbose
+node build/web/browser/vita3k_web_interpreter_tests.js
+```
+
+The native Dynarmic path remains unchanged. The next interpreter increment
+should expand instruction coverage and add differential tests before adapting
+`CPUInterface`; it should not yet attempt full Vita process/thread integration.
+
 ## Next inspection targets before code changes
 
 * Enumerate all `cpu::init_cpu` call paths and thread run-loop/SVC handling to define interpreter ownership.

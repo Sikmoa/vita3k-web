@@ -10,6 +10,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_executable(vita3k_web
     src/main.cpp
     src/memory.cpp
+    src/interpreter.cpp
 )
 
 target_compile_definitions(vita3k_web PRIVATE VITA3K_WEB=1)
@@ -19,9 +20,16 @@ add_executable(vita3k_web_memory_tests
     tests/memory_tests.cpp
 )
 
+add_executable(vita3k_web_interpreter_tests
+    src/memory.cpp
+    src/interpreter.cpp
+    tests/interpreter_tests.cpp
+)
+
 if(NOT EMSCRIPTEN)
     enable_testing()
     add_test(NAME vita3k_web_memory COMMAND vita3k_web_memory_tests)
+    add_test(NAME vita3k_web_interpreter COMMAND vita3k_web_interpreter_tests)
 endif()
 
 target_link_options(vita3k_web PRIVATE
