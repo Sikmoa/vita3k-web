@@ -34,7 +34,7 @@ std::uint32_t Memory::allocate(std::uint32_t size_bytes, const char *name) {
     for (std::uint32_t page = 1; page < permissions_.size(); ++page) {
         if (!allocated_[page]) {
             if (++run == pages) {
-                    const auto address = (page + 1 - pages) * page_size;
+                const auto address = (page + 1 - pages) * page_size;
                 return allocate_at(address, size_bytes, name) ? address : 0;
             }
         } else {
