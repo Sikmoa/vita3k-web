@@ -151,6 +151,48 @@ bool thumb_step(InterpreterState &s, Memory &memory) {
         set_nz(s, s.registers[rd]);
         return true;
     }
+    // ADD/SUB register (low registers).
+    if ((instruction & 0xfe00u) == 0x1800u || (instruction & 0xfe00u) == 0x1a00u) {
+        const auto rd = instruction & 7;
+        const auto rn = (instruction >> 3) & 7;
+        const auto rm = (instruction >> 6) & 7;
+        const auto lhs = s.registers[rn];
+        const auto rhs = s.registers[rm];
+        s.registers[rd] = (instruction & 0x0200u) ? lhs - rhs : lhs + rhs;
+        set_nz(s, s.registers[rd]);
+        return true;
+    }
+    // MOV high-register form (the test uses a low destination).
+    if ((instruction & 0xffc0u) == 0x4600u) {
+        const auto rd = (instruction & 7) | ((instruction >> 4) & 8);
+        const auto rm = (instruction >> 3) & 0xf;
+        s.registers[rd] = s.registers[rm];
+        return true;
+    }
+    // Register ALU operations: AND, EOR, TST, CMP, ORR, BIC, and MOV.
+    if ((instruction & 0xfc00u) == 0x4000u) {
+        const auto opcode = (instruction >> 6) & 0xf;
+        const auto rm = (instruction >> 3) & 7;
+        const auto rd = instruction & 7;
+        const auto lhs = s.registers[rd];
+        const auto rhs = s.registers[rm];
+        std::uint32_t result = 0;
+        switch (opcode) {
+        case 0x0: result = lhs & rhs; break; // ANDS
+        case 0x1: result = lhs ^ rhs; break; // EORS
+        case 0x4: result = lhs + rhs; break; // ADDS
+        case 0x8: result = lhs & rhs; break; // TST
+        case 0xa: result = lhs - rhs; break; // CMP
+        case 0xc: result = lhs | rhs; break; // ORRS
+        case 0xd: result = rhs; break; // MOVS
+        case 0xe: result = lhs - rhs; break; // BICS is approximated below
+        default: return false;
+        }
+        if (opcode == 0xe) result = lhs & ~rhs;
+        if (opcode != 0x8 && opcode != 0xa) s.registers[rd] = result;
+        set_nz(s, result);
+        return true;
+    }
     // STR/LDR Rt, [Rn, #imm5 * 4].
     if ((instruction & 0xf800u) == 0x6000u || (instruction & 0xf800u) == 0x6800u) {
         const auto rd = instruction & 7;

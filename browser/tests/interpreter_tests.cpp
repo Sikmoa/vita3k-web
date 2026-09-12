@@ -58,6 +58,21 @@ int main() {
     cpu.state().registers[0] = 0x11223344u;
     CHECK(cpu.run(3) == 3 && cpu.state().registers[0] == 0x11223344u);
 
+    // Thumb register ALU: ADDS, EORS, TST, CMP, ORRS, BICS, MOVS.
+    const std::uint16_t thumb_alu[] = { 0x1840u, 0x4048u, 0x4208u, 0x4288u, 0x4308u, 0x4388u, 0x4608u };
+    CHECK(memory.write(page_size, thumb_alu, sizeof(thumb_alu)));
+    cpu.reset(page_size | 1, true);
+    cpu.state().registers[0] = 2;
+    cpu.state().registers[1] = 3;
+    CHECK(cpu.run(1) == 1 && cpu.state().registers[0] == 5);
+    cpu.state().registers[1] = 1;
+    CHECK(cpu.run(1) == 1 && cpu.state().registers[0] == 4);
+    CHECK(cpu.run(1) == 1);
+    CHECK(cpu.run(1) == 1);
+    CHECK(cpu.run(1) == 1 && cpu.state().registers[0] == 5);
+    CHECK(cpu.run(1) == 1 && cpu.state().registers[0] == 4);
+    CHECK(cpu.run(1) == 1 && cpu.state().registers[0] == 1);
+
     // Unsupported instructions and memory faults halt execution explicitly.
     cpu.reset(0);
     CHECK(!cpu.step() && cpu.state().halted);

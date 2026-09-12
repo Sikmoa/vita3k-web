@@ -159,8 +159,9 @@ The browser target now includes a standalone `vita3k::web::Interpreter` over
 `CPUInterface` backend. It deliberately supports only a small deterministic
 subset: ARM immediate MOV/ADD/SUB/CMP and B/BL, positive-immediate word
 LDR/STR, plus Thumb-1 immediate MOVS/ADDS/SUBS, unconditional B, BX, and
-word LDR/STR. It tracks the PC, general registers, Thumb state, and the CPSR
-N/Z flags. Unsupported instructions and checked
+word LDR/STR. It also supports Thumb low-register ADD/SUB and the basic
+register ALU forms (AND/EOR/TST/CMP/ORR/BIC/MOV). It tracks the PC, general
+registers, Thumb state, and the CPSR N/Z flags. Unsupported instructions and checked
 memory faults halt the probe instead of being silently treated as successful.
 
 Validate the slice with:
