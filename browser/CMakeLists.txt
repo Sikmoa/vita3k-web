@@ -38,6 +38,9 @@ add_custom_command(TARGET vita3k_web POST_BUILD
         "${CMAKE_CURRENT_SOURCE_DIR}/web/worker.js"
         "${CMAKE_BINARY_DIR}/dist/worker.js"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/web/capabilities.js"
+        "${CMAKE_BINARY_DIR}/dist/capabilities.js"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "$<TARGET_FILE:vita3k_web>"
         "${CMAKE_BINARY_DIR}/dist/vita3k_web.js"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

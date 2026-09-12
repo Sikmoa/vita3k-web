@@ -130,8 +130,8 @@ support. The page and Worker must be served over HTTP (not `file://`), and the
 Worker must be able to fetch `vita3k_web.js` and the adjacent
 `vita3k_web.wasm`. A successful page reports `Vita3K WebAssembly bootstrap
 ready.` and logs the M1 initialization message. The current target produces
-`build/web/dist/index.html`, `worker.js`, `vita3k_web.js`, and
-`vita3k_web.wasm`. Browser automation is optional; static artifact inspection
+`build/web/dist/index.html`, `worker.js`, `capabilities.js`, `vita3k_web.js`,
+and `vita3k_web.wasm`. Browser automation is optional; static artifact inspection
 and an HTTP smoke check are useful when no headless browser is installed.
 
 ## Next inspection targets before code changes
