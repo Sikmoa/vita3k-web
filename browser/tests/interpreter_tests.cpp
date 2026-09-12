@@ -107,6 +107,22 @@ int main() {
     CHECK(cpu.step() && cpu.state().registers[0] == 0x11111111u);
     CHECK(cpu.state().registers[1] == 0x22222222u && cpu.state().registers[15] == page_size);
 
+    // Thumb byte/halfword stores and loads use checked guest memory.
+    const std::uint16_t thumb_narrow_memory[] = {
+        0x7008u, 0x7808u, 0x8008u, 0x8808u, 0x5008u, 0x5c08u,
+    };
+    CHECK(memory.write(page_size, thumb_narrow_memory, sizeof(thumb_narrow_memory)));
+    cpu.reset(page_size | 1, true);
+    cpu.state().registers[0] = 0x0000ff80u;
+    cpu.state().registers[1] = page_size + 0x180;
+    CHECK(cpu.run(1) == 1);
+    cpu.state().registers[0] = 0;
+    CHECK(cpu.run(1) == 1 && cpu.state().registers[0] == 0x80);
+    cpu.state().registers[0] = 0xabcd1234u;
+    CHECK(cpu.run(1) == 1);
+    cpu.state().registers[0] = 0;
+    CHECK(cpu.run(1) == 1 && cpu.state().registers[0] == 0x1234);
+
     // Unsupported instructions and memory faults halt execution explicitly.
     cpu.reset(0);
     CHECK(!cpu.step() && cpu.state().halted);

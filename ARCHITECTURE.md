@@ -185,7 +185,9 @@ arithmetic instructions update N/Z/C/V for the supported immediate forms.
 Thumb immediate shifts (LSL/LSR/ASR) and conditional branches are also
 covered, including carry updates from shifts. Thumb PUSH/POP is now covered
 for low registers plus LR/PC, with checked stack memory and Thumb-state
-updates on PC restores.
+updates on PC restores. Thumb byte and halfword transfers are also covered:
+register-offset STRH/LDRH/STRB/LDRB/LDSB/LDSH plus immediate STRB/LDRB and
+STRH/LDRH forms, all routed through checked browser memory.
 
 ## Next inspection targets before code changes
 

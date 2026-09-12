@@ -193,6 +193,59 @@ bool thumb_step(InterpreterState &s, Memory &memory) {
         set_nz(s, result);
         return true;
     }
+    // Register-offset byte/halfword transfers.
+    if ((instruction & 0xfc00u) == 0x5000u) {
+        const auto operation = (instruction >> 9) & 7;
+        const auto rm = (instruction >> 6) & 7;
+        const auto rn = (instruction >> 3) & 7;
+        const auto rd = instruction & 7;
+        const auto address = s.registers[rn] + s.registers[rm];
+        std::uint8_t byte = 0;
+        std::uint16_t halfword = 0;
+        switch (operation) {
+        case 0: return memory.write(address, &s.registers[rd], sizeof(halfword)); // STRH
+        case 1: return memory.read(address, &s.registers[rd], sizeof(halfword)); // LDRH
+        case 2: return memory.write(address, &s.registers[rd], sizeof(byte)); // STRB
+        case 3:
+            if (!memory.read(address, &byte, sizeof(byte))) return false; // LDRB
+            s.registers[rd] = byte;
+            return true;
+        case 5:
+            if (!memory.read(address, &byte, sizeof(byte))) return false; // LDSB
+            s.registers[rd] = static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int8_t>(byte)));
+            return true;
+        case 7:
+            if (!memory.read(address, &halfword, sizeof(halfword))) return false; // LDSH
+            s.registers[rd] = static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(halfword)));
+            return true;
+        default: return false;
+        }
+    }
+    // Immediate byte and halfword transfers.
+    if ((instruction & 0xf800u) == 0x7000u || (instruction & 0xf800u) == 0x7800u) {
+        const auto rd = instruction & 7;
+        const auto rn = (instruction >> 3) & 7;
+        const auto address = s.registers[rn] + ((instruction >> 6) & 0x1f);
+        std::uint8_t byte = 0;
+        if (instruction & 0x0800u) {
+            if (!memory.read(address, &byte, sizeof(byte))) return false;
+            s.registers[rd] = byte;
+            return true;
+        }
+        return memory.write(address, &s.registers[rd], sizeof(byte));
+    }
+    if ((instruction & 0xf800u) == 0x8000u || (instruction & 0xf800u) == 0x8800u) {
+        const auto rd = instruction & 7;
+        const auto rn = (instruction >> 3) & 7;
+        const auto address = s.registers[rn] + (((instruction >> 6) & 0x1f) * 2);
+        std::uint16_t halfword = 0;
+        if (instruction & 0x0800u) {
+            if (!memory.read(address, &halfword, sizeof(halfword))) return false;
+            s.registers[rd] = halfword;
+            return true;
+        }
+        return memory.write(address, &s.registers[rd], sizeof(halfword));
+    }
     // STR/LDR Rt, [Rn, #imm5 * 4].
     if ((instruction & 0xf800u) == 0x6000u || (instruction & 0xf800u) == 0x6800u) {
         const auto rd = instruction & 7;
