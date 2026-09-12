@@ -9,6 +9,14 @@ endif()
 
 project(Vita3K)
 
+# The browser build is intentionally a separate, minimal target during M1.
+# It must not pull in Qt, SDL, Vulkan, Dynarmic, or desktop-only dependencies.
+if(EMSCRIPTEN)
+	set(VITA3K_WEB ON CACHE BOOL "Build the Vita3K browser target" FORCE)
+	add_subdirectory(browser)
+	return()
+endif()
+
 # Detects the amount of processors of the host machine and forwards the result to CPU_COUNT
 include(ProcessorCount)
 ProcessorCount(CPU_COUNT)

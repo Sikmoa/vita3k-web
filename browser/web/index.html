@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vita3K Web — M1 Bootstrap</title>
+</head>
+<body>
+  <main>
+    <h1>Vita3K Web</h1>
+    <p id="status">Loading browser bootstrap…</p>
+    <p id="capabilities"></p>
+  </main>
+  <script type="module">
+    import { detectBrowserCapabilities, requiredCapabilities, formatCapabilities } from './capabilities.js';
+
+    const status = document.querySelector('#status');
+    const capabilities = detectBrowserCapabilities();
+    document.querySelector('#capabilities').textContent = formatCapabilities(capabilities);
+    const missing = requiredCapabilities(capabilities).filter((name) => !capabilities[name]);
+    if (missing.length) {
+      status.textContent = `Missing required browser capabilities: ${missing.join(', ')}`;
+      throw new Error(status.textContent);
+    }
+
+    const worker = new Worker('./worker.js', { type: 'module' });
+    worker.onmessage = ({ data }) => {
+      if (data.type === 'ready') status.textContent = 'Vita3K WebAssembly bootstrap ready.';
+      if (data.type === 'log') console.log('[vita3k-web]', data.message);
+      if (data.type === 'error') status.textContent = `Error: ${data.message}`;
+    };
+    worker.onerror = (event) => {
+      status.textContent = `Worker error: ${event.message || 'unknown error'}`;
+    };
+  </script>
+</body>
+</html>
