@@ -13,6 +13,9 @@
   </main>
   <script type="module">
     import { detectBrowserCapabilities, requiredCapabilities, formatCapabilities } from './capabilities.js';
+    import { createWebStorage } from './storage.js';
+    import { createWebGPUBridge } from './webgpu.js';
+    import { createAudioInputBridge } from './audio_input.js';
 
     const status = document.querySelector('#status');
     const capabilities = detectBrowserCapabilities();
@@ -23,15 +26,23 @@
       throw new Error(status.textContent);
     }
 
+    const storage = createWebStorage();
+    const webgpu = createWebGPUBridge();
+    const audioInput = createAudioInputBridge();
     const worker = new Worker('./worker.js', { type: 'module' });
     worker.onmessage = ({ data }) => {
-      if (data.type === 'ready') status.textContent = 'Vita3K WebAssembly bootstrap ready.';
+      if (data.type === 'lifecycle') console.log('[vita3k-web] lifecycle:', data.state);
+      if (data.type === 'ready') {
+        status.textContent = 'Vita3K WebAssembly bootstrap ready.';
+        console.log('[vita3k-web] bridges:', { storage, webgpu, audioInput });
+      }
       if (data.type === 'log') console.log('[vita3k-web]', data.message);
       if (data.type === 'error') status.textContent = `Error: ${data.message}`;
     };
     worker.onerror = (event) => {
       status.textContent = `Worker error: ${event.message || 'unknown error'}`;
     };
+    globalThis.vita3kWeb = { worker, storage, webgpu, audioInput };
   </script>
 </body>
 </html>
