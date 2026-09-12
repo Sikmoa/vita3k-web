@@ -29,6 +29,20 @@ bool arm_step(InterpreterState &s, Memory &memory) {
         return true;
     }
 
+    // LDR/STR with a positive, pre-indexed immediate word offset (condition AL).
+    if ((instruction >> 28) == 0xe && (instruction & 0x0e500000u) == 0x04100000u) {
+        const auto rn = (instruction >> 16) & 0xf;
+        const auto rd = (instruction >> 12) & 0xf;
+        const auto address = s.registers[rn] + (instruction & 0xfffu);
+        return memory.read(address, &s.registers[rd], sizeof(s.registers[rd]));
+    }
+    if ((instruction >> 28) == 0xe && (instruction & 0x0e500000u) == 0x04000000u) {
+        const auto rn = (instruction >> 16) & 0xf;
+        const auto rd = (instruction >> 12) & 0xf;
+        const auto address = s.registers[rn] + (instruction & 0xfffu);
+        return memory.write(address, &s.registers[rd], sizeof(s.registers[rd]));
+    }
+
     // MOV, ADD, SUB and CMP with an immediate operand (condition AL only).
     if ((instruction >> 28) != 0xe || !(instruction & (1u << 25)))
         return false;
@@ -88,6 +102,15 @@ bool thumb_step(InterpreterState &s, Memory &memory) {
         s.registers[rd] = subtract ? s.registers[rd] - immediate : s.registers[rd] + immediate;
         set_nz(s, s.registers[rd]);
         return true;
+    }
+    // STR/LDR Rt, [Rn, #imm5 * 4].
+    if ((instruction & 0xf800u) == 0x6000u || (instruction & 0xf800u) == 0x6800u) {
+        const auto rd = instruction & 7;
+        const auto rn = (instruction >> 3) & 7;
+        const auto address = s.registers[rn] + ((instruction >> 6) & 0x1f) * 4;
+        if (instruction & 0x0800u)
+            return memory.read(address, &s.registers[rd], sizeof(s.registers[rd]));
+        return memory.write(address, &s.registers[rd], sizeof(s.registers[rd]));
     }
     // B, unconditional, 11-bit signed halfword offset.
     if ((instruction & 0xf800u) == 0xe000u) {

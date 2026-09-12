@@ -157,9 +157,10 @@ later work.
 The browser target now includes a standalone `vita3k::web::Interpreter` over
 `browser::Memory`. This is an execution probe, not yet the production
 `CPUInterface` backend. It deliberately supports only a small deterministic
-subset: ARM immediate MOV/ADD/SUB/CMP and B/BL, plus Thumb-1 immediate
-MOVS/ADDS/SUBS, unconditional B, and BX. It tracks the PC, general registers,
-Thumb state, and the CPSR N/Z flags. Unsupported instructions and checked
+subset: ARM immediate MOV/ADD/SUB/CMP and B/BL, positive-immediate word
+LDR/STR, plus Thumb-1 immediate MOVS/ADDS/SUBS, unconditional B, BX, and
+word LDR/STR. It tracks the PC, general registers, Thumb state, and the CPSR
+N/Z flags. Unsupported instructions and checked
 memory faults halt the probe instead of being silently treated as successful.
 
 Validate the slice with:
@@ -176,6 +177,8 @@ node build/web/browser/vita3k_web_interpreter_tests.js
 The native Dynarmic path remains unchanged. The next interpreter increment
 should expand instruction coverage and add differential tests before adapting
 `CPUInterface`; it should not yet attempt full Vita process/thread integration.
+The memory operations use `Memory::read`/`write`, so permission and bounds
+faults are explicit and testable rather than host signal handlers.
 
 ## Next inspection targets before code changes
 
