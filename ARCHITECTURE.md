@@ -179,7 +179,10 @@ The native Dynarmic path remains unchanged. The next interpreter increment
 should expand instruction coverage and add differential tests before adapting
 `CPUInterface`; it should not yet attempt full Vita process/thread integration.
 The memory operations use `Memory::read`/`write`, so permission and bounds
-faults are explicit and testable rather than host signal handlers. ARM condition
+faults are explicit and testable rather than host signal handlers. The
+interpreter exposes `StepResult` (`Executed`, `MemoryFault`, `Unsupported`, and
+`Halted`) so callers can distinguish a failed guest access from an unsupported
+opcode or a previously halted core. ARM condition
 codes (EQ/NE and the remaining standard conditions) are evaluated, and
 arithmetic instructions update N/Z/C/V for the supported immediate forms.
 Thumb immediate shifts (LSL/LSR/ASR) and conditional branches are also

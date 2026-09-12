@@ -126,6 +126,8 @@ int main() {
     // Unsupported instructions and memory faults halt execution explicitly.
     cpu.reset(0);
     CHECK(!cpu.step() && cpu.state().halted);
+    CHECK(cpu.step_result() == StepResult::MemoryFault);
     CHECK(!cpu.step());
+    CHECK(cpu.step_result() == StepResult::Halted);
     std::puts("M3 interpreter checks passed");
 }

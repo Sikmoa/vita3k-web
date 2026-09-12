@@ -346,11 +346,29 @@ const InterpreterState &Interpreter::state() const noexcept { return state_; }
 InterpreterState &Interpreter::state() noexcept { return state_; }
 
 bool Interpreter::step() {
-    if (state_.halted)
+    if (state_.halted) {
+        state_.last_result = StepResult::Halted;
         return false;
+    }
+    const auto pc = state_.registers[15];
+    const auto instruction_size = state_.thumb ? sizeof(std::uint16_t) : sizeof(std::uint32_t);
+    if (!memory_->valid_range(pc, instruction_size) || !memory_->can_access(pc, instruction_size, false)) {
+        state_.halted = true;
+        state_.last_result = StepResult::MemoryFault;
+        return false;
+    }
     const bool result = state_.thumb ? thumb_step(state_, *memory_) : arm_step(state_, *memory_);
-    if (!result) state_.halted = true;
+    if (!result) {
+        state_.halted = true;
+        state_.last_result = StepResult::Unsupported;
+    } else {
+        state_.last_result = StepResult::Executed;
+    }
     return result;
+}
+
+StepResult Interpreter::step_result() const noexcept {
+    return state_.last_result;
 }
 
 std::size_t Interpreter::run(std::size_t instruction_limit) {

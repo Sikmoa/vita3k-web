@@ -7,11 +7,19 @@
 
 namespace vita3k::web {
 
+enum class StepResult {
+    Executed,
+    MemoryFault,
+    Unsupported,
+    Halted,
+};
+
 struct InterpreterState {
     std::uint32_t registers[16]{};
     std::uint32_t cpsr = 0;
     bool thumb = false;
     bool halted = false;
+    StepResult last_result = StepResult::Halted;
 };
 
 /** A deliberately small ARMv7 bring-up interpreter for browser tests.
@@ -30,6 +38,7 @@ public:
 
     // Returns false for an unsupported instruction or a memory fault.
     bool step();
+    StepResult step_result() const noexcept;
     std::size_t run(std::size_t instruction_limit);
 
 private:
