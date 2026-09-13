@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vita3K Web — Vita Display</title>
+  <style>
+    main { font-family: system-ui, sans-serif; margin: 1rem auto; max-width: 1024px; }
+    #vita-canvas { width: 100%; image-rendering: pixelated; background: #111; border: 1px solid #333; }
+    label { display: block; margin: 0.5rem 0; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Vita3K Web — Vita Display</h1>
+    <p id="status">Loading Vita3K WebAssembly runtime…</p>
+    <canvas id="vita-canvas" width="960" height="544"></canvas>
+    <label>Vita eboot.bin <input id="elf-file" type="file" accept=".bin"></label>
+  </main>
+  <script type="module" src="./display.js"></script>
+</body>
+</html>
