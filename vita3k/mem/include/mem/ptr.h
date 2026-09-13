@@ -37,12 +37,7 @@ public:
     }
 
     Ptr(T *pointer, const MemState &mem) {
-        const uint8_t *const pointer_bytes = reinterpret_cast<const uint8_t *>(pointer);
-        if (pointer_bytes == 0) {
-            addr = 0;
-        } else {
-            addr = static_cast<Address>(pointer_bytes - &mem.memory[0]);
-        }
+        mem_host_to_guest(mem, pointer, addr);
     }
 
     Address address() const {
@@ -54,6 +49,9 @@ public:
         return Ptr<U>(addr);
     }
 
+    // Unchecked HLE/native fast path, NOT an interpreter access check. In Wasm,
+    // a bulk host span is contiguous only within one allocation (or one external
+    // mapping). Use mem_read/write/fetch for guest-controlled ranges/permissions.
     T *get(const MemState &mem) const {
         if (addr == 0) {
             return nullptr;
@@ -64,7 +62,7 @@ public:
             const auto offset = mem.sparse_host_memory ? addr % KiB(4) : addr;
             return reinterpret_cast<T *>(mem.page_table[page] + offset);
         } else {
-            return reinterpret_cast<T *>(&mem.memory[addr]);
+            return mem.memory ? reinterpret_cast<T *>(&mem.memory[addr]) : nullptr;
         }
     }
 
@@ -72,9 +70,9 @@ public:
     bool atomic_compare_and_swap(MemState &mem, U value, U expected) {
         static_assert(std::is_arithmetic_v<U>);
         static_assert(std::is_same_v<U, T>);
-        uint8_t *mem_ptr = mem.use_page_table ? mem.page_table[addr / KiB(4)] : mem.memory.get();
-        const auto offset = mem.sparse_host_memory ? addr % KiB(4) : addr;
-        const auto ptr = reinterpret_cast<volatile U *>(&mem_ptr[offset]);
+        const auto ptr = get(mem);
+        if (!ptr)
+            return false;
         return ::atomic_compare_and_swap(ptr, value, expected);
     }
 

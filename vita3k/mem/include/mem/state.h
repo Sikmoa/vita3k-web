@@ -63,6 +63,13 @@ struct MemExternalMapping {
     uint32_t size;
 };
 
+// One owning buffer per guest allocation, NOT per page. Trimming an aligned
+// allocation keeps the buffer alive and advances offset to its first live byte.
+struct SparseAllocation {
+    std::unique_ptr<uint8_t[]> memory;
+    size_t offset = 0;
+};
+
 struct MemState {
     std::mutex generation_mutex;
     std::mutex protect_mutex;
@@ -78,7 +85,10 @@ struct MemState {
     PageNameMap page_name_map;
 
     bool use_page_table = false;
+    // Native entries are absolute-address biases; sparse entries point to the
+    // actual page start. Ptr/checked helpers account for this distinction.
     PageTable page_table;
-    std::vector<std::unique_ptr<uint8_t[]>> sparse_pages;
+    std::map<uint32_t, SparseAllocation> sparse_allocations; // keyed by first live page
+    std::unique_ptr<MemPerm[]> page_permissions;
     std::map<uint64_t, MemExternalMapping, std::greater<>> external_mapping;
 };

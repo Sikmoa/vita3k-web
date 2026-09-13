@@ -22,7 +22,7 @@
 
 struct BitmapAllocator {
     std::vector<std::uint32_t> words;
-    std::size_t max_offset;
+    std::size_t max_offset = 0;
 
 protected:
     int force_fill(const std::uint32_t offset, const std::uint32_t size, const bool or_mode = false);

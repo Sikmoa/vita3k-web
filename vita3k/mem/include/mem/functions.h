@@ -28,24 +28,38 @@ typedef std::function<bool(uint8_t *addr, bool write)> AccessViolationHandler;
 
 constexpr Address user_main_memory_start = 0x80000000U;
 
-// Permission when protecting a memory range
-// Note: WriteOnly is actually not supported (ReadWrite used instead)
-enum struct MemPerm {
+// Guest access bits. Native host protection cannot enforce WriteOnly or execute
+// permission (guest instructions are interpreted/JIT compiled, not host code).
+// Checked accesses enforce all three bits on every touched 4 KiB guest page.
+enum struct MemPerm : uint8_t {
     None = 0,
     ReadOnly = 1 << 0,
     WriteOnly = 1 << 1,
-    ReadWrite = ReadOnly | WriteOnly
+    ReadWrite = 3,
+    Execute = 1 << 2,
+    ReadExecute = 5,
+    ReadWriteExecute = 7
 };
 
 constexpr MemPerm most_restrictive_perm(MemPerm a, MemPerm b) {
-    if (a == MemPerm::None || b == MemPerm::None)
-        return MemPerm::None;
-    if (a == MemPerm::ReadOnly || b == MemPerm::ReadOnly)
-        return MemPerm::ReadOnly;
-    if (a == MemPerm::WriteOnly || b == MemPerm::WriteOnly)
-        return MemPerm::WriteOnly;
-    return MemPerm::ReadWrite;
+    return static_cast<MemPerm>(static_cast<uint8_t>(a) & static_cast<uint8_t>(b));
 }
+
+// Interpreter access API. Validates the WHOLE range before copying, including
+// allocation, overflow and permissions; failure does not modify the destination.
+// Cross-page/cross-allocation access is supported. Zero bytes is a successful
+// no-op, even for a null address/buffer. Fetch requires Execute, not ReadOnly.
+// These do not dispatch native fault/watch callbacks: denied access returns false.
+// Like Ptr, access must be serialized against allocation/protection changes.
+bool mem_read(const MemState &state, Address addr, void *destination, size_t size);
+bool mem_write(MemState &state, Address addr, const void *source, size_t size);
+bool mem_fetch(const MemState &state, Address addr, void *destination, size_t size);
+// Page-granular, outward-rounded guest permissions; default allocation is RWX.
+// Rejects invalid/unallocated ranges without changing permissions.
+bool mem_set_permissions(MemState &state, Address addr, size_t size, MemPerm perm);
+// Safe reverse translation. Unrelated, freed, null and shadowed backing pointers
+// fail and set addr to zero. Never subtracts unrelated C++ pointers.
+bool mem_host_to_guest(const MemState &state, const void *pointer, Address &addr);
 
 bool init(MemState &state, const bool use_page_table);
 void deinit_mem(MemState &state);
