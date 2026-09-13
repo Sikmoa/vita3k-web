@@ -22,6 +22,7 @@
 #include <util/types.h>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -75,6 +76,14 @@ struct DisplayState {
     std::vector<DisplayStateVBlankWaitInfo> vblank_wait_infos;
     std::atomic<uint64_t> last_setframe_vblank_count = 0;
     std::map<SceUID, CallbackPtr> vblank_callbacks{};
+
+    // Cooperative vblank pacing for hosts without a host vblank thread (the
+    // browser Worker runs the emulator on a single thread). wait_vblank's
+    // __EMSCRIPTEN__ branch advances the vblank clock whenever this steady-
+    // clock deadline passes, at the same ~60fps cadence as the native
+    // vblank_sync_thread (TARGET_MICRO_PER_FRAME). Kept as explicit state so
+    // the browser timing can evolve toward exact Vita 59.94Hz timing later.
+    std::chrono::steady_clock::time_point next_vblank_time{};
 
     // if set to true, make sceDisplayWaitVblankStartMulti/sceDisplayWaitSetFrameBufMulti behave as sceDisplayWaitVblankStart/sceDisplayWaitSetFrameBuf
     // this allows some game running at 30fps to run at 60fps without any issue

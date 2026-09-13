@@ -17,15 +17,19 @@
 
 #include <display/functions.h>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#else
 #include <dialog/state.h>
+#include <motion/functions.h>
+#include <touch/functions.h>
+#endif
 #include <display/state.h>
 #include <emuenv/state.h>
 #include <kernel/state.h>
 #include <renderer/state.h>
 
 #include <chrono>
-#include <motion/functions.h>
-#include <touch/functions.h>
 
 // Code heavily influenced by PPSSSPP's SceDisplay.cpp
 
@@ -35,46 +39,65 @@ static constexpr int64_t TARGET_MICRO_PER_FRAME = 1000000LL / TARGET_FPS;
 static constexpr int predict_threshold = 3;
 static constexpr int max_expected_swapchain_size = 6;
 
+// One emulated vblank tick: increments the vblank count, notifies the vblank
+// callbacks and wakes the threads whose target vcount was reached. On native
+// builds this runs on the host vblank thread (see vblank_sync_thread below);
+// single-threaded hosts such as the browser Worker drive it cooperatively from
+// wait_vblank instead, on the emulator's only thread.
+void advance_vblank(EmuEnvState &emuenv) {
+    DisplayState &display = emuenv.display;
+
+    const std::lock_guard<std::mutex> guard(display.mutex);
+
+    {
+        const std::lock_guard<std::mutex> guard_info(display.display_info_mutex);
+        ++display.vblank_count;
+
+#ifndef __EMSCRIPTEN__
+        // Native-only: this both dereferences the native renderer (absent in
+        // the browser runtime) and depends on the host pause/common-dialog
+        // state that only exists with a frontend.
+        // in this case, even though no new game frames are being rendered, we still need to update the screen
+        if (emuenv.kernel.is_threads_paused() || (emuenv.common_dialog.status == SCE_COMMON_DIALOG_STATUS_RUNNING))
+            // only display the UI/common dialog at 30 fps
+            // this is necessary so that the command buffer processing doesn't get starved
+            // with vsync enabled and a screen with a refresh rate of 60Hz or less
+            if (display.vblank_count % 2 == 0)
+                emuenv.renderer->should_display = true;
+#endif
+    }
+
+#ifndef __EMSCRIPTEN__
+    // Native-only per-vblank host input sampling; the browser Worker has no
+    // host touch/motion event sources to sample here.
+    // maybe we should also use a mutex for this part, but it shouldn't be an issue
+    touch_vsync_update(emuenv);
+    refresh_motion(emuenv.motion, emuenv.ctrl);
+#endif
+
+    // Notify Vblank callback in each VBLANK start
+    for (auto &[_, cb] : display.vblank_callbacks)
+        cb->event_notify(cb->get_notifier_id());
+
+    for (std::size_t i = 0; i < display.vblank_wait_infos.size();) {
+        auto &vblank_wait_info = display.vblank_wait_infos[i];
+        if (vblank_wait_info.target_vcount <= display.vblank_count) {
+            ThreadStatePtr target_wait = vblank_wait_info.target_thread;
+
+            target_wait->update_status(ThreadStatus::run);
+            display.vblank_wait_infos.erase(display.vblank_wait_infos.begin() + i);
+        } else {
+            i++;
+        }
+    }
+}
+
 static void vblank_sync_thread(EmuEnvState &emuenv) {
     DisplayState &display = emuenv.display;
 
     while (!display.abort.load()) {
-        {
-            const std::lock_guard<std::mutex> guard(display.mutex);
+        advance_vblank(emuenv);
 
-            {
-                const std::lock_guard<std::mutex> guard_info(display.display_info_mutex);
-                ++display.vblank_count;
-
-                // in this case, even though no new game frames are being rendered, we still need to update the screen
-                if (emuenv.kernel.is_threads_paused() || (emuenv.common_dialog.status == SCE_COMMON_DIALOG_STATUS_RUNNING))
-                    // only display the UI/common dialog at 30 fps
-                    // this is necessary so that the command buffer processing doesn't get starved
-                    // with vsync enabled and a screen with a refresh rate of 60Hz or less
-                    if (display.vblank_count % 2 == 0)
-                        emuenv.renderer->should_display = true;
-            }
-
-            // maybe we should also use a mutex for this part, but it shouldn't be an issue
-            touch_vsync_update(emuenv);
-            refresh_motion(emuenv.motion, emuenv.ctrl);
-
-            // Notify Vblank callback in each VBLANK start
-            for (auto &[_, cb] : display.vblank_callbacks)
-                cb->event_notify(cb->get_notifier_id());
-
-            for (std::size_t i = 0; i < display.vblank_wait_infos.size();) {
-                auto &vblank_wait_info = display.vblank_wait_infos[i];
-                if (vblank_wait_info.target_vcount <= display.vblank_count) {
-                    ThreadStatePtr target_wait = vblank_wait_info.target_thread;
-
-                    target_wait->update_status(ThreadStatus::run);
-                    display.vblank_wait_infos.erase(display.vblank_wait_infos.begin() + i);
-                } else {
-                    i++;
-                }
-            }
-        }
         const auto time_ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         const auto time_left = TARGET_MICRO_PER_FRAME - (time_ms % TARGET_MICRO_PER_FRAME);
         std::this_thread::sleep_for(std::chrono::microseconds(time_left));
@@ -85,7 +108,9 @@ void start_sync_thread(EmuEnvState &emuenv) {
     emuenv.display.vblank_thread = std::make_unique<std::thread>(vblank_sync_thread, std::ref(emuenv));
 }
 
-void wait_vblank(DisplayState &display, KernelState &kernel, const ThreadStatePtr &wait_thread, const uint64_t target_vcount, const bool is_cb) {
+void wait_vblank(EmuEnvState &emuenv, const ThreadStatePtr &wait_thread, const uint64_t target_vcount, const bool is_cb) {
+    DisplayState &display = emuenv.display;
+
     if (!wait_thread) {
         return;
     }
@@ -103,16 +128,50 @@ void wait_vblank(DisplayState &display, KernelState &kernel, const ThreadStatePt
             display.vblank_wait_infos.push_back({ wait_thread, target_vcount });
         }
 
+#ifdef __EMSCRIPTEN__
+        // Browser Worker path: there is no host vblank thread, so nothing would
+        // ever wake status_cond. The waiting thread drives the emulated vblank
+        // clock itself instead: advance_vblank performs the same per-vblank
+        // work vblank_sync_thread does natively (increment the vblank count,
+        // notify vblank callbacks, wake threads whose target vcount was
+        // reached) and emscripten_sleep yields to the browser event loop
+        // between ticks (built with ASYNCIFY). The clock advances whenever a
+        // full ~60fps period (TARGET_MICRO_PER_FRAME) has elapsed on the
+        // steady clock, so sceDisplayGetVcount keeps progressing monotonically
+        // at a realistic cadence; everything runs on the Worker's single thread
+        // so no host-thread data races are possible.
+        while (wait_thread->status != ThreadStatus::run && !display.abort.load()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (display.next_vblank_time.time_since_epoch().count() == 0) {
+                // First cooperative wait: seed the cadence so the first vblank
+                // lands one full period from now, like arriving just after a
+                // vblank start on native.
+                display.next_vblank_time = now + std::chrono::microseconds(TARGET_MICRO_PER_FRAME);
+            }
+            // Advance by every fully elapsed period, mirroring the native
+            // vblank thread's steady wall-clock cadence (a slow guest sees its
+            // vcount jump by the number of missed vblanks, as on native).
+            while (now >= display.next_vblank_time) {
+                advance_vblank(emuenv);
+                display.next_vblank_time += std::chrono::microseconds(TARGET_MICRO_PER_FRAME);
+            }
+
+            thread_lock.unlock();
+            emscripten_sleep(1);
+            thread_lock.lock();
+        }
+#else
         wait_thread->status_cond.wait(thread_lock, [&]() {
             return wait_thread->status == ThreadStatus::run;
         });
+#endif
     }
 
     if (is_cb) {
         for (auto &[_, cb] : display.vblank_callbacks) {
             if (cb->get_owner_thread_id() == wait_thread->id) {
                 std::string name = cb->get_name();
-                cb->execute(kernel, [name]() {
+                cb->execute(emuenv.kernel, [name]() {
                 });
             }
         }
@@ -193,7 +252,10 @@ void update_prediction(EmuEnvState &emuenv, DisplayFrameInfo &frame) {
 
     if (!display.predicting) {
         display.next_rendered_frame = frame;
-        emuenv.renderer->should_display = true;
+        // The browser runtime has no renderer; presentation happens through the
+        // display state itself (sce_frame / next_rendered_frame) instead.
+        if (emuenv.renderer)
+            emuenv.renderer->should_display = true;
     }
 
     for (auto &pred_frame : display.predicted_frames) {
@@ -211,7 +273,9 @@ void update_prediction(EmuEnvState &emuenv, DisplayFrameInfo &frame) {
     if (display.predicting) {
         LOG_TRACE("Mispredicted the next swapchain image");
         display.next_rendered_frame = frame;
-        emuenv.renderer->should_display = true;
+        // No renderer exists in the browser runtime (see above).
+        if (emuenv.renderer)
+            emuenv.renderer->should_display = true;
     }
 
     // let predict_next_image reset the cycle if necessary
@@ -246,6 +310,7 @@ void DisplayState::deinit() {
 
     vblank_count = 0;
     last_setframe_vblank_count = 0;
+    next_vblank_time = {};
 
     fps_hack = false;
     // pretty sure we set this on game boot

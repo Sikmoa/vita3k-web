@@ -27,7 +27,12 @@ struct EmuEnvState;
 struct DisplayFrameInfo;
 
 void start_sync_thread(EmuEnvState &emuenv);
-void wait_vblank(DisplayState &display, KernelState &kernel, const ThreadStatePtr &wait_thread, const uint64_t target_vcount, const bool is_cb);
+// One emulated vblank tick: increments the vblank count, notifies the vblank
+// callbacks and wakes the threads whose target vcount was reached. Runs on the
+// native host vblank thread; single-threaded hosts (browser Worker) drive it
+// cooperatively from wait_vblank instead.
+void advance_vblank(EmuEnvState &emuenv);
+void wait_vblank(EmuEnvState &emuenv, const ThreadStatePtr &wait_thread, const uint64_t target_vcount, const bool is_cb);
 // if the result is not nullptr, contain the predicted frame (pointer needs to be freed later)
 DisplayFrameInfo *predict_next_image(EmuEnvState &emuenv, Address sync_object);
 void update_prediction(EmuEnvState &emuenv, DisplayFrameInfo &frame);
