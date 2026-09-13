@@ -152,6 +152,22 @@ add_subdirectory(gdbstub)
 add_subdirectory(packages)
 add_subdirectory(vkutil)
 
+option(VITA3K_VITASDK_LAUNCH_TEST "Build the genuine VitaSDK native interpreter launch probe" OFF)
+if(VITA3K_VITASDK_LAUNCH_TEST)
+	if(NOT VITA3K_INTERPRETER_CPU OR ANDROID OR CMAKE_CROSSCOMPILING)
+		message(FATAL_ERROR "VITA3K_VITASDK_LAUNCH_TEST requires a native VITA3K_INTERPRETER_CPU build")
+	endif()
+	set(VITA3K_FIXTURE_SOURCE_DIR "${CMAKE_SOURCE_DIR}/browser/tests/vita_homebrew_fixture")
+	set(VITA3K_FIXTURE_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/vita_homebrew_fixture")
+	add_subdirectory("${VITA3K_FIXTURE_SOURCE_DIR}" "${VITA3K_FIXTURE_BINARY_DIR}")
+	add_executable(vita3k_vitasdk_launch_test "${VITA3K_FIXTURE_SOURCE_DIR}/native_launch.cpp")
+	target_link_libraries(vita3k_vitasdk_launch_test PRIVATE emuenv modules kernel cpu)
+	add_dependencies(vita3k_vitasdk_launch_test vita3k_vita_homebrew_fixture)
+	add_test(NAME vita3k_vitasdk_launch
+		COMMAND vita3k_vitasdk_launch_test "${VITA3K_FIXTURE_BINARY_DIR}/eboot.bin")
+	set_tests_properties(vita3k_vitasdk_launch PROPERTIES TIMEOUT 15 LABELS "interpreter;vitasdk;integration")
+endif()
+
 if(ANDROID)
 	add_library(vita3k SHARED
 		android/jni/android_state.cpp
