@@ -95,7 +95,10 @@ struct ThreadState {
     void update_status(ThreadStatus status, std::optional<ThreadStatus> expected = std::nullopt);
     Address stack_top() const;
 
-    void run_loop();
+    // Cooperative hosts drive an already-started thread synchronously and return
+    // instead of parking when it becomes dormant/suspended/waiting. Native host
+    // threads retain the default parking behavior.
+    void run_loop(bool cooperative = false);
     void raise_waiting_threads();
 
     // this function must be called from the thread itself (inside a svc call)

@@ -187,7 +187,7 @@ void ThreadState::exit_delete(bool exit) {
     signal.send();
 }
 
-void ThreadState::run_loop() {
+void ThreadState::run_loop(bool cooperative) {
     bool guest_returned = false;
 
     // Set thread-local CPU state so signal handlers can access it.
@@ -235,6 +235,10 @@ void ThreadState::run_loop() {
             // Return from nested levels to the top level (or completely if deleted)
             if (!top_level || delete_requested)
                 break;
+            if (cooperative) {
+                exit_requested = false;
+                break;
+            }
             exit_requested = false;
             guest_returned = false;
             // Status is now dormant: we'll park until the next start() or exit_delete().
@@ -242,6 +246,8 @@ void ThreadState::run_loop() {
 
         // Park until we have something to do.
         if (status != ThreadStatus::run) {
+            if (cooperative)
+                break;
             status_cond.wait(lock, [&] {
                 return status == ThreadStatus::run || delete_requested;
             });
