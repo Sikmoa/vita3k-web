@@ -1,0 +1,136 @@
+# Real VitaSDK/newlib startup HLE. Include after runtime_core.cmake.
+# This deliberately does not claim all imports linked into newlib (notably
+# networking and general filesystem operations). Unselected NIDs remain unsupported.
+include_guard(GLOBAL)
+set(_HLE_BROWSER_ROOT "${CMAKE_CURRENT_LIST_DIR}")
+set(_HLE_ROOT "${CMAKE_CURRENT_LIST_DIR}/../vita3k")
+set(_HLE_EXT "${CMAKE_CURRENT_LIST_DIR}/../external")
+
+set(_hle_exports
+    sceKernelExitProcess
+    sceKernelAllocMemBlock sceKernelFreeMemBlock sceKernelGetMemBlockBase
+    sceKernelCreateLwMutex sceKernelDeleteLwMutex sceKernelLockLwMutex
+    sceKernelTryLockLwMutex sceKernelUnlockLwMutex
+    sceKernelCreateMutex sceKernelDeleteMutex sceKernelLockMutex sceKernelUnlockMutex
+    sceKernelGetTLSAddr sceKernelGetThreadTLSAddr sceKernelGetThreadId
+    sceKernelGetThreadInfo sceKernelGetProcessId
+    sceKernelExitThread sceKernelExitDeleteThread
+    sceKernelGetProcessTimeLow sceKernelLibcGettimeofday sceKernelGetProcessParam
+    sceClibMemcpy sceClibMemset
+    sceIoOpen sceIoClose
+)
+
+# Take NID values from the one authoritative database, never a second resolver.
+set(_hle_generated "${CMAKE_CURRENT_BINARY_DIR}/runtime-hle-generated")
+file(MAKE_DIRECTORY "${_hle_generated}")
+file(STRINGS "${_HLE_ROOT}/nids/include/nids/nids.inc" _hle_nid_lines)
+set(_hle_nids "// Generated from Vita3K nids.inc; do not edit.\n")
+foreach(_export IN LISTS _hle_exports)
+    set(_found FALSE)
+    foreach(_line IN LISTS _hle_nid_lines)
+        if(_line MATCHES "^NID\\(${_export},")
+            string(APPEND _hle_nids "${_line}\n")
+            set(_found TRUE)
+        endif()
+    endforeach()
+    if(NOT _found)
+        message(FATAL_ERROR "Startup HLE export absent from nids.inc: ${_export}")
+    endif()
+endforeach()
+file(CONFIGURE OUTPUT "${_hle_generated}/startup_nids.inc" CONTENT "${_hle_nids}" @ONLY)
+file(CONFIGURE OUTPUT "${_hle_generated}/startup_libraries.inc" CONTENT "LIBRARY(SceSysmem)\n" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_HLE_ROOT}/nids/include/nids/nids.inc")
+
+set(_hle_module_sources
+    "${_HLE_ROOT}/modules/SceLibKernel/SceLibKernel.cpp"
+    "${_HLE_ROOT}/modules/SceKernelThreadMgr/SceThreadmgr.cpp"
+    "${_HLE_ROOT}/modules/SceKernelThreadMgr/SceThreadmgrCoredumpTime.cpp"
+    "${_HLE_ROOT}/modules/SceSysmem/SceSysmem.cpp"
+    "${_HLE_ROOT}/modules/SceSysmem/SceSysmemForDriver.cpp"
+    "${_HLE_ROOT}/modules/SceProcessmgr/SceProcessmgr.cpp"
+    "${_HLE_ROOT}/modules/SceIofilemgr/SceIofilemgr.cpp"
+)
+# Compile the existing implementation files through registration-only adapters.
+# This is necessary because EXPORT's make_bridge initialization roots even
+# unselected bridges. No function body, bridge implementation or call is copied.
+set(_hle_bridges "// Generated bridge selection; do not edit.\n")
+set(_hle_adapters)
+set(_hle_found_exports)
+foreach(_source IN LISTS _hle_module_sources)
+    file(STRINGS "${_source}" _export_lines REGEX "^EXPORT\\(")
+    foreach(_line IN LISTS _export_lines)
+        if(NOT _line MATCHES "^EXPORT\\([^,]+, *([A-Za-z0-9_]+)")
+            message(FATAL_ERROR "Cannot parse HLE EXPORT: ${_line}")
+        endif()
+        set(_name "${CMAKE_MATCH_1}")
+        if(_name IN_LIST _hle_exports)
+            set(_emit VITA3K_HLE_EMIT_BRIDGE)
+            list(APPEND _hle_found_exports "${_name}")
+        else()
+            set(_emit VITA3K_HLE_SKIP_BRIDGE)
+        endif()
+        string(APPEND _hle_bridges "#define VITA3K_HLE_BRIDGE_${_name} ${_emit}\n")
+    endforeach()
+    get_filename_component(_stem "${_source}" NAME_WE)
+    set(_adapter "${_hle_generated}/${_stem}_selected.cpp")
+    file(CONFIGURE OUTPUT "${_adapter}" CONTENT
+        "// Registration-only adapter; original implementation follows.\n#include \"${_HLE_BROWSER_ROOT}/src/hle_select_exports.h\"\n#include \"${_source}\"\n" @ONLY)
+    list(APPEND _hle_adapters "${_adapter}")
+endforeach()
+foreach(_name IN LISTS _hle_exports)
+    if(NOT _name IN_LIST _hle_found_exports)
+        message(FATAL_ERROR "Selected HLE export has no source implementation: ${_name}")
+    endif()
+endforeach()
+file(CONFIGURE OUTPUT "${_hle_generated}/startup_bridge_selection.inc" CONTENT "${_hle_bridges}" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_hle_module_sources})
+
+add_library(vita3k_web_runtime_hle STATIC
+    "${_HLE_ROOT}/modules/module_parent.cpp"
+    "${_HLE_ROOT}/module/src/write_return_value.cpp"
+    ${_hle_adapters}
+    "${_HLE_ROOT}/kernel/src/sync_primitives.cpp"
+    "${_HLE_BROWSER_ROOT}/src/hle_io.cpp"
+    "${_HLE_ROOT}/io/src/device.cpp"
+    "${_HLE_ROOT}/io/src/filesystem.cpp"
+    "${_HLE_ROOT}/io/src/state_functions.cpp"
+    "${_HLE_ROOT}/util/src/string_utils.cpp"
+    "${_HLE_ROOT}/emuenv/src/emuenv.cpp"
+    "${_HLE_ROOT}/motion/src/motion_input.cpp"
+    "${_HLE_ROOT}/camera/src/camera.cpp"
+    "${_HLE_ROOT}/overlay/src/display_manager.cpp"
+)
+file(GLOB _hle_includes "${_HLE_ROOT}/*/include")
+target_include_directories(vita3k_web_runtime_hle PUBLIC ${_hle_includes}
+    "${_HLE_EXT}/yaml-cpp/include")
+target_include_directories(vita3k_web_runtime_hle PRIVATE
+    "${_hle_generated}" "${_HLE_EXT}/dlmalloc" "${_HLE_EXT}/printf"
+    "${_HLE_EXT}/stb")
+target_compile_definitions(vita3k_web_runtime_hle PRIVATE
+    ONLY_MSPACES=1
+    VITA3K_HLE_NID_LIST="startup_nids.inc"
+    VITA3K_HLE_LIBRARY_LIST="startup_libraries.inc")
+# Full EmuEnvState construction is used unchanged, including all subsystem
+# state objects. Its camera and motion destructors need actual SDL3 symbols;
+# building SDL with device backends disabled avoids inventing state types or
+# no-op destructors. No desktop window, renderer, audio or camera is started.
+if(NOT TARGET SDL3::SDL3-static)
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    foreach(_sub AUDIO VIDEO RENDER CAMERA JOYSTICK HAPTIC SENSOR POWER DIALOG)
+        set(SDL_${_sub} OFF CACHE BOOL "" FORCE)
+    endforeach()
+    add_subdirectory("${_HLE_EXT}/sdl" "${CMAKE_CURRENT_BINARY_DIR}/runtime-deps/sdl" EXCLUDE_FROM_ALL)
+endif()
+target_link_libraries(vita3k_web_runtime_hle
+    PUBLIC vita3k_web_runtime_core
+    PRIVATE SDL3::SDL3-static)
+
+if(EMSCRIPTEN)
+    target_compile_options(vita3k_web_runtime_hle PRIVATE
+        "-include${_HLE_BROWSER_ROOT}/src/hle_host_stat.h")
+endif()
+# The linker drops unselected original functions, not substitute implementations.
+target_compile_options(vita3k_web_runtime_hle PRIVATE -ffunction-sections -fdata-sections)

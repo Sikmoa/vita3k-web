@@ -37,17 +37,27 @@
 #include <util/log.h>
 #include <util/string_utils.h>
 
+#include <initializer_list>
 #include <unordered_set>
+
+// Reduced/headless builds select exports at build time. Dispatch and bridges
+// remain identical; native builds retain the complete canonical lists.
+#ifndef VITA3K_HLE_NID_LIST
+#define VITA3K_HLE_NID_LIST <nids/nids.inc>
+#endif
+#ifndef VITA3K_HLE_LIBRARY_LIST
+#define VITA3K_HLE_LIBRARY_LIST <modules/library_init_list.inc>
+#endif
 
 static constexpr bool LOG_UNK_NIDS_ALWAYS = false;
 
 #define LIBRARY(name) extern const LibraryInitFn import_library_init_##name;
-#include <modules/library_init_list.inc>
+#include VITA3K_HLE_LIBRARY_LIST
 #undef LIBRARY
 
 #define VAR_NID(name, nid) extern const ImportVarFactory import_##name;
 #define NID(name, nid) extern const ImportFn import_##name;
-#include <nids/nids.inc>
+#include VITA3K_HLE_NID_LIST
 #undef NID
 #undef VAR_NID
 
@@ -59,7 +69,7 @@ static const ImportFn *resolve_import(uint32_t nid) {
 #define NID(name, nid) \
     case nid:          \
         return &import_##name;
-#include <nids/nids.inc>
+#include VITA3K_HLE_NID_LIST
 #undef NID
 #undef VAR_NID
     default:
@@ -77,17 +87,17 @@ struct VarExport {
 };
 
 void init_exported_vars(EmuEnvState &emuenv) {
-    const auto var_exports = std::to_array<VarExport>({
+    const std::initializer_list<VarExport> var_exports = {
 #define NID(name, nid)
 #define VAR_NID(name, nid) \
     {                      \
         nid,               \
         import_##name      \
     },
-#include <nids/nids.inc>
+#include VITA3K_HLE_NID_LIST
 #undef VAR_NID
 #undef NID
-    });
+    };
 
     for (const auto &var : var_exports) {
         auto addr = var.factory(emuenv);
@@ -465,6 +475,6 @@ bool load_sys_module_internal_with_arg(EmuEnvState &emuenv, SceSysmoduleInternal
 
 void init_libraries(EmuEnvState &emuenv) {
 #define LIBRARY(name) import_library_init_##name(emuenv);
-#include <modules/library_init_list.inc>
+#include VITA3K_HLE_LIBRARY_LIST
 #undef LIBRARY
 }

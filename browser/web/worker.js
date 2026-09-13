@@ -40,7 +40,10 @@ self.onmessage = async ({ data }) => {
   case 'resume':
     if (lifecycle === 'paused') transition('ready');
     break;
+  case 'run-vita':
   case 'run-guest': {
+    const vita = data.type === 'run-vita';
+    const resultType = vita ? 'vita-exit' : 'guest-exit';
     try {
       const path = data.path || 'guest.elf';
       let input;
@@ -57,13 +60,15 @@ self.onmessage = async ({ data }) => {
       if (!allocation) throw new Error('unable to allocate ELF input buffer');
       try {
         module.HEAPU8.set(input, allocation);
-        const exitCode = module._vita3k_web_run_elf_probe(allocation, input.byteLength);
-        post({ type: 'guest-exit', path, size: input.byteLength, exitCode, ok: exitCode >= 0 });
+        const exitCode = vita
+          ? module._vita3k_web_run_vita(allocation, input.byteLength)
+          : module._vita3k_web_run_elf_probe(allocation, input.byteLength);
+        post({ type: resultType, path, size: input.byteLength, exitCode, ok: exitCode >= 0 });
       } finally {
         module._free(allocation);
       }
     } catch (error) {
-      post({ type: 'guest-exit', exitCode: -1, ok: false, message: String(error) });
+      post({ type: resultType, exitCode: -1, ok: false, message: String(error) });
     }
     break;
   }
