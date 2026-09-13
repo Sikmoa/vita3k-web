@@ -8,6 +8,38 @@ import {join} from 'node:path';
 const directory = process.argv[2];
 const fixtures = JSON.parse(readFileSync(join(directory, 'cases.json'), 'utf8'));
 const memory = new WebAssembly.Memory({initial: 2});
+const bytes = new Uint8Array(memory.buffer);
+// Helper contract (wasm_jit_cpu.cpp checked_memory_read/write): reads zero
+// memory_value[0..3] then fill the addressed guest bytes little-endian;
+// writes consume bytes across all four words, so 8-byte transfers use two.
+const mem_read = (stateOffset, address, width) => {
+    const view = new DataView(memory.buffer);
+    if (address + width > bytes.length) {
+        view.setUint32(stateOffset + 88, address >>> 0, true);
+        view.setUint32(stateOffset + 92, 0, true);
+        return 2;
+    }
+    for (let word = 0; word < 4; ++word)
+        view.setUint32(stateOffset + 96 + 4 * word, 0, true);
+    for (let i = 0; i < width; ++i) {
+        const word = view.getUint32(stateOffset + 96 + 4 * (i >> 2), true);
+        view.setUint32(stateOffset + 96 + 4 * (i >> 2), word | (bytes[address + i] << ((i & 3) * 8)), true);
+    }
+    return 0;
+};
+const mem_write = (stateOffset, address, width) => {
+    const view = new DataView(memory.buffer);
+    if (address + width > bytes.length) {
+        view.setUint32(stateOffset + 88, address >>> 0, true);
+        view.setUint32(stateOffset + 92, 1, true);
+        return 2;
+    }
+    for (let i = 0; i < width; ++i) {
+        const word = view.getUint32(stateOffset + 96 + 4 * (i >> 2), true);
+        bytes[address + i] = word >>> ((i & 3) * 8);
+    }
+    return 0;
+};
 // Import a funcref table, then invoke slot 0 via an actual Wasm call_indirect.
 // Type 0 is (i32)->i32, the same signature used by the generated export.
 const indirectModule = new WebAssembly.Module(Uint8Array.from([
@@ -23,9 +55,12 @@ for (const fixture of fixtures) {
     const bytes = readFileSync(join(directory, `${fixture.name}.wasm`));
     assert(WebAssembly.validate(bytes), `${fixture.name}: module must validate`);
     const module = new WebAssembly.Module(bytes);
-    assert.deepEqual(WebAssembly.Module.imports(module), [{module: 'env', name: 'memory', kind: 'memory'}]);
+    assert.deepEqual(WebAssembly.Module.imports(module), [
+        {module: 'env', name: 'memory', kind: 'memory'},
+        {module: 'env', name: 'mem_read', kind: 'function'},
+        {module: 'env', name: 'mem_write', kind: 'function'}]);
     assert.deepEqual(WebAssembly.Module.exports(module), [{name: 'block', kind: 'function'}]);
-    const {exports: {block}} = new WebAssembly.Instance(module, {env: {memory}});
+    const {exports: {block}} = new WebAssembly.Instance(module, {env: {memory, mem_read, mem_write}});
     // Wasm export is an actual typed function, not a JS trampoline.
     const table = new WebAssembly.Table({initial: 1, element: 'anyfunc'});
     table.set(0, block);
@@ -33,15 +68,28 @@ for (const fixture of fixtures) {
     for (const [index, test] of fixture.cases.entries()) {
         for (const offset of [0x400, 0x10404]) {
             const whole = new Uint32Array(memory.buffer);
-            const view = new Uint32Array(memory.buffer, offset, 21);
+            const view = new Uint32Array(memory.buffer, offset, 93);
             whole.fill(0xcafebabe);
             view.set(test.in);
+            // Guest-memory preconditions (loads): seed after the fill so only
+            // these words differ from the 0xcafebabe background.
+            if (test.pre)
+                for (const [address, word] of Object.entries(test.pre))
+                    new DataView(memory.buffer).setUint32(Number(address), word >>> 0, true);
             const reason = indirect(offset);
             const label = `${fixture.name} case ${index} @${offset}`;
             assert.equal(reason >>> 0, test.out[19], `${label}: reason`);
             assert.deepEqual(Array.from(view), test.out, `${label}: state`);
             assert.equal(whole[offset / 4 - 1], 0xcafebabe, `${label}: leading canary`);
-            assert.equal(whole[offset / 4 + 21], 0xcafebabe, `${label}: trailing canary`);
+            assert.equal(whole[offset / 4 + 93], 0xcafebabe, `${label}: trailing canary`);
+            // Guest-memory expectations: checked AFTER execution so helper-
+            // backed stores must have landed at the addressed guest bytes.
+            if (test.mem) {
+                const words = new DataView(memory.buffer);
+                for (const [address, word] of Object.entries(test.mem))
+                    assert.equal(words.getUint32(Number(address), true), word,
+                        `${label}: guest memory @${address}`);
+            }
             ++runs;
         }
     }

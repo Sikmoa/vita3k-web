@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <random>
 #include <vector>
 
@@ -69,13 +70,25 @@ JitState next(JitState state, uint32_t count = 1, uint32_t pc = 0x1004) {
     return state;
 }
 
-struct Case { JitState input, expected; };
+struct Case {
+    JitState input, expected;
+    // Guest-memory expectations for the JS harness's linear memory (little-
+    // endian words): `pre` seeds words before execution (loads), `mem`
+    // verifies words after execution (stores). Address -> word.
+    std::map<uint32_t, uint32_t> pre, mem;
+    Case(const JitState &in, const JitState &out) : input(in), expected(out) {}
+    Case() = default;
+};
 
 void json_state(std::ostream &os, const JitState &s) {
     os << '[';
     for (const auto r : s.regs)
         os << r << ',';
-    os << s.cpsr << ',' << s.fpscr << ',' << s.svc << ',' << s.exit_reason << ',' << s.executed << ']';
+    os << s.cpsr << ',' << s.fpscr << ',' << s.svc << ',' << s.exit_reason << ',' << s.executed;
+    os << ',' << s.memory_cookie << ',' << s.fault_address << ',' << s.fault_write;
+    for (auto v : s.memory_value) os << ',' << v;
+    for (auto v : s.fpu) os << ',' << v;
+    os << ',' << s.tpidruro << ']';
 }
 
 class Suite {
@@ -107,6 +120,19 @@ public:
             json_state(manifest, test.input);
             manifest << ",\"out\":";
             json_state(manifest, test.expected);
+            const auto words = [&](const char *name, const std::map<uint32_t, uint32_t> &region) {
+                if (region.empty()) return;
+                manifest << ",\"" << name << "\":{";
+                bool first_word = true;
+                for (const auto &[address, word] : region) {
+                    if (!first_word) manifest << ',';
+                    first_word = false;
+                    manifest << '"' << address << "\":" << word;
+                }
+                manifest << '}';
+            };
+            words("pre", test.pre);
+            words("mem", test.mem);
             manifest << '}';
             ++runs;
         }
@@ -352,7 +378,7 @@ void frontend(Suite &suite) {
         }
         suite.add(thumb ? "thumb_bx" : "arm_bx", bx, exchanges);
     }
-    auto movne = translate({0x13a0002a}, false);
+        auto movne = translate({0x13a0002a}, false);
     auto in = initial(), pass = next(in); pass.regs[0] = 42;
     auto failin = in; failin.cpsr |= 0x40000000;
     suite.add("arm_movne", movne, {{in, pass}, {failin, next(failin)}});
@@ -361,6 +387,157 @@ void frontend(Suite &suite) {
     in = initial(); in.regs[1] = 0x80000000; in.cpsr |= 0x30000000;
     auto out = next(in); out.regs[0] = in.regs[1]; out.cpsr |= 0x80000000;
     suite.add("arm_movs_reg", movs, {{in, out}});
+}
+
+// The M14b stall: the fixture's NEON memset loop (VitaSDK libc, Thumb).
+// vdup.32 q8,lr fills the stored vector; vst1.32 {d16-d17},[ip]! writes 16
+// bytes and post-increments ip; cmp r3,ip + bne close the loop. The runtime
+// splits memory instructions into single-instruction blocks; mirror that.
+void vector_loop(Suite &suite) {
+    // vdup.32 q8, lr: broadcast into all four Q8 lanes (fpu words 32..35).
+    auto dup_q = translate({0xeea0, 0xeb90}, true);
+    {
+        auto in = initial(true);
+        in.regs[14] = 0x81000e36;
+        auto out = next(in, 1, 0x1004);
+        for (unsigned i = 0; i < 4; ++i) out.fpu[32 + i] = 0x81000e36;
+        suite.add("thumb_vdup32_q8_lr", dup_q, {{in, out}});
+    }
+    // vdup.32 d16, lr: a D write must not touch its neighbour's words.
+    auto dup_d = translate({0xee80, 0xeb90}, true);
+    {
+        auto in = initial(true);
+        in.regs[14] = 0x13579bdf;
+        in.fpu[34] = 0x0bad0bad; // d17 low word must survive the d16 write
+        in.fpu[35] = 0xf00dbee0; // d17 high word
+        auto out = next(in, 1, 0x1004);
+        out.fpu[32] = out.fpu[33] = 0x13579bdf;
+        suite.add("thumb_vdup32_d16_lr", dup_d, {{in, out}});
+    }
+    // vst1.32 {d16-d17},[ip]!: four 32-bit element stores at ip+0,4,8,12
+    // followed by the writeback ip += 16. Data must land in guest memory at
+    // the addressed buffer, never at the block's own code, and every lane
+    // (both halves of both D registers) must be preserved.
+    auto store = translate({0xf94c, 0x0a8d}, true);
+    {
+        auto in = initial(true);
+        in.regs[12] = 0x3000; // guest buffer, clear of both state offsets
+        in.fpu[32] = 0x11112222; in.fpu[33] = 0x33334444; // d16 low/high
+        in.fpu[34] = 0x55556666; in.fpu[35] = 0x77778888; // d17 low/high
+        auto out = next(in, 1, 0x1004);
+        out.regs[12] = 0x3010; // post-increment writeback: 8 * nelem * regs
+        out.memory_value[0] = 0x77778888; // last stored element
+        Case store_case{in, out};
+        store_case.mem = {{0x3000, 0x11112222}, {0x3004, 0x33334444},
+            {0x3008, 0x55556666}, {0x300c, 0x77778888}};
+        suite.add("thumb_vst1_postinc", store, {store_case});
+    }
+    // cmp r3,ip; bne back to 0x1000: the loop terminator taken/not-taken.
+    auto branch = translate({0x4563, 0xd1fd}, true);
+    std::vector<Case> cases;
+    for (bool equal : {false, true}) {
+        auto in = initial(true);
+        in.regs[3] = 0x3010;
+        in.regs[12] = equal ? 0x3010 : 0x3000;
+        auto out = next(in, 2, equal ? 0x1004 : 0x1000);
+        // cmp r3,ip: no borrow (C=1); Z only when equal; V/N clear here.
+        out.cpsr = (in.cpsr & 0x0fffffff) | (equal ? 0x60000000u : 0x20000000u);
+        cases.push_back({in, out});
+    }
+    suite.add("thumb_memset_branch", branch, cases);
+}
+
+// The fixture's VFPv3 save/restore and 64-bit store sites, from the same
+// IR-coverage run: vpush/vpop split into two 32-bit helper stores/loads via
+// GetExtendedRegister64's LeastSignificantWord/MostSignificantWord words,
+// while STRD lowers to a single 8-byte WriteMemory64 of a packed U64. All
+// encodings are the fixture's own bytes (0x81000c1c..0x81000e68).
+void vfp_memory(Suite &suite) {
+    // vpush {d8}: sp -= 8, then d8's two words stored at [sp] and [sp+4].
+    auto vpush = translate({0xed2d, 0x8b02}, true);
+    {
+        auto in = initial(true);
+        in.regs[13] = 0x2000;
+        in.fpu[16] = 0x9e3779b9; // d8 low
+        in.fpu[17] = 0x0badc0de; // d8 high
+        auto out = next(in, 1, 0x1004);
+        out.regs[13] = 0x1ff8;
+        out.memory_value[0] = 0x0badc0de; // last published store word
+        Case push_case{in, out};
+        push_case.mem = {{0x1ff8, 0x9e3779b9}, {0x1ffc, 0x0badc0de}};
+        suite.add("thumb_vpush_d8", vpush, {push_case});
+    }
+    // vldr d8,[pc,#140]: two reads at Align(PC,4)+4+140 = 0x1090/0x1094,
+    // packed little-endian into d8. Exercises the read side of the helper.
+    auto vldr = translate({0xed9f, 0x8b23}, true);
+    {
+        auto in = initial(true);
+        auto out = next(in, 1, 0x1004);
+        out.fpu[16] = 0x11223344;
+        out.fpu[17] = 0x55667788;
+        out.memory_value[0] = 0x55667788; // last read; helper zeroes the rest
+        Case load_case{in, out};
+        load_case.pre = {{0x1090, 0x11223344}, {0x1094, 0x55667788}};
+        suite.add("thumb_vldr_d8_pc140", vldr, {load_case});
+    }
+    // vstr d8,[r4,#176]: d8's words stored at [r4+0xb0] and [r4+0xb4].
+    auto vstr = translate({0xed84, 0x8b2c}, true);
+    {
+        auto in = initial(true);
+        in.regs[4] = 0x2000;
+        in.fpu[16] = 0xcafebabe;
+        in.fpu[17] = 0x12345678;
+        auto out = next(in, 1, 0x1004);
+        out.memory_value[0] = 0x12345678;
+        Case store_case{in, out};
+        store_case.mem = {{0x20b0, 0xcafebabe}, {0x20b4, 0x12345678}};
+        suite.add("thumb_vstr_d8_r4_176", vstr, {store_case});
+    }
+    // strd r5,r9,[r4,#20]: a single 8-byte WriteMemory64 publishes both
+    // memory_value words; the helper must consume them across the words.
+    auto strd = translate({0xe9c4, 0x5905}, true);
+    {
+        auto in = initial(true);
+        in.regs[4] = 0x2100;
+        in.regs[5] = 0x0badf00d;
+        in.regs[9] = 0x0d15ea5e;
+        auto out = next(in, 1, 0x1004);
+        out.memory_value[0] = 0x0badf00d;
+        out.memory_value[1] = 0x0d15ea5e;
+        Case strd_case{in, out};
+        strd_case.mem = {{0x2114, 0x0badf00d}, {0x2118, 0x0d15ea5e}};
+        suite.add("thumb_strd_r5_r9_r4_20", strd, {strd_case});
+    }
+    // vpop {d8}: reads use the original sp, then sp += 8.
+    auto vpop = translate({0xecbd, 0x8b02}, true);
+    {
+        auto in = initial(true);
+        in.regs[13] = 0x2200;
+        auto out = next(in, 1, 0x1004);
+        out.regs[13] = 0x2208;
+        out.fpu[16] = 0x31415926;
+        out.fpu[17] = 0x27182818;
+        out.memory_value[0] = 0x27182818;
+        Case pop_case{in, out};
+        pop_case.pre = {{0x2200, 0x31415926}, {0x2204, 0x27182818}};
+        suite.add("thumb_vpop_d8", vpop, {pop_case});
+    }
+    // vpop {d8-d11}: four D registers restored from [sp..sp+0x1f], sp += 0x20.
+    auto vpop4 = translate({0xecbd, 0x8b08}, true);
+    {
+        auto in = initial(true);
+        in.regs[13] = 0x2300;
+        auto out = next(in, 1, 0x1004);
+        out.regs[13] = 0x2320;
+        const std::array<uint32_t, 8> words{
+            0x00010203, 0x04050607, 0x08090a0b, 0x0c0d0e0f,
+            0x10111213, 0x14151617, 0x18191a1b, 0x1c1d1e1f};
+        for (unsigned i = 0; i < 8; ++i) out.fpu[16 + i] = words[i]; // d8..d11
+        out.memory_value[0] = words[7];
+        Case pop4_case{in, out};
+        for (unsigned i = 0; i < 8; ++i) pop4_case.pre[0x2300 + 4 * i] = words[i];
+        suite.add("thumb_vpop_d8_d11", vpop4, {pop4_case});
+    }
 }
 
 void rejects() {
@@ -383,7 +560,7 @@ void rejects() {
     block = blank(); block.SetEndLocation(loc().SetIT(A32::ITState{0x18})); reject(block);
     block = blank(); append(block, Opcode::A32CallSupervisor, {Value{uint32_t(1)}}); reject(block);
     block = translate({0xef000000}, false); append(block, Opcode::Void, {}); reject(block);
-    block = translate({0xe5900000}, false); reject(block); // actual LDR memory IR
+    block = translate({0xe5900000}, false); // actual LDR memory IR is helper-backed
     block = translate({0xe7f000f0}, false); reject(block); // actual UDF exception IR
     block = blank();
     const auto x = append(block, Opcode::And32, {Value{uint32_t(1)}, Value{uint32_t(2)}});
@@ -392,6 +569,27 @@ void rejects() {
     IR::Terminal terminal = IR::Term::LinkBlock{loc()};
     for (unsigned i = 0; i < 18; ++i) terminal = IR::Term::If{Cond::NE, terminal, IR::Term::LinkBlock{loc()}};
     block.ReplaceTerminal(terminal); reject(block);
+    // Vector/D-register selection must fail closed: RegNumber alone cannot
+    // distinguish S/D/Q, so anything but an explicit D (for 64-bit access)
+    // or D/Q (for vector access) must be rejected, never mis-lowered.
+    block = blank(); append(block, Opcode::A32GetVector, {Value{A32::ExtReg::S0}}); reject(block);
+    block = blank(); append(block, Opcode::A32GetExtendedRegister64, {Value{A32::ExtReg::S1}}); reject(block);
+    block = blank(); append(block, Opcode::A32GetExtendedRegister64, {Value{A32::ExtReg::Q0}}); reject(block);
+    block = blank();
+    {
+        const auto vec = append(block, Opcode::VectorBroadcast32, {Value{uint32_t(1)}});
+        append(block, Opcode::A32SetVector, {Value{A32::ExtReg::S0}, vec}); reject(block);
+    }
+    block = blank();
+    {
+        const auto packed = append(block, Opcode::Pack2x32To1x64, {Value{uint32_t(1)}, Value{uint32_t(2)}});
+        append(block, Opcode::A32SetExtendedRegister64, {Value{A32::ExtReg::S2}, packed}); reject(block);
+    }
+    block = blank();
+    {
+        const auto packed = append(block, Opcode::Pack2x32To1x64, {Value{uint32_t(1)}, Value{uint32_t(2)}});
+        append(block, Opcode::A32SetExtendedRegister64, {Value{A32::ExtReg::Q1}, packed}); reject(block);
+    }
 }
 } // namespace
 
@@ -404,5 +602,7 @@ int main(int argc, char **argv) {
     conditions(suite);
     scalars(suite);
     frontend(suite);
+    vector_loop(suite);
+    vfp_memory(suite);
     std::cout << "Native rejection/determinism checks passed; generated " << suite.modules << " modules and " << suite.runs << " execution cases\n";
 }

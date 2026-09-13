@@ -33,6 +33,11 @@ public:
 
     void set_instruction_budget(uint64_t value);
     const std::string &get_last_error() const;
+    // Valid after a generated memory-fault exit. CPU state is restored to the
+    // faulting instruction's entry; earlier stores in that instruction may
+    // already be visible (memory accesses are checked, not transactional).
+    uint32_t get_fault_address() const;
+    bool get_fault_write() const;
     uint64_t instructions_executed() const;
     uint64_t compiled_blocks() const;
     uint64_t cache_hits() const;
