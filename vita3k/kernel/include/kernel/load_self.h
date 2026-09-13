@@ -20,6 +20,7 @@
 #include <util/fs.h>
 #include <util/types.h>
 
+#include <cstddef>
 #include <string>
 
 struct KernelState;
@@ -27,4 +28,9 @@ struct MemState;
 struct KernelModule;
 
 SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std::string &self_path, const fs::path &dump_path);
+// Size-aware entry point for byte-oriented/browser transports; null/empty input
+// is rejected. Checks image and module/link-table bounds, not all relocation
+// semantics or subsequent guest execution. This is not a hostile-code sandbox.
+// Only the legacy load_self wrapper retains the trusted, unknown-size contract.
+SceUID load_self_sized(KernelState &kernel, MemState &mem, const void *self, std::size_t self_size, const std::string &self_path, const fs::path &dump_path);
 int unload_self(KernelState &kernel, MemState &mem, KernelModule &module);

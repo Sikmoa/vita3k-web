@@ -40,6 +40,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 
 static constexpr uint32_t NID_MODULE_STOP = 0x79F8E492;
 static constexpr uint32_t NID_MODULE_EXIT = 0x913482A9;
@@ -499,15 +500,185 @@ static bool load_exports(SceKernelModuleInfo *kernel_module_info, const sce_modu
     return true;
 }
 
-/**
- * \return Negative on failure
- */
-SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std::string &self_path, const fs::path &dump_path) {
+// Bounds for the relocated metadata consumed by the linker below. Deliberately
+// not a relocation interpreter: relocation targets/opcodes and late bindings
+// still have the existing trusted-module contract.
+static bool validate_module_tables(const sce_module_info_raw &module, Address base, uint32_t size,
+    const SegmentInfosForReloc &segments, const MemState &mem) {
+    const auto relative_range = [size](uint32_t begin, uint32_t end) {
+        return !(begin & 3) && !(end & 3) && begin <= end && end <= size;
+    };
+    const auto guest_range = [&](Address address, uint64_t length, uint32_t alignment = 4) {
+        if (length == 0)
+            return true;
+        if (!address || address % alignment)
+            return false;
+        for (const auto &[_, segment] : segments) {
+            if (address >= segment.addr && address - segment.addr <= segment.size
+                && length <= segment.size - (address - segment.addr))
+                return true;
+        }
+        return false;
+    };
+    const auto guest_string = [&](Address address) {
+        if (!address)
+            return true; // Nameless main-module exports are normal.
+        for (const auto &[_, segment] : segments) {
+            if (address >= segment.addr && address - segment.addr < segment.size)
+                return std::memchr(Ptr<const char>(address).get(mem), 0,
+                           segment.size - (address - segment.addr)) != nullptr;
+        }
+        return false;
+    };
+    const auto entry_offset = [size](uint32_t offset) {
+        return offset == 0 || offset == UINT32_MAX
+            || ((offset & ~1u) < size && size - (offset & ~1u) >= 2);
+    };
+    if (!relative_range(module.export_top, module.export_end)
+        || !relative_range(module.import_top, module.import_end)
+        || !relative_range(module.exidx_top, module.exidx_end)
+        || !relative_range(module.extab_top, module.extab_end)
+        || !entry_offset(module.module_start) || !entry_offset(module.module_stop)
+        || module.tls_filesz > module.tls_memsz
+        || module.tls_start > size || module.tls_filesz > size - module.tls_start
+        || (!module.tls_start && module.tls_filesz))
+        return false;
+
+    const auto var_reftable = [&](Address address) {
+        if (!guest_range(address, sizeof(VarImportsHeader)))
+            return false;
+        const auto *header = Ptr<const VarImportsHeader>(address).get(mem);
+        return header->reloc_data_size >= sizeof(VarImportsHeader)
+            && guest_range(address, header->reloc_data_size);
+    };
+    const auto imports_table = [&](Address nids, Address entries, uint32_t count, bool functions) {
+        if (!guest_range(nids, uint64_t(count) * 4) || !guest_range(entries, uint64_t(count) * 4))
+            return false;
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto address = Ptr<const uint32_t>(entries).get(mem)[i];
+            if (functions) {
+                // load_func_imports both patches the first three words and reads
+                // the fourth word for the optional relocation reference table.
+                if (!guest_range(address, 4 * sizeof(uint32_t)))
+                    return false;
+                const auto reftable = Ptr<const uint32_t>(address).get(mem)[3];
+                if (reftable && !var_reftable(reftable))
+                    return false;
+            } else if (!var_reftable(address)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const auto *bytes = Ptr<const uint8_t>(base).get(mem);
+    for (uint32_t offset = module.import_top; offset < module.import_end;) {
+        if (module.import_end - offset < sizeof(uint16_t))
+            return false;
+        uint16_t record_size;
+        std::memcpy(&record_size, bytes + offset, sizeof(record_size));
+        if ((record_size != sizeof(sce_module_imports_raw) && record_size != sizeof(sce_module_imports_short_raw))
+            || record_size > module.import_end - offset)
+            return false;
+        sce_module_imports_raw imports{};
+        if (record_size == sizeof(sce_module_imports_short_raw)) {
+            sce_module_imports_short_raw short_imports;
+            std::memcpy(&short_imports, bytes + offset, sizeof(short_imports));
+            imports.num_syms_funcs = short_imports.num_syms_funcs;
+            imports.num_syms_vars = short_imports.num_syms_vars;
+            imports.num_syms_tls_vars = short_imports.num_syms_tls_vars;
+            imports.library_name = short_imports.library_name;
+            imports.func_nid_table = short_imports.func_nid_table;
+            imports.func_entry_table = short_imports.func_entry_table;
+            imports.var_nid_table = short_imports.var_nid_table;
+            imports.var_entry_table = short_imports.var_entry_table;
+        } else {
+            std::memcpy(&imports, bytes + offset, sizeof(imports));
+        }
+        if (imports.num_syms_tls_vars || !imports.library_name || !guest_string(imports.library_name)
+            || !imports_table(imports.func_nid_table, imports.func_entry_table, imports.num_syms_funcs, true)
+            || !imports_table(imports.var_nid_table, imports.var_entry_table, imports.num_syms_vars, false))
+            return false;
+        offset += record_size;
+    }
+    for (uint32_t offset = module.export_top; offset < module.export_end;) {
+        if (module.export_end - offset < sizeof(sce_module_exports_raw))
+            return false;
+        sce_module_exports_raw exports;
+        std::memcpy(&exports, bytes + offset, sizeof(exports));
+        if (exports.size != sizeof(exports) || exports.num_syms_tls_vars
+            || !guest_string(exports.library_name))
+            return false;
+        const uint64_t count = uint64_t(exports.num_syms_funcs) + exports.num_syms_vars;
+        if (!guest_range(exports.nid_table, count * 4) || !guest_range(exports.entry_table, count * 4))
+            return false;
+        for (uint64_t i = 0; i < count; ++i) {
+            const auto address = Ptr<const uint32_t>(exports.entry_table).get(mem)[i];
+            const auto nid = Ptr<const uint32_t>(exports.nid_table).get(mem)[i];
+            if (!guest_range(address & ~1u, 1, 1))
+                return false;
+            if (i >= exports.num_syms_funcs && nid == NID_PROCESS_PARAM) {
+                // load_process_param always reads version, then sce_libc_param
+                // except for old homebrew (version zero).
+                if (!guest_range(address, offsetof(SceProcessParam, version) + sizeof(uint32_t)))
+                    return false;
+                const auto *param = Ptr<const SceProcessParam>(address).get(mem);
+                if (param->version && !guest_range(address, offsetof(SceProcessParam, sce_libc_param) + sizeof(uint32_t)))
+                    return false;
+            }
+        }
+        offset += exports.size;
+    }
+    return true;
+}
+
+// Bound record reads before calling the existing relocation engine. This does
+// NOT validate relocation segment references, patch targets or opcode semantics.
+static bool has_complete_relocation_records(const uint8_t *bytes, uint32_t size) {
+    constexpr uint8_t record_sizes[] = { 12, 8, 8, 8, 4, 4, 4, 4, 4, 4 };
+    uint32_t offset = 0;
+    while (offset < size) {
+        const auto format = bytes[offset] & 0xf;
+        if (format >= sizeof(record_sizes) || record_sizes[format] > size - offset)
+            return false;
+        offset += record_sizes[format];
+    }
+    return true;
+}
+
+// Unknown size is private to the trusted native wrapper, never a public opt-out.
+static SceUID load_self_impl(KernelState &kernel, MemState &mem, const void *self, std::size_t self_size, const std::string &self_path, const fs::path &dump_path) {
+    if (!self)
+        return SCE_KERNEL_ERROR_ILLEGAL_ELF_HEADER;
     const uint8_t *const image_bytes = static_cast<const uint8_t *>(self);
-    const SCE_header &self_header = *static_cast<const SCE_header *>(self);
+    std::size_t image_size = self_size;
+    auto has_bytes = [&image_size, self_size](std::uint64_t offset, std::uint64_t size) {
+        return self_size == 0 || (offset <= image_size && size <= image_size - offset);
+    };
+    if (self_size != 0 && self_size < sizeof(uint32_t))
+        return SCE_KERNEL_ERROR_ILLEGAL_ELF_HEADER;
 
     constexpr uint32_t SCE_MAGIC = 0x00454353; // "SCE\0"
-    const bool is_self = (self_header.magic == SCE_MAGIC);
+    uint32_t magic = 0;
+    std::memcpy(&magic, self, sizeof(magic));
+    const bool is_self = (magic == SCE_MAGIC);
+    if (is_self && self_size != 0 && self_size < sizeof(SCE_header))
+        return SCE_KERNEL_ERROR_ILLEGAL_SELF_HEADER;
+    if (!is_self && self_size != 0 && self_size < sizeof(Elf32_Ehdr))
+        return SCE_KERNEL_ERROR_ILLEGAL_ELF_HEADER;
+    // Input can be byte-aligned. Do not bind typed references into it.
+    SCE_header self_header{};
+    if (is_self) {
+        std::memcpy(&self_header, self, sizeof(self_header));
+        if (self_size != 0) {
+            if (self_header.self_filesize < sizeof(SCE_header)
+                || self_header.self_filesize > self_size
+                || self_header.header_len < sizeof(SCE_header)
+                || self_header.header_len > self_header.self_filesize)
+                return SCE_KERNEL_ERROR_ILLEGAL_SELF_HEADER;
+            image_size = static_cast<std::size_t>(self_header.self_filesize);
+        }
+    }
 
     if (is_self) {
         // assumes little endian host
@@ -527,15 +698,14 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
         }
     }
 
+    // elf_filesize describes the original ELF, NOT bytes embedded in the SELF.
+    // Only its ELF header is read here; each segment has its own stored length.
+    if (!has_bytes(is_self ? self_header.elf_offset : 0, sizeof(Elf32_Ehdr)))
+        return SCE_KERNEL_ERROR_ILLEGAL_ELF_HEADER;
     const uint8_t *const elf_bytes = is_self ? (image_bytes + self_header.elf_offset) : image_bytes;
-    const Elf32_Ehdr &elf = *reinterpret_cast<const Elf32_Ehdr *>(elf_bytes);
+    Elf32_Ehdr elf;
+    std::memcpy(&elf, elf_bytes, sizeof(elf));
     const uint32_t module_info_offset = elf.e_entry & 0x3fffffff;
-    const Elf32_Phdr *const segments = is_self
-        ? reinterpret_cast<const Elf32_Phdr *>(image_bytes + self_header.phdr_offset)
-        : reinterpret_cast<const Elf32_Phdr *>(elf_bytes + elf.e_phoff);
-    const segment_info *const seg_infos = is_self
-        ? reinterpret_cast<const segment_info *>(image_bytes + self_header.section_info_offset)
-        : nullptr;
 
     // Verify ELF header is correct
     if (!EHDR_HAS_VALID_MAGIC(elf)) {
@@ -566,6 +736,59 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
     // log elf header
     LOG_TRACE("ELF Header: e_type: {}, e_machine: {}, e_version: {}, e_entry: {}, e_phoff: {}, e_shoff: {}, e_flags: {}, e_ehsize: {}, e_phentsize: {}, e_phnum: {}, e_shentsize: {}, e_shnum: {}, e_shstrndx: {}",
         log_hex(elf.e_type), log_hex(elf.e_machine), log_hex(elf.e_version), log_hex(elf.e_entry), log_hex(elf.e_phoff), log_hex(elf.e_shoff), log_hex(elf.e_flags), log_hex(elf.e_ehsize), log_hex(elf.e_phentsize), log_hex(elf.e_phnum), log_hex(elf.e_shentsize), log_hex(elf.e_shnum), log_hex(elf.e_shstrndx));
+
+    // The loader indexes native Elf32_Phdr records, so accepting a larger
+    // advertised stride would validate a different table from the one consumed.
+    if (self_size != 0 && (elf.e_ehsize != sizeof(Elf32_Ehdr)
+                             || elf.e_version != EV_CURRENT || elf.e_phnum == 0
+                             || elf.e_phentsize != sizeof(Elf32_Phdr)))
+        return SCE_KERNEL_ERROR_ILLEGAL_ELF_HEADER;
+    const auto phdr_offset = is_self ? self_header.phdr_offset : elf.e_phoff;
+    const auto phdr_size = static_cast<std::uint64_t>(elf.e_phnum) * sizeof(Elf32_Phdr);
+    if (!has_bytes(phdr_offset, phdr_size))
+        return SCE_KERNEL_ERROR_ILLEGAL_ELF_HEADER;
+    if (is_self && !has_bytes(self_header.section_info_offset,
+                       static_cast<std::uint64_t>(elf.e_phnum) * sizeof(segment_info)))
+        return SCE_KERNEL_ERROR_ILLEGAL_SELF_HEADER;
+
+    std::vector<Elf32_Phdr> segments(elf.e_phnum);
+    std::vector<segment_info> seg_infos(is_self ? elf.e_phnum : 0);
+    if (phdr_size)
+        std::memcpy(segments.data(), image_bytes + phdr_offset, phdr_size);
+    if (!seg_infos.empty())
+        std::memcpy(seg_infos.data(), image_bytes + self_header.section_info_offset, seg_infos.size() * sizeof(segment_info));
+
+    // Validate every file span before constructing segment pointers or allocating
+    // guest memory. A compressed segment consumes length bytes, produces filesz.
+    if (self_size != 0) {
+        for (std::size_t i = 0; i < segments.size(); ++i) {
+            const auto &seg = segments[i];
+            if (is_self) {
+                const auto &info = seg_infos[i];
+                if (!has_bytes(info.offset, info.length)
+                    || (info.compression != 1 && info.compression != 2)
+                    || info.encryption != 2
+                    || (info.compression == 1 && info.length < seg.p_filesz)
+                    || info.length > std::numeric_limits<mz_ulong>::max())
+                    return SCE_KERNEL_ERROR_ILLEGAL_SELF_HEADER;
+            } else if (!has_bytes(seg.p_offset, seg.p_filesz)) {
+                return SCE_KERNEL_ERROR_ILLEGAL_ELF_HEADER;
+            }
+            if (seg.p_type == PT_LOAD
+                && (seg.p_filesz > seg.p_memsz
+                    || i >= MODULE_INFO_NUM_SEGMENTS
+                    || (seg.p_vaddr & 3)
+                    || seg.p_memsz > UINT32_MAX - 0xfff
+                    || static_cast<uint64_t>(seg.p_vaddr) + seg.p_memsz > UINT32_MAX))
+                return SCE_KERNEL_ERROR_ILLEGAL_ELF_HEADER;
+        }
+        const auto index = elf.e_entry >> 30;
+        if (index >= segments.size() || segments[index].p_type != PT_LOAD
+            || (module_info_offset & 3)
+            || module_info_offset > segments[index].p_filesz
+            || sizeof(sce_module_info_raw) > segments[index].p_filesz - module_info_offset)
+            return SCE_KERNEL_ERROR_ILLEGAL_ELF_HEADER;
+    }
 
     bool isRelocatable;
     if (elf.e_type == ET_SCE_EXEC) {
@@ -627,10 +850,10 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
             : (elf_bytes + seg_header.p_offset);
 
         const auto uncompress_segment = [&](void *dst) {
-            unsigned long dest_bytes = seg_header.p_filesz;
-            const uint8_t *const compressed_segment_bytes = image_bytes + seg_infos[seg_index].offset;
-            int res = mz_uncompress(static_cast<unsigned char *>(dst), &dest_bytes, compressed_segment_bytes, static_cast<mz_ulong>(seg_infos[seg_index].length));
-            assert(res == MZ_OK);
+            mz_ulong dest_bytes = seg_header.p_filesz;
+            const int res = mz_uncompress(static_cast<unsigned char *>(dst), &dest_bytes,
+                seg_bytes, static_cast<mz_ulong>(seg_infos[seg_index].length));
+            return res == MZ_OK && dest_bytes == seg_header.p_filesz;
         };
 
         LOG_DEBUG_IF(LOG_MODULE_LOADING, "    [{}] (p_type: {}): p_offset: {}, p_vaddr: {}, p_paddr: {}, p_filesz: {}, p_memsz: {}, p_flags: {}, p_align: {}", get_seg_header_string(seg_header.p_type), log_hex(seg_header.p_type), log_hex(seg_header.p_offset), log_hex(seg_header.p_vaddr), log_hex(seg_header.p_paddr), log_hex(seg_header.p_filesz), log_hex(seg_header.p_memsz), log_hex(seg_header.p_flags), log_hex(seg_header.p_align));
@@ -662,14 +885,16 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
                     }
                 }
 
+                segment_reloc_info[seg_index] = { segment_address, seg_header.p_vaddr, seg_header.p_memsz };
                 const Ptr<uint8_t> seg_ptr(segment_address);
                 if (is_self && seg_infos[seg_index].compression == 2) {
-                    uncompress_segment(seg_ptr.get(mem));
+                    if (!uncompress_segment(seg_ptr.get(mem))) {
+                        free_all_segments(mem, segment_reloc_info);
+                        return SCE_KERNEL_ERROR_ILLEGAL_SELF_HEADER;
+                    }
                 } else {
                     memcpy(seg_ptr.get(mem), seg_bytes, seg_header.p_filesz);
                 }
-
-                segment_reloc_info[seg_index] = { segment_address, seg_header.p_vaddr, seg_header.p_memsz };
             }
         } else if (seg_header.p_type == PT_SCE_RELA) {
             const void *reloc_data = seg_bytes;
@@ -677,11 +902,27 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
 
             if (is_self && seg_infos[seg_index].compression == 2) {
                 uncompressed = std::make_unique<uint8_t[]>(seg_header.p_filesz);
-                uncompress_segment(uncompressed.get());
+                if (!uncompress_segment(uncompressed.get())) {
+                    free_all_segments(mem, segment_reloc_info);
+                    return SCE_KERNEL_ERROR_ILLEGAL_SELF_HEADER;
+                }
                 reloc_data = uncompressed.get();
             }
 
+            if (self_size != 0 && !has_complete_relocation_records(static_cast<const uint8_t *>(reloc_data), seg_header.p_filesz)) {
+                free_all_segments(mem, segment_reloc_info);
+                return SCE_KERNEL_ERROR_ILLEGAL_ELF_HEADER;
+            }
+            // The relocation engine uses word-aligned records; byte transports
+            // and SELF segment offsets need not have host alignment.
+            std::vector<uint32_t> aligned_relocations;
+            if (reinterpret_cast<uintptr_t>(reloc_data) % alignof(uint32_t)) {
+                aligned_relocations.resize((static_cast<size_t>(seg_header.p_filesz) + 3) / 4);
+                std::memcpy(aligned_relocations.data(), reloc_data, seg_header.p_filesz);
+                reloc_data = aligned_relocations.data();
+            }
             if (!relocate(reloc_data, seg_header.p_filesz, segment_reloc_info, mem)) {
+                free_all_segments(mem, segment_reloc_info);
                 return -1;
             }
         } else if ((seg_header.p_type == PT_SCE_COMMENT) || (seg_header.p_type == PT_SCE_VERSION)
@@ -692,47 +933,51 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
         }
     }
 
-    if (kernel.debugger.dump_elfs) {
-        const uint8_t *dump_begin = is_self ? (image_bytes + self_header.header_len) : elf_bytes;
-        const uint8_t *dump_end;
-
-        if (is_self) {
-            dump_end = image_bytes + self_header.self_filesize;
+    if (kernel.debugger.dump_elfs && !segment_reloc_info.empty()) {
+        // SELF payloads are independently stored (and may be compressed), not
+        // an ELF beginning at header_len. Reconstruct only the loaded image from
+        // the already checked headers instead of interpreting payload as headers.
+        uint64_t dump_size = std::max<uint64_t>(sizeof(elf), uint64_t(elf.e_phoff) + phdr_size);
+        for (const auto &[index, _] : segment_reloc_info)
+            dump_size = std::max(dump_size, uint64_t(segments[index].p_offset) + segments[index].p_filesz);
+        const uint64_t original_size = is_self ? self_header.elf_filesize : image_size;
+        if (dump_size > std::numeric_limits<size_t>::max()
+            || (self_size != 0 && (dump_size > original_size || elf.e_phoff < sizeof(elf)))) {
+            LOG_WARN("Not dumping {}: invalid original ELF layout", self_path);
         } else {
-            size_t elf_size = 0;
-            auto dump_segments = reinterpret_cast<const Elf32_Phdr *>(elf_bytes + elf.e_phoff);
-            for (const auto &[seg_index, segment] : segment_reloc_info) {
-                uint8_t *seg_bytes = Ptr<uint8_t>(segment.addr).get(mem);
-                elf_size = std::max(elf_size, static_cast<size_t>(dump_segments[seg_index].p_offset) + static_cast<size_t>(dump_segments[seg_index].p_filesz));
+            std::vector<uint8_t> dump_elf(static_cast<size_t>(dump_size));
+            std::memcpy(dump_elf.data(), &elf, sizeof(elf));
+            auto dump_segments = segments;
+            for (const auto &[index, segment] : segment_reloc_info) {
+                std::memcpy(dump_elf.data() + segments[index].p_offset,
+                    Ptr<const uint8_t>(segment.addr).get(mem), segments[index].p_filesz);
+                dump_segments[index].p_vaddr = segment.addr;
             }
-            dump_end = elf_bytes + elf_size;
+            std::memcpy(dump_elf.data() + elf.e_phoff, dump_segments.data(), phdr_size);
+            fs::create_directories(dump_path);
+            const auto first = segment_reloc_info.begin()->first;
+            const auto last = segment_reloc_info.rbegin()->first;
+            const auto start = dump_segments[first].p_vaddr;
+            const auto end = dump_segments[last].p_vaddr + dump_segments[last].p_filesz;
+            const auto elf_name = fs::path(self_path).filename().stem().string();
+            const auto filename = dump_path / fmt::format("{}-{}_{}.elf", log_hex_full(start), log_hex_full(end), elf_name);
+            fs_utils::dump_data(filename, dump_elf.data(), dump_elf.size());
         }
-
-        std::vector<uint8_t> dump_elf(dump_begin, dump_end);
-        if (is_self) {
-            dump_elf.resize(self_header.elf_filesize);
-        }
-
-        Elf32_Phdr *dump_segments = reinterpret_cast<Elf32_Phdr *>(dump_elf.data() + elf.e_phoff);
-        uint16_t last_index = 0;
-        for (const auto &[seg_index, segment] : segment_reloc_info) {
-            uint8_t *seg_bytes = Ptr<uint8_t>(segment.addr).get(mem);
-            memcpy(dump_elf.data() + dump_segments[seg_index].p_offset, seg_bytes, dump_segments[seg_index].p_filesz);
-            dump_segments[seg_index].p_vaddr = segment.addr;
-            last_index = std::max(seg_index, last_index);
-        }
-        fs::create_directories(dump_path);
-        const auto start = dump_segments[0].p_vaddr;
-        const auto end = dump_segments[last_index].p_vaddr + dump_segments[last_index].p_filesz;
-        const auto elf_name = fs::path(self_path).filename().stem().string();
-        const auto filename = dump_path / fmt::format("{}-{}_{}.elf", log_hex_full(start), log_hex_full(end), elf_name);
-        fs_utils::dump_data(filename, dump_elf.data(), dump_elf.size());
     }
 
     const unsigned int module_info_segment_index = elf.e_entry >> 30;
-    const Ptr<const uint8_t> module_info_segment_address = Ptr<const uint8_t>(segment_reloc_info[module_info_segment_index].addr);
+    const auto module_segment = segment_reloc_info.find(module_info_segment_index);
+    if (module_segment == segment_reloc_info.end()) {
+        free_all_segments(mem, segment_reloc_info);
+        return SCE_KERNEL_ERROR_ILLEGAL_ELF_HEADER;
+    }
+    const Ptr<const uint8_t> module_info_segment_address(module_segment->second.addr);
     const uint8_t *const module_info_segment_bytes = module_info_segment_address.get(mem);
     const sce_module_info_raw *const module_info = reinterpret_cast<const sce_module_info_raw *>(module_info_segment_bytes + module_info_offset);
+    if (self_size != 0 && !validate_module_tables(*module_info, module_segment->second.addr, module_segment->second.size, segment_reloc_info, mem)) {
+        free_all_segments(mem, segment_reloc_info);
+        return SCE_KERNEL_ERROR_ILLEGAL_ELF_HEADER;
+    }
 
     for (const auto &[seg, infos] : segment_reloc_info) {
         LOG_INFO("Loaded module segment {} @ [0x{:08X} - 0x{:08X} / 0x{:08X}] (size: 0x{:08X}) of module {}", seg, infos.addr, infos.addr + infos.size, infos.p_vaddr, infos.size, self_path);
@@ -746,7 +991,8 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
 
     auto *sceKernelModuleInfo = &kernelModuleInfo->info;
     sceKernelModuleInfo->size = sizeof(*sceKernelModuleInfo);
-    strncpy(sceKernelModuleInfo->module_name, module_info->name, 28);
+    std::memcpy(sceKernelModuleInfo->module_name, module_info->name, sizeof(module_info->name));
+    sceKernelModuleInfo->module_name[sizeof(module_info->name)] = '\0';
     // unk28
     if (module_info->module_start != 0xffffffff && module_info->module_start != 0)
         sceKernelModuleInfo->start_entry = module_info_segment_address + module_info->module_start;
@@ -814,6 +1060,16 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
     }
 
     return uid;
+}
+
+SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std::string &self_path, const fs::path &dump_path) {
+    return load_self_impl(kernel, mem, self, 0, self_path, dump_path);
+}
+
+SceUID load_self_sized(KernelState &kernel, MemState &mem, const void *self, std::size_t self_size, const std::string &self_path, const fs::path &dump_path) {
+    if (!self || self_size == 0)
+        return SCE_KERNEL_ERROR_ILLEGAL_ELF_HEADER;
+    return load_self_impl(kernel, mem, self, self_size, self_path, dump_path);
 }
 
 int unload_self(KernelState &kernel, MemState &mem, KernelModule &module) {
