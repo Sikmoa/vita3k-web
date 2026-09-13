@@ -2,9 +2,22 @@
 import { createWebStorage } from './storage.js';
 
 const storage = createWebStorage('./');
-const post = (message) => self.postMessage({ ...message, timestamp: performance.now() });
+const post = (message, transfer) => self.postMessage({ ...message, timestamp: performance.now() }, transfer || []);
 let module = null;
 let lifecycle = 'starting';
+
+// Host hooks called from Wasm (see browser/src/vita_runtime.cpp). With
+// ASYNCIFY the run call may suspend; the final exit code therefore arrives
+// through vita3kWebOnExit instead of the call's return value.
+globalThis.vita3kWebOnExit = (code) => {
+  post({ type: 'vita-exit', exitCode: code, ok: code >= 0 });
+};
+// The view is only valid synchronously; copy it before yielding. The data is
+// TIGHT RGBA produced in Wasm from the real sceDisplaySetFrameBuf state.
+globalThis.vita3kWebOnFrame = (generation, width, height, view) => {
+  const data = view.slice().buffer;
+  post({ type: 'vita-frame', generation, width, height, pixelFormat: 'A8B8G8R8', data }, [data]);
+};
 
 const transition = (state) => {
   lifecycle = state;
@@ -60,12 +73,21 @@ self.onmessage = async ({ data }) => {
       if (!allocation) throw new Error('unable to allocate ELF input buffer');
       try {
         module.HEAPU8.set(input, allocation);
-        const exitCode = vita
-          ? module._vita3k_web_run_vita(allocation, input.byteLength)
-          : module._vita3k_web_run_elf_probe(allocation, input.byteLength);
-        post({ type: resultType, path, size: input.byteLength, exitCode, ok: exitCode >= 0 });
-      } finally {
+        if (vita) {
+          // Completion is always reported via the vita3kWebOnExit hook (the
+          // call may suspend across ASYNCIFY yields, losing its return value).
+          // The input buffer is intentionally not freed here: freeing while
+          // the guest run is suspended would mutate the Wasm heap under a
+          // suspended stack. One input buffer per worker run is bounded.
+          module._vita3k_web_run_vita(allocation, input.byteLength);
+        } else {
+          const exitCode = module._vita3k_web_run_elf_probe(allocation, input.byteLength);
+          post({ type: resultType, path, size: input.byteLength, exitCode, ok: exitCode >= 0 });
+          module._free(allocation);
+        }
+      } catch (error) {
         module._free(allocation);
+        throw error;
       }
     } catch (error) {
       post({ type: resultType, exitCode: -1, ok: false, message: String(error) });
