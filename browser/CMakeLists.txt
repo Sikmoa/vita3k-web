@@ -10,6 +10,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 include(${CMAKE_CURRENT_SOURCE_DIR}/runtime_core.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/runtime_hle.cmake)
 
+# Experimental M14 tests only; the existing application keeps InterpreterCPU.
+option(VITA3K_WEB_JIT_TESTS "Build Dynarmic-IR to Wasm JIT prototype tests" OFF)
+if(VITA3K_WEB_JIT_TESTS)
+    if(NOT EMSCRIPTEN)
+        message(FATAL_ERROR "VITA3K_WEB_JIT_TESTS requires Emscripten")
+    endif()
+    include(${CMAKE_CURRENT_SOURCE_DIR}/runtime_wasmjit.cmake)
+endif()
+
 # Genuine VitaSDK display fixture (CPU-rendered animated framebuffer).
 option(VITA3K_WEB_DISPLAY_FIXTURE "Build the genuine VitaSDK display fixture" ON)
 if(VITA3K_WEB_DISPLAY_FIXTURE)

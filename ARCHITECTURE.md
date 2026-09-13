@@ -1,5 +1,10 @@
 # Vita3K WebAssembly Port — M0 Architecture Map
 
+> Current experimental JIT work: [M14a implementation and validation](browser/M14_JIT.md).
+> The working homebrew/display runtime remains on InterpreterCPU; the new
+> Dynarmic-IR → Wasm backend is opt-in and currently limited to register-only
+> blocks. The sections below retain the historical survey/milestone record.
+
 This document records the first repository survey for the browser port. It is deliberately a map and decision record, not an implementation plan disguised as a rewrite.
 
 ## Source baseline
