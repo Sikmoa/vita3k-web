@@ -21,6 +21,8 @@
 #include <mem/functions.h>
 #include <mem/state.h>
 
+#include <type_traits>
+
 template <class T>
 class Ptr {
 public:
@@ -37,7 +39,13 @@ public:
     }
 
     Ptr(T *pointer, const MemState &mem) {
-        mem_host_to_guest(mem, pointer, addr);
+        if constexpr (std::is_function_v<T>) {
+            // Host function pointers never live in guest memory; trace-only
+            // users (to_debug_str) just need a stable printable value.
+            addr = pointer ? static_cast<Address>(reinterpret_cast<uintptr_t>(pointer)) : 0;
+        } else {
+            mem_host_to_guest(mem, pointer, addr);
+        }
     }
 
     Address address() const {
