@@ -114,7 +114,7 @@ struct WasmJitCPU::Impl {
     State state{};
     std::atomic<bool> stopped{false};
     bool breakpoint = false, log_code = false, log_mem = false;
-    uint64_t budget = 1'000'000, executed = 0, compiled = 0, hits = 0, invalidated = 0;
+    uint64_t budget = 1'000'000'000'000, executed = 0, compiled = 0, hits = 0, invalidated = 0;
     std::string error;
     std::map<Key, Block> cache;
 

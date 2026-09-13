@@ -29,7 +29,13 @@ function present(frame) {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  const worker = new Worker('./worker.js', { type: 'module' });
+  // Optional backend selection: display.html?backend=jit runs the animated
+  // homebrew through the M14 WasmJitCPU module instead of the interpreter.
+  const backend = new URLSearchParams(self.location.search).get('backend');
+  const workerUrl = backend === 'jit' ? './worker.js?backend=jit' : './worker.js';
+  const backendLabel = document.querySelector('#backend-label');
+  if (backendLabel) backendLabel.textContent = backend === 'jit' ? '(WasmJitCPU)' : '(InterpreterCPU)';
+  const worker = new Worker(workerUrl, { type: 'module' });
   worker.onmessage = ({ data }) => {
     if (data.type === 'lifecycle') console.log('[vita3k-web] lifecycle:', data.state);
     if (data.type === 'ready') {
