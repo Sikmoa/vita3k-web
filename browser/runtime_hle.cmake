@@ -18,6 +18,8 @@ set(_hle_exports
     sceKernelGetProcessTimeLow sceKernelLibcGettimeofday sceKernelGetProcessParam
     sceClibMemcpy sceClibMemset
     sceIoOpen sceIoClose
+    _sceDisplaySetFrameBuf sceDisplaySetFrameBuf sceDisplayWaitVblankStart
+    sceDisplayGetVcount sceDisplayGetRefreshRate
 )
 
 # Take NID values from the one authoritative database, never a second resolver.
@@ -50,6 +52,8 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceSysmem/SceSysmemForDriver.cpp"
     "${_HLE_ROOT}/modules/SceProcessmgr/SceProcessmgr.cpp"
     "${_HLE_ROOT}/modules/SceIofilemgr/SceIofilemgr.cpp"
+    "${_HLE_ROOT}/modules/SceDisplay/SceDisplay.cpp"
+    "${_HLE_ROOT}/modules/SceDriverUser/SceDisplayUser.cpp"
 )
 # Compile the existing implementation files through registration-only adapters.
 # This is necessary because EXPORT's make_bridge initialization roots even
@@ -97,6 +101,7 @@ add_library(vita3k_web_runtime_hle STATIC
     "${_HLE_ROOT}/io/src/state_functions.cpp"
     "${_HLE_ROOT}/util/src/string_utils.cpp"
     "${_HLE_ROOT}/emuenv/src/emuenv.cpp"
+    "${_HLE_ROOT}/display/src/display.cpp"
     "${_HLE_ROOT}/motion/src/motion_input.cpp"
     "${_HLE_ROOT}/camera/src/camera.cpp"
     "${_HLE_ROOT}/overlay/src/display_manager.cpp"
