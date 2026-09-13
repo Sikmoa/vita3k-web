@@ -150,6 +150,33 @@ void control_and_vectors(Fixture &f) {
     CHECK(f.state.svc == 14 && f.cpu.get_pc() == test_it_svc + 6);
     CHECK((f.cpu.get_cpsr() & ((3u << 25) | (0x3fu << 10))) == 0);
     f.run(); CHECK(f.state.svc == 15); // resume after SVC, do not execute it again
+    f.start(test_bitfield); f.reg(1, 0xdeadbeef); f.reg(3, 0xfffffedc); f.reg(4, 0x12345678); f.reg(5, 0xab);
+    f.reg(6, 0xffffffff);
+    f.run();
+    CHECK(f.state.svc == 0x21);
+    CHECK(f.reg(0) == (0xdeadbeef & 0x1ff)); // ubfx #0,#9
+    CHECK(f.reg(2) == 0xffffffed); // sbfx #4,#12 of 0xfffffedc (0xfed sign-extended)
+    CHECK(f.reg(4) == 0x12344b78); // bfi #8,#5 of 0xab: 0x0b at bits 8-12
+    CHECK(f.reg(6) == 0xfffffc07); // bfc #3,#7
+    f.start(test_extend); f.reg(1, 0xdeadbeef); f.reg(3, 0xffffff80); f.reg(5, 0x1234fedc);
+    f.reg(7, 0x89abcdef); f.reg(9, 0x12345678); f.reg(11, 0xaabbccdd); f.reg(14, 0x00000100);
+    f.run();
+    CHECK(f.state.svc == 0x22);
+    CHECK(f.reg(0) == 24); // clz of 0xef (the uxtb result)
+    CHECK(f.reg(2) == 0x78563412); // rev of 0x12345678
+    CHECK(f.reg(4) == 0xfedc); // uxth
+    CHECK(f.reg(6) == 0xffffcdef); // sxth of low half 0xcdef
+    CHECK(f.reg(8) == 0xbbaaddcc); // rev16 of 0xaabbccdd
+    CHECK(f.reg(10) == 0xffffddcc); // revsh of 0xaabbccdd (0xccdd -> 0xddcc, sign-extended)
+    CHECK(f.reg(12) == 0x00800000); // rbit of lr 0x100
+    f.start(test_extend_wide); f.reg(7, 0x89abcdef); f.reg(9, 0x12345678); f.reg(11, 0xaabbccdd); f.reg(14, 0x00000100);
+    f.run();
+    CHECK(f.state.svc == 0x23);
+    CHECK(f.reg(0) == 0x78); // uxtb.w plain of 0x12345678
+    CHECK(f.reg(1) == 0xaabb); // uxth.w of ror(0xaabbccdd,16) = 0xccddaabb
+    CHECK(f.reg(2) == 0x178); // uxtab: lr 0x100 + uxtb(0x12345678)
+    CHECK(f.reg(3) == 0xffffffcd); // sxtb.w of ror(0x89abcdef,8) = 0xef89abcd
+    CHECK(f.reg(4) == 0xffffcdef); // sxth.w of 0x89abcdef
     f.start(test_vfp); f.reg(0, data); f.reg(1, 0xaabbccdd);
     f.word(data + 8, 0xabcd330e); f.word(data + 12, 0xe66d1234);
     for (unsigned i = 16; i < 24; ++i) f.cpu.set_float_reg(i, std::bit_cast<float>(0x7fc00000u + i));

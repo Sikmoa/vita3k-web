@@ -196,3 +196,30 @@ test test_it_svc
     it eq
     svceq #14
     svc #15
+
+test test_bitfield
+    ubfx r0, r1, #0, #9
+    sbfx r2, r3, #4, #12
+    bfi r4, r5, #8, #5
+    bfc r6, #3, #7
+    svc #0x21
+
+test test_extend
+    uxtb r0, r1
+    sxtb r2, r3
+    uxth r4, r5
+    sxth r6, r7
+    rev r2, r9
+    rev16 r8, r11
+    revsh r10, r11
+    rbit r12, lr
+    clz r0, r0
+    svc #0x22
+
+test test_extend_wide
+    uxtb.w r0, r9
+    uxth.w r1, r11, ror #16
+    uxtab r2, lr, r9
+    sxtb.w r3, r7, ror #8
+    sxth.w r4, r7
+    svc #0x23

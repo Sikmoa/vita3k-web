@@ -178,6 +178,7 @@ int InterpreterCPU::fail(uint32_t pc, uint32_t opcode, const char *reason) {
 }
 int InterpreterCPU::step() {
     parent->svc_called = false;
+    ++executed_instructions;
     if (stopped) return 1;
     const uint32_t pc = regs[15], saved_cpsr = cpsr;
     uint32_t opcode = 0;
@@ -341,7 +342,92 @@ int InterpreterCPU::thumb32(uint16_t hi, uint16_t lo, uint32_t pc) {
     const unsigned rn = hi & 15, rd = (lo >> 8) & 15, rt = lo >> 12;
     const uint32_t imm12 = ((hi >> 10) & 1) << 11 | ((lo >> 12) & 7) << 8 | (lo & 255);
     if (hi == 0xf3af && lo == 0x8000) return 0; // NOP.W shares branch prefix
-    if ((hi & 0xf800) == 0xf000 && (lo & 0x8000)) { // branches, not data processing
+    if ((hi & 0xff00) == 0xf300 && (lo & 0x0010) == 0 && rd != 15) {
+        // T2 bitfield ops (ARMv7-A A6.7), verified against VitaSDK binutils:
+        //   UBFX r0,r1,#0,#9  = f3c1 0008  (hi&0xe0 == 0xc0)
+        //   SBFX r2,r3,#4,#12 = f343 120b  (hi&0xe0 == 0x40)
+        //   BFI  r4,r5,#8,#5  = f365 240c  (hi&0xe0 == 0x60)
+        //   BFC  r6,#3,#7     = f36f 06c9  (hi&0xe0 == 0x60, rn==15)
+        // lsb = imm3:imm2; low nibble of lo = msb (insert) / width-1 (extract).
+        const unsigned lsb = (((lo >> 12) & 7) << 2) | ((lo >> 6) & 3);
+        const unsigned field = lo & 0xf;
+        switch (hi & 0xe0) {
+        case 0x40: { // SBFX
+            const unsigned width = field + 1;
+            if (rn == 15 || lsb + width > 32) return -1;
+            const uint32_t bits = (regs[rn] >> lsb) & (width >= 32 ? 0xffffffffu : (1u << width) - 1);
+            regs[rd] = sign_extend(bits, width);
+            break;
+        }
+        case 0xc0: { // UBFX
+            const unsigned width = field + 1;
+            if (rn == 15 || lsb + width > 32) return -1;
+            regs[rd] = (regs[rn] >> lsb) & (width >= 32 ? 0xffffffffu : (1u << width) - 1);
+            break;
+        }
+        case 0x60: { // BFI/BFC
+            const unsigned msb = field;
+            if (lsb > msb || msb > 31) return -1;
+            const unsigned width = msb - lsb + 1;
+            const uint32_t src = rn == 15 ? 0 : regs[rn];
+            const uint32_t mask = ((1u << width) - 1) << lsb;
+            regs[rd] = (regs[rd] & ~mask) | ((src << lsb) & mask);
+            break;
+        }
+        default:
+            return -1;
+        }
+    } else if ((hi & 0xff00) == 0xfa00 && (lo & 0xf000) == 0xf000 && ((lo >> 6) & 3) == 2
+        && (((hi >> 5) & 7) == 0 || ((hi >> 5) & 7) == 2)) {
+        // T2 extends, verified against VitaSDK GAS encodings:
+        //   uxtb.w r0,r1 = fa5f f081; uxtab r8,r9,r2 = fa59 f882;
+        //   uxth.w r4,r5,ror #16 = fa1f f4a5.
+        // hi[7:5]=000 halfword / 010 byte, hi[4]=unsigned, hi[3:0]=Rn
+        // (15 = plain extend, otherwise extend-and-add), lo[15:12]=1111,
+        // lo[11:8]=Rd, lo[7:6]=10, lo[5:4]=rotation/8, lo[3:0]=Rm.
+        if (rd == 15 || (lo & 15) == 15) return -1;
+        const unsigned rot = ((lo >> 4) & 3) * 8;
+        const uint32_t rotated = std::rotr(regs[lo & 15], int(rot));
+        const bool halfword = ((hi >> 5) & 7) == 0;
+        const uint32_t ext = halfword
+            ? ((hi & 0x10) ? rotated & 0xffff : sign_extend(rotated & 0xffff, 16))
+            : ((hi & 0x10) ? rotated & 0xff : sign_extend(rotated & 0xff, 8));
+        regs[rd] = rn == 15 ? ext : regs[rn] + ext;
+    } else if ((hi & 0xfff0) == 0xfa90 && (lo & 0xf000) == 0xf000) {
+        // T2 reverse/bit-field ops, verified against VitaSDK GAS encodings:
+        //   rev.w r8,r9 = fa99 f889; rev16.w r10,r11 = fa9b fa9b;
+        //   rbit r6,r7 = fa97 f6a7; revsh.w r4,r5 = fa95 f4b5.
+        // hi=0xfa9R (GAS repeats Rm in hi[3:0]); lo[7:4] selects the op,
+        // Rm is lo[3:0] and Rd is lo[11:8].
+        if (rd == 15 || (lo & 15) == 15) return -1;
+        const uint32_t v = regs[lo & 15];
+        switch ((lo >> 4) & 15) {
+        case 8: // REV: reverse bytes
+            regs[rd] = ((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >> 8) & 0xff00) | (v >> 24);
+            break;
+        case 9: // REV16: reverse bytes within each halfword
+            regs[rd] = ((v & 0x00ff00ff) << 8) | ((v >> 8) & 0x00ff00ff);
+            break;
+        case 0xa: { // RBIT: reverse bits
+            uint32_t r = v;
+            r = ((r >> 1) & 0x55555555) | ((r & 0x55555555) << 1);
+            r = ((r >> 2) & 0x33333333) | ((r & 0x33333333) << 2);
+            r = ((r >> 4) & 0x0f0f0f0f) | ((r & 0x0f0f0f0f) << 4);
+            r = ((r >> 8) & 0x00ff00ff) | ((r & 0x00ff00ff) << 8);
+            regs[rd] = (r >> 16) | (r << 16);
+            break;
+        }
+        case 0xb: // REVSH: reverse bytes of low halfword, sign-extend
+            regs[rd] = sign_extend(((v & 0xff) << 8) | ((v >> 8) & 0xff), 16);
+            break;
+        default:
+            return -1;
+        }
+    } else if ((hi & 0xfff0) == 0xfab0 && (lo & 0xf0f0) == 0xf080) {
+        // CLZ.W, verified against VitaSDK GAS: clz r1,r2 = fab2 f182.
+        if (rd == 15 || (lo & 15) == 15) return -1;
+        regs[rd] = regs[lo & 15] == 0 ? 32u : static_cast<uint32_t>(std::countl_zero(regs[lo & 15]));
+    } else if ((hi & 0xf800) == 0xf000 && (lo & 0x8000)) { // branches, not data processing
         const unsigned s = (hi >> 10) & 1, j1 = (lo >> 13) & 1, j2 = (lo >> 11) & 1;
         if ((lo & 0xd000) == 0x8000) {
             const unsigned cond = (hi >> 6) & 15;
@@ -406,9 +492,6 @@ int InterpreterCPU::thumb32(uint16_t hi, uint16_t lo, uint32_t pc) {
         }
         if (logical && flags) nzc(result, b.carry);
         if (rd != 15) regs[rd] = result; else if (!flags) return -1;
-    } else if ((hi & 0xfff0) == 0xfa50 && (lo & 0xf0c0) == 0xf080 && rn == 15) { // UXTB.W
-        if (rd == 15) return -1;
-        regs[rd] = std::rotr(regs[lo & 15], int((lo >> 4) & 3) * 8) & 255;
     } else if ((hi & 0xff80) == 0xfa00 && (lo & 0xf0f0) == 0xf000) { // register shift
         const auto s = shift(regs[rn], (hi >> 5) & 3, regs[lo & 15] & 255, cpsr & c_flag);
         if (rd == 15 || rn == 15 || (lo & 15) == 15) return -1;

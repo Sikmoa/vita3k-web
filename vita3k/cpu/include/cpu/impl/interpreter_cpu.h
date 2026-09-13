@@ -36,6 +36,8 @@ public:
     // Budget applies to each run() (SVC remains a cooperative return boundary).
     void set_instruction_budget(uint64_t value) { instruction_budget = value; }
     const std::string &get_last_error() const { return last_error; }
+    // Total guest instructions executed by this backend (benchmarking).
+    uint64_t instructions_executed() const { return executed_instructions; }
 
 private:
     int thumb16(uint16_t op, uint32_t pc, bool in_it);
@@ -57,6 +59,9 @@ private:
     std::size_t core_id;
     std::atomic<bool> stopped{false};
     bool breakpoint = false, log_code = false, log_mem = false;
-    uint64_t instruction_budget = 1'000'000;
+    // Effectively unlimited: production hosts run guest threads for whole
+    // frames. Tests that want budget exhaustion call set_instruction_budget.
+    uint64_t instruction_budget = 1'000'000'000'000;
+    uint64_t executed_instructions = 0;
     std::string last_error;
 };
