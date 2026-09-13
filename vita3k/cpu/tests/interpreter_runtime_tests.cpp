@@ -19,8 +19,10 @@ int main() {
     instructions[0] = 0xe3a0002au; // mov r0, #42
     instructions[1] = 0xe3a07000u; // mov r7, #0 (test-only service marker)
     instructions[2] = 0xef000000u; // svc #0
-    // The instruction after SVC is the normal Vita import/NID slot.
-    instructions[3] = 0x12345678u;
+    // Native Vita import stubs place a return instruction after SVC, then the
+    // NID at post-SVC PC + 4.
+    instructions[3] = 0xe1a0f00eu; // mov pc, lr
+    instructions[4] = 0x12345678u;
 
     bool svc_seen = false;
     uint32_t svc_number = 0;
@@ -42,7 +44,7 @@ int main() {
     CHECK(thread->cpu != nullptr);
     CHECK(read_pc(*thread->cpu) == 0);
     CHECK(thread->start(0, Ptr<void>(0)) == SCE_KERNEL_OK);
-    thread->run_loop();
+    thread->run_loop(true);
     CHECK(svc_seen && svc_number == 0 && import_nid_ok && register_ok);
     CHECK(read_reg(*thread->cpu, 0) == 42);
 

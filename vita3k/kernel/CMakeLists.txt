@@ -38,4 +38,10 @@ if(VITA3K_INTERPRETER_CPU AND NOT ANDROID)
     )
     target_link_libraries(vita3k_interpreter_runtime_tests PRIVATE kernel)
     add_test(NAME vita3k_interpreter_runtime COMMAND vita3k_interpreter_runtime_tests)
+
+    add_executable(vita3k_interpreter_instruction_tests
+        ../cpu/tests/interpreter_instruction_tests.cpp
+    )
+    target_link_libraries(vita3k_interpreter_instruction_tests PRIVATE cpu mem util)
+    add_test(NAME vita3k_interpreter_instruction COMMAND vita3k_interpreter_instruction_tests)
 endif()
