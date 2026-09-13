@@ -2,6 +2,9 @@
 // This is a synchronous, non-graphical launch entrypoint, not another kernel.
 #include <cpu/functions.h>
 #include <cpu/impl/interpreter_cpu.h>
+#ifdef VITA3K_USE_WASM_JIT
+#include <cpu/impl/wasm_jit_cpu.h>
+#endif
 #include <emuenv/state.h>
 #include <kernel/load_self.h>
 #include <kernel/state.h>
@@ -13,6 +16,7 @@
 
 #include "vita_runtime.h"
 
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <memory>
@@ -39,6 +43,23 @@ EM_JS(void, vita3k_web_post_frame_hook, (int generation, int width, int height, 
 
 // Total guest instructions of the most recent run (benchmarking).
 static uint64_t vita3k_web_bench_instructions = 0;
+static bool vita3k_web_trace_cpu = false;
+
+extern "C" EMSCRIPTEN_KEEPALIVE
+void vita3k_web_set_trace(int enabled) { vita3k_web_trace_cpu = enabled != 0; }
+
+static void trace_cpu(CPUState &cpu, uint32_t nid) {
+    if (!vita3k_web_trace_cpu) return;
+    const auto context = save_context(cpu);
+    std::printf("[vita3k-web] CPU state: {\"nid\":%u,\"r\":[", nid);
+    for (unsigned i = 0; i < 16; ++i)
+        std::printf("%s%u", i ? "," : "", context.cpu_registers[i]);
+    std::printf("],\"cpsr\":%u,\"fpscr\":%u,\"tpidruro\":%u,\"svc\":%u,\"fpu\":[",
+        context.cpsr, context.fpscr, read_tpidruro(cpu), cpu.svc);
+    for (unsigned i = 0; i < 64; ++i)
+        std::printf("%s%u", i ? "," : "", std::bit_cast<uint32_t>(context.fpu_registers[i]));
+    std::puts("]}");
+}
 
 extern "C" EMSCRIPTEN_KEEPALIVE
 uint64_t vita3k_web_last_run_instructions() {
@@ -69,6 +90,7 @@ static int run_vita(const uint8_t *bytes, uint32_t size) {
         if (!env->kernel.init(env->mem, [&](CPUState &cpu, uint32_t nid, SceUID tid) {
                 ++imports;
                 std::printf("[vita3k-web] Vita import: %s NID=%08x PC=%08x\n", import_name(nid), nid, read_pc(cpu));
+                trace_cpu(cpu, nid);
                 ::call_import(*env, cpu, nid, tid);
                 // Present exactly once per real sceDisplaySetFrameBuf call: one
                 // frame/update generation, matching the real API semantics.
@@ -101,12 +123,33 @@ static int run_vita(const uint8_t *bytes, uint32_t size) {
         }
         thread = std::make_shared<ThreadState>(env->kernel.get_next_uid(), env->kernel, env->mem);
         if (thread->init("vita-homebrew-main", module.start_entry, priority, affinity, stack_size, nullptr) < 0) return -6;
+#ifdef VITA3K_USE_WASM_JIT
+        // Keep production ThreadState initialization, then transfer its CPU
+        // state into the explicitly selected experimental backend.
+        const auto initial = save_context(*thread->cpu);
+        const auto tls = read_tpidruro(*thread->cpu);
+        const auto core = get_processor_id(*thread->cpu);
+        thread->cpu->cpu = std::make_unique<WasmJitCPU>(thread->cpu.get(), core);
+        load_context(*thread->cpu, initial);
+        write_tpidruro(*thread->cpu, tls);
+        std::puts("[vita3k-web] CPU backend: WasmJitCPU (no fallback)");
+#else
+        std::puts("[vita3k-web] CPU backend: InterpreterCPU");
+#endif
         env->kernel.threads.emplace(thread->id, thread);
         env->main_thread_id = thread->id;
         if (thread->start(0, Ptr<void>{}, true) < 0) return -7;
         thread->run_loop(true);
         if (const auto *interp = dynamic_cast<const InterpreterCPU *>(thread->cpu->cpu.get()))
             vita3k_web_bench_instructions = interp->instructions_executed();
+#ifdef VITA3K_USE_WASM_JIT
+        if (const auto *jit = dynamic_cast<const WasmJitCPU *>(thread->cpu->cpu.get())) {
+            vita3k_web_bench_instructions = jit->instructions_executed();
+            std::printf("[vita3k-web] JIT stats: instructions=%llu compiled=%llu hits=%llu invalidated=%llu\n",
+                (unsigned long long)jit->instructions_executed(), (unsigned long long)jit->compiled_blocks(),
+                (unsigned long long)jit->cache_hits(), (unsigned long long)jit->invalidated_blocks());
+        }
+#endif
         std::printf("[vita3k-web] Vita result: process_exit=%d code=%d imports=%u missing_nids=%zu PC=%08x\n",
             exited, exit_code, imports, env->missing_nids.size(), read_pc(*thread->cpu));
         return exited && env->missing_nids.empty() ? exit_code : -8;

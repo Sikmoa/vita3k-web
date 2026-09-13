@@ -3,10 +3,12 @@
 // instruction throughput from the runtime's own counters.
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 extern "C" {
 int vita3k_web_run_vita(const std::uint8_t *bytes, std::uint32_t size);
+void vita3k_web_set_trace(int enabled);
 std::uint64_t vita3k_web_last_run_instructions();
 }
 
@@ -30,6 +32,8 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "Empty input: %s\n", argv[1]);
         return 2;
     }
+    vita3k_web_set_trace(std::getenv("VITA3K_TRACE_CPU") != nullptr);
+    if (std::getenv("VITA3K_TRACE_CPU")) std::fprintf(stderr, "trace enabled\n");
     const int code = vita3k_web_run_vita(image.data(), static_cast<std::uint32_t>(image.size()));
     std::printf("[bench] exit=%d\n", code);
     return code == 42 ? 0 : 1;

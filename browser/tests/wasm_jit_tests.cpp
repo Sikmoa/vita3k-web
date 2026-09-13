@@ -415,10 +415,9 @@ void failure_boundaries(Suite &suite, Fixture &fixture) {
             REQUIRE(bytes == read_bytes(fixture.memory.state, code_address, mapped_size));
 #endif
         });
-        suite.test(thumb ? "Thumb supported oracle load must NOT fall back" : "ARM supported oracle load must NOT fall back", [&] {
-            // Memory IR is outside M14's declared whitelist, but the real
-            // InterpreterCPU supports this instruction. Falling back would
-            // reach SVC and change r2, and therefore MUST fail this test.
+        suite.test(thumb ? "Thumb checked load matches oracle" : "ARM checked load matches oracle", [&] {
+            // M14b lowers this through checked MemState helpers. Successful
+            // loads must match the oracle, without modifying guest memory.
             const size_t size = thumb ? sizeof(thumb_memory_unsupported) : sizeof(arm_memory_unsupported);
             fixture.install(thumb ? thumb_memory_unsupported : arm_memory_unsupported, size);
             auto start = initial(thumb, nzcv_mask);
@@ -428,17 +427,18 @@ void failure_boundaries(Suite &suite, Fixture &fixture) {
             const auto bytes = read_bytes(fixture.memory.state, code_address, mapped_size);
             auto expected = at_svc(start, size);
             expected.context.cpu_registers[2] = payload;
-            equal_state(fixture.run_reference(start), expected, "real oracle LDR");
+            fixture.compare(start, expected);
 #ifdef __EMSCRIPTEN__
+            start.context.cpu_registers[0] = 0x20000000; // deliberately unmapped
             restore(*fixture.generated, start);
             REQUIRE(run(*fixture.generated) < 0);
             REQUIRE(!fixture.jit().get_last_error().empty());
-            equal_state(snapshot(*fixture.generated), start, "unsupported memory IR unchanged, no fallback");
+            equal_state(snapshot(*fixture.generated), start, "faulting load leaves CPU state unchanged");
 #endif
             REQUIRE(bytes == read_bytes(fixture.memory.state, code_address, mapped_size));
         });
 #ifdef __EMSCRIPTEN__
-        suite.test(thumb ? "Thumb rejects unsupported block before its valid prefix" : "ARM rejects unsupported block before its valid prefix", [&] {
+        suite.test(thumb ? "Thumb valid prefix executes before unsupported instruction" : "ARM valid prefix executes before unsupported instruction", [&] {
             fixture.install(thumb ? thumb_prefix_unsupported : arm_prefix_unsupported,
                 thumb ? sizeof(thumb_prefix_unsupported) : sizeof(arm_prefix_unsupported));
             const auto start = initial(thumb, nzcv_mask);
@@ -446,7 +446,11 @@ void failure_boundaries(Suite &suite, Fixture &fixture) {
             restore(*fixture.generated, start);
             REQUIRE(run(*fixture.generated) < 0);
             REQUIRE(!fixture.jit().get_last_error().empty());
-            equal_state(snapshot(*fixture.generated), start, "rejected block prefix must not execute");
+            auto stopped = start;
+            stopped.context.cpu_registers[3] = 99;
+            stopped.context.cpu_registers[15] += thumb ? 2 : 4;
+            if (thumb) stopped.context.cpsr &= ~0xc0000000u; // MOVS prefix
+            equal_state(snapshot(*fixture.generated), stopped, "valid single-instruction prefix commits before fault");
             REQUIRE(bytes == read_bytes(fixture.memory.state, code_address, mapped_size));
         });
 #endif

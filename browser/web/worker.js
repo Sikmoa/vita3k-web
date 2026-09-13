@@ -26,7 +26,9 @@ const transition = (state) => {
 
 try {
   transition('loading');
-  const moduleUrl = new URL('./vita3k_web.js', self.location.href).href;
+  const jit = new URL(self.location.href).searchParams.get('backend') === 'jit';
+  const moduleName = jit ? 'vita3k_web_jit' : 'vita3k_web';
+  const moduleUrl = new URL(`./${moduleName}.js`, self.location.href).href;
   const { default: createModule } = await import(moduleUrl);
   if (typeof createModule !== 'function') throw new TypeError('Emscripten module factory is not callable');
   module = await createModule({
@@ -35,7 +37,7 @@ try {
     printErr: (message) => post({ type: 'log', message }),
   });
   transition('ready');
-  post({ type: 'ready', diagnostics: { module: 'vita3k_web', wasm: true, worker: true } });
+  post({ type: 'ready', diagnostics: { module: moduleName, backend: jit ? 'jit' : 'interpreter', wasm: true, worker: true } });
 } catch (error) {
   lifecycle = 'error';
   post({ type: 'error', state: lifecycle, message: String(error) });
@@ -79,6 +81,7 @@ self.onmessage = async ({ data }) => {
           // The input buffer is intentionally not freed here: freeing while
           // the guest run is suspended would mutate the Wasm heap under a
           // suspended stack. One input buffer per worker run is bounded.
+          module._vita3k_web_set_trace?.(data.trace ? 1 : 0);
           module._vita3k_web_run_vita(allocation, input.byteLength);
         } else {
           const exitCode = module._vita3k_web_run_elf_probe(allocation, input.byteLength);
