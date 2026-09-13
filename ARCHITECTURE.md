@@ -257,3 +257,89 @@ execution cannot catch.
 * Trace `renderer::Backend` dispatch in creation, scene, state, batch, and shader code.
 * Identify direct `fs::` writes in package installation and config initialization, separating logical VFS operations from host storage.
 * Check available Emscripten toolchain/dependency support locally before choosing the first CMake target.
+
+## Real Vita3K runtime convergence and genuine VitaSDK launch (complete)
+
+The browser target no longer uses a parallel emulator model. The standalone
+`browser::web::Memory`/`Interpreter`/guest-image probes remain only as early
+milestone regressions; production browser execution now runs the real Vita3K
+architecture:
+
+```text
+browser File / fixture bytes
+  -> Worker (browser/web/worker.js, run-vita)
+  -> Wasm module export vita3k_web_run_vita (browser/src/vita_runtime.cpp)
+  -> load_self_sized() -> existing kernel/src/load_self.cpp
+  -> real MemState (sparse Wasm backing) + real KernelState/EmuEnvState
+  -> real main ThreadState (cooperative run_loop(true))
+  -> InterpreterCPU behind the production CPUInterface contract
+  -> genuine ARM/Thumb guest execution of crt0/newlib/main
+  -> real import stubs -> SVC -> NID -> modules::call_import
+  -> real selected HLE exports (no substitute resolver)
+  -> sceKernelExitProcess -> observable exit code
+```
+
+Key seams, all preserving native behavior:
+
+* `browser/runtime_core.cmake` compiles the real `mem`, `cpu`, `kernel`,
+  `rtc`, `nids`, miniz and loader sources under Emscripten. Nothing in that
+  graph is a browser reimplementation.
+* `browser/runtime_hle.cmake` selects 27 existing HLE exports (SceSysmem,
+  SceLibKernel, SceThreadmgr, SceProcessmgr, SceIofilemgr) via
+  registration-only adapters over the unchanged `module_parent.cpp`
+  `::call_import`/`make_bridge` machinery and the authoritative `nids.inc`.
+  Full `EmuEnvState` is constructed unchanged; SDL is built static with all
+  device backends off so real subsystem destructors still link.
+* `MemState` gained a sparse Wasm host backend (one contiguous buffer per
+allocation, flat 1M-entry page table, shared guest allocator metadata) plus
+checked `mem_read`/`mem_write`/`mem_fetch`/`mem_set_permissions` and safe
+`mem_host_to_guest`. Native direct mapping is untouched.
+* `ThreadState::run_loop(true)` is an opt-in cooperative mode for hosts that
+  drive an already-started thread synchronously (browser/Worker); the native
+  SDL host-thread path is unchanged.
+* `InterpreterCPU` implements the startup Thumb16/Thumb32/ARM families with
+  correct NZCV/IT/interworking and the post-SVC PC import contract
+  (NID at post-SVC PC + 4 after `mov pc, lr`), using checked memory access.
+
+Genuine fixture: `browser/tests/vita_homebrew_fixture` builds a real VitaSDK
+executable from `main.c` (`return 42`) with `arm-vita-eabi-gcc`,
+`vita-elf-create`, and `vita-make-fself` entirely in the build tree
+(`VITA3K_VITASDK_LAUNCH_TEST=ON`, `VITASDK=/opt/vitasdk/vitasdk`). The
+committed `eboot.bin`/`fixture.velf`/`fixture.elf` are regenerable SDK outputs
+kept so tests run without VitaSDK installed.
+
+### Validation record
+
+* Native interpreter build, genuine fixture launch through production
+  `EmuEnvState`/`create_thread`/`run_loop`/`::call_import`:
+  `process_exit_requested=true status=42 import_calls=23 missing_nids=0`
+  (`ctest -R vita3k_vitasdk_launch`, ~0.3 s).
+* Chromium/Playwright Worker end-to-end on the same `eboot.bin`:
+  `vita-exit exitCode=42 ok=true`, 23 real imports (LwMutex ops, memblock
+  alloc/base/free, TLS, `sceIoOpen` tty0: x3, `sceIoClose` x3, mutex ops,
+  `sceKernelExitProcess`), zero page errors
+  (`browser/tests/worker_smoke.mjs`).
+* Loader hardening: 2,973 checks per suite (normal and ASan/UBSan/NDEBUG)
+  covering genuine VELF, SELF and compressed SELF through both APIs.
+* MemState: 517 native checks (Clang+GCC, UBSan, direct and page-table) and
+  291 executed wasm32 checks under Node (also UBSan); allocator suite 13/13.
+* Interpreter: 233 focused assertions (also ASan/UBSan), 348
+  assembler-verified encodings, Unicorn differential 31,650 Thumb + 600 ARM
+  cases; native convergence and instruction tests registered as
+  `vita3k_interpreter_runtime` / `vita3k_interpreter_instruction`.
+* Browser regressions all pass under Node: M2 memory, M3 interpreter, guest
+  probe, generated ARM ELF exit-42, real-loader Wasm probe, and the generic
+  Worker ELF smoke in Chromium.
+
+### Current limitations
+
+* Interpreter performance is bring-up quality: the debug Wasm build needs
+  tens of seconds for the fixture; optimized builds and later an ARM-to-Wasm
+  JIT are future work.
+* Only the startup HLE subset is selected for the browser target; other NIDs
+  remain unsupported rather than faked. Graphics, audio, input, and further
+  syscalls are not wired.
+* `load_self_sized` is validated on genuine fixtures, not hostile input;
+  relocation hardening is documented in `vita3k/kernel/tests/README.md`.
+* Browser execution is a single cooperative main thread; SDL host threads
+  and multi-threaded Wasm remain future work.
