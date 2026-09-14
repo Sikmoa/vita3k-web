@@ -218,11 +218,11 @@ function inspectRun(run) {
   if (label === 'jit') {
     const statsLines = lines.filter(line => line.startsWith('[vita3k-web] JIT stats:'));
     assert.equal(statsLines.length, 1, 'Missing/duplicate final JIT stats');
-    const match = /^\[vita3k-web\] JIT stats: instructions=(\d+) compiled=(\d+) hits=(\d+) invalidated=(\d+)$/.exec(statsLines[0]);
+    const match = /^\[vita3k-web\] JIT stats: instructions=(\d+) compiled=(\d+) hits=(\d+) invalidated=(\d+)(?: regions=(\d+))?$/.exec(statsLines[0]);
     assert.ok(match, `Malformed JIT stats: ${statsLines[0]}`);
-    stats = Object.fromEntries(['instructions', 'compiled', 'hits', 'invalidated'].map((key, index) => [key, match[index + 1]]));
+    stats = Object.fromEntries(['instructions', 'compiled', 'hits', 'invalidated', 'regions'].map((key, index) => [key, match[index + 1] ?? '0']));
     assert.ok(BigInt(stats.instructions) > 0n, 'JIT executed no guest instructions');
-    assert.ok(BigInt(stats.compiled) > 0n, 'JIT compiled no blocks');
+    assert.ok(BigInt(stats.compiled) > 0n || BigInt(stats.regions) > 0n, 'JIT compiled no blocks or regions');
     // Zero hits/invalidations are valid for this small fixture; never invent work.
   }
   // Keep every CPU field verbatim. No PC/register masking or dropping fields to

@@ -145,9 +145,10 @@ static int run_vita(const uint8_t *bytes, uint32_t size) {
 #ifdef VITA3K_USE_WASM_JIT
         if (const auto *jit = dynamic_cast<const WasmJitCPU *>(thread->cpu->cpu.get())) {
             vita3k_web_bench_instructions = jit->instructions_executed();
-            std::printf("[vita3k-web] JIT stats: instructions=%llu compiled=%llu hits=%llu invalidated=%llu\n",
+            std::printf("[vita3k-web] JIT stats: instructions=%llu compiled=%llu hits=%llu invalidated=%llu regions=%llu\n",
                 (unsigned long long)jit->instructions_executed(), (unsigned long long)jit->compiled_blocks(),
-                (unsigned long long)jit->cache_hits(), (unsigned long long)jit->invalidated_blocks());
+                (unsigned long long)jit->cache_hits(), (unsigned long long)jit->invalidated_blocks(),
+                (unsigned long long)jit->regions_formed());
             std::printf("[vita3k-web] JIT profile: %s\n", jit->get_profile().c_str());
         }
 #endif
