@@ -148,6 +148,7 @@ static int run_vita(const uint8_t *bytes, uint32_t size) {
             std::printf("[vita3k-web] JIT stats: instructions=%llu compiled=%llu hits=%llu invalidated=%llu\n",
                 (unsigned long long)jit->instructions_executed(), (unsigned long long)jit->compiled_blocks(),
                 (unsigned long long)jit->cache_hits(), (unsigned long long)jit->invalidated_blocks());
+            std::printf("[vita3k-web] JIT profile: %s\n", jit->get_profile().c_str());
         }
 #endif
         std::printf("[vita3k-web] Vita result: process_exit=%d code=%d imports=%u missing_nids=%zu PC=%08x\n",

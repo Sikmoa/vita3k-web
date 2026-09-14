@@ -23,6 +23,11 @@ endif()
 option(VITA3K_WEB_DISPLAY_FIXTURE "Build the genuine VitaSDK display fixture" ON)
 if(VITA3K_WEB_DISPLAY_FIXTURE)
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/tests/vita_display_fixture)
+    # M14c benchmark harness: Node bench modules/run targets over the short
+    # fixture. Included before the -O2 add_compile_options line below so the
+    # interpreter and JIT bench modules share one effective flag context
+    # (the same one the existing vita3k_web_bench target gets).
+    include(${CMAKE_CURRENT_SOURCE_DIR}/tests/bench.cmake)
 endif()
 
 # Node-runnable interpreter benchmark over the genuine exit-42 fixture. It is
