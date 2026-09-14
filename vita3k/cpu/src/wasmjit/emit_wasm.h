@@ -18,6 +18,12 @@ enum class ExitReason : uint32_t {
     Svc = 1,
     Fault = 2,
     Unsupported = 3,
+    // Region-mode exits (REGION_ABI.md): the module returns to the host so
+    // it can dispatch/compile, account budget, or handle self-modifying code.
+    Miss = 4,   // next_pc set; host looks up/forms another region
+    Budget = 5, // next_pc set; per-call tick budget exhausted
+    Smc = 6,    // store into a cached code page observed (smc_dirty)
+    Stop = 7,   // host requested stop via stop_flag
 };
 
 // Shared with generated Wasm, not Dynarmic's native backend JitState.
@@ -34,13 +40,28 @@ struct JitState {
     uint32_t memory_value[4];
     uint32_t fpu[64]; // S0..S31 alias D0..D15; D16..D31 follow (little-endian words)
     uint32_t tpidruro;
+    // M14c region ABI appends (REGION_ABI.md; offsets are contractual).
+    uint32_t next_pc;         // +372 resume PC for Miss/Budget/Smc/Stop
+    uint32_t fault_pc;        // +376 guest PC of the faulting instruction
+    uint32_t page_table_base; // +380 host offset of page_table entries, 0=off
+    uint32_t page_perms_base; // +384 host offset of page permission bytes, 0=off
+    uint32_t smc_dirty;       // +388 set by checked writes into code pages
+    uint32_t stop_flag;       // +392 host sets 1 to request a return
+    uint32_t dispatches;      // +396 region dispatch-loop iterations (profiling)
 };
 static_assert(std::is_standard_layout_v<JitState>);
 static_assert(offsetof(JitState, memory_cookie) == 84);
 static_assert(offsetof(JitState, memory_value) == 96);
 static_assert(offsetof(JitState, fpu) == 112);
 static_assert(offsetof(JitState, tpidruro) == 368);
-static_assert(sizeof(JitState) == 372);
+static_assert(offsetof(JitState, next_pc) == 372);
+static_assert(offsetof(JitState, fault_pc) == 376);
+static_assert(offsetof(JitState, page_table_base) == 380);
+static_assert(offsetof(JitState, page_perms_base) == 384);
+static_assert(offsetof(JitState, smc_dirty) == 388);
+static_assert(offsetof(JitState, stop_flag) == 392);
+static_assert(offsetof(JitState, dispatches) == 396);
+static_assert(sizeof(JitState) == 400);
 
 // Emits an MVP Wasm module importing env.memory (unshared, min 1 page)
 // and env.mem_read/env.mem_write: (stateOffset i32, address i32, bytes i32)->i32.
@@ -72,5 +93,30 @@ static_assert(sizeof(JitState) == 372);
 // Unknown operations fail closed, including FP arithmetic and exclusive memory.
 // Limits: 4096 IR instructions, 4096 guest ticks, terminal depth 16 / 256 nodes.
 std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block);
+
+// M14c region emission (REGION_ABI.md). One WebAssembly.Module per REGION:
+// many guest basic blocks with an in-module dispatch loop, so hot loops never
+// return to the host. The module exports run(state:i32, budget:i32)->i32 and
+// exits only for Svc/Fault/Miss/Budget/Smc/Stop. `blocks` and `meta` must be
+// parallel, non-empty, sorted strictly ascending by entry_pc (formation
+// guarantees at most one block per guest PC). Dispatch validates each entry's
+// CPSR mode bits (psr_mask/psr_value) and FPSCR mode bits against the block's
+// own location. LinkBlock terminals chaining to a member with the SAME full
+// location descriptor become direct branches; others set next_pc and return
+// Miss. Memory IR is accepted at any CycleCount: a faulting helper sets
+// fault_pc from the faulting memory op's own location immediate (arg0) and
+// returns Fault WITHOUT rollback or executed adjustment. Per-call budget is
+// the `budget` argument (max additional ticks); dispatch refuses a block whose
+// meta.ticks would exceed it and returns Budget with next_pc set. Limits: 512
+// blocks, 32768 total ticks, 4 MiB module. EMPTY vector = unsupported.
+struct RegionBlockMeta {
+    uint32_t entry_pc;
+    uint32_t psr_mask;
+    uint32_t psr_value;
+    uint32_t ticks; // conservative: CycleCount + ConditionFailedCycleCount
+};
+std::vector<uint8_t> emit_region(
+    const std::vector<const Dynarmic::IR::Block *> &blocks,
+    const std::vector<RegionBlockMeta> &meta);
 
 } // namespace vita3k::wasmjit

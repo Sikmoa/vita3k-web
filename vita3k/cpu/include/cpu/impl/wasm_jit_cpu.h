@@ -32,6 +32,9 @@ public:
     void invalidate_jit_cache(Address, size_t) override;
 
     void set_instruction_budget(uint64_t value);
+    // Region modules (many blocks, in-Wasm dispatch) vs single-block modules.
+    // Default: region mode (M14c production path).
+    void set_region_mode(bool value);
     const std::string &get_last_error() const;
     // Valid after a generated memory-fault exit. CPU state is restored to the
     // faulting instruction's entry; earlier stores in that instruction may
@@ -40,6 +43,11 @@ public:
     bool get_fault_write() const;
     uint64_t instructions_executed() const;
     uint64_t compiled_blocks() const;
+    // Region-mode metric: successfully installed code regions (a region
+    // batches many basic blocks into one WebAssembly.Module).
+    uint64_t regions_formed() const;
+    // One-line phase profile: emit/install/run ms, dispatch and helper counts.
+    std::string get_profile() const;
     uint64_t cache_hits() const;
     uint64_t invalidated_blocks() const;
 private:

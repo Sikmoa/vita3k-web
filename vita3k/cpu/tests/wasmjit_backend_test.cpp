@@ -79,6 +79,7 @@ void backend(MemState &mem) {
     CPUState parent{};
     parent.mem = &mem;
     WasmJitCPU jit(&parent, 3);
+    jit.set_region_mode(false); // this section verifies single-block semantics
     jit.set_instruction_budget(128);
     CHECK(jit.processor_id() == 3);
     // Full context, including payload NaNs and both halves of every D register.
@@ -197,6 +198,128 @@ void backend(MemState &mem) {
         CHECK(word == 0x5a5a5a5a);
     }
 }
+// M14c region formation: DFS membership, one-block-per-PC, PSR metadata,
+// tick accounting and sorted output on a real Thumb CFG with a loop, an
+// unconditional branch over dead code, and a SVC-terminated block.
+void formation(MemState &mem) {
+    // 0x00 movs r0,#0; 0x02 adds r0,#1; 0x04 cmp r0,#3; 0x06 bne 0x02;
+    // 0x08 b 0x0c; 0x0a nop (unreachable); 0x0c svc 0x42
+    const std::array<uint32_t, 4> words{0x30002000, 0xd1fc2803, 0xbf00e000, 0xbf00df42};
+    CHECK(mem_write(mem, code, words.data(), words.size() * sizeof(uint32_t)));
+    Region region;
+    std::vector<Dynarmic::IR::Block> ir;
+    CHECK(form_region(mem, code, 0x30, 0, region, ir)); // Thumb, user mode
+    CHECK(region.blocks.size() == 4); // entry, loop body, b, svc
+    CHECK(ir.size() == region.blocks.size());
+    std::vector<uint32_t> pcs;
+    for (const auto &block : region.blocks) {
+        pcs.push_back(block.pc);
+        CHECK(block.psr_mask == PSR_DISPATCH_MASK);
+        CHECK(block.psr_value == 0x20); // T bit, no IT/E
+        CHECK(block.ticks >= 1);
+        CHECK(!block.original.empty());
+    }
+    CHECK(std::is_sorted(pcs.begin(), pcs.end()));
+    CHECK(std::adjacent_find(pcs.begin(), pcs.end()) == pcs.end()); // one per PC
+    CHECK(std::find(pcs.begin(), pcs.end(), code) != pcs.end());
+    CHECK(std::find(pcs.begin(), pcs.end(), code + 2) != pcs.end()); // loop body
+    CHECK(std::find(pcs.begin(), pcs.end(), code + 8) != pcs.end()); // b
+    CHECK(std::find(pcs.begin(), pcs.end(), code + 0xc) != pcs.end()); // svc
+    CHECK(std::find(pcs.begin(), pcs.end(), code + 0xa) == pcs.end()); // dead nop
+    uint64_t sum = 0;
+    for (const auto &block : region.blocks) sum += block.ticks;
+    CHECK(region.total_ticks == sum);
+    CHECK(region.total_ticks < REGION_MAX_TICKS && region.blocks.size() < REGION_MAX_BLOCKS);
+    CHECK(region.page_begin == code / 4096 && region.page_end == (code + 0x10 + 4095) / 4096);
+    // An unmapped entry cannot form a region.
+    Region bad;
+    std::vector<Dynarmic::IR::Block> bad_ir;
+    CHECK(!form_region(mem, 0x83000000, 0x30, 0, bad, bad_ir) && bad.blocks.empty());
+    // Formation is deterministic.
+    Region again;
+    std::vector<Dynarmic::IR::Block> again_ir;
+    CHECK(form_region(mem, code, 0x30, 0, again, again_ir));
+    CHECK(again.blocks.size() == region.blocks.size());
+    for (size_t i = 0; i < again.blocks.size(); ++i) {
+        CHECK(again.blocks[i].pc == region.blocks[i].pc);
+        CHECK(again.blocks[i].ticks == region.blocks[i].ticks);
+        CHECK(again.blocks[i].original == region.blocks[i].original);
+        CHECK(Dynarmic::A32::LocationDescriptor(again_ir[i].Location()).PC() == again.blocks[i].pc);
+    }
+    // The emitted region module is valid Wasm with the run(state,budget) export.
+    std::vector<const Dynarmic::IR::Block *> ptrs;
+    std::vector<vita3k::wasmjit::RegionBlockMeta> meta;
+    for (size_t i = 0; i < region.blocks.size(); ++i) {
+        ptrs.push_back(&ir[i]);
+        meta.push_back({region.blocks[i].pc, region.blocks[i].psr_mask,
+            region.blocks[i].psr_value, region.blocks[i].ticks});
+    }
+    const auto module = vita3k::wasmjit::emit_region(ptrs, meta);
+    CHECK(!module.empty());
+    // Mismatched meta is rejected: wrong ticks, wrong PSR, unsorted, dup PCs.
+    auto bad_meta = meta;
+    bad_meta[1].ticks += 1;
+    CHECK(vita3k::wasmjit::emit_region(ptrs, bad_meta).empty());
+    bad_meta = meta;
+    bad_meta[2].entry_pc = bad_meta[1].entry_pc; // duplicate PC
+    CHECK(vita3k::wasmjit::emit_region(ptrs, bad_meta).empty());
+    CHECK(vita3k::wasmjit::emit_region({}, {}).empty());
+}
+
+// Region-mode execution: the same guest programs run through REGION modules
+// with in-Wasm dispatch, chaining, budget and fault semantics.
+void region_exec(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0); // region mode is the default
+    jit.set_instruction_budget(4096);
+
+    // The loop CFG: blocks chain inside ONE region; only the SVC exits.
+    // 0x00 movs r0,#0; 0x02 adds r0,#1; 0x04 cmp r0,#3; 0x06 bne 0x02;
+    // 0x08 b 0x0c; 0x0a nop (unreachable); 0x0c svc 0x42
+    // 0x3001 = adds r0,#1 (GAS-verified; 0x3008 would decode as adds r0,#8).
+    const std::array<uint32_t, 4> words{0x30012000, 0xd1fc2803, 0xbf00e000, 0xbf00df42};;
+    CHECK(mem_write(mem, code, words.data(), words.size() * sizeof(uint32_t)));
+    jit.set_cpsr(0x30);
+    jit.set_pc(code | 1);
+    CHECK(jit.run() == 0 && parent.svc_called && parent.svc == 0x42);
+    CHECK(jit.get_reg(0) == 3); // loop executed adds three times
+    CHECK(jit.get_pc() == code + 0xe); // PC past the 2-byte svc (Thumb)
+    CHECK(jit.compiled_blocks() == 0); // no single-block modules were built
+    CHECK(jit.get_last_error().empty());
+
+    // Host-side code patch: the cached region must be dropped and rebuilt.
+    const std::array<uint32_t, 2> patch{0xdf432000, 0}; // movs r0,#0; svc 0x43
+    CHECK(mem_write(mem, code, patch.data(), patch.size() * sizeof(uint32_t)));
+    jit.set_pc(code | 1);
+    CHECK(jit.run() == 0 && parent.svc_called && parent.svc == 0x43);
+    CHECK(jit.get_reg(0) == 0);
+    CHECK(jit.invalidated_blocks() > 0);
+
+    // Budget exhaustion: block 0x00 costs 4 ticks (movs+adds+cmp+bne); with a
+    // 5-tick budget it completes, then dispatch refuses the 3-tick successor.
+    CHECK(mem_write(mem, code, words.data(), words.size() * sizeof(uint32_t)));
+    jit.set_cpsr(0x30);
+    jit.set_pc(code | 1);
+    jit.set_instruction_budget(5);
+    const uint64_t executed_before = jit.instructions_executed();
+    CHECK(jit.run() == 0); // budget consumed cleanly, no error
+    CHECK(jit.instructions_executed() - executed_before == 4);
+    CHECK(jit.get_pc() == code + 2); // stopped at the successor entry
+
+    // Memory fault mid-region: fault_address is the guest address; executed
+    // counts only blocks completed before the faulting instruction.
+    const std::array<uint32_t, 2> faultprog{0x68012007, 0xbf00df42}; // movs r0,#7; ldr r1,[r0]; svc
+    CHECK(mem_write(mem, code, faultprog.data(), faultprog.size() * sizeof(uint32_t)));
+    jit.set_cpsr(0x30);
+    jit.set_pc(code | 1);
+    jit.set_instruction_budget(4096);
+    const uint64_t fault_executed_before = jit.instructions_executed();
+    CHECK(jit.run() == -1);
+    CHECK(jit.get_fault_address() == 7 && !jit.get_fault_write());
+    CHECK(jit.instructions_executed() - fault_executed_before == 0); // ticks count only COMPLETED blocks (REGION_ABI); the movs' block faulted at the ldr
+    CHECK(jit.get_last_error().find("guest memory read fault") != std::string::npos);
+}
 } // namespace
 
 int main() {
@@ -206,6 +329,8 @@ int main() {
     CHECK(try_alloc_at(mem, data, 2 * page, "JIT checked memory") == data);
     helpers(mem);
     backend(mem);
+    formation(mem);
+    region_exec(mem);
     deinit_mem(mem);
     std::printf("WasmJit backend: %u checks passed (real memory, no interpreter)\n", checks);
 }

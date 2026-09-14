@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "emit_wasm.h"
 
+#include <algorithm>
+#include <functional>
 #include <limits>
 #include <unordered_map>
 
@@ -23,7 +25,8 @@ namespace Term = Dynarmic::IR::Term;
 
 // Only MVP opcodes. In particular, no sign-extension proposal or multivalue.
 enum Wasm : uint8_t {
-    If = 0x04, Else = 0x05, End = 0x0b, Return = 0x0f, Call = 0x10, Select = 0x1b,
+    Block = 0x02, Loop = 0x03, If = 0x04, Else = 0x05, End = 0x0b,
+    Br = 0x0c, BrTable = 0x0e, Return = 0x0f, Call = 0x10, Select = 0x1b,
     Get = 0x20, Set = 0x21, Load = 0x28, Store = 0x36, Const = 0x41,
     Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtU = 0x49, GtU = 0x4b, LeU = 0x4d,
     Clz = 0x67, Add = 0x6a, Sub = 0x6b, Mul = 0x6c, And = 0x71, Or = 0x72, Xor = 0x73,
@@ -59,6 +62,15 @@ void section(Bytes &module, uint8_t id, const Bytes &payload) {
     module.insert(module.end(), payload.begin(), payload.end());
 }
 
+// Free byte helpers so the region dispatcher can share the exact emitter
+// encoding without an Emitter instance.
+void b_op(Bytes &c, uint8_t byte) { c.push_back(byte); }
+void b_imm(Bytes &c, uint32_t n) { constant(c, n); }
+void b_get(Bytes &c, uint32_t index) { b_op(c, Get); uleb(c, index); }
+void b_set(Bytes &c, uint32_t index) { b_op(c, Set); uleb(c, index); }
+void b_load(Bytes &c, uint32_t offset) { b_get(c, 0); b_op(c, Load); uleb(c, 2); uleb(c, offset); }
+void b_store(Bytes &c, uint32_t offset) { b_op(c, Store); uleb(c, 2); uleb(c, offset); }
+
 bool scalar(Type type) {
     return type == Type::U1 || type == Type::U8 || type == Type::U16 || type == Type::U32 || type == Type::U64 || type == Type::NZCVFlags;
 }
@@ -76,6 +88,19 @@ class Emitter {
 public:
     explicit Emitter(const Dynarmic::IR::Block &block)
         : block(block), start(block.Location()), finish(block.EndLocation()) {}
+
+    // Region layout (REGION_ABI.md): run(state=0, budget=1) with locals
+    // 2=executed_call, 3=pc, 4=CheckBit, 5=i64 scratch, 6=dispatch index,
+    // 7..=per-block SSA words (reused across bodies).
+    Emitter(const Dynarmic::IR::Block &block, unsigned index,
+        const std::vector<const Dynarmic::IR::Block *> &members)
+        : block(block), start(block.Location()), finish(block.EndLocation())
+        , region(true), body_index(index), members(&members) {
+        check_bit_local = 4;
+        scratch_local = 5;
+        ssa_base = 7;
+        next_local = 7;
+    }
 
     Bytes run() {
         bool has_memory = false;
@@ -152,13 +177,24 @@ private:
     Location start, finish;
     Bytes code;
     std::unordered_map<const Inst *, uint32_t> locals;
+    // Single-block layout: 1=CheckBit, 2=i64 scratch, SSA from 3.
+    uint32_t check_bit_local = 1, scratch_local = 2, ssa_base = 3;
     uint32_t next_local = 3;
     unsigned terminal_nodes = 0;
     bool ok = true;
+public:
+    std::string rejection;
+private:
+    void reject(const char *why) { ok = false; if (rejection.empty()) rejection = why; }
     bool svc = false;
     bool pc_written = false;
     bool has_bx = false;
     bool check_bit_written = false;
+    // Region mode state.
+    bool region = false;
+    unsigned body_index = 0;   // br-to-dispatch depth equals the body index
+    unsigned extra_labels = 0; // if/else nesting inside this body
+    const std::vector<const Dynarmic::IR::Block *> *members = nullptr;
 
     void op(uint8_t byte) { code.push_back(byte); }
     void imm(uint32_t n) { constant(code, n); }
@@ -170,8 +206,20 @@ private:
     void store_constant(uint32_t offset, uint32_t n) { get(0); imm(n); store(offset); }
     void mask(uint32_t bits) { imm(bits); op(And); }
     void checked_status() {
-        set(1); get(1); op(Eqz); begin_if();
-        op(Else); store_constant(offsetof(JitState, executed), 0);
+        // The helper result is still on the stack: branch on it directly
+        // without staging through a local (in region layout local 1 is the
+        // budget and must never be clobbered).
+        op(Eqz); begin_if();
+        op(Else);
+        if (region) {
+            // Fault mid-region: record the faulting guest instruction's PC
+            // (arg0 of the memory op is its own U64 location descriptor) and
+            // return WITHOUT touching executed (it holds prior blocks' ticks)
+            // and WITHOUT rollback (REGION_ABI fault contract).
+            get(0); imm(pending_fault_pc); store(offsetof(JitState, fault_pc));
+        } else {
+            store_constant(offsetof(JitState, executed), 0);
+        }
         store_constant(offsetof(JitState, exit_reason), static_cast<uint32_t>(ExitReason::Fault));
         imm(static_cast<uint32_t>(ExitReason::Fault)); op(Return); op(End);
     }
@@ -180,10 +228,13 @@ private:
     // A32ReadMemoryN(imm loc:U64, vaddr:U32, imm acctype) and
     // A32WriteMemoryN(imm loc:U64, vaddr:U32, value, imm acctype). The guest
     // address is therefore arg1 and the stored data arg2; arg0 is NOT the
-    // address (its low word is the block's own PC). Write helpers consume
-    // memory_value, so the value must be published BEFORE the call.
+    // address (its low word is the instruction's own PC). Write helpers
+    // consume memory_value, so the value must be published BEFORE the call.
+    uint32_t pending_fault_pc = 0;
     void memory_call(const Inst &inst, bool write, unsigned bytes) {
-        if (inst.GetArg(1).GetType() != Type::U32) { ok = false; return; }
+        if (inst.GetArg(1).GetType() != Type::U32) { reject("memory_call arg1 not U32"); return; }
+        if (!inst.GetArg(0).IsImmediate()) { reject("memory_call arg0 not imm"); return; }
+        pending_fault_pc = static_cast<uint32_t>(inst.GetArg(0).GetImmediateAsU64());
         if (write) {
             const auto &value = inst.GetArg(2);
             get(0); value_word(value, 0);
@@ -203,13 +254,13 @@ private:
     void value_word(const Value &v, unsigned word = 0) {
         const auto type = v.GetType();
         const unsigned words = type == Type::U128 ? 4 : type == Type::U64 ? 2 : 1;
-        if (word >= words) { ok = false; return; }
+        if (word >= words) { reject("value word>=words"); return; }
         if (v.IsImmediate()) {
-            if (type == Type::NZCVFlags || type == Type::Opaque || type == Type::Void) { ok = false; return; }
+            if (type == Type::NZCVFlags || type == Type::Opaque || type == Type::Void) { reject("value NZCV/Opaque/Void"); return; }
             imm(static_cast<uint32_t>(v.GetImmediateAsU64() >> (word * 32)));
         } else {
             const auto it = locals.find(v.GetInstRecursive());
-            if (it == locals.end()) { ok = false; return; }
+            if (it == locals.end()) { reject("value producer missing"); return; }
             get(it->second + word);
         }
     }
@@ -264,7 +315,7 @@ private:
         case Cond::GT: flag(30); op(Eqz); flag(31); flag(28); op(Eq); op(And); break;
         case Cond::LE: flag(30); flag(31); flag(28); op(Ne); op(Or); break;
         case Cond::AL: imm(1); break;
-        default: ok = false; break; // NV is not an unconditional alias
+        default: reject("cond NV"); break; // NV is not an unconditional alias
         }
     }
 
@@ -299,8 +350,8 @@ private:
             // a void if when validating the enclosing function's result type.
             op(0x00); // unreachable
         } else if (const auto *test = boost::get<Term::CheckBit>(&term)) {
-            if (!check_bit_written) { ok = false; return; }
-            get(1); begin_if();
+            if (!check_bit_written) { reject("single check_bit unwritten"); return; }
+            get(check_bit_local); begin_if();
             terminal(test->then_, depth + 1);
             op(Else);
             terminal(test->else_, depth + 1);
@@ -308,7 +359,7 @@ private:
         } else if (boost::get<Term::ReturnToDispatch>(&term) || boost::get<Term::PopRSBHint>(&term)
             || boost::get<Term::FastDispatchHint>(&term)) {
             if (!pc_written)
-                ok = false;
+                reject("single terminal a");
             ret(svc ? ExitReason::Svc : ExitReason::Continue);
         } else if (const auto *halt = boost::get<Term::CheckHalt>(&term)) {
             // No halt field/import: only accept a check whose two outcomes
@@ -316,17 +367,17 @@ private:
             if (!boost::get<Term::ReturnToDispatch>(&halt->else_)
                 && !boost::get<Term::PopRSBHint>(&halt->else_)
                 && !boost::get<Term::FastDispatchHint>(&halt->else_)) {
-                ok = false;
+                reject("single terminal b");
                 return;
             }
             terminal(halt->else_, depth + 1);
         } else {
-            ok = false; // Invalid, Interpret, CheckBit are never silently skipped
+            reject("single terminal c"); // Invalid, Interpret, CheckBit are never silently skipped
         }
         // SVC cannot be followed by a link/conditional terminal: such a block
         // would resume execution without allowing its host callback to run.
         if (svc && (boost::get<Term::LinkBlock>(&term) || boost::get<Term::LinkBlockFast>(&term) || boost::get<Term::If>(&term) || boost::get<Term::CheckBit>(&term)))
-            ok = false;
+            reject("single terminal d");
     }
 
     void nz(const Value &v) {
@@ -439,6 +490,148 @@ private:
         return ok;
     }
 
+    // --- Region mode (REGION_ABI.md) ---------------------------------
+
+    void add_ticks(uint32_t ticks) {
+        // Per-call budget local and the monotonic state counter both advance
+        // by exactly the completed block's (or cond-fail's) tick count.
+        get(2); imm(ticks); op(Add); set(2);
+        get(0); load(offsetof(JitState, executed)); imm(ticks); op(Add); store(offsetof(JitState, executed));
+    }
+
+    void br_redispatch() {
+        // Body i sits inside blocks $b0..$b(i-1) and the dispatch loop, so the
+        // loop label is `body_index` labels away, plus any open if/else.
+        op(Br); uleb(code, body_index + extra_labels);
+    }
+
+    void set_next_pc_runtime() { get(0); get(3); store(offsetof(JitState, next_pc)); }
+
+    bool is_member(const Location &loc) const {
+        for (const Dynarmic::IR::Block *m : *members)
+            if (Location(m->Location()) == loc)
+                return true;
+        return false;
+    }
+
+    void terminal_region(const Term::Terminal &term, unsigned depth) {
+        if (depth > 16 || ++terminal_nodes > 256) {
+            reject("generic 517");
+            return;
+        }
+        const uint32_t ticks = static_cast<uint32_t>(block.CycleCount());
+        if (const auto *link = boost::get<Term::LinkBlock>(&term)) {
+            const Location target(link->next);
+            location(target);
+            add_ticks(ticks);
+            if (is_member(target))
+                br_redispatch(); // in-region chaining: no host crossing
+            else {
+                store_constant(offsetof(JitState, next_pc), target.PC());
+                ret(ExitReason::Miss);
+            }
+        } else if (const auto *fast = boost::get<Term::LinkBlockFast>(&term)) {
+            const Location target(fast->next);
+            location(target);
+            add_ticks(ticks);
+            if (is_member(target))
+                br_redispatch();
+            else {
+                store_constant(offsetof(JitState, next_pc), target.PC());
+                ret(ExitReason::Miss);
+            }
+        } else if (const auto *test = boost::get<Term::If>(&term)) {
+            condition(test->if_);
+            begin_if();
+            ++extra_labels;
+            terminal_region(test->then_, depth + 1);
+            op(Else);
+            terminal_region(test->else_, depth + 1);
+            --extra_labels;
+            op(End); op(0x00);
+        } else if (const auto *test = boost::get<Term::CheckBit>(&term)) {
+            if (!check_bit_written) { reject("region check_bit unwritten"); return; }
+            get(check_bit_local); begin_if();
+            ++extra_labels;
+            terminal_region(test->then_, depth + 1);
+            op(Else);
+            terminal_region(test->else_, depth + 1);
+            --extra_labels;
+            op(End); op(0x00);
+        } else if (boost::get<Term::ReturnToDispatch>(&term) || boost::get<Term::PopRSBHint>(&term)
+            || boost::get<Term::FastDispatchHint>(&term)) {
+            if (!pc_written)
+                reject("region terminal a");
+            add_ticks(ticks);
+            set_next_pc_runtime();
+            // Non-SVC re-dispatch terminals return to the host with next_pc;
+            // Continue(0) is a single-block-only concept (REGION_ABI.md).
+            ret(svc ? ExitReason::Svc : ExitReason::Miss);
+        } else if (const auto *halt = boost::get<Term::CheckHalt>(&term)) {
+            if (!boost::get<Term::ReturnToDispatch>(&halt->else_)
+                && !boost::get<Term::PopRSBHint>(&halt->else_)
+                && !boost::get<Term::FastDispatchHint>(&halt->else_)) {
+                reject("region terminal b");
+                return;
+            }
+            terminal_region(halt->else_, depth + 1);
+        } else {
+            reject("region terminal c"); // Invalid, Interpret never silently skipped
+        }
+        if (svc && (boost::get<Term::LinkBlock>(&term) || boost::get<Term::LinkBlockFast>(&term) || boost::get<Term::If>(&term) || boost::get<Term::CheckBit>(&term)))
+            reject("region terminal d");
+    }
+
+    // Emits ONE member block's body (conditional entry + instructions +
+    // region terminal). The caller splices it after the matching `end` in
+    // the region's nested-block chain.
+public:
+    Bytes region_body() {
+        if (block.size() > 4096 || block.CycleCount() == 0 || block.CycleCount() > 4096
+            || block.ConditionFailedCycleCount() > 4096 || !valid_location(start) || !valid_location(finish))
+            return {};
+        if (block.GetCondition() != Cond::AL) {
+            if (!block.HasConditionFailedLocation() || block.ConditionFailedCycleCount() == 0)
+                return {};
+            condition(block.GetCondition());
+            op(Eqz);
+            begin_if();
+            ++extra_labels;
+            // Condition failed: account its ticks and re-dispatch (the fail
+            // target may be another member of this same region).
+            add_ticks(static_cast<uint32_t>(block.ConditionFailedCycleCount()));
+            location(Location(block.ConditionFailedLocation()));
+            br_redispatch();
+            op(Else);
+            emit_instructions_and_terminal();
+            --extra_labels;
+            op(End);
+        } else {
+            emit_instructions_and_terminal();
+        }
+        if (!ok)
+            return {};
+        return std::move(code);
+    }
+
+    void emit_instructions_and_terminal() {
+        for (const Inst &inst : block)
+            has_bx |= inst.GetOpcode() == Op::A32BXWritePC;
+        for (const Inst &inst : block) {
+            if (svc || !instruction(inst)) {
+                if (rejection.empty())
+                    rejection = std::string("instruction ") + Dynarmic::IR::GetNameOf(inst.GetOpcode());
+                return;
+            }
+            locals.emplace(&inst, next_local);
+            next_local += 10;
+        }
+        terminal_region(block.GetTerminal(), 0);
+    }
+
+    uint32_t ssa_words() const { return next_local - ssa_base; }
+
+private:
     bool instruction(const Inst &inst) {
         const Op kind = inst.GetOpcode();
         if (arithmetic(kind)) { add_sub(inst); return ok; }
@@ -510,9 +703,9 @@ private:
             // exactly like Pack2x32To1x64, so word-1 consumers never see a
             // stale/unset slot.
             value64(inst.GetArg(0)); value(inst.GetArg(1)); op(ExtendU); op(ShrU64);
-            set(2);
-            get(2); op(Wrap); set(next_local);
-            get(2); op(0x42); uleb(code, 32); op(ShrU64); op(Wrap); set(next_local + 1);
+            set(scratch_local);
+            get(scratch_local); op(Wrap); set(next_local);
+            get(scratch_local); op(0x42); uleb(code, 32); op(ShrU64); op(Wrap); set(next_local + 1);
             return ok;
         case Op::SignExtendByteToWord: arg(0); imm(24); op(Shl); imm(24); op(ShrS); break;
         case Op::SignExtendHalfToWord: arg(0); imm(16); op(Shl); imm(16); op(ShrS); break;
@@ -542,7 +735,7 @@ private:
             // goes through the parent dispatcher instead of speculating.
             return inst.GetArg(0).IsImmediate() && inst.GetArg(0).GetType() == Type::U64;
         case Op::A32SetCheckBit:
-            value_word(inst.GetArg(0)); set(1); check_bit_written = true; return ok;
+            value_word(inst.GetArg(0)); set(check_bit_local); check_bit_written = true; return ok;
         case Op::VectorBroadcast32:
             // Lanes live in words 0..3 of the slot: value_word reads lane i
             // from word i, and a 4-word stride would collide with the
@@ -593,10 +786,29 @@ private:
             // i32 locals used by every SSA slot.
             value_word(inst.GetArg(0)); op(ExtendU);
             value_word(inst.GetArg(1)); op(ExtendU); op(0x42); uleb(code, 32); op(Shl64); op(Or64);
-            set(2);
-            get(2); op(Wrap); set(next_local);
-            get(2); op(0x42); uleb(code, 32); op(ShrU64); op(Wrap); set(next_local + 1);
+            set(scratch_local);
+            get(scratch_local); op(Wrap); set(next_local);
+            get(scratch_local); op(0x42); uleb(code, 32); op(ShrU64); op(Wrap); set(next_local + 1);
             return ok;
+        case Op::A32GetExtendedRegister32: {
+            const auto reg = inst.GetArg(0);
+            if (reg.GetType() != Type::A32ExtReg) return false;
+            if (!Dynarmic::A32::IsSingleExtReg(reg.GetA32ExtRegRef())) return false;
+            const auto n = Dynarmic::A32::RegNumber(reg.GetA32ExtRegRef());
+            if (n >= 32) return false;
+            // U32 result: one word; Sn is fpu word n.
+            load(offsetof(JitState, fpu) + n * sizeof(uint32_t)); set(next_local);
+            return ok;
+        }
+        case Op::A32SetExtendedRegister32: {
+            const auto reg = inst.GetArg(0);
+            if (reg.GetType() != Type::A32ExtReg) return false;
+            if (!Dynarmic::A32::IsSingleExtReg(reg.GetA32ExtRegRef())) return false;
+            const auto n = Dynarmic::A32::RegNumber(reg.GetA32ExtRegRef());
+            if (n >= 32) return false;
+            get(0); value_word(inst.GetArg(1), 0); store(offsetof(JitState, fpu) + n * sizeof(uint32_t));
+            return ok;
+        }
         case Op::A32GetExtendedRegister64: {
             const auto reg = inst.GetArg(0);
             if (reg.GetType() != Type::A32ExtReg) return false;
@@ -637,5 +849,156 @@ private:
 
 std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block) {
     return Emitter(block).run();
+}
+
+std::vector<uint8_t> emit_region(
+    const std::vector<const Dynarmic::IR::Block *> &blocks,
+    const std::vector<RegionBlockMeta> &meta) {
+    constexpr size_t kMaxBlocks = 512;
+    constexpr uint64_t kMaxTicks = 32768;
+    constexpr size_t kMaxModule = 4 << 20;
+    const size_t n = blocks.size();
+    if (n == 0 || n != meta.size() || n > kMaxBlocks)
+        return {};
+    uint64_t total_ticks = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const auto &b = *blocks[i];
+        const Location loc(b.Location());
+        if (meta[i].entry_pc != loc.PC() || meta[i].psr_mask != Location::CPSR_MODE_MASK
+            || meta[i].psr_value != (loc.CPSR().Value() & Location::CPSR_MODE_MASK)
+            || meta[i].ticks != static_cast<uint32_t>(b.CycleCount() + b.ConditionFailedCycleCount()))
+            return {};
+        if (i && meta[i].entry_pc <= meta[i - 1].entry_pc) // strictly ascending, one per PC
+            return {};
+        total_ticks += meta[i].ticks;
+    }
+    if (total_ticks > kMaxTicks)
+        return {};
+
+    // Per-block bodies share the region local layout; SSA words are reused.
+    std::vector<Bytes> bodies(n);
+    uint32_t max_ssa = 0;
+    for (size_t i = 0; i < n; ++i) {
+        Emitter emitter(*blocks[i], unsigned(i), blocks);
+        bodies[i] = emitter.region_body();
+        if (bodies[i].empty())
+            return {};
+        max_ssa = std::max(max_ssa, emitter.ssa_words());
+    }
+
+    // Dispatch prologue + static PC search tree + br_table.
+    Bytes d;
+    const auto exit_with = [&](ExitReason reason) {
+        b_get(d, 0); b_get(d, 3); b_store(d, offsetof(JitState, next_pc));
+        b_get(d, 0); b_imm(d, static_cast<uint32_t>(reason)); b_store(d, offsetof(JitState, exit_reason));
+        b_imm(d, static_cast<uint32_t>(reason)); b_op(d, Return);
+    };
+    // state.dispatches++
+    b_get(d, 0);
+    b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, dispatches));
+    b_imm(d, 1); b_op(d, Add); b_store(d, offsetof(JitState, dispatches));
+    // if (state.stop_flag) { next_pc = regs[15]; return Stop }
+    b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, stop_flag));
+    b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Stop); b_op(d, End);
+    // if (state.smc_dirty) { next_pc = regs[15]; return Smc }
+    b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, smc_dirty));
+    b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Smc); b_op(d, End);
+    // pc = regs[15]; idx = n (default)
+    b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, regs) + 15 * sizeof(uint32_t));
+    b_set(d, 3);
+    b_imm(d, static_cast<uint32_t>(n)); b_set(d, 6);
+
+    // Balanced static search over the sorted, constant entry PCs.
+    std::function<void(size_t, size_t)> tree = [&](size_t lo, size_t hi) {
+        if (hi - lo == 1) {
+            b_get(d, 3); b_imm(d, meta[lo].entry_pc); b_op(d, Eq);
+            b_op(d, If); b_op(d, 0x40);
+            {
+                // Entry PSR mismatch -> Miss (host re-dispatches at regs[15]).
+                b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, cpsr));
+                b_imm(d, meta[lo].psr_mask); b_op(d, And);
+                b_imm(d, meta[lo].psr_value); b_op(d, Ne);
+                b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Miss); b_op(d, End);
+                // FPSCR mode bits are part of the block's translation key.
+                const uint32_t fpscr = Location(blocks[lo]->Location()).FPSCR().Value()
+                    & Location::FPSCR_MODE_MASK;
+                b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, fpscr));
+                b_imm(d, Location::FPSCR_MODE_MASK); b_op(d, And);
+                b_imm(d, fpscr); b_op(d, Ne);
+                b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Miss); b_op(d, End);
+                // Budget: executed_call + ticks > budget -> Budget.
+                b_get(d, 2); b_imm(d, meta[lo].ticks); b_op(d, Add);
+                b_get(d, 1); b_op(d, GtU);
+                b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Budget); b_op(d, End);
+                b_imm(d, static_cast<uint32_t>(lo)); b_set(d, 6);
+            }
+            b_op(d, End);
+            return;
+        }
+        const size_t mid = (lo + hi) / 2;
+        b_get(d, 3); b_imm(d, meta[mid].entry_pc); b_op(d, LtU);
+        b_op(d, If); b_op(d, 0x40);
+        tree(lo, mid);
+        b_op(d, Else);
+        tree(mid, hi);
+        b_op(d, End);
+    };
+    tree(0, n);
+
+    // br_table: vec of n labels then the default. Index i -> $bI (depth n-i
+    // at this position); default -> $default (depth 0, innermost).
+    b_get(d, 6);
+    b_op(d, BrTable);
+    uleb(d, static_cast<uint32_t>(n)); // vec count
+    for (size_t i = 0; i < n; ++i)
+        uleb(d, static_cast<uint32_t>(n - i));
+    uleb(d, 0);
+
+    // Function body: nested block chain, bodies in reverse label order.
+    Bytes code;
+    b_op(code, Loop); b_op(code, 0x40); // $outer: br here = redispatch
+    for (size_t i = 0; i < n; ++i) { b_op(code, Block); b_op(code, 0x40); } // $b0..$b(n-1)
+    b_op(code, Block); b_op(code, 0x40); // $default (innermost)
+    code.insert(code.end(), d.begin(), d.end());
+    b_op(code, End); // close $default -> miss body
+    {
+        b_get(code, 0); b_get(code, 3); b_store(code, offsetof(JitState, next_pc));
+        b_get(code, 0); b_imm(code, static_cast<uint32_t>(ExitReason::Miss)); b_store(code, offsetof(JitState, exit_reason));
+        b_imm(code, static_cast<uint32_t>(ExitReason::Miss)); b_op(code, Return);
+    }
+    for (size_t i = n; i-- > 0;) { // close $b(i) -> body i
+        b_op(code, End);
+        code.insert(code.end(), bodies[i].begin(), bodies[i].end());
+    }
+    b_op(code, End); // close loop
+    b_op(code, 0x00); // unreachable: every body ends in br/return; the loop never falls through
+    b_op(code, End); // end function body
+
+    Bytes body;
+    uleb(body, 3); // three local runs
+    uleb(body, 3); body.push_back(0x7f); // locals 2,3,4: executed_call, pc, CheckBit
+    uleb(body, 1); body.push_back(0x7e); // local 5: i64 scratch
+    uleb(body, 1 + max_ssa); body.push_back(0x7f); // local 6: dispatch index; 7..: SSA
+    body.insert(body.end(), code.begin(), code.end());
+    Bytes functions{1};
+    uleb(functions, static_cast<uint32_t>(body.size()));
+    functions.insert(functions.end(), body.begin(), body.end());
+
+    Bytes module{0, 'a', 's', 'm', 1, 0, 0, 0};
+    section(module, 1, {2,
+        0x60, 2, 0x7f, 0x7f, 1, 0x7f, // type 0: (i32,i32)->i32 for run
+        0x60, 3, 0x7f, 0x7f, 0x7f, 1, 0x7f}); // type 1: checked helpers
+    section(module, 2, {3,
+        3, 'e', 'n', 'v', 6, 'm', 'e', 'm', 'o', 'r', 'y', 2, 0, 1,
+        3, 'e', 'n', 'v', 8, 'm', 'e', 'm', '_', 'r', 'e', 'a', 'd', 0, 1,
+        3, 'e', 'n', 'v', 9, 'm', 'e', 'm', '_', 'w', 'r', 'i', 't', 'e', 0, 1});
+    section(module, 3, {1, 0}); // one function, type 0
+    // Function index space counts IMPORTED functions first: mem_read=0,
+    // mem_write=1, our run=2. (Same layout as the single-block module.)
+    section(module, 7, {1, 3, 'r', 'u', 'n', 0, 2});
+    section(module, 10, functions);
+    if (module.size() > kMaxModule)
+        return {};
+    return module;
 }
 } // namespace vita3k::wasmjit

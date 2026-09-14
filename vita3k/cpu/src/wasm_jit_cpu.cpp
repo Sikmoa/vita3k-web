@@ -21,6 +21,8 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <optional>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -28,17 +30,181 @@ namespace {
 using JitState = vita3k::wasmjit::JitState;
 using MemoryFunction = uint32_t (*)(JitState *, uint32_t, uint32_t) noexcept;
 
+// --- M14c region formation -----------------------------------------------
+// A region batches many guest blocks into ONE WebAssembly module with an
+// in-module dispatch loop (REGION_ABI.md). Formation is a DFS over
+// translate_block following terminal LinkBlock/LinkBlockFast targets; each
+// successor is translated with the descriptor carried by the terminal edge,
+// so chained in-region blocks assume the architecturally correct PSR/FPSCR
+// by construction. The host cache is keyed by full location descriptor.
+//
+// Formation guarantees (relied on by the emitted dispatch loop):
+//  - at most ONE block per guest PC per region (same PC with different PSR is
+//    not a member; dispatch Misses and the host forms another region);
+//  - blocks sorted by entry PC in the Region;
+//  - per-block tick cost = CycleCount + ConditionFailedCycleCount (one tick
+//    per guest instruction including condition-failed slots; conservative for
+//    the budget check since conditions may pass).
+constexpr uint32_t PSR_DISPATCH_MASK = Dynarmic::A32::LocationDescriptor::CPSR_MODE_MASK;
+constexpr size_t REGION_MAX_BLOCKS = 512;
+constexpr uint64_t REGION_MAX_TICKS = 32768;
+constexpr uint32_t REGION_BLOCK_INSTR_LIMIT = 64; // per-block translate budget
+
+struct RegionBlock {
+    Address pc = 0;
+    uint32_t psr_mask = 0, psr_value = 0; // dispatch validation bits
+    uint32_t ticks = 0;                    // conservative tick cost
+    std::vector<uint8_t> original;         // guest bytes [pc, EndLocation.PC)
+};
+struct Region {
+    std::vector<RegionBlock> blocks; // sorted by pc
+    uint64_t total_ticks = 0;
+    Address page_begin = 0, page_end = 0; // guest page span covered
+};
+
+// Static successor targets of a terminal tree. ReturnToDispatch, PopRSBHint
+// and FastDispatchHint have no static target and are reached via dispatch at
+// runtime; Interpret/Invalid mean the emitter rejects the block entirely.
+void collect_targets(const Dynarmic::IR::Term::Terminal &terminal,
+    std::vector<Dynarmic::A32::LocationDescriptor> &out) {
+    using namespace Dynarmic::IR::Term;
+    struct Visitor {
+        std::vector<Dynarmic::A32::LocationDescriptor> *out;
+        void operator()(const Invalid &) const {}
+        void operator()(const Interpret &) const {}
+        void operator()(const ReturnToDispatch &) const {}
+        void operator()(const PopRSBHint &) const {}
+        void operator()(const FastDispatchHint &) const {}
+        void operator()(const LinkBlock &t) const { out->push_back(Dynarmic::A32::LocationDescriptor{t.next}); }
+        void operator()(const LinkBlockFast &t) const { out->push_back(Dynarmic::A32::LocationDescriptor{t.next}); }
+        void operator()(const boost::recursive_wrapper<If> &t) const {
+            collect_targets(t.get().then_, *out);
+            collect_targets(t.get().else_, *out);
+        }
+        void operator()(const boost::recursive_wrapper<CheckBit> &t) const {
+            collect_targets(t.get().then_, *out);
+            collect_targets(t.get().else_, *out);
+        }
+        void operator()(const boost::recursive_wrapper<CheckHalt> &t) const {
+            collect_targets(t.get().else_, *out);
+        }
+    } visitor{&out};
+    boost::apply_visitor(visitor, terminal);
+}
+
+// DFS region formation from an entry location. Returns false when the ENTRY
+// block cannot be translated/fetched (caller rejects); interior successors
+// that fail fetch are skipped and handled by a runtime Miss, so a single
+// unmapped branch target cannot poison the region. `ir_out` receives the
+// translated blocks PERMUTED INTO THE SAME SORTED ORDER as region.blocks
+// (emit_region validates meta against each block's own location).
+bool form_region(MemState &mem, uint32_t entry_pc, uint32_t entry_cpsr,
+    uint32_t entry_fpscr, Region &region, std::vector<Dynarmic::IR::Block> &ir_out) {
+    using Dynarmic::A32::LocationDescriptor;
+    std::vector<LocationDescriptor> stack;
+    std::vector<Dynarmic::IR::Block> ir_blocks; // DFS order, parallel to region.blocks pre-sort
+    std::set<uint32_t> member_pcs; // one block per PC per region
+    stack.emplace_back(LocationDescriptor{entry_pc,
+        Dynarmic::A32::PSR{entry_cpsr}, Dynarmic::A32::FPSCR{entry_fpscr}});
+    while (!stack.empty() && region.blocks.size() < REGION_MAX_BLOCKS
+        && region.total_ticks < REGION_MAX_TICKS) {
+        const LocationDescriptor location = stack.back();
+        stack.pop_back();
+        const uint32_t pc = location.PC();
+        if (!member_pcs.insert(pc).second)
+            continue; // already a member (any PSR): dispatch stays one-per-PC
+        std::optional<Dynarmic::IR::Block> ir;
+        try {
+            ir = vita3k::wasmjit::translate_block(mem, pc,
+                location.CPSR().Value(), REGION_BLOCK_INSTR_LIMIT, location.FPSCR().Value());
+        } catch (const std::exception &) {
+            // Unmapped/non-executable fetch. Only the entry block is fatal.
+            // The PC stays in member_pcs so later duplicate pushes skip cheaply.
+            if (region.blocks.empty())
+                return false;
+            continue; // successor is unreachable as a compiled member
+        }
+        RegionBlock block;
+        block.pc = pc;
+        const uint32_t psr = location.CPSR().Value();
+        block.psr_mask = PSR_DISPATCH_MASK;
+        block.psr_value = psr & PSR_DISPATCH_MASK;
+        block.ticks = static_cast<uint32_t>(ir->CycleCount() + ir->ConditionFailedCycleCount());
+        const uint64_t end = LocationDescriptor(ir->EndLocation()).PC();
+        if (end <= pc || end - pc > 128) // defensive: same span rule as emit_block
+            return false;
+        block.original.resize(end - pc);
+        if (!mem_fetch(mem, pc, block.original.data(), block.original.size()))
+            return false;
+        region.total_ticks += block.ticks;
+        collect_targets(ir->GetTerminal(), stack);
+        region.blocks.push_back(std::move(block));
+        ir_blocks.push_back(std::move(*ir));
+    }
+    // Apply the sorted-by-pc permutation to BOTH vectors (IR::Block is
+    // move-only; sort an index vector, then move-construct in order).
+    std::vector<size_t> order(region.blocks.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return region.blocks[a].pc < region.blocks[b].pc;
+    });
+    Region sorted;
+    std::vector<Dynarmic::IR::Block> sorted_ir;
+    sorted_ir.reserve(order.size());
+    for (const size_t index : order) {
+        sorted.blocks.push_back(std::move(region.blocks[index]));
+        sorted_ir.push_back(std::move(ir_blocks[index]));
+    }
+    sorted.total_ticks = region.total_ticks;
+    region = std::move(sorted);
+    ir_out = std::move(sorted_ir);
+    if (!region.blocks.empty()) {
+        region.page_begin = region.blocks.front().pc / 4096;
+        region.page_end = (region.blocks.back().pc + region.blocks.back().original.size() + 4095) / 4096;
+    }
+    return !region.blocks.empty();
+}
+// --- end region formation -------------------------------------------------
+
+// Guest pages holding any cached JIT code (4 GiB / 4 KiB = 1 MiB bitmap).
+// checked_memory_write consults this so a store into a code page can be
+// observed by the region dispatch loop without host involvement.
+std::array<uint8_t, 1 << 20> g_code_pages{};
+void mark_code_pages(const Region &region, int delta) {
+    for (uint64_t page = region.page_begin; page < region.page_end; ++page)
+        g_code_pages[page] = static_cast<uint8_t>(int(g_code_pages[page]) + delta);
+}
+
+// Region-entry validation (replaces per-block unchanged()): revalidate the
+// guest bytes of EVERY member block once per region entry. Between entries,
+// stores into code pages set g_code_pages, letting checked_memory_write flag
+// smc_dirty for an immediate Smc exit instead of waiting for this check.
+bool region_unchanged(const Region &region, MemState &mem) {
+    std::array<uint8_t, 128> bytes{};
+    for (const auto &block : region.blocks) {
+        if (!mem_fetch(mem, block.pc, bytes.data(), block.original.size()))
+            return false;
+        if (!std::equal(block.original.begin(), block.original.end(), bytes.begin()))
+            return false;
+    }
+    return true;
+}
+
 uint32_t memory_fault(JitState &state, uint32_t address, bool write) noexcept {
     state.fault_address = address;
     state.fault_write = write;
     return static_cast<uint32_t>(vita3k::wasmjit::ExitReason::Fault);
 }
 
+// Profiling counters (worker is single-threaded; no atomics needed).
+uint64_t g_mem_reads = 0, g_mem_writes = 0;
+
 bool valid_memory_size(uint32_t bytes) noexcept {
     return bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8 || bytes == 16;
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t checked_memory_read(JitState *state, uint32_t address, uint32_t bytes) noexcept {
+    ++g_mem_reads;
     if (!valid_memory_size(bytes) || !state->memory_cookie)
         return memory_fault(*state, address, false);
     const auto *mem = reinterpret_cast<const MemState *>(static_cast<uintptr_t>(state->memory_cookie));
@@ -54,8 +220,13 @@ EMSCRIPTEN_KEEPALIVE uint32_t checked_memory_read(JitState *state, uint32_t addr
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t checked_memory_write(JitState *state, uint32_t address, uint32_t bytes) noexcept {
+    ++g_mem_writes;
     if (!valid_memory_size(bytes) || !state->memory_cookie)
         return memory_fault(*state, address, true);
+    // A store into a page holding cached JIT code must be observable by the
+    // region dispatch loop without host involvement (REGION_ABI smc_dirty).
+    if (g_code_pages[address >> 12])
+        state->smc_dirty = 1;
     auto *mem = reinterpret_cast<MemState *>(static_cast<uintptr_t>(state->memory_cookie));
     std::array<uint8_t, 16> value{};
     for (uint32_t i = 0; i < bytes; ++i)
@@ -99,6 +270,43 @@ EM_JS(void, vita3k_jit_release, (int slot), {
     setWasmTableEntry(slot, null);
     (Module['vita3kJitFreeSlots'] || (Module['vita3kJitFreeSlots'] = [])).push(slot);
 });
+// Region modules export run(state, budget) -> reason instead of block(state).
+// The HOST calls run via EM_JS (never call_indirect from Wasm), so region
+// functions live in a JS map keyed by slot — no shared-table slot aliasing.
+EM_JS(int, vita3k_jit_install_region, (const uint8_t *bytes, unsigned length,
+    MemoryFunction read_memory, MemoryFunction write_memory), {
+    const regions = Module['vita3kJitRegions'] || (Module['vita3kJitRegions'] = new Map());
+    let slot = -1;
+    const freeSlots = Module['vita3kJitFreeSlots'] || (Module['vita3kJitFreeSlots'] = []);
+    try {
+        const raw = HEAPU8.slice(bytes, bytes + length);
+        if (typeof process !== 'undefined' && process.env?.VITA3K_DUMP_JIT) require('fs').writeFileSync('/tmp/jit-region.wasm', raw);
+        const module = new WebAssembly.Module(raw);
+        const instance = new WebAssembly.Instance(module, {env: {
+            memory: wasmMemory,
+            mem_read: wasmTable.get(read_memory),
+            mem_write: wasmTable.get(write_memory)
+        }});
+        const run = instance.exports.run;
+        if (typeof run !== 'function') throw new Error('region module does not export run');
+        slot = regions.size
+            ? Array.from({length: regions.size}, (_, i) => i).find(i => !regions.has(i)) ?? regions.size
+            : 0;
+        regions.set(slot, run);
+        return slot;
+    } catch (error) {
+        if (slot >= 0) regions.delete(slot);
+        console.error('Vita3K JIT region compilation failed:', error);
+        return -1;
+    }
+});
+EM_JS(uint32_t, vita3k_jit_run, (int slot, uint32_t state, uint32_t budget), {
+    const fn = Module['vita3kJitRegions'].get(slot);
+    return fn(state, budget);
+});
+EM_JS(void, vita3k_jit_release_region, (int slot), {
+    Module['vita3kJitRegions'].delete(slot);
+});
 
 struct WasmJitCPU::Impl {
     using State = vita3k::wasmjit::JitState;
@@ -109,14 +317,30 @@ struct WasmJitCPU::Impl {
         int table_index;
         uint32_t instruction_limit;
     };
+    // M14c region: one WebAssembly.Module per REGION with an in-Wasm
+    // dispatch loop. Keyed by entry location hash (the dispatch loop
+    // validates PSR per block, so one region serves many locations).
+    struct RegionEntry {
+        std::shared_ptr<Region> region;
+        int table_index = -1;
+    };
     CPUState *parent;
     std::size_t core;
     State state{};
     std::atomic<bool> stopped{false};
     bool breakpoint = false, log_code = false, log_mem = false;
     uint64_t budget = 1'000'000'000'000, executed = 0, compiled = 0, hits = 0, invalidated = 0;
+    // Phase profiling: milliseconds and counts for the JIT cost centers.
+    double emit_ms = 0, install_ms = 0, run_js_ms = 0;
+    uint64_t js_calls = 0, misses = 0, svc_exits = 0, budget_exits = 0;
+    // Region-mode profiling.
+    uint64_t regions = 0, region_misses = 0, smc_exits = 0, dispatches = 0;
+    // Region mode is the production path (M14c); single-block execution
+    // remains for step() and the single-block module suite.
+    bool region_mode = true;
     std::string error;
     std::map<Key, Block> cache;
+    std::map<uint64_t, RegionEntry> region_cache;
 
     Impl(CPUState *parent, std::size_t core) : parent(parent), core(core) {
         static_assert(sizeof(uintptr_t) == sizeof(uint32_t), "JIT memory cookie requires wasm32");
@@ -127,6 +351,11 @@ struct WasmJitCPU::Impl {
         for (const auto &[key, block] : cache) vita3k_jit_release(block.table_index);
         invalidated += cache.size();
         cache.clear();
+        for (auto &[key, entry] : region_cache) {
+            if (entry.table_index >= 0) vita3k_jit_release_region(entry.table_index);
+            mark_code_pages(*entry.region, -1);
+        }
+        region_cache.clear();
     }
     int fail(const char *reason) {
         error = reason;
@@ -151,6 +380,132 @@ struct WasmJitCPU::Impl {
         return mem_fetch(*parent->mem, block.pc, bytes.data(), block.original.size())
             && std::equal(block.original.begin(), block.original.end(), bytes.begin());
     }
+    // Region-mode execution: form/compile a region on miss, then let the
+    // generated module's in-Wasm dispatch loop run many guest blocks per
+    // host entry. Handles all ExitReason values from REGION_ABI.md.
+    int execute_regions(uint64_t remaining_budget) {
+        uint64_t budget_progress_mark = state.executed;
+        using vita3k::wasmjit::ExitReason;
+        while (true) {
+            if (stopped || breakpoint)
+                return 1;
+            const uint32_t pc = state.regs[15];
+            const auto loc = Dynarmic::A32::LocationDescriptor{pc,
+                Dynarmic::A32::PSR{state.cpsr}, Dynarmic::A32::FPSCR{state.fpscr}};
+            const uint64_t key = loc.UniqueHash();
+            auto found = region_cache.find(key);
+            if (found != region_cache.end() && !region_unchanged(*found->second.region, *parent->mem)) {
+                // Guest code changed under us (Ptr/HLE write without tracking,
+                // or a store the smc bitmap missed). Drop and recompile.
+                vita3k_jit_release_region(found->second.table_index);
+                mark_code_pages(*found->second.region, -1);
+                region_cache.erase(found);
+                ++invalidated;
+                found = region_cache.end();
+            }
+            if (found == region_cache.end()) {
+                ++region_misses;
+                auto region = std::make_shared<Region>();
+                std::vector<Dynarmic::IR::Block> ir_blocks;
+                if (!form_region(*parent->mem, pc, state.cpsr, state.fpscr, *region, ir_blocks))
+                    return fail("region formation failed at entry");
+                std::vector<const Dynarmic::IR::Block *> block_ptrs;
+                std::vector<vita3k::wasmjit::RegionBlockMeta> meta;
+                block_ptrs.reserve(region->blocks.size());
+                meta.reserve(region->blocks.size());
+                for (size_t i = 0; i < region->blocks.size(); ++i) {
+                    block_ptrs.push_back(&ir_blocks[i]);
+                    meta.push_back({region->blocks[i].pc, region->blocks[i].psr_mask,
+                        region->blocks[i].psr_value, region->blocks[i].ticks});
+                }
+                const double t0 = emscripten_get_now();
+                const auto bytes = vita3k::wasmjit::emit_region(block_ptrs, meta);
+                emit_ms += emscripten_get_now() - t0;
+                if (bytes.empty())
+                    return fail("region emission rejected (no fallback)");
+                const double t1 = emscripten_get_now();
+                const int slot = vita3k_jit_install_region(bytes.data(), bytes.size(),
+                    checked_memory_read, checked_memory_write);
+                install_ms += emscripten_get_now() - t1;
+                if (slot < 0)
+                    return fail("browser rejected generated region Wasm");
+                mark_code_pages(*region, +1);
+                RegionEntry entry{std::move(region), slot};
+                found = region_cache.emplace(key, std::move(entry)).first;
+                ++regions;
+            }
+            ++hits;
+            // Refresh per-run state fields (bases are stable but cheap).
+            state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent->mem));
+            state.smc_dirty = 0;
+            state.stop_flag = 0;
+            state.exit_reason = 0;
+            state.svc = 0;
+            const uint32_t state_offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&state));
+            const uint32_t call_budget = static_cast<uint32_t>(std::min<uint64_t>(remaining_budget, 0x7fffffffu));
+            const uint32_t executed_before = state.executed;
+            const uint32_t dispatches_before = state.dispatches;
+            const double t2 = emscripten_get_now();
+            const uint32_t reason = vita3k_jit_run(found->second.table_index, state_offset, call_budget);
+            run_js_ms += emscripten_get_now() - t2;
+            ++js_calls;
+            dispatches += state.dispatches >= dispatches_before
+                ? state.dispatches - dispatches_before : state.dispatches;
+            const uint32_t executed_now = state.executed; // monotonic in region modules
+            // A single-block step() between region calls resets the counter;
+            // then `after` alone is what this region executed since the reset.
+            const uint32_t delta = executed_now >= executed_before
+                ? executed_now - executed_before : executed_now;
+            if (delta > call_budget)
+                return fail("generated region overran its budget");
+            executed += delta;
+            remaining_budget -= delta;
+            switch (static_cast<ExitReason>(reason)) {
+            case ExitReason::Svc:
+                parent->svc = state.svc;
+                parent->svc_called = true;
+                ++svc_exits;
+                return 0;
+            case ExitReason::Fault: {
+                char message[96];
+                std::snprintf(message, sizeof(message), "guest memory %s fault at %08x (pc %08x)",
+                    state.fault_write ? "write" : "read", state.fault_address, state.fault_pc);
+                return fail(message);
+            }
+            case ExitReason::Miss:
+                // next_pc set by the module; loop to dispatch/compile it.
+                continue;
+            case ExitReason::Budget:
+                ++budget_exits;
+                if (remaining_budget == 0 || state.executed == budget_progress_mark)
+                    return 0; // exhausted cleanly; no block fits (or nothing left)
+                budget_progress_mark = state.executed;
+                continue; // re-enter with the remaining budget
+            case ExitReason::Smc:
+                ++smc_exits;
+                // Drop every region touching dirty pages; the dispatch loop
+                // will re-form from the current PC.
+                for (auto it = region_cache.begin(); it != region_cache.end();) {
+                    const Region &r = *it->second.region;
+                    const uint64_t page = state.next_pc >> 12; // dirty page from the store
+                    if (page >= r.page_begin && page < r.page_end) {
+                        vita3k_jit_release_region(it->second.table_index);
+                        mark_code_pages(r, -1);
+                        it = region_cache.erase(it);
+                        ++invalidated;
+                    } else
+                        ++it;
+                }
+                state.smc_dirty = 0;
+                continue;
+            case ExitReason::Stop:
+                return 1;
+            default:
+                return fail("generated region returned unsupported exit");
+            }
+        }
+    }
+
     int execute(uint32_t limit) {
         using namespace Dynarmic::A32;
         const LocationDescriptor location(state.regs[15], PSR{state.cpsr}, FPSCR{state.fpscr});
@@ -166,6 +521,7 @@ struct WasmJitCPU::Impl {
             if (found == cache.end()) {
                 if (cache.size() >= 1024) clear(); // bounded prototype cache
                 uint32_t translation_limit = limit;
+                const double t0 = emscripten_get_now();
                 auto ir = vita3k::wasmjit::translate_block(*parent->mem,
                     state.regs[15], state.cpsr, translation_limit, state.fpscr);
                 auto bytes = vita3k::wasmjit::emit_block(ir);
@@ -178,6 +534,8 @@ struct WasmJitCPU::Impl {
                         state.regs[15], state.cpsr, translation_limit, state.fpscr);
                     bytes = vita3k::wasmjit::emit_block(ir);
                 }
+                emit_ms += emscripten_get_now() - t0;
+                ++misses;
                 if (bytes.empty()) return reject(ir);
                 // Cache under the REQUESTED limit, even for a one-instruction
                 // retry, so subsequent run() entries reuse the smaller block.
@@ -193,8 +551,10 @@ struct WasmJitCPU::Impl {
                 // Allocate cache entry before installing so allocation failure
                 // cannot leak a function-table slot.
                 found = cache.emplace(key, std::move(block)).first;
+                const double t1 = emscripten_get_now();
                 found->second.table_index = vita3k_jit_install(bytes.data(), bytes.size(),
                     checked_memory_read, checked_memory_write);
+                install_ms += emscripten_get_now() - t1;
                 if (found->second.table_index < 0) {
                     cache.erase(found);
                     return fail("browser rejected generated Wasm");
@@ -214,7 +574,10 @@ struct WasmJitCPU::Impl {
             // otherwise Emscripten lowers this to invoke_ii (a JS trampoline),
             // not a direct Wasm call_indirect. Guest faults use return reasons.
             const uint32_t state_offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&state));
+            const double t2 = emscripten_get_now();
             const uint32_t reason = vita3k_jit_call(found->second.table_index, state_offset);
+            run_js_ms += emscripten_get_now() - t2;
+            ++js_calls;
             if (reason == static_cast<uint32_t>(vita3k::wasmjit::ExitReason::Fault)) {
                 const uint32_t address = state.fault_address, write = state.fault_write;
                 state = before;
@@ -236,6 +599,7 @@ struct WasmJitCPU::Impl {
             if (reason == static_cast<uint32_t>(vita3k::wasmjit::ExitReason::Svc)) {
                 parent->svc = state.svc;
                 parent->svc_called = true;
+                ++svc_exits;
                 return 0;
             }
             if (reason != 0) return fail("generated block returned unsupported/fault exit");
@@ -253,6 +617,8 @@ int WasmJitCPU::run() {
     impl->parent->svc_called = false;
     impl->error.clear();
     const auto start = impl->executed;
+    if (impl->region_mode)
+        return impl->execute_regions(impl->budget - (impl->executed - start));
     while (impl->executed - start < impl->budget) {
         if (impl->stopped || impl->breakpoint) return 1;
         const uint32_t limit = std::min<uint64_t>(32, impl->budget - (impl->executed - start));
@@ -317,6 +683,15 @@ void WasmJitCPU::invalidate_jit_cache(Address start, size_t length) {
             ++impl->invalidated;
         } else ++it;
     }
+    for (auto it = impl->region_cache.begin(); it != impl->region_cache.end();) {
+        const Region &r = *it->second.region;
+        if (first_page < r.page_end && r.page_begin < end_page) {
+            if (it->second.table_index >= 0) vita3k_jit_release_region(it->second.table_index);
+            mark_code_pages(r, -1);
+            it = impl->region_cache.erase(it);
+            ++impl->invalidated;
+        } else ++it;
+    }
 }
 bool WasmJitCPU::is_thumb_mode() { return impl->state.cpsr & 0x20; }
 bool WasmJitCPU::hit_breakpoint() { return impl->breakpoint; }
@@ -328,10 +703,27 @@ bool WasmJitCPU::get_log_mem() { return impl->log_mem; }
 void WasmJitCPU::clear_exclusive() { /* Exclusive IR is rejected; no monitor is acquired. */ }
 std::size_t WasmJitCPU::processor_id() const { return impl->core; }
 void WasmJitCPU::set_instruction_budget(uint64_t v) { impl->budget = v; }
+void WasmJitCPU::set_region_mode(bool v) { impl->region_mode = v; }
 const std::string &WasmJitCPU::get_last_error() const { return impl->error; }
 uint32_t WasmJitCPU::get_fault_address() const { return impl->state.fault_address; }
 bool WasmJitCPU::get_fault_write() const { return impl->state.fault_write != 0; }
 uint64_t WasmJitCPU::instructions_executed() const { return impl->executed; }
 uint64_t WasmJitCPU::compiled_blocks() const { return impl->compiled; }
+uint64_t WasmJitCPU::regions_formed() const { return impl->regions; }
 uint64_t WasmJitCPU::cache_hits() const { return impl->hits; }
 uint64_t WasmJitCPU::invalidated_blocks() const { return impl->invalidated; }
+std::string WasmJitCPU::get_profile() const {
+    char buffer[640];
+    std::snprintf(buffer, sizeof(buffer),
+        "emit_ms=%.1f install_ms=%.1f run_js_ms=%.1f js_calls=%llu misses=%llu "
+        "svc_exits=%llu blocks=%llu mem_reads=%llu mem_writes=%llu "
+        "regions=%llu region_misses=%llu smc_exits=%llu budget_exits=%llu dispatches=%llu",
+        impl->emit_ms, impl->install_ms, impl->run_js_ms,
+        (unsigned long long)impl->js_calls, (unsigned long long)impl->misses,
+        (unsigned long long)impl->svc_exits, (unsigned long long)impl->compiled,
+        (unsigned long long)g_mem_reads, (unsigned long long)g_mem_writes,
+        (unsigned long long)impl->regions, (unsigned long long)impl->region_misses,
+        (unsigned long long)impl->smc_exits, (unsigned long long)impl->budget_exits,
+        (unsigned long long)impl->dispatches);
+    return buffer;
+}

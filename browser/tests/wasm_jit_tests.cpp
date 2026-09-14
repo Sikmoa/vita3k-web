@@ -167,7 +167,7 @@ struct Fixture {
         if (result != 0) throw std::runtime_error(jit().get_last_error());
         REQUIRE(jit().get_last_error().empty());
         REQUIRE(generated->svc_called);
-        REQUIRE(jit().compiled_blocks() > 0);
+        REQUIRE(jit().regions_formed() > 0 || jit().compiled_blocks() > 0); // region or single-block mode
         REQUIRE(jit().instructions_executed() > instructions);
         REQUIRE(bytes == read_bytes(memory.state, code_address, mapped_size));
         return snapshot(*generated);
@@ -183,10 +183,10 @@ struct Fixture {
         equal_state(actual, oracle, "WasmJit vs Interpreter");
         // Re-enter with identical state: require an actual hot cache entry, not
         // just another translation producing the same answer.
-        const auto compiled = jit().compiled_blocks();
+        const auto compiled = jit().regions_formed() + jit().compiled_blocks();
         const auto hits = jit().cache_hits();
         equal_state(run_jit(start), oracle, "hot WasmJit vs Interpreter");
-        REQUIRE(jit().compiled_blocks() == compiled);
+        REQUIRE(jit().regions_formed() + jit().compiled_blocks() == compiled);
         REQUIRE(jit().cache_hits() > hits);
 #endif
     }
@@ -258,10 +258,10 @@ void loops_and_conditions(Suite &suite, Fixture &fixture) {
         }
 #ifdef __EMSCRIPTEN__
         equal_state(fixture.run_jit(start), expected, "ARM loop JIT vs architecture");
-        const auto compiled = fixture.jit().compiled_blocks();
+        const auto compiled = fixture.jit().regions_formed() + fixture.jit().compiled_blocks();
         const auto hits = fixture.jit().cache_hits();
         equal_state(fixture.run_jit(start), expected, "ARM loop hot JIT vs architecture");
-        REQUIRE(fixture.jit().compiled_blocks() == compiled);
+        REQUIRE(fixture.jit().regions_formed() + fixture.jit().compiled_blocks() == compiled);
         REQUIRE(fixture.jit().cache_hits() > hits);
 #else
         std::puts("M14 NOT RUN: ARM full-loop final execution requires Emscripten JIT");
@@ -333,27 +333,30 @@ void cache_mutations(Suite &suite, Fixture &fixture) {
             };
             check(7);
 #ifdef __EMSCRIPTEN__
-            auto compiled = fixture.jit().compiled_blocks();
+            // Region mode counts installed regions (re-installs included);
+            // single-block mode counts modules. Either proves recompilation.
+            auto code_units = [&] { return fixture.jit().regions_formed() + fixture.jit().compiled_blocks(); };
+            auto compiled = code_units();
             auto invalidated = fixture.jit().invalidated_blocks();
             invalidate_jit_cache(*fixture.generated, code_address, width);
             REQUIRE(fixture.jit().invalidated_blocks() > invalidated);
             check(7); // Identical bytes must still recompile after explicit invalidation.
-            REQUIRE(fixture.jit().compiled_blocks() > compiled);
-            compiled = fixture.jit().compiled_blocks();
+            REQUIRE(code_units() > compiled);
+            compiled = code_units();
 #endif
             REQUIRE(mem_write(fixture.memory.state, code_address,
                 thumb ? thumb_patch_11 : arm_patch_11, width));
             check(11); // Deliberately no invalidate_jit_cache: checked guest write.
 #ifdef __EMSCRIPTEN__
-            REQUIRE(fixture.jit().compiled_blocks() > compiled);
-            compiled = fixture.jit().compiled_blocks();
+            REQUIRE(code_units() > compiled);
+            compiled = code_units();
 #endif
             auto *trusted = Ptr<uint8_t>(code_address).get(fixture.memory.state);
             REQUIRE(trusted != nullptr);
             std::memcpy(trusted, thumb ? thumb_patch_13 : arm_patch_13, width);
             check(13); // Trusted Ptr bypass: entry-time source-byte validation is required.
 #ifdef __EMSCRIPTEN__
-            REQUIRE(fixture.jit().compiled_blocks() > compiled);
+            REQUIRE(code_units() > compiled);
 #endif
             std::memcpy(trusted, thumb ? thumb_patch_17 : arm_patch_17, width);
 #ifdef __EMSCRIPTEN__
@@ -362,7 +365,7 @@ void cache_mutations(Suite &suite, Fixture &fixture) {
             check(17);
 #ifdef __EMSCRIPTEN__
             // Cached code must not bypass a later execute-permission removal.
-            compiled = fixture.jit().compiled_blocks();
+            compiled = code_units();
             invalidated = fixture.jit().invalidated_blocks();
             REQUIRE(mem_set_permissions(fixture.memory.state, code_address, size, MemPerm::ReadWrite));
             restore(*fixture.generated, start);
@@ -372,13 +375,13 @@ void cache_mutations(Suite &suite, Fixture &fixture) {
             equal_state(snapshot(*fixture.generated), start, "NX cached entry unchanged");
             REQUIRE(fixture.jit().invalidated_blocks() > invalidated);
             check(17);
-            REQUIRE(fixture.jit().compiled_blocks() > compiled);
+            REQUIRE(code_units() > compiled);
 
             // Generated modules share the SAME Memory object across growth.
             REQUIRE(emscripten_resize_heap(emscripten_get_heap_size() + 65536));
-            compiled = fixture.jit().compiled_blocks();
+            compiled = code_units();
             check(17);
-            REQUIRE(fixture.jit().compiled_blocks() == compiled);
+            REQUIRE(code_units() == compiled);
 
             // Unmapping a hot page must fail, not execute stale translated code.
             const auto saved_bytes = read_bytes(fixture.memory.state, code_address, mapped_size);
@@ -542,7 +545,7 @@ Snapshot runtime_probe(bool use_jit) {
     REQUIRE(code_before == read_bytes(runtime.memory.state, code_address, mapped_size));
     REQUIRE(stack_before == read_bytes(runtime.memory.state, thread.stack.get(), thread.stack_size));
 #ifdef __EMSCRIPTEN__
-    if (use_jit) REQUIRE(static_cast<WasmJitCPU &>(*thread.cpu->cpu).compiled_blocks() > 0);
+    if (use_jit) REQUIRE(static_cast<WasmJitCPU &>(*thread.cpu->cpu).regions_formed() + static_cast<WasmJitCPU &>(*thread.cpu->cpu).compiled_blocks() > 0);
 #endif
     return seen;
 }
