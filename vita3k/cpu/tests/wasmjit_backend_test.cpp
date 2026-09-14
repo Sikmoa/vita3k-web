@@ -3,6 +3,8 @@
 // Uses production MemState and Dynarmic translation; no interpreter or mocks.
 #include "../src/wasm_jit_cpu.cpp"
 #include <mem/ptr.h>
+#include <dynarmic/frontend/A32/a32_types.h>
+#include <dynarmic/ir/opcodes.h>
 #include <cstdlib>
 
 namespace {
@@ -204,7 +206,7 @@ void backend(MemState &mem) {
 void formation(MemState &mem) {
     // 0x00 movs r0,#0; 0x02 adds r0,#1; 0x04 cmp r0,#3; 0x06 bne 0x02;
     // 0x08 b 0x0c; 0x0a nop (unreachable); 0x0c svc 0x42
-    const std::array<uint32_t, 4> words{0x30002000, 0xd1fc2803, 0xbf00e000, 0xbf00df42};
+    const std::array<uint32_t, 4> words{0x30012000, 0xd1fc2803, 0xbf00e000, 0xbf00df42};
     CHECK(mem_write(mem, code, words.data(), words.size() * sizeof(uint32_t)));
     Region region;
     std::vector<Dynarmic::IR::Block> ir;
@@ -278,12 +280,12 @@ void region_exec(MemState &mem) {
     // 0x00 movs r0,#0; 0x02 adds r0,#1; 0x04 cmp r0,#3; 0x06 bne 0x02;
     // 0x08 b 0x0c; 0x0a nop (unreachable); 0x0c svc 0x42
     // 0x3001 = adds r0,#1 (GAS-verified; 0x3008 would decode as adds r0,#8).
-    const std::array<uint32_t, 4> words{0x30012000, 0xd1fc2803, 0xbf00e000, 0xbf00df42};;
+    const std::array<uint32_t, 4> words{0x30012000, 0xd1fc2803, 0xbf00e000, 0xbf00df42};
     CHECK(mem_write(mem, code, words.data(), words.size() * sizeof(uint32_t)));
     jit.set_cpsr(0x30);
     jit.set_pc(code | 1);
     CHECK(jit.run() == 0 && parent.svc_called && parent.svc == 0x42);
-    CHECK(jit.get_reg(0) == 3); // loop executed adds three times
+    CHECK(jit.get_reg(0) == 3); // movs r0,#1, then adds runs twice (1->2->3)
     CHECK(jit.get_pc() == code + 0xe); // PC past the 2-byte svc (Thumb)
     CHECK(jit.compiled_blocks() == 0); // no single-block modules were built
     CHECK(jit.get_last_error().empty());
@@ -303,7 +305,7 @@ void region_exec(MemState &mem) {
     jit.set_pc(code | 1);
     jit.set_instruction_budget(5);
     const uint64_t executed_before = jit.instructions_executed();
-    CHECK(jit.run() == 0); // budget consumed cleanly, no error
+    CHECK(jit.run() == 0); // cannot-fit slice boundary: clean return, no error
     CHECK(jit.instructions_executed() - executed_before == 4);
     CHECK(jit.get_pc() == code + 2); // stopped at the successor entry
 
@@ -318,7 +320,204 @@ void region_exec(MemState &mem) {
     CHECK(jit.run() == -1);
     CHECK(jit.get_fault_address() == 7 && !jit.get_fault_write());
     CHECK(jit.instructions_executed() - fault_executed_before == 0); // ticks count only COMPLETED blocks (REGION_ABI); the movs' block faulted at the ldr
+    CHECK(jit.get_pc() == code + 2); // faulting ldr, not the block entry
     CHECK(jit.get_last_error().find("guest memory read fault") != std::string::npos);
+
+    // Budget fully consumed is an error in BOTH modes (the interpreter-oracle
+    // runaway-guard contract); only the cannot-fit slice boundary returns 0.
+    // Restore the loop CFG first: the fault program overwrote it.
+    CHECK(mem_write(mem, code, words.data(), words.size() * sizeof(uint32_t)));
+    jit.set_instruction_budget(4); // exactly block A's 4 ticks
+    jit.set_cpsr(0x30);
+    jit.set_pc(code | 1);
+    const uint64_t exhausted_before = jit.instructions_executed();
+    CHECK(jit.run() == -1);
+    CHECK(jit.get_last_error().find("budget") != std::string::npos);
+    CHECK(jit.instructions_executed() - exhausted_before == 4);
+    jit.set_region_mode(false);
+    jit.set_instruction_budget(2); // the program cannot finish in 2 instructions
+    jit.set_cpsr(0x30);
+    jit.set_pc(code | 1);
+    CHECK(jit.run() == -1);
+    CHECK(jit.get_last_error().find("budget") != std::string::npos);
+}
+
+void region_regressions(MemState &mem) {
+    namespace A32 = Dynarmic::A32;
+    namespace IR = Dynarmic::IR;
+    using Op = IR::Opcode;
+    using Value = IR::Value;
+    using Reason = vita3k::wasmjit::ExitReason;
+    const auto loc = [](uint32_t pc) {
+        return A32::LocationDescriptor{pc, A32::PSR{0x10}, A32::FPSCR{0}};
+    };
+    const auto blank = [&](uint32_t pc) {
+        IR::Block block{loc(pc)};
+        block.SetEndLocation(loc(pc + 4));
+        block.SetTerminal(IR::Term::LinkBlock{loc(pc + 4)});
+        block.CycleCount() = 1;
+        return block;
+    };
+    const auto append = [](IR::Block &block, Op op,
+                            std::initializer_list<Value> args) {
+        block.AppendNewInst(op, args);
+        return Value{&block.back()};
+    };
+    const auto emit = [](std::initializer_list<const IR::Block *> input) {
+        std::vector<const IR::Block *> blocks(input);
+        std::vector<vita3k::wasmjit::RegionBlockMeta> meta;
+        for (const auto *block : blocks) {
+            const A32::LocationDescriptor at(block->Location());
+            meta.push_back({at.PC(), PSR_DISPATCH_MASK,
+                at.CPSR().Value() & PSR_DISPATCH_MASK,
+                static_cast<uint32_t>(block->CycleCount()
+                    + block->ConditionFailedCycleCount())});
+        }
+        return vita3k::wasmjit::emit_region(blocks, meta);
+    };
+    const auto run = [](const std::vector<uint8_t> &bytes, JitState &state,
+                         uint32_t budget) {
+        CHECK(!bytes.empty());
+        const int slot = vita3k_jit_install_region(bytes.data(), bytes.size(),
+            checked_memory_read, checked_memory_write);
+        CHECK(slot >= 0);
+        const auto reason = vita3k_jit_run(slot,
+            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&state)), budget);
+        vita3k_jit_release_region(slot);
+        return static_cast<Reason>(reason);
+    };
+
+    // Rejection after a valid prefix must discard the entire body.
+    auto bad = blank(code);
+    append(bad, Op::A32SetRegister, {Value{A32::Reg::R0}, Value{uint32_t(7)}});
+    append(bad, Op::Breakpoint, {});
+    CHECK(emit({&bad}).empty());
+
+    // First SSA slot: a wide producer in A, then zero-extension in B.
+    auto a = blank(code), b = blank(code + 4);
+    const auto wide = append(a, Op::Pack2x32To1x64,
+        {Value{uint32_t(0)}, Value{uint32_t(0xdeadbeef)}});
+    append(a, Op::A32SetExtendedRegister64, {Value{A32::ExtReg::D0}, wide});
+    const auto narrow = append(b, Op::ZeroExtendWordToLong, {Value{uint32_t(1)}});
+    append(b, Op::A32SetExtendedRegister64, {Value{A32::ExtReg::D1}, narrow});
+    append(b, Op::A32SetRegister,
+        {Value{static_cast<A32::Reg>(15)}, Value{uint32_t(code + 8)}});
+    append(b, Op::A32CallSupervisor, {Value{uint32_t(0x66)}});
+    b.ReplaceTerminal(IR::Term::ReturnToDispatch{});
+    const auto module = emit({&a, &b});
+    JitState state{};
+    state.regs[15] = code;
+    state.cpsr = 0x10;
+    CHECK(run(module, state, 2) == Reason::Svc);
+    CHECK(state.fpu[1] == 0xdeadbeef);
+    CHECK(state.fpu[2] == 1 && state.fpu[3] == 0);
+    CHECK(state.next_pc == code + 8 && state.executed == 2);
+
+    // No side effects after SVC, including dead/invalidated IR markers.
+    append(b, Op::Void, {});
+    CHECK(emit({&b}).empty());
+
+    for (const auto reason : {Reason::Stop, Reason::Smc}) {
+        state = JitState{};
+        state.regs[15] = code + 4;
+        state.cpsr = 0x10;
+        state.executed = 17;
+        state.stop_flag = reason == Reason::Stop;
+        state.smc_dirty = reason == Reason::Smc;
+        CHECK(run(module, state, 2) == reason);
+        CHECK(state.next_pc == code + 4 && state.executed == 17);
+    }
+
+    auto bx = blank(code);
+    append(bx, Op::A32BXWritePC, {Value{uint32_t(code + 0x21)}});
+    bx.ReplaceTerminal(IR::Term::ReturnToDispatch{});
+    state = JitState{};
+    state.regs[15] = code;
+    state.cpsr = 0x10;
+    CHECK(run(emit({&bx}), state, 1) == Reason::Miss);
+    CHECK(state.regs[15] == code + 0x20 && state.next_pc == code + 0x20);
+    CHECK((state.cpsr & 0x20) != 0);
+
+    // Real region execution across both 32-bit counter wrap boundaries.
+    auto loop = blank(code);
+    const auto r0 = append(loop, Op::A32GetRegister, {Value{A32::Reg::R0}});
+    const auto sum = append(loop, Op::Add32,
+        {r0, Value{uint32_t(1)}, Value{false}});
+    append(loop, Op::A32SetRegister, {Value{A32::Reg::R0}, sum});
+    loop.ReplaceTerminal(IR::Term::LinkBlock{loc(code)});
+    state = JitState{};
+    state.regs[15] = code;
+    state.cpsr = 0x10;
+    state.executed = state.dispatches = 0xfffffff0;
+    CHECK(run(emit({&loop}), state, 32) == Reason::Budget);
+    CHECK(state.regs[0] == 32 && state.executed == 0x10);
+    CHECK(counter_delta(0xfffffff0, state.executed) == 32);
+    CHECK(counter_delta(0xfffffff0, state.dispatches) == 33);
+
+    // Reference counts, cross-page writes, and full-width address rounding.
+    Region tracked;
+    RegionBlock tracked_block;
+    tracked_block.pc = data + page;
+    tracked_block.original.resize(4);
+    tracked.blocks.push_back(std::move(tracked_block));
+    collect_code_pages(tracked);
+    CHECK(g_code_pages[data / page] == 0);
+    CHECK(g_code_pages[data / page + 1] == 0);
+    for (unsigned i = 0; i < 256; ++i) mark_code_pages(tracked, +1);
+    CHECK(g_code_pages[data / page + 1] == 256);
+    state = JitState{};
+    state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mem));
+    state.memory_value[0] = 0x12345678;
+    CHECK(checked_memory_write(&state, data + page - 2, 4) == 0);
+    CHECK(state.smc_dirty == 1);
+    for (unsigned i = 0; i < 256; ++i) mark_code_pages(tracked, -1);
+    CHECK(g_code_pages[data / page + 1] == 0);
+    tracked.blocks[0].pc = 0xfffff000;
+    collect_code_pages(tracked);
+    CHECK(tracked.page_begin == 0xfffff && tracked.page_end == 0x100000);
+
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(4096);
+
+    // A guest store changes the next instruction before it executes.
+    put(mem, jit, {0xe5810000, 0xe3a02001, 0xef000042});
+    jit.set_reg(0, 0xe3a0202a);
+    jit.set_reg(1, code + 4);
+    CHECK(jit.run() == 0 && parent.svc_called && jit.get_reg(2) == 42);
+    CHECK(jit.invalidated_blocks() != 0);
+
+    // 64 ARM instructions need a 256-byte snapshot.
+    std::array<uint32_t, 65> long_code{};
+    long_code.fill(0xe2800001);
+    long_code.back() = 0xef000042;
+    CHECK(mem_write(mem, code, long_code.data(), sizeof(long_code)));
+    jit.invalidate_jit_cache(code, page);
+    jit.set_cpsr(0x10);
+    jit.set_pc(code);
+    jit.set_reg(0, 0);
+    CHECK(jit.run() == 0 && parent.svc_called && jit.get_reg(0) == 64);
+
+    // BNE targets UDF, but Z=1 takes the supported SVC fallthrough.
+    put(mem, jit, {0x1a000000, 0xef000042, 0xe7f000f0});
+    jit.set_cpsr(0x40000010);
+    CHECK(jit.run() == 0 && parent.svc_called && parent.svc == 0x42);
+
+    // LRU eviction releases compiled regions and their page references.
+    std::vector<uint32_t> calls(REGION_CACHE_LIMIT + 1, 0xef000042);
+    CHECK(calls.size() * sizeof(uint32_t) <= page);
+    CHECK(mem_write(mem, code, calls.data(), calls.size() * sizeof(uint32_t)));
+    jit.invalidate_jit_cache(code, page);
+    jit.set_cpsr(0x10);
+    for (size_t i = 0; i < calls.size(); ++i) {
+        jit.set_pc(code + static_cast<uint32_t>(i * 4));
+        CHECK(jit.run() == 0 && parent.svc_called);
+    }
+    const auto formed = jit.regions_formed();
+    jit.set_pc(code);
+    CHECK(jit.run() == 0 && parent.svc_called);
+    CHECK(jit.regions_formed() == formed + 1);
 }
 } // namespace
 
@@ -331,6 +530,7 @@ int main() {
     backend(mem);
     formation(mem);
     region_exec(mem);
+    region_regressions(mem);
     deinit_mem(mem);
     std::printf("WasmJit backend: %u checks passed (real memory, no interpreter)\n", checks);
 }

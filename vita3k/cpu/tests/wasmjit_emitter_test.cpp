@@ -4,7 +4,7 @@
 #include "../src/wasmjit/emit_wasm.h"
 
 #include <array>
-#include <cassert>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -18,6 +18,11 @@
 #include <dynarmic/frontend/A32/translate/translate_callbacks.h>
 #include <dynarmic/ir/basic_block.h>
 #include <dynarmic/ir/opcodes.h>
+
+#define CHECK(expr) do { if (!(expr)) { \
+    std::cerr << "FAIL " << __FILE__ << ':' << __LINE__ << ": " #expr << '\n'; \
+    std::abort(); \
+} } while (false)
 
 namespace {
 namespace A32 = Dynarmic::A32;
@@ -106,10 +111,10 @@ public:
             std::cerr << "Unexpected rejection: " << name << '\n' << IR::DumpBlock(block);
             std::abort();
         }
-        assert(bytes == emit_block(block)); // deterministic, no IR mutation
+        CHECK(bytes == emit_block(block)); // deterministic, no IR mutation
         std::ofstream wasm(path / (name + ".wasm"), std::ios::binary);
         wasm.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
-        assert(wasm.good());
+        CHECK(wasm.good());
         if (modules++) manifest << ',';
         manifest << "{\"name\":\"" << name << "\",\"cases\":[";
         bool first = true;
@@ -540,8 +545,34 @@ void vfp_memory(Suite &suite) {
     }
 }
 
+
+void most_significant_word(Suite &suite) {
+    auto block = blank();
+    const auto packed = append(block, Opcode::Pack2x32To1x64,
+        {reg(block, Reg::R0), reg(block, Reg::R1)});
+    const auto high = append(block, Opcode::MostSignificantWord, {packed});
+    const auto carry = append(block, Opcode::GetCarryFromOp, {high});
+    set(block, Reg::R2, high);
+    append(block, Opcode::A32SetCpsrNZC,
+        {append(block, Opcode::GetNZFromOp, {high}), carry});
+    std::vector<Case> cases;
+    for (const uint32_t lo : {0u, 0x80000000u}) {
+        for (const uint32_t hi : {0u, 1u, 0x80000000u, 0xffffffffu}) {
+            auto in = initial();
+            in.regs[0] = lo;
+            in.regs[1] = hi;
+            in.cpsr |= 0x10000000;
+            auto out = next(in);
+            out.regs[2] = hi;
+            out.cpsr = (in.cpsr & 0x1fffffff) | nz(hi) | ((lo >> 31) << 29);
+            cases.push_back({in, out});
+        }
+    }
+    suite.add("most_significant_word_carry", block, cases);
+}
+
 void rejects() {
-    auto reject = [](const IR::Block &b) { assert(emit_block(b).empty()); };
+    auto reject = [](const IR::Block &b) { CHECK(emit_block(b).empty()); };
     auto block = blank(); append(block, Opcode::Breakpoint, {}); reject(block);
     block = blank(); append(block, Opcode::A32GetFpscr, {}); reject(block);
     block = blank(); block.ReplaceTerminal(IR::Term::Interpret{loc()}); reject(block);
@@ -594,7 +625,7 @@ void rejects() {
 } // namespace
 
 int main(int argc, char **argv) {
-    assert(argc == 2);
+    CHECK(argc == 2);
     rejects();
     Suite suite{argv[1]};
     arithmetic(suite);
@@ -604,5 +635,6 @@ int main(int argc, char **argv) {
     frontend(suite);
     vector_loop(suite);
     vfp_memory(suite);
+    most_significant_word(suite);
     std::cout << "Native rejection/determinism checks passed; generated " << suite.modules << " modules and " << suite.runs << " execution cases\n";
 }

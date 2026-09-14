@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "frontend.h"
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 
@@ -9,6 +10,7 @@
 #include <dynarmic/frontend/A32/a32_location_descriptor.h>
 #include <dynarmic/frontend/A32/translate/a32_translate.h>
 #include <dynarmic/frontend/A32/translate/translate_callbacks.h>
+#include <dynarmic/ir/opcodes.h>
 #include <fmt/format.h>
 #include <mem/functions.h>
 
@@ -33,7 +35,17 @@ public:
     }
 
     bool PreCodeReadHook(bool, uint32_t, Dynarmic::A32::IREmitter &ir) override {
-        if (remaining == 0) {
+        // End after a complete guest store, including all its IR and
+        // writeback. The dispatcher must check SMC before the next guest
+        // instruction. Do not exit between the elements of STM/VST1.
+        const bool wrote_memory = std::any_of(ir.block.begin(), ir.block.end(),
+            [](const Dynarmic::IR::Inst &inst) {
+                using Op = Dynarmic::IR::Opcode;
+                const auto op = inst.GetOpcode();
+                return op == Op::A32WriteMemory8 || op == Op::A32WriteMemory16
+                    || op == Op::A32WriteMemory32 || op == Op::A32WriteMemory64;
+            });
+        if (remaining == 0 || wrote_memory) {
             // current_location already includes the previous instruction's PC
             // and IT advance; reconstructing from the initial CPSR loses this.
             ir.SetTerm(Dynarmic::IR::Term::LinkBlock{ir.current_location});

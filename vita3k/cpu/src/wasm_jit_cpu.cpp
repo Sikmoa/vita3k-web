@@ -1,4 +1,4 @@
-// Opt-in M14 proof: Dynarmic frontend/IR -> generated Wasm -> call_indirect.
+// Opt-in M14 proof: Dynarmic frontend/IR -> generated Wasm regions.
 // No interpreter fallback. The display application's default backend is unchanged.
 #include <cpu/impl/wasm_jit_cpu.h>
 
@@ -48,7 +48,14 @@ using MemoryFunction = uint32_t (*)(JitState *, uint32_t, uint32_t) noexcept;
 constexpr uint32_t PSR_DISPATCH_MASK = Dynarmic::A32::LocationDescriptor::CPSR_MODE_MASK;
 constexpr size_t REGION_MAX_BLOCKS = 512;
 constexpr uint64_t REGION_MAX_TICKS = 32768;
-constexpr uint32_t REGION_BLOCK_INSTR_LIMIT = 64; // per-block translate budget
+constexpr uint32_t REGION_BLOCK_INSTR_LIMIT = 64;
+constexpr size_t REGION_MAX_CODE_BYTES = REGION_BLOCK_INSTR_LIMIT * 4;
+constexpr size_t REGION_CACHE_LIMIT = 128;
+constexpr uint32_t REGION_CALL_TICKS = 32768; // Bound latency of host stop checks.
+
+uint32_t counter_delta(uint32_t before, uint32_t after) noexcept {
+    return after - before; // A call cannot execute a full 2^32 ticks.
+}
 
 struct RegionBlock {
     Address pc = 0;
@@ -59,8 +66,23 @@ struct RegionBlock {
 struct Region {
     std::vector<RegionBlock> blocks; // sorted by pc
     uint64_t total_ticks = 0;
-    Address page_begin = 0, page_end = 0; // guest page span covered
+    Address page_begin = 0, page_end = 0; // Half-open page-index bounds.
+    std::vector<uint32_t> code_pages;     // Only pages actually containing code.
 };
+
+void collect_code_pages(Region &region) {
+    region.code_pages.clear();
+    for (const auto &block : region.blocks) {
+        const uint64_t end = uint64_t(block.pc) + block.original.size();
+        for (uint64_t p = block.pc / 4096; p < (end + 4095) / 4096; ++p)
+            region.code_pages.push_back(static_cast<uint32_t>(p));
+    }
+    auto &pages = region.code_pages;
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    region.page_begin = pages.empty() ? 0 : pages.front();
+    region.page_end = pages.empty() ? 0 : pages.back() + 1;
+}
 
 // Static successor targets of a terminal tree. ReturnToDispatch, PopRSBHint
 // and FastDispatchHint have no static target and are reached via dispatch at
@@ -101,78 +123,99 @@ void collect_targets(const Dynarmic::IR::Term::Terminal &terminal,
 bool form_region(MemState &mem, uint32_t entry_pc, uint32_t entry_cpsr,
     uint32_t entry_fpscr, Region &region, std::vector<Dynarmic::IR::Block> &ir_out) {
     using Dynarmic::A32::LocationDescriptor;
+    region = Region{};
+    ir_out.clear();
     std::vector<LocationDescriptor> stack;
-    std::vector<Dynarmic::IR::Block> ir_blocks; // DFS order, parallel to region.blocks pre-sort
-    std::set<uint32_t> member_pcs; // one block per PC per region
-    stack.emplace_back(LocationDescriptor{entry_pc,
-        Dynarmic::A32::PSR{entry_cpsr}, Dynarmic::A32::FPSCR{entry_fpscr}});
+    std::vector<Dynarmic::IR::Block> ir_blocks;
+    std::set<uint32_t> member_pcs;
+    stack.emplace_back(entry_pc, Dynarmic::A32::PSR{entry_cpsr},
+        Dynarmic::A32::FPSCR{entry_fpscr});
     while (!stack.empty() && region.blocks.size() < REGION_MAX_BLOCKS
         && region.total_ticks < REGION_MAX_TICKS) {
-        const LocationDescriptor location = stack.back();
+        const auto location = stack.back();
         stack.pop_back();
         const uint32_t pc = location.PC();
         if (!member_pcs.insert(pc).second)
-            continue; // already a member (any PSR): dispatch stays one-per-PC
+            continue;
         std::optional<Dynarmic::IR::Block> ir;
-        try {
-            ir = vita3k::wasmjit::translate_block(mem, pc,
-                location.CPSR().Value(), REGION_BLOCK_INSTR_LIMIT, location.FPSCR().Value());
-        } catch (const std::exception &) {
-            // Unmapped/non-executable fetch. Only the entry block is fatal.
-            // The PC stays in member_pcs so later duplicate pushes skip cheaply.
+        RegionBlock block;
+        const auto candidate = [&](uint32_t limit) {
+            try {
+                auto translated = vita3k::wasmjit::translate_block(mem, pc,
+                    location.CPSR().Value(), limit, location.FPSCR().Value());
+                const uint64_t end = LocationDescriptor(translated.EndLocation()).PC();
+                if (end <= pc || end - pc > REGION_MAX_CODE_BYTES)
+                    return false;
+                const uint64_t ticks = translated.CycleCount()
+                    + translated.ConditionFailedCycleCount();
+                if (!ticks || ticks > REGION_MAX_TICKS)
+                    return false;
+                block.pc = pc;
+                block.psr_mask = PSR_DISPATCH_MASK;
+                block.psr_value = location.CPSR().Value() & PSR_DISPATCH_MASK;
+                block.ticks = static_cast<uint32_t>(ticks);
+                // Use the actual region emitter to validate this member.
+                // No browser compilation or interpreter fallback occurs here.
+                const vita3k::wasmjit::RegionBlockMeta meta{
+                    pc, block.psr_mask, block.psr_value, block.ticks};
+                if (vita3k::wasmjit::emit_region({&translated}, {meta}).empty())
+                    return false;
+                block.original.resize(static_cast<size_t>(end - pc));
+                if (!mem_fetch(mem, pc, block.original.data(), block.original.size()))
+                    return false;
+                ir.emplace(std::move(translated));
+                return true;
+            } catch (const std::exception &) {
+                return false;
+            }
+        };
+        // A supported first instruction must not be poisoned by later
+        // unsupported IR or speculative fetches across an unmapped boundary.
+        if (!candidate(REGION_BLOCK_INSTR_LIMIT) && !candidate(1)) {
             if (region.blocks.empty())
                 return false;
-            continue; // successor is unreachable as a compiled member
+            continue; // This edge becomes a runtime Miss.
         }
-        RegionBlock block;
-        block.pc = pc;
-        const uint32_t psr = location.CPSR().Value();
-        block.psr_mask = PSR_DISPATCH_MASK;
-        block.psr_value = psr & PSR_DISPATCH_MASK;
-        block.ticks = static_cast<uint32_t>(ir->CycleCount() + ir->ConditionFailedCycleCount());
-        const uint64_t end = LocationDescriptor(ir->EndLocation()).PC();
-        if (end <= pc || end - pc > 128) // defensive: same span rule as emit_block
-            return false;
-        block.original.resize(end - pc);
-        if (!mem_fetch(mem, pc, block.original.data(), block.original.size()))
-            return false;
+        if (region.total_ticks + block.ticks > REGION_MAX_TICKS)
+            continue;
         region.total_ticks += block.ticks;
         collect_targets(ir->GetTerminal(), stack);
+        if (ir->GetCondition() != Dynarmic::IR::Cond::AL
+            && ir->HasConditionFailedLocation())
+            stack.emplace_back(ir->ConditionFailedLocation());
         region.blocks.push_back(std::move(block));
         ir_blocks.push_back(std::move(*ir));
     }
-    // Apply the sorted-by-pc permutation to BOTH vectors (IR::Block is
-    // move-only; sort an index vector, then move-construct in order).
     std::vector<size_t> order(region.blocks.size());
-    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    for (size_t i = 0; i < order.size(); ++i)
+        order[i] = i;
     std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
         return region.blocks[a].pc < region.blocks[b].pc;
     });
     Region sorted;
+    sorted.total_ticks = region.total_ticks;
     std::vector<Dynarmic::IR::Block> sorted_ir;
     sorted_ir.reserve(order.size());
-    for (const size_t index : order) {
-        sorted.blocks.push_back(std::move(region.blocks[index]));
-        sorted_ir.push_back(std::move(ir_blocks[index]));
+    for (const auto i : order) {
+        sorted.blocks.push_back(std::move(region.blocks[i]));
+        sorted_ir.push_back(std::move(ir_blocks[i]));
     }
-    sorted.total_ticks = region.total_ticks;
+    collect_code_pages(sorted);
     region = std::move(sorted);
     ir_out = std::move(sorted_ir);
-    if (!region.blocks.empty()) {
-        region.page_begin = region.blocks.front().pc / 4096;
-        region.page_end = (region.blocks.back().pc + region.blocks.back().original.size() + 4095) / 4096;
-    }
     return !region.blocks.empty();
 }
 // --- end region formation -------------------------------------------------
 
-// Guest pages holding any cached JIT code (4 GiB / 4 KiB = 1 MiB bitmap).
-// checked_memory_write consults this so a store into a code page can be
-// observed by the region dispatch loop without host involvement.
-std::array<uint8_t, 1 << 20> g_code_pages{};
+// Wide reference counts: multiple CPUs and cached entries can share pages.
+std::array<uint32_t, 1 << 20> g_code_pages{};
 void mark_code_pages(const Region &region, int delta) {
-    for (uint64_t page = region.page_begin; page < region.page_end; ++page)
-        g_code_pages[page] = static_cast<uint8_t>(int(g_code_pages[page]) + delta);
+    for (const uint32_t page : region.code_pages) {
+        if (delta > 0)
+            ++g_code_pages[page];
+        else
+            --g_code_pages[page];
+    }
 }
 
 // Region-entry validation (replaces per-block unchanged()): revalidate the
@@ -180,7 +223,7 @@ void mark_code_pages(const Region &region, int delta) {
 // stores into code pages set g_code_pages, letting checked_memory_write flag
 // smc_dirty for an immediate Smc exit instead of waiting for this check.
 bool region_unchanged(const Region &region, MemState &mem) {
-    std::array<uint8_t, 128> bytes{};
+    std::array<uint8_t, REGION_MAX_CODE_BYTES> bytes{};
     for (const auto &block : region.blocks) {
         if (!mem_fetch(mem, block.pc, bytes.data(), block.original.size()))
             return false;
@@ -223,23 +266,27 @@ EMSCRIPTEN_KEEPALIVE uint32_t checked_memory_write(JitState *state, uint32_t add
     ++g_mem_writes;
     if (!valid_memory_size(bytes) || !state->memory_cookie)
         return memory_fault(*state, address, true);
-    // A store into a page holding cached JIT code must be observable by the
-    // region dispatch loop without host involvement (REGION_ABI smc_dirty).
-    if (g_code_pages[address >> 12])
-        state->smc_dirty = 1;
     auto *mem = reinterpret_cast<MemState *>(static_cast<uintptr_t>(state->memory_cookie));
     std::array<uint8_t, 16> value{};
     for (uint32_t i = 0; i < bytes; ++i)
         value[i] = static_cast<uint8_t>(state->memory_value[i / 4] >> ((i % 4) * 8));
     if (!mem_write(*mem, address, value.data(), bytes))
         return memory_fault(*state, address, true);
+    // Only successful writes dirty code. Widen before computing the range.
+    const uint64_t end = uint64_t(address) + bytes;
+    for (uint64_t page = address >> 12; page < (end + 4095) / 4096; ++page) {
+        if (g_code_pages[page]) {
+            state->smc_dirty = 1;
+            break;
+        }
+    }
     return 0;
 }
 } // namespace
 
-// Compilation alone crosses JS. Cache-hit execution and checked memory helpers
-// are native Wasm calls, not JS wrappers. Function pointers arrive as table
-// indices; wasmTable.get supplies the actual Wasm function references as imports.
+// Compilation and host entry into generated functions cross JS. Inside a
+// generated region, dispatch and checked memory helpers stay in Wasm.
+// Imported helper pointers arrive as table indices.
 EM_JS(int, vita3k_jit_install, (const uint8_t *bytes, unsigned length,
     MemoryFunction read_memory, MemoryFunction write_memory), {
     let slot = -1;
@@ -280,7 +327,7 @@ EM_JS(int, vita3k_jit_install_region, (const uint8_t *bytes, unsigned length,
     const freeSlots = Module['vita3kJitFreeSlots'] || (Module['vita3kJitFreeSlots'] = []);
     try {
         const raw = HEAPU8.slice(bytes, bytes + length);
-        if (typeof process !== 'undefined' && process.env?.VITA3K_DUMP_JIT) require('fs').writeFileSync('/tmp/jit-region.wasm', raw);
+        if (typeof process !== 'undefined' && process.env?.VITA3K_DUMP_JIT) require('fs').writeFileSync('/tmp/jit-region-' + arguments[2] + '-' + Date.now() + '.wasm', raw);
         const module = new WebAssembly.Module(raw);
         const instance = new WebAssembly.Instance(module, {env: {
             memory: wasmMemory,
@@ -323,7 +370,9 @@ struct WasmJitCPU::Impl {
     struct RegionEntry {
         std::shared_ptr<Region> region;
         int table_index = -1;
+        uint64_t last_used = 0;
     };
+    uint64_t region_clock = 0;
     CPUState *parent;
     std::size_t core;
     State state{};
@@ -347,15 +396,21 @@ struct WasmJitCPU::Impl {
         state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent->mem));
     }
     ~Impl() { clear(); }
+    void clear_regions() {
+        for (auto &[key, entry] : region_cache) {
+            if (entry.table_index >= 0) {
+                vita3k_jit_release_region(entry.table_index);
+                mark_code_pages(*entry.region, -1);
+            }
+        }
+        invalidated += region_cache.size();
+        region_cache.clear();
+    }
     void clear() {
         for (const auto &[key, block] : cache) vita3k_jit_release(block.table_index);
         invalidated += cache.size();
         cache.clear();
-        for (auto &[key, entry] : region_cache) {
-            if (entry.table_index >= 0) vita3k_jit_release_region(entry.table_index);
-            mark_code_pages(*entry.region, -1);
-        }
-        region_cache.clear();
+        clear_regions();
     }
     int fail(const char *reason) {
         error = reason;
@@ -389,6 +444,8 @@ struct WasmJitCPU::Impl {
         while (true) {
             if (stopped || breakpoint)
                 return 1;
+            if (remaining_budget == 0)
+                return 0;
             const uint32_t pc = state.regs[15];
             const auto loc = Dynarmic::A32::LocationDescriptor{pc,
                 Dynarmic::A32::PSR{state.cpsr}, Dynarmic::A32::FPSCR{state.fpscr}};
@@ -404,6 +461,17 @@ struct WasmJitCPU::Impl {
                 found = region_cache.end();
             }
             if (found == region_cache.end()) {
+                if (region_cache.size() >= REGION_CACHE_LIMIT) {
+                    const auto victim = std::min_element(region_cache.begin(), region_cache.end(),
+                        [](const auto &a, const auto &b) {
+                            return a.second.last_used < b.second.last_used;
+                        });
+                    vita3k_jit_release_region(victim->second.table_index);
+                    mark_code_pages(*victim->second.region, -1);
+                    region_cache.erase(victim);
+                    ++invalidated;
+                }
+                const double t0 = emscripten_get_now();
                 ++region_misses;
                 auto region = std::make_shared<Region>();
                 std::vector<Dynarmic::IR::Block> ir_blocks;
@@ -418,44 +486,49 @@ struct WasmJitCPU::Impl {
                     meta.push_back({region->blocks[i].pc, region->blocks[i].psr_mask,
                         region->blocks[i].psr_value, region->blocks[i].ticks});
                 }
-                const double t0 = emscripten_get_now();
                 const auto bytes = vita3k::wasmjit::emit_region(block_ptrs, meta);
                 emit_ms += emscripten_get_now() - t0;
                 if (bytes.empty())
                     return fail("region emission rejected (no fallback)");
+                // Allocate the map node before installing the JS function.
+                found = region_cache.emplace(key,
+                    RegionEntry{std::move(region), -1}).first;
                 const double t1 = emscripten_get_now();
                 const int slot = vita3k_jit_install_region(bytes.data(), bytes.size(),
                     checked_memory_read, checked_memory_write);
                 install_ms += emscripten_get_now() - t1;
-                if (slot < 0)
+                if (slot < 0) {
+                    region_cache.erase(found); // No pages were marked yet.
                     return fail("browser rejected generated region Wasm");
-                mark_code_pages(*region, +1);
-                RegionEntry entry{std::move(region), slot};
-                found = region_cache.emplace(key, std::move(entry)).first;
+                }
+                found->second.table_index = slot;
+                mark_code_pages(*found->second.region, +1);
                 ++regions;
             }
             ++hits;
+            found->second.last_used = ++region_clock;
+            if (log_code)
+                std::fprintf(stderr, "JIT region PC=%08x blocks=%zu\n",
+                    pc, found->second.region->blocks.size());
             // Refresh per-run state fields (bases are stable but cheap).
             state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent->mem));
             state.smc_dirty = 0;
-            state.stop_flag = 0;
+            // stop() owns an atomic request. Mirror it at entry and return
+            // to the atomic host check at least every REGION_CALL_TICKS.
+            // Event-loop yielding remains the worker scheduler's job.
+            state.stop_flag = stopped.load() ? 1u : 0u;
             state.exit_reason = 0;
             state.svc = 0;
             const uint32_t state_offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&state));
-            const uint32_t call_budget = static_cast<uint32_t>(std::min<uint64_t>(remaining_budget, 0x7fffffffu));
+            const uint32_t call_budget = static_cast<uint32_t>(std::min<uint64_t>(remaining_budget, REGION_CALL_TICKS));
             const uint32_t executed_before = state.executed;
             const uint32_t dispatches_before = state.dispatches;
             const double t2 = emscripten_get_now();
             const uint32_t reason = vita3k_jit_run(found->second.table_index, state_offset, call_budget);
             run_js_ms += emscripten_get_now() - t2;
             ++js_calls;
-            dispatches += state.dispatches >= dispatches_before
-                ? state.dispatches - dispatches_before : state.dispatches;
-            const uint32_t executed_now = state.executed; // monotonic in region modules
-            // A single-block step() between region calls resets the counter;
-            // then `after` alone is what this region executed since the reset.
-            const uint32_t delta = executed_now >= executed_before
-                ? executed_now - executed_before : executed_now;
+            dispatches += counter_delta(dispatches_before, state.dispatches);
+            const uint32_t delta = counter_delta(executed_before, state.executed);
             if (delta > call_budget)
                 return fail("generated region overran its budget");
             executed += delta;
@@ -467,6 +540,15 @@ struct WasmJitCPU::Impl {
                 ++svc_exits;
                 return 0;
             case ExitReason::Fault: {
+                // No rollback: completed blocks and the instructions before the
+                // faulting memory op already executed architecturally
+                // (REGION_ABI), and the checked helpers validate the whole
+                // access before writing, so the faulting instruction left no
+                // partial effects. What IS stale is the PC: region bodies
+                // write regs[15] only at terminals, so it still points at the
+                // block entry. Point it at the faulting instruction
+                // (fault_pc), matching single-block faults.
+                state.regs[15] = state.fault_pc;
                 char message[96];
                 std::snprintf(message, sizeof(message), "guest memory %s fault at %08x (pc %08x)",
                     state.fault_write ? "write" : "read", state.fault_address, state.fault_pc);
@@ -477,25 +559,23 @@ struct WasmJitCPU::Impl {
                 continue;
             case ExitReason::Budget:
                 ++budget_exits;
-                if (remaining_budget == 0 || state.executed == budget_progress_mark)
-                    return 0; // exhausted cleanly; no block fits (or nothing left)
+                // True exhaustion (budget fully consumed) is an error, exactly
+                // like single-block mode and the interpreter oracle: the
+                // budget is a runaway guard, not a completion.
+                if (remaining_budget == 0)
+                    return fail("instruction budget exhausted");
+                // No forward progress: the next block cannot fit the remaining
+                // budget slice. Report a clean slice boundary so the caller
+                // can re-grant; not an error, and not a livelock.
+                if (state.executed == budget_progress_mark)
+                    return 0;
                 budget_progress_mark = state.executed;
                 continue; // re-enter with the remaining budget
             case ExitReason::Smc:
                 ++smc_exits;
-                // Drop every region touching dirty pages; the dispatch loop
-                // will re-form from the current PC.
-                for (auto it = region_cache.begin(); it != region_cache.end();) {
-                    const Region &r = *it->second.region;
-                    const uint64_t page = state.next_pc >> 12; // dirty page from the store
-                    if (page >= r.page_begin && page < r.page_end) {
-                        vita3k_jit_release_region(it->second.table_index);
-                        mark_code_pages(r, -1);
-                        it = region_cache.erase(it);
-                        ++invalidated;
-                    } else
-                        ++it;
-                }
+                // next_pc is a continuation, not the modified address.
+                // A Boolean dirty flag requires conservative invalidation.
+                clear_regions();
                 state.smc_dirty = 0;
                 continue;
             case ExitReason::Stop:
@@ -570,9 +650,8 @@ struct WasmJitCPU::Impl {
             state.fault_write = 0;
             state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent->mem));
             const State before = state;
-            // Generated modules do not throw C++ exceptions. noexcept is vital:
-            // otherwise Emscripten lowers this to invoke_ii (a JS trampoline),
-            // not a direct Wasm call_indirect. Guest faults use return reasons.
+            // Host entry currently uses the EM_JS trampoline below.
+            // Guest faults use return reasons; checked helpers are Wasm imports.
             const uint32_t state_offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&state));
             const double t2 = emscripten_get_now();
             const uint32_t reason = vita3k_jit_call(found->second.table_index, state_offset);
@@ -617,8 +696,13 @@ int WasmJitCPU::run() {
     impl->parent->svc_called = false;
     impl->error.clear();
     const auto start = impl->executed;
-    if (impl->region_mode)
-        return impl->execute_regions(impl->budget - (impl->executed - start));
+    if (impl->region_mode) {
+        try {
+            return impl->execute_regions(impl->budget);
+        } catch (const std::exception &e) {
+            return impl->fail(e.what());
+        }
+    }
     while (impl->executed - start < impl->budget) {
         if (impl->stopped || impl->breakpoint) return 1;
         const uint32_t limit = std::min<uint64_t>(32, impl->budget - (impl->executed - start));

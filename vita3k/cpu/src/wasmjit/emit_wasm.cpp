@@ -102,6 +102,7 @@ public:
         next_local = 7;
     }
 
+    uint32_t meta_entry_pc_for_dbg() const { return start.PC(); }
     Bytes run() {
         bool has_memory = false;
         for (const Inst &inst : block) {
@@ -505,7 +506,10 @@ private:
         op(Br); uleb(code, body_index + extra_labels);
     }
 
-    void set_next_pc_runtime() { get(0); get(3); store(offsetof(JitState, next_pc)); }
+    void set_next_pc_runtime() {
+        get(0); load(offsetof(JitState, regs) + 15 * sizeof(uint32_t));
+        store(offsetof(JitState, next_pc));
+    }
 
     bool is_member(const Location &loc) const {
         for (const Dynarmic::IR::Block *m : *members)
@@ -619,6 +623,7 @@ public:
             has_bx |= inst.GetOpcode() == Op::A32BXWritePC;
         for (const Inst &inst : block) {
             if (svc || !instruction(inst)) {
+                ok = false; // Never publish a partially emitted body.
                 if (rejection.empty())
                     rejection = std::string("instruction ") + Dynarmic::IR::GetNameOf(inst.GetOpcode());
                 return;
@@ -693,10 +698,9 @@ private:
         case Op::LeastSignificantHalf: arg(0); mask(0xffff); break;
         case Op::LeastSignificantWord: arg(0); break;
         case Op::MostSignificantWord:
-            // Word 1 is the result; like the x64 backend's shr(r64, 32), the
-            // carry pseudo is the bit shifted out: bit 0 of word 1.
+            // SHR by 32 returns word 1; its carry is original bit 31.
             value_word(inst.GetArg(0), 1); set(next_local);
-            value_word(inst.GetArg(0), 1); mask(1); set(next_local + 4);
+            value_word(inst.GetArg(0), 0); imm(31); op(ShrU); set(next_local + 4);
             return ok;
         case Op::LogicalShiftRight64:
             // U64 result: publish both words via the i64 scratch local,
@@ -709,7 +713,10 @@ private:
             return ok;
         case Op::SignExtendByteToWord: arg(0); imm(24); op(Shl); imm(24); op(ShrS); break;
         case Op::SignExtendHalfToWord: arg(0); imm(16); op(Shl); imm(16); op(ShrS); break;
-        case Op::ZeroExtendWordToLong: value_word(inst.GetArg(0)); break;
+        case Op::ZeroExtendWordToLong:
+            value_word(inst.GetArg(0)); set(next_local);
+            imm(0); set(next_local + 1); // Region bodies reuse these locals.
+            return ok;
         case Op::ZeroExtendByteToWord: arg(0); mask(0xff); break;
         case Op::ZeroExtendHalfToWord: arg(0); mask(0xffff); break;
         case Op::ConditionalSelect32:
@@ -881,15 +888,17 @@ std::vector<uint8_t> emit_region(
     for (size_t i = 0; i < n; ++i) {
         Emitter emitter(*blocks[i], unsigned(i), blocks);
         bodies[i] = emitter.region_body();
-        if (bodies[i].empty())
+        if (bodies[i].empty()) {
             return {};
+        }
         max_ssa = std::max(max_ssa, emitter.ssa_words());
     }
 
     // Dispatch prologue + static PC search tree + br_table.
     Bytes d;
     const auto exit_with = [&](ExitReason reason) {
-        b_get(d, 0); b_get(d, 3); b_store(d, offsetof(JitState, next_pc));
+        b_get(d, 0); b_load(d, offsetof(JitState, regs) + 15 * sizeof(uint32_t));
+        b_store(d, offsetof(JitState, next_pc));
         b_get(d, 0); b_imm(d, static_cast<uint32_t>(reason)); b_store(d, offsetof(JitState, exit_reason));
         b_imm(d, static_cast<uint32_t>(reason)); b_op(d, Return);
     };
