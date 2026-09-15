@@ -13,7 +13,7 @@ node build/web/browser/vita3k_jit_backend_test_node.js
 Compiles `vita3k/cpu/tests/wasmjit_backend_test.cpp` (which includes the backend
 `wasm_jit_cpu.cpp` so it can call the checked helpers directly) to a Node
 executable and runs it in Node's Wasm engine. Expected last line:
-`WasmJit backend: 778 checks passed (real memory, no interpreter)`.
+`WasmJit backend: 834 checks passed (real memory, no interpreter)`.
 
 ## Emitter fixture suite (real Dynarmic IR → Wasm modules, run in Node)
 

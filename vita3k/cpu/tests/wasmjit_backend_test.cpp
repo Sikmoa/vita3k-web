@@ -915,6 +915,142 @@ void region_store_continuations(MemState &mem) {
     CHECK(points.size() == 4);
     CHECK(Location(merged.EndLocation()).PC() == code + 20);
 }
+// M16 Wasm-side dispatch pump: inter-region transfers without host exits.
+// Region A (LDR r1,[pc]; BX r1) Miss-exits with next_pc=codeB; region B adds
+// and SVCs. Loop region C and Thumb loop region T exercise slice/budget and
+// the location-hash key paths. All expectations mirror host semantics.
+void dispatch_pump(MemState &mem) {
+    using Reason = vita3k::wasmjit::ExitReason;
+    using Location = Dynarmic::A32::LocationDescriptor;
+    static bool installed = false;
+    if (!installed) {
+        const auto dbytes = vita3k::wasmjit::emit_dispatch();
+        CHECK(!dbytes.empty());
+        CHECK(vita3k_jit_install_dispatch(dbytes.data(), dbytes.size()) == 0);
+        installed = true;
+    }
+    constexpr uint32_t codeB = code + 0x100, codeC = code + 0x200, codeT = code + 0x300;
+    std::vector<Region> kept;
+    std::vector<int> slots;
+    const auto install_region = [&](uint32_t entry, uint32_t cpsr) {
+        Region region;
+        std::vector<Dynarmic::IR::Block> ir;
+        CHECK(form_region(mem, entry, cpsr, 0, region, ir));
+        std::vector<const Dynarmic::IR::Block *> blocks;
+        std::vector<vita3k::wasmjit::RegionBlockMeta> meta;
+        uint32_t ticks = 0;
+        for (size_t i = 0; i < ir.size(); ++i) {
+            blocks.push_back(&ir[i]);
+            const auto &b = region.blocks[i];
+            meta.push_back({b.pc, b.psr_mask, b.psr_value, b.ticks, b.store_continuations});
+            ticks += b.ticks;
+        }
+        const auto bytes = vita3k::wasmjit::emit_region(blocks, meta);
+        CHECK(!bytes.empty());
+        const int slot = vita3k_jit_install_region(bytes.data(), bytes.size(),
+            checked_memory_read, checked_memory_write);
+        CHECK(slot >= 0);
+        mark_code_pages(region, +1);
+        slots.push_back(slot);
+        const uint64_t key = Location(entry, Dynarmic::A32::PSR{cpsr}, Dynarmic::A32::FPSCR{0}).UniqueHash();
+        CHECK(dispatch_map_insert(key, static_cast<uint32_t>(slot)));
+        kept.push_back(std::move(region));
+        return ticks;
+    };
+    const auto fresh = [&](uint32_t entry, uint32_t cpsr) {
+        JitState state{};
+        state.regs[15] = entry;
+        state.cpsr = cpsr;
+        state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mem));
+        state.page_table_base = reinterpret_cast<uint32_t>(mem.page_table.get());
+        state.page_perms_base = reinterpret_cast<uint32_t>(mem.page_permissions.get());
+        state.code_pages_base = reinterpret_cast<uint32_t>(g_code_pages.data());
+        return state;
+    };
+    const auto drun = [&](JitState &state, uint32_t remaining) {
+        return static_cast<Reason>(vita3k_jit_run_dispatch(
+            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&state)),
+            remaining, dispatch_map_base(), dispatch_epoch_addr()));
+    };
+    // A: LDR r1,[pc,#4]; BX r1; NOP; .word codeB (literal at code+12).
+    CHECK(mem_write(mem, code, std::array<uint32_t, 4>{0xe59f1004, 0xe12fff31, 0xe1a00000, codeB}.data(), 16));
+    const uint32_t aTicks = install_region(code, 0x10);
+    // B: ADD r0,r0,#1; SVC. Ends Svc with r0 == 1.
+    CHECK(mem_write(mem, codeB, std::array<uint32_t, 2>{0xe2800001, 0xef000042}.data(), 8));
+    const uint32_t bTicks = install_region(codeB, 0x10);
+    CHECK(bTicks == 2);
+    // A -> B -> Svc in one dispatcher call: exactly one in-Wasm transfer.
+    auto state = fresh(code, 0x10);
+    CHECK(drun(state, 100) == Reason::Svc);
+    CHECK(state.regs[0] == 1 && state.executed == aTicks + bTicks);
+    CHECK(state.tx_wasm == 1 && state.next_pc == codeB + 8);
+    // SVC wins over budget at an exact boundary (remaining == A+B cost).
+    state = fresh(code, 0x10);
+    CHECK(drun(state, aTicks + bTicks) == Reason::Svc);
+    CHECK(state.executed == aTicks + bTicks);
+    // Transfer immediately before exhaustion: A completes, B cannot start.
+    // B re-resolves once with zero progress, then Budget surfaces.
+    state = fresh(code, 0x10);
+    CHECK(drun(state, aTicks + 1) == Reason::Budget);
+    CHECK(state.executed == aTicks && state.tx_wasm == 2);
+    CHECK(state.next_pc == codeB);
+    // C: ADD r0,r0,#1; B C. Ticks per iteration drive slice accounting.
+    CHECK(mem_write(mem, codeC, std::array<uint32_t, 2>{0xe2800001, 0xeafffffd}.data(), 8));
+    const uint32_t cTicks = install_region(codeC, 0x10);
+    CHECK(cTicks == 2);
+    // remaining = 0: Budget with no work, matching the host loop top.
+    state = fresh(codeC, 0x10);
+    CHECK(drun(state, 0) == Reason::Budget);
+    CHECK(state.executed == 0 && state.tx_wasm == 0);
+    // remaining < one iteration: entry check fails, no progress -> Budget.
+    state = fresh(codeC, 0x10);
+    CHECK(drun(state, 1) == Reason::Budget);
+    CHECK(state.executed == 0 && state.next_pc == codeC);
+    // Exact single iteration then exhaustion: full consumption -> Budget.
+    state = fresh(codeC, 0x10);
+    CHECK(drun(state, cTicks) == Reason::Budget);
+    CHECK(state.executed == cTicks && state.regs[0] == 1);
+    // Non-divisible total: two iterations plus a fruitless third slice.
+    state = fresh(codeC, 0x10);
+    CHECK(drun(state, 2 * cTicks + 1) == Reason::Budget);
+    CHECK(state.executed == 2 * cTicks && state.regs[0] == 2);
+    CHECK(state.tx_wasm == 1);
+    // stop_flag short-circuits the pump.
+    state = fresh(codeC, 0x10);
+    state.stop_flag = 1;
+    CHECK(drun(state, 100) == Reason::Stop);
+    CHECK(state.executed == 0);
+    // Unknown PC: Miss with next_pc published, nothing executed.
+    state = fresh(0x83000000, 0x10);
+    CHECK(drun(state, 100) == Reason::Miss);
+    CHECK(state.next_pc == 0x83000000 && state.executed == 0);
+    // Stale epoch: previously mapped entry now Misses; re-insert recovers.
+    dispatch_bump_epoch();
+    state = fresh(code, 0x10);
+    CHECK(drun(state, 100) == Reason::Miss);
+    CHECK(state.next_pc == code && state.executed == 0);
+    const uint64_t akey = Location(code, Dynarmic::A32::PSR{0x10}, Dynarmic::A32::FPSCR{0}).UniqueHash();
+    const uint64_t bkey = Location(codeB, Dynarmic::A32::PSR{0x10}, Dynarmic::A32::FPSCR{0}).UniqueHash();
+    const uint64_t ckey = Location(codeC, Dynarmic::A32::PSR{0x10}, Dynarmic::A32::FPSCR{0}).UniqueHash();
+    CHECK(dispatch_map_insert(akey, static_cast<uint32_t>(slots[0])));
+    CHECK(dispatch_map_insert(bkey, static_cast<uint32_t>(slots[1])));
+    CHECK(dispatch_map_insert(ckey, static_cast<uint32_t>(slots[2])));
+    state = fresh(code, 0x10);
+    CHECK(drun(state, 100) == Reason::Svc);
+    CHECK(state.regs[0] == 1 && state.tx_wasm == 1);
+    // Thumb entry resolve exercises T-bit key computation end to end.
+    CHECK(mem_write(mem, codeT, std::array<uint32_t, 1>{0xe7fd3001}.data(), 4));
+    const uint32_t tTicks = install_region(codeT, 0x30);
+    CHECK(tTicks == 2);
+    state = fresh(codeT, 0x30);
+    CHECK(drun(state, 2 * tTicks) == Reason::Budget);
+    CHECK(state.executed == 2 * tTicks && state.regs[0] == 2);
+    CHECK(state.regs[15] == codeT);
+    for (int slot : slots)
+        vita3k_jit_release_region(slot);
+    for (auto &r : kept)
+        mark_code_pages(r, -1);
+}
 } // namespace
 
 int main() {
@@ -929,6 +1065,7 @@ int main() {
     region_budget_continuations(mem);
     region_regressions(mem);
     region_store_continuations(mem);
+    dispatch_pump(mem);
     deinit_mem(mem);
     std::printf("WasmJit backend: %u checks passed (real memory, no interpreter)\n", checks);
 }

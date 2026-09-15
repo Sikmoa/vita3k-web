@@ -358,3 +358,56 @@ per-call scratch, NOT saved across fault rollbacks.
 
 Per-phase ms (emit/install/run), js_calls (region entries), misses, svc,
 fault, smc, stop, budget exits, dispatches, mem helper call counts.
+
+## M16 Wasm-side multi-region dispatch pump
+
+Steady-state region->region transfers stay inside Wasm. The host compiles
+regions exactly as before; a small dispatcher module (one function
+`dispatch(state, remaining, map_base, epoch_addr) -> ExitReason`, built once
+by `emit_dispatch`) chains them through a host-shared funcref table:
+
+```text
+host -> dispatch -> region A -Miss-> lookup(B) -> region B -Miss-> ...
+       -> host only on Svc/Fault/Stop/Smc/Budget-boundary/true-miss/overrun
+```
+
+Transfer lookup is an open-addressed guest-location-hash -> table-slot map
+in linear memory (2048 x 16B entries `{key_lo, key_hi, slot, epoch}`,
+empty = epoch 0). The key is the region-cache `UniqueHash(pc, cpsr, fpscr)`
+recomputed in Wasm; the hash/index function is shared verbatim with the
+host (`dispatch_map_index`). Entries carry the map epoch at insert; the
+dispatcher only matches entries whose epoch equals `*epoch_addr`. The host
+bumps the epoch on EVERY region eviction, so stale slots can never match;
+released table slots are additionally nulled (a missed guard would trap
+loudly instead of executing the wrong region).
+
+Per pump iteration the dispatcher: checks `stop_flag`, clamps a
+`REGION_CALL_TICKS` slice out of the remaining budget, `call_indirect`s the
+slot, verifies the region reported no more ticks than its slice (else
+`DispatchReason::RegionOverrun`, which the host fails like the equivalent
+single-region overrun), and routes the reason. `Miss` with a mapped target
+chains in-Wasm (`tx_wasm++`); unmapped targets return `Miss` with `next_pc`
+published, and the host resolves-or-compiles through the unchanged
+loop-top path. `Svc`/`Fault`/`Stop` pass through untouched so the host's
+pre-switch SMC normalization and all exit handling behave exactly as in
+host-driven execution. `Smc` with pending dirt routes to the host
+normalizer rather than chaining into a stale region. `Budget` returns to
+the host at exhaustion/no-progress boundaries only, so the existing
+budget-exhaustion-fail and clean-slice semantics (and their tests) are
+unchanged; internal slice continues stay in the pump.
+
+`Miss` intentionally keeps its single meaning ("next_pc published, resolve
+or compile"); the compile-vs-cached distinction lives on the host, which
+holds the authoritative `region_cache` (the Wasm map is a hint cache: on a
+dispatcher Miss the host looks up the full key, refreshes the map entry on
+a hit, or forms/compiles/installs/inserts on a true miss).
+
+Termination mirrors the host loop: `left == 0` returns `Budget` (the host
+fails on full consumption, as before), and a `Budget` return with no
+forward progress since pump entry returns `Budget` (the host reports the
+clean slice boundary). No exact-zero reliance: all comparisons are
+`>=`/`==`-on-empty, and slices are clamped, never assumed to divide the
+total. `JitState.tx_wasm` counts chained transfers per call (host
+accumulates like `dispatches`); `host_miss` counts dispatcher Miss returns
+(~all resolve to compiled regions at the loop top; true compiles remain
+`region_misses`).

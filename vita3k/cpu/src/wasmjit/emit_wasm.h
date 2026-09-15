@@ -60,6 +60,10 @@ struct JitState {
     uint32_t mem_fast_reads;  // +404 inline fast-path reads this call
     uint32_t mem_fast_writes; // +408 inline fast-path writes this call
     uint32_t smc_page;        // +412 code page that triggered smc_dirty
+    // M16 Wasm-side dispatch pump (REGION_ABI.md): per-dispatcher-call tally
+    // of region->region transfers completed inside Wasm. The host accumulates
+    // it into process counters the same way it does `dispatches`.
+    uint32_t tx_wasm;         // +416 in-Wasm cached-region transfers
 };
 static_assert(std::is_standard_layout_v<JitState>);
 static_assert(offsetof(JitState, memory_cookie) == 84);
@@ -77,7 +81,8 @@ static_assert(offsetof(JitState, code_pages_base) == 400);
 static_assert(offsetof(JitState, mem_fast_reads) == 404);
 static_assert(offsetof(JitState, mem_fast_writes) == 408);
 static_assert(offsetof(JitState, smc_page) == 412);
-static_assert(sizeof(JitState) == 416);
+static_assert(offsetof(JitState, tx_wasm) == 416);
+static_assert(sizeof(JitState) == 420);
 
 // Emits an MVP Wasm module importing env.memory (unshared, min 1 page)
 // and env.mem_read/env.mem_write: (stateOffset i32, address i32, bytes i32)->i32.
@@ -178,5 +183,49 @@ std::vector<uint8_t> emit_region(
 // and discarding one-block Wasm modules for every candidate successor.
 bool validate_region_block(const Dynarmic::IR::Block &block,
     const std::vector<StoreContinuation> &store_continuations = {});
+
+// M16 Wasm-side multi-region dispatcher (REGION_ABI.md).
+// The dispatcher pumps already-compiled region run() functions through a
+// host-shared funcref table, resolving transfer targets through an
+// open-addressed guest-location -> table-slot map in linear memory.
+//
+// Map entry (16 bytes, host-written, dispatcher-read):
+//   +0 key_lo  low 32 bits of the region-cache location hash
+//   +4 key_hi  high 32 bits of the region-cache location hash
+//   +8 slot    shared-table index of the region's run function
+//   +12 epoch  map epoch at insert; must equal *epoch_addr to match
+// An entry with epoch == 0 was never written and terminates probing.
+// Stale entries (epoch mismatch) are skipped on lookup and overwritten on
+// insert. The host bumps *epoch_addr on EVERY region eviction, so a stale
+// slot can never match; table slots are additionally nulled on release.
+// Map capacity is fixed (kDispatchMapEntries, power of two); the host keeps
+// live regions far below it (REGION_CACHE_LIMIT) and fails loudly if an
+// insert finds no reusable slot within kDispatchMaxProbe.
+//
+// mrun(state, remaining, map_base, epoch_addr) -> ExitReason runs the pump:
+// entry and every transfer resolve (pc, cpsr, fpscr) to the location hash
+// exactly like the host region cache, probe the map, and call_indirect the
+// slot with a REGION_CALL_TICKS-clamped slice of the remaining budget.
+// Stop is checked per transfer from state.stop_flag. Regions returning Miss
+// with a mapped target chain inside Wasm (tx_wasm++); unmapped targets,
+// Svc, Fault, Stop, Smc and slice-exhausted Budget return to the host with
+// next_pc published exactly as a single-region run would. A region reporting
+// more ticks than its slice returns DispatchOverrun (host fails, as it does
+// for the equivalent single-region overrun today).
+constexpr uint32_t kDispatchMapEntries = 2048;
+constexpr uint32_t kDispatchMapMask = kDispatchMapEntries - 1;
+constexpr uint32_t kDispatchMaxProbe = 64;
+constexpr uint32_t kDispatchEntryBytes = 16;
+constexpr uint32_t kDispatchTableLimit = 512;
+constexpr uint32_t kDispatchSliceTicks = 131072; // == REGION_CALL_TICKS
+// Hash must be bit-identical to dispatch_map_index() in wasm_jit_cpu.cpp.
+constexpr uint32_t kDispatchHashK = 0x9e3779b9u;
+inline uint32_t dispatch_map_index(uint32_t key_lo, uint32_t key_hi) {
+    return (key_lo ^ (key_hi * kDispatchHashK)) & kDispatchMapMask;
+}
+enum class DispatchReason : uint32_t {
+    RegionOverrun = 8, // region reported more ticks than its slice
+};
+std::vector<uint8_t> emit_dispatch();
 
 } // namespace vita3k::wasmjit

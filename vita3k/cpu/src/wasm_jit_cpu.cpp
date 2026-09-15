@@ -316,6 +316,59 @@ void account_fast_counters(JitState &state) noexcept {
     state.mem_fast_writes = 0;
 }
 
+// M16 Wasm-side dispatch map (see emit_wasm.h): open-addressed
+// location-hash -> table-slot cache in linear memory, read by generated
+// dispatcher code. Plain statics: on wasm32 their addresses ARE linear
+// offsets, exactly like the page-table bases the JIT already exposes.
+// Entry layout: {key_lo, key_hi, slot, epoch}; epoch 0 = never written.
+static uint32_t dispatch_map[vita3k::wasmjit::kDispatchMapEntries * 4] = {};
+static uint32_t dispatch_epoch = 1;
+static uint32_t dispatch_map_base() {
+    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&dispatch_map[0]));
+}
+static uint32_t dispatch_epoch_addr() {
+    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&dispatch_epoch));
+}
+// Every region-cache removal path must bump the epoch (stale entries can
+// never match afterwards); table slots are nulled on release as backup.
+static void dispatch_bump_epoch() noexcept {
+    ++dispatch_epoch;
+    if (dispatch_epoch == 0) { // Never use the never-written marker.
+        std::memset(dispatch_map, 0, sizeof(dispatch_map));
+        dispatch_epoch = 1;
+    }
+}
+// Insert or refresh; bit-identical probing to the dispatcher emitter.
+// Returns false only if no reusable slot exists within the probe limit
+// (impossible at REGION_CACHE_LIMIT << map size; fails loudly if hit).
+static bool dispatch_map_insert(uint64_t key, uint32_t slot) noexcept {
+    using namespace vita3k::wasmjit;
+    const uint32_t lo = static_cast<uint32_t>(key);
+    const uint32_t hi = static_cast<uint32_t>(key >> 32);
+    uint32_t idx = dispatch_map_index(lo, hi);
+    for (uint32_t i = 0; i < kDispatchMaxProbe; ++i) {
+        uint32_t *e = &dispatch_map[(idx & kDispatchMapMask) * 4];
+        if (e[3] == dispatch_epoch && e[0] == lo && e[1] == hi) {
+            e[2] = slot; // refresh existing mapping
+            return true;
+        }
+        idx++;
+    }
+    idx = dispatch_map_index(lo, hi);
+    for (uint32_t i = 0; i < kDispatchMaxProbe; ++i) {
+        uint32_t *e = &dispatch_map[(idx & kDispatchMapMask) * 4];
+        if (e[3] != dispatch_epoch) { // empty or stale: overwrite
+            e[0] = lo;
+            e[1] = hi;
+            e[2] = slot;
+            e[3] = dispatch_epoch;
+            return true;
+        }
+        idx++;
+    }
+    return false;
+}
+
 bool valid_memory_size(uint32_t bytes) noexcept {
     return bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8 || bytes == 16;
 }
@@ -401,6 +454,14 @@ EM_JS(void, vita3k_jit_release, (int slot), {
 // Region modules export run(state, budget) -> reason instead of block(state).
 // The HOST calls run via EM_JS (never call_indirect from Wasm), so region
 // functions live in a JS map keyed by slot — no shared-table slot aliasing.
+// M16: region run functions are ALSO published into a host-shared funcref
+// table so the Wasm-side dispatcher can call_indirect them without host
+// round-trips. Table slots reuse the JS-map slot namespace (bounded by
+// REGION_CACHE_LIMIT, far below the initial table size).
+EM_JS(void, vita3k_jit_table_ensure, (), {
+    if (!Module['vita3kJitTable'])
+        Module['vita3kJitTable'] = new WebAssembly.Table({initial: 512, element: 'anyfunc'});
+});
 EM_JS(int, vita3k_jit_install_region, (const uint8_t *bytes, unsigned length,
     MemoryFunction read_memory, MemoryFunction write_memory), {
     const regions = Module['vita3kJitRegions'] || (Module['vita3kJitRegions'] = new Map());
@@ -419,6 +480,11 @@ EM_JS(int, vita3k_jit_install_region, (const uint8_t *bytes, unsigned length,
         if (typeof run !== 'function') throw new Error('region module does not export run');
         slot = freeSlots.length ? freeSlots.pop() : regions.size;
         regions.set(slot, run);
+        const table = Module['vita3kJitTable'];
+        if (table) {
+            while (slot >= table.length) table.grow(256);
+            table.set(slot, run);
+        }
         return slot;
     } catch (error) {
         if (slot >= 0) {
@@ -429,6 +495,32 @@ EM_JS(int, vita3k_jit_install_region, (const uint8_t *bytes, unsigned length,
         return -1;
     }
 });
+// The multi-region dispatcher module is built once per process; it imports
+// the shared region table and the same linear memory as the regions.
+EM_JS(int, vita3k_jit_install_dispatch, (const uint8_t *bytes, unsigned length), {
+    try {
+        const raw = HEAPU8.slice(bytes, bytes + length);
+        if (typeof process !== 'undefined' && process.env?.VITA3K_DUMP_JIT) require('fs').writeFileSync('/tmp/jit-dispatch.wasm', raw);
+        if (!Module['vita3kJitTable'])
+            Module['vita3kJitTable'] = new WebAssembly.Table({initial: 512, element: 'anyfunc'});
+        const module = new WebAssembly.Module(raw);
+        const instance = new WebAssembly.Instance(module, {env: {
+            memory: wasmMemory,
+            region_table: Module['vita3kJitTable']
+        }});
+        const dispatch = instance.exports.dispatch;
+        if (typeof dispatch !== 'function') throw new Error('dispatch module does not export dispatch');
+        Module['vita3kJitDispatch'] = dispatch;
+        return 0;
+    } catch (error) {
+        console.error('Vita3K JIT dispatch compilation failed:', error);
+        return -1;
+    }
+});
+EM_JS(uint32_t, vita3k_jit_run_dispatch, (uint32_t state, uint32_t remaining, uint32_t map_base, uint32_t epoch_addr), {
+    const fn = Module['vita3kJitDispatch'];
+    return fn(state, remaining, map_base, epoch_addr);
+});
 EM_JS(uint32_t, vita3k_jit_run, (int slot, uint32_t state, uint32_t budget), {
     const fn = Module['vita3kJitRegions'].get(slot);
     return fn(state, budget);
@@ -436,6 +528,11 @@ EM_JS(uint32_t, vita3k_jit_run, (int slot, uint32_t state, uint32_t budget), {
 EM_JS(void, vita3k_jit_release_region, (int slot), {
     Module['vita3kJitRegions'].delete(slot);
     (Module['vita3kJitFreeRegionSlots'] || (Module['vita3kJitFreeRegionSlots'] = [])).push(slot);
+    // Null the shared-table entry too; the epoch guard makes it unreachable,
+    // this only converts a hypothetical bug into a loud trap instead of
+    // silent wrong-region execution.
+    const table = Module['vita3kJitTable'];
+    if (table && slot < table.length) table.set(slot, null);
 });
 
 struct WasmJitCPU::Impl {
@@ -467,6 +564,11 @@ struct WasmJitCPU::Impl {
     uint64_t js_calls = 0, misses = 0, svc_exits = 0, budget_exits = 0;
     // Region-mode profiling.
     uint64_t regions = 0, region_misses = 0, smc_exits = 0, dispatches = 0;
+    // M16 pump counters: in-Wasm chained transfers (tx_wasm) vs dispatcher
+    // Miss returns to the host (host_miss; ~all resolve to compiled regions
+    // at the loop top, true compiles are region_misses).
+    uint64_t tx_wasm = 0, host_miss = 0;
+    bool dispatch_installed = false;
     // Region mode is the production path (M14c); single-block execution
     // remains for step() and the single-block module suite.
     bool region_mode = true;
@@ -488,8 +590,10 @@ struct WasmJitCPU::Impl {
         }
         invalidated += region_cache.size();
         region_cache.clear();
+        dispatch_bump_epoch();
     }
     void clear_regions_for_page(uint32_t page) {
+        bool erased = false;
         for (auto it = region_cache.begin(); it != region_cache.end();) {
             const Region &region = *it->second.region;
             if (!std::binary_search(region.code_pages.begin(), region.code_pages.end(), page)) {
@@ -501,7 +605,10 @@ struct WasmJitCPU::Impl {
             mark_code_pages(region, -1);
             it = region_cache.erase(it);
             ++invalidated;
+            erased = true;
         }
+        if (erased)
+            dispatch_bump_epoch();
     }
     void clear() {
         for (const auto &[key, block] : cache) vita3k_jit_release(block.table_index);
@@ -543,6 +650,20 @@ struct WasmJitCPU::Impl {
                 return 1;
             if (remaining_budget == 0)
                 return fail("instruction budget exhausted");
+            // M16: the shared region table must exist before any region
+            // install in this iteration publishes into it (installs that
+            // run before the first dispatcher setup would otherwise leave
+            // null slots behind and trap the pump's call_indirect). The
+            // dispatcher module itself is installed once, lazily, here.
+            if (!dispatch_installed) {
+                vita3k_jit_table_ensure();
+                const auto dbytes = vita3k::wasmjit::emit_dispatch();
+                if (dbytes.empty())
+                    return fail("dispatch emission rejected");
+                if (vita3k_jit_install_dispatch(dbytes.data(), dbytes.size()) < 0)
+                    return fail("browser rejected dispatch Wasm");
+                dispatch_installed = true;
+            }
             const uint32_t pc = state.regs[15];
             const auto loc = Dynarmic::A32::LocationDescriptor{pc,
                 Dynarmic::A32::PSR{state.cpsr}, Dynarmic::A32::FPSCR{state.fpscr}};
@@ -555,6 +676,7 @@ struct WasmJitCPU::Impl {
                 mark_code_pages(*found->second.region, -1);
                 region_cache.erase(found);
                 ++invalidated;
+                dispatch_bump_epoch();
                 found = region_cache.end();
             }
             if (found == region_cache.end()) {
@@ -567,6 +689,7 @@ struct WasmJitCPU::Impl {
                     mark_code_pages(*victim->second.region, -1);
                     region_cache.erase(victim);
                     ++invalidated;
+                    dispatch_bump_epoch();
                 }
                 const double t0 = emscripten_get_now();
                 ++region_misses;
@@ -632,18 +755,31 @@ struct WasmJitCPU::Impl {
             state.stop_flag = stopped.load() ? 1u : 0u;
             state.exit_reason = 0;
             state.svc = 0;
+            // M16 pump: publish the entry mapping, then let the Wasm-side
+            // dispatcher chain compiled-region transfers without host exits.
+            // regs[15] is the transfer target after every Miss/Budget/Smc
+            // return (all exits publish it), so the loop-top resolve below
+            // serves both fresh entries and post-dispatcher Miss targets.
+            if (found->second.table_index < 0
+                || found->second.table_index >= static_cast<int>(vita3k::wasmjit::kDispatchTableLimit))
+                return fail("region slot outside dispatch table");
+            if (!dispatch_map_insert(key, static_cast<uint32_t>(found->second.table_index)))
+                return fail("region map full");
             const uint32_t state_offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&state));
-            const uint32_t call_budget = static_cast<uint32_t>(std::min<uint64_t>(remaining_budget, REGION_CALL_TICKS));
+            const uint32_t granted = static_cast<uint32_t>(std::min<uint64_t>(remaining_budget, UINT32_MAX));
             const uint32_t executed_before = state.executed;
             const uint32_t dispatches_before = state.dispatches;
+            const uint32_t tx_before = state.tx_wasm;
             const double t2 = emscripten_get_now();
-            const uint32_t reason = vita3k_jit_run(found->second.table_index, state_offset, call_budget);
+            const uint32_t reason = vita3k_jit_run_dispatch(state_offset, granted,
+                dispatch_map_base(), dispatch_epoch_addr());
             run_js_ms += emscripten_get_now() - t2;
             ++js_calls;
             account_fast_counters(state);
             dispatches += counter_delta(dispatches_before, state.dispatches);
+            tx_wasm += counter_delta(tx_before, state.tx_wasm);
             const uint32_t delta = counter_delta(executed_before, state.executed);
-            if (delta > call_budget)
+            if (delta > granted)
                 return fail("generated region overran its budget");
             executed += delta;
             remaining_budget -= delta;
@@ -682,8 +818,15 @@ struct WasmJitCPU::Impl {
                 return fail(message);
             }
             case ExitReason::Miss:
-                // next_pc set by the module; loop to dispatch/compile it.
+                // next_pc set by the module AND regs[15] already equals it
+                // (every Miss path publishes both); the loop top resolves
+                // the target through the host cache, refreshing the Wasm
+                // map on the way into the pump. Unmapped targets compile
+                // through the normal formation path there.
+                ++host_miss;
                 continue;
+            case static_cast<ExitReason>(vita3k::wasmjit::DispatchReason::RegionOverrun):
+                return fail("generated region overran its budget");
             case ExitReason::Budget:
                 ++budget_exits;
                 // True exhaustion (budget fully consumed) is an error, exactly
@@ -957,7 +1100,8 @@ std::string WasmJitCPU::get_profile() const {
         "svc_exits=%llu blocks=%llu mem_reads=%llu mem_writes=%llu "
         "regions=%llu region_misses=%llu smc_exits=%llu budget_exits=%llu dispatches=%llu "
         "fast_reads=%llu fast_writes=%llu slow_unmapped=%llu slow_perms=%llu "
-        "slow_cross=%llu slow_code=%llu slow_other=%llu",
+        "slow_cross=%llu slow_code=%llu slow_other=%llu "
+        "tx_wasm=%llu host_miss=%llu",
         impl->emit_ms, impl->install_ms, impl->run_js_ms,
         (unsigned long long)impl->js_calls, (unsigned long long)impl->misses,
         (unsigned long long)impl->svc_exits, (unsigned long long)impl->compiled,
@@ -968,6 +1112,7 @@ std::string WasmJitCPU::get_profile() const {
         (unsigned long long)g_mem_fast_reads, (unsigned long long)g_mem_fast_writes,
         (unsigned long long)g_mem_slow_unmapped, (unsigned long long)g_mem_slow_perms,
         (unsigned long long)g_mem_slow_cross_page, (unsigned long long)g_mem_slow_code_page,
-        (unsigned long long)g_mem_slow_other);
+        (unsigned long long)g_mem_slow_other,
+        (unsigned long long)impl->tx_wasm, (unsigned long long)impl->host_miss);
     return buffer;
 }

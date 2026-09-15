@@ -27,7 +27,8 @@ namespace Term = Dynarmic::IR::Term;
 // Only MVP opcodes. In particular, no sign-extension proposal or multivalue.
 enum Wasm : uint8_t {
     Block = 0x02, Loop = 0x03, If = 0x04, Else = 0x05, End = 0x0b,
-    Br = 0x0c, BrTable = 0x0e, Return = 0x0f, Call = 0x10, Select = 0x1b,
+    Br = 0x0c, BrIf = 0x0d, BrTable = 0x0e, Return = 0x0f, Call = 0x10,
+    CallIndirect = 0x11, Select = 0x1b,
     Get = 0x20, Set = 0x21, Load = 0x28, Load8U = 0x2d, Load16U = 0x2f,
     Store = 0x36, Store8 = 0x3a, Store16 = 0x3b, Const = 0x41,
     Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtU = 0x49, GtU = 0x4b, LeU = 0x4d,
@@ -1427,6 +1428,214 @@ std::vector<uint8_t> emit_region(
     // mem_write=1, our run=2. (Same layout as the single-block module.)
     section(module, 7, {1, 3, 'r', 'u', 'n', 0, 2});
     section(module, 10, functions);
+    if (module.size() > kMaxModule)
+        return {};
+    return module;
+}
+
+// M16 Wasm-side multi-region dispatcher (see emit_wasm.h for the ABI).
+// mrun(state, remaining, map_base, epoch_addr) -> ExitReason. All branch
+// depths below are counted from each emission site; resolve() takes the
+// $out depth as a parameter because call sites nest differently.
+std::vector<uint8_t> emit_dispatch() {
+    constexpr size_t kMaxModule = 4 << 20;
+    // Locals: params 0=state 1=remaining 2=map_base 3=epoch_addr;
+    // 4=left 5=mark 6=slot 7=key_lo 8=key_hi 9=idx 10=nprobe 11=reason
+    // 12=exec_before 13=slice 14=pc.
+    Bytes c;
+    const auto ret_out = [&](uint32_t reason, uint32_t out_depth) {
+        b_imm(c, reason); b_set(c, 11);
+        b_op(c, Br); uleb(c, out_depth);
+    };
+    const auto if_void = [&](const auto &body) {
+        b_op(c, If); b_op(c, 0x40);
+        body();
+        b_op(c, End);
+    };
+    const auto load_state = [&](uint32_t offset) {
+        b_get(c, 0); b_op(c, Load); uleb(c, 2); uleb(c, offset);
+    };
+    // Compute key_hi = fpscr | T | E<<1 | IT<<8 from state.cpsr/fpscr.
+    // Matches Dynarmic A32 LocationDescriptor::UniqueHash (T=bit5, E=bit9,
+    // ITSTATE=(bit26:25,bit15:10)); single_stepping is always false here.
+    const auto compute_key_hi = [&] {
+        b_load(c, offsetof(JitState, fpscr));
+        b_load(c, offsetof(JitState, cpsr)); b_imm(c, 5); b_op(c, ShrU);
+        b_imm(c, 1); b_op(c, And); b_op(c, Or);
+        b_load(c, offsetof(JitState, cpsr)); b_imm(c, 9); b_op(c, ShrU);
+        b_imm(c, 1); b_op(c, And); b_imm(c, 1); b_op(c, Shl); b_op(c, Or);
+        b_load(c, offsetof(JitState, cpsr)); b_imm(c, 25); b_op(c, ShrU);
+        b_imm(c, 3); b_op(c, And);
+        b_load(c, offsetof(JitState, cpsr)); b_imm(c, 8); b_op(c, ShrU);
+        b_imm(c, 0xfc); b_op(c, And); b_op(c, Or);
+        b_imm(c, 8); b_op(c, Shl); b_op(c, Or);
+        b_set(c, 8);
+    };
+    // Probe the map for local 14's PC; on hit leaves slot in local 6 and
+    // falls out of the $r block, else publishes next_pc and br $out.
+    // out_depth = $out depth measured WITHOUT the if_void level that always
+    // wraps the miss() call sites; +1 is applied internally.
+    const auto emit_resolve = [&](uint32_t out_depth) {
+        const uint32_t br_out = out_depth + 1;
+        b_get(c, 14); b_set(c, 7);
+        compute_key_hi();
+        b_get(c, 7); b_get(c, 8); b_imm(c, kDispatchHashK); b_op(c, Mul);
+        b_op(c, Xor); b_imm(c, kDispatchMapMask); b_op(c, And); b_set(c, 9);
+        b_imm(c, 0); b_set(c, 10);
+        b_op(c, Block); b_op(c, 0x40); // $r
+        b_op(c, Loop); b_op(c, 0x40);  // $p
+        const auto miss = [&] {
+            b_get(c, 0); b_get(c, 14); b_store(c, offsetof(JitState, next_pc));
+            ret_out(static_cast<uint32_t>(ExitReason::Miss), br_out);
+        };
+        // if (nprobe >= MAX): miss.-GeU unavailable; use LtU+Eqz.
+        b_get(c, 10); b_imm(c, kDispatchMaxProbe); b_op(c, LtU); b_op(c, Eqz);
+        if_void(miss);
+        // epoch = *(map_base + idx*16 + 12); if 0: miss (never written).
+        b_get(c, 2); b_get(c, 9); b_imm(c, 4); b_op(c, Shl); b_op(c, Add);
+        b_imm(c, 12); b_op(c, Add);
+        b_op(c, Load); uleb(c, 2); uleb(c, 0);
+        b_op(c, Eqz);
+        if_void(miss);
+        // match = (epoch == *epoch_addr) & (lo==key_lo) & (hi==key_hi).
+        b_get(c, 2); b_get(c, 9); b_imm(c, 4); b_op(c, Shl); b_op(c, Add);
+        b_imm(c, 12); b_op(c, Add);
+        b_op(c, Load); uleb(c, 2); uleb(c, 0);
+        b_get(c, 3); b_op(c, Load); uleb(c, 2); uleb(c, 0);
+        b_op(c, Eq);
+        b_get(c, 2); b_get(c, 9); b_imm(c, 4); b_op(c, Shl); b_op(c, Add);
+        b_op(c, Load); uleb(c, 2); uleb(c, 0);
+        b_get(c, 7); b_op(c, Eq); b_op(c, And);
+        b_get(c, 2); b_get(c, 9); b_imm(c, 4); b_op(c, Shl); b_op(c, Add);
+        b_imm(c, 4); b_op(c, Add);
+        b_op(c, Load); uleb(c, 2); uleb(c, 0);
+        b_get(c, 8); b_op(c, Eq); b_op(c, And);
+        if_void([&] {
+            b_get(c, 2); b_get(c, 9); b_imm(c, 4); b_op(c, Shl); b_op(c, Add);
+            b_imm(c, 8); b_op(c, Add);
+            b_op(c, Load); uleb(c, 2); uleb(c, 0);
+            b_set(c, 6);
+            // Inside if_void at probe level: if=0,$p=1,$r=2 -> br 2 breaks $r.
+            // miss() below always runs inside if_void too, so its $out br
+            // needs out_depth+1; callers pass the UNADJUSTED $out depth and
+            // this function adds one. All depths rechecked against nesting.
+            b_op(c, Br); uleb(c, 2); // break $r: slot valid
+        });
+        b_get(c, 9); b_imm(c, 1); b_op(c, Add);
+        b_imm(c, kDispatchMapMask); b_op(c, And); b_set(c, 9);
+        b_get(c, 10); b_imm(c, 1); b_op(c, Add); b_set(c, 10);
+        b_op(c, Br); uleb(c, 0); // next probe
+        b_op(c, End); // $p
+        b_op(c, End); // $r: fallthrough = slot valid
+    };
+    const auto tx_bump = [&] {
+        // Stack for Store must be [addr, value]: duplicate addr first.
+        b_get(c, 0); b_get(c, 0); b_op(c, Load); uleb(c, 2); uleb(c, offsetof(JitState, tx_wasm));
+        b_imm(c, 1); b_op(c, Add);
+        b_store(c, offsetof(JitState, tx_wasm));
+    };
+    Bytes body{1};
+    uleb(body, 11); body.push_back(0x7f); // one run of 11 i32 locals (4..14)
+    // left = remaining; mark = executed.
+    b_get(c, 1); b_set(c, 4);
+    load_state(offsetof(JitState, executed)); b_set(c, 5);
+    b_op(c, Block); b_op(c, 0x40); // $out (depth 0 here)
+    // left == 0 at entry: Budget, exactly like the host loop top failing.
+    b_get(c, 4); b_op(c, Eqz);
+    if_void([&] { ret_out(static_cast<uint32_t>(ExitReason::Budget), 1); });
+    // Entry resolve from architectural regs[15].
+    load_state(offsetof(JitState, regs) + 15 * sizeof(uint32_t)); b_set(c, 14);
+    emit_resolve(2);
+    b_op(c, Loop); b_op(c, 0x40); // $pump
+    // NOTE: ret_out sites below run INSIDE if_void, so $out is one level
+    // deeper than at the pump body (if=0,$pump=1,$out=2): they br 2, not 1.
+    // stop_flag -> Stop.
+    load_state(offsetof(JitState, stop_flag));
+    if_void([&] { ret_out(static_cast<uint32_t>(ExitReason::Stop), 2); });
+    // left == 0 -> Budget (host fails on full consumption, as today).
+    b_get(c, 4); b_op(c, Eqz);
+    if_void([&] { ret_out(static_cast<uint32_t>(ExitReason::Budget), 2); });
+    // slice = min(left, kDispatchSliceTicks).
+    b_get(c, 4); b_imm(c, kDispatchSliceTicks); b_op(c, GtU);
+    b_op(c, If); b_op(c, 0x7f);
+    b_imm(c, kDispatchSliceTicks);
+    b_op(c, Else);
+    b_get(c, 4);
+    b_op(c, End);
+    b_set(c, 13);
+    // reason = table[slot](state, slice).
+    load_state(offsetof(JitState, executed)); b_set(c, 12);
+    b_get(c, 0); b_get(c, 13); b_get(c, 6);
+    b_op(c, CallIndirect); uleb(c, 0); uleb(c, 0);
+    b_set(c, 11);
+    // Overrun guard: delta > slice must fail like the host check.
+    load_state(offsetof(JitState, executed)); b_get(c, 12); b_op(c, Sub);
+    b_get(c, 13); b_op(c, GtU);
+    if_void([&] { ret_out(static_cast<uint32_t>(DispatchReason::RegionOverrun), 2); });
+    b_get(c, 4); load_state(offsetof(JitState, executed)); b_get(c, 12);
+    b_op(c, Sub); b_op(c, Sub); b_set(c, 4); // left -= delta
+    // smc_dirty with a chainable reason must exit via the host normalizer;
+    // Svc/Fault/Stop pass through untouched (host normalizes first, as today).
+    b_get(c, 11); b_imm(c, static_cast<uint32_t>(ExitReason::Miss)); b_op(c, Eq);
+    b_get(c, 11); b_imm(c, static_cast<uint32_t>(ExitReason::Budget)); b_op(c, Eq);
+    b_op(c, Or);
+    if_void([&] {
+        load_state(offsetof(JitState, smc_dirty));
+        // Inner if adds a level: if=0,outer=1,$pump=2,$out=3.
+        if_void([&] { ret_out(static_cast<uint32_t>(ExitReason::Smc), 3); });
+    });
+    // Host-direct reasons pass through.
+    b_get(c, 11); b_imm(c, static_cast<uint32_t>(ExitReason::Svc)); b_op(c, Eq);
+    b_get(c, 11); b_imm(c, static_cast<uint32_t>(ExitReason::Fault)); b_op(c, Eq);
+    b_op(c, Or);
+    b_get(c, 11); b_imm(c, static_cast<uint32_t>(ExitReason::Stop)); b_op(c, Eq);
+    b_op(c, Or);
+    b_get(c, 11); b_imm(c, static_cast<uint32_t>(ExitReason::Smc)); b_op(c, Eq);
+    b_op(c, Or);
+    if_void([&] { b_op(c, Br); uleb(c, 2); }); // br $out, reason intact
+    // Budget: host owns exhaustion/no-progress semantics; only continue here.
+    b_get(c, 11); b_imm(c, static_cast<uint32_t>(ExitReason::Budget)); b_op(c, Eq);
+    if_void([&] {
+        // left == 0 or no progress: let the host arm decide (fail or clean slice).
+        b_get(c, 4); b_op(c, Eqz);
+        if_void([&] { b_op(c, Br); uleb(c, 3); }); // br $out
+        load_state(offsetof(JitState, executed)); b_get(c, 5); b_op(c, Eq);
+        if_void([&] { b_op(c, Br); uleb(c, 3); }); // br $out
+        load_state(offsetof(JitState, executed)); b_set(c, 5);
+        load_state(offsetof(JitState, regs) + 15 * sizeof(uint32_t)); b_set(c, 14);
+        emit_resolve(4);
+        tx_bump();
+        b_op(c, Br); uleb(c, 1); // br $pump
+    });
+    // Miss (or fallthrough unknown reason, which the host rejects): resolve
+    // next_pc; unmapped targets return Miss with next_pc published.
+    b_get(c, 11); b_imm(c, static_cast<uint32_t>(ExitReason::Miss)); b_op(c, Eq);
+    if_void([&] {
+        load_state(offsetof(JitState, next_pc)); b_set(c, 14);
+        emit_resolve(4);
+        tx_bump();
+        b_op(c, Br); uleb(c, 1); // br $pump
+    });
+    b_op(c, Br); uleb(c, 1); // unknown reason -> host default arm fails
+    b_op(c, End); // $pump
+    b_op(c, End); // $out
+    b_get(c, 11); // function result
+    b_op(c, End); // end function body
+    Bytes funcs{1};
+    uleb(funcs, static_cast<uint32_t>(body.size() + c.size()));
+    funcs.insert(funcs.end(), body.begin(), body.end());
+    funcs.insert(funcs.end(), c.begin(), c.end());
+    Bytes module{0, 'a', 's', 'm', 1, 0, 0, 0};
+    section(module, 1, {2,
+        0x60, 2, 0x7f, 0x7f, 1, 0x7f, // type 0: region run(state,budget)->reason
+        0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f}); // type 1: dispatch
+    section(module, 2, {2,
+        3, 'e', 'n', 'v', 6, 'm', 'e', 'm', 'o', 'r', 'y', 2, 0, 1,
+        3, 'e', 'n', 'v', 12, 'r', 'e', 'g', 'i', 'o', 'n', '_', 't', 'a', 'b', 'l', 'e',
+        1, 0x70, 0, 1});
+    section(module, 3, {1, 1}); // one function, type 1
+    section(module, 7, {1, 8, 'd', 'i', 's', 'p', 'a', 't', 'c', 'h', 0, 0});
+    section(module, 10, funcs);
     if (module.size() > kMaxModule)
         return {};
     return module;
