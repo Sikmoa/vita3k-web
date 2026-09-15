@@ -152,7 +152,8 @@ void collect_targets(const Dynarmic::IR::Term::Terminal &terminal,
 // translated blocks PERMUTED INTO THE SAME SORTED ORDER as region.blocks
 // (emit_region validates meta against each block's own location).
 bool form_region(MemState &mem, uint32_t entry_pc, uint32_t entry_cpsr,
-    uint32_t entry_fpscr, Region &region, std::vector<Dynarmic::IR::Block> &ir_out) {
+    uint32_t entry_fpscr, Region &region, std::vector<Dynarmic::IR::Block> &ir_out,
+    size_t max_store_continuations = vita3k::wasmjit::kDefaultMaxStoreContinuations) {
     using Dynarmic::A32::LocationDescriptor;
     region = Region{};
     ir_out.clear();
@@ -176,7 +177,8 @@ bool form_region(MemState &mem, uint32_t entry_pc, uint32_t entry_cpsr,
             try {
                 auto translated = vita3k::wasmjit::translate_block(mem, pc,
                     location.CPSR().Value(), limit, location.FPSCR().Value(),
-                    continue_stores ? &block.store_continuations : nullptr);
+                    continue_stores ? &block.store_continuations : nullptr,
+                    max_store_continuations);
                 const uint64_t end = LocationDescriptor(translated.EndLocation()).PC();
                 if (end <= pc || end - pc > REGION_MAX_CODE_BYTES)
                     return false;

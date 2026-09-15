@@ -715,10 +715,13 @@ void region_store_continuations(MemState &mem) {
     Region region;
     std::vector<Dynarmic::IR::Block> ir;
     std::vector<vita3k::wasmjit::RegionBlockMeta> meta;
+    // Production leaves continuations disabled (kDefaultMaxStoreContinuations
+    // == 0); pass an explicit cap here so the tests still exercise the
+    // side-exit machinery end to end.
     const auto install = [&](std::initializer_list<uint32_t> words, uint32_t cpsr = 0x10,
                             MemoryFunction write_memory = checked_memory_write) {
         CHECK(mem_write(mem, code, words.begin(), words.size() * sizeof(uint32_t)));
-        CHECK(form_region(mem, code, cpsr, 0, region, ir));
+        CHECK(form_region(mem, code, cpsr, 0, region, ir, 64));
         std::vector<const Dynarmic::IR::Block *> blocks;
         meta.clear();
         for (size_t i = 0; i < ir.size(); ++i) {
@@ -896,6 +899,21 @@ void region_store_continuations(MemState &mem) {
     CHECK(mem_write(mem, code, suffix.data(), sizeof(suffix)));
     CHECK(form_region(mem, code, 0x10, 0, region, ir));
     CHECK(region.blocks.front().ticks == 2 && region.blocks.front().store_continuations.empty());
+
+    // The default cap is 0: four stores still end the block after the first
+    // one (legacy behavior, no continuations). An explicit cap merges them.
+    const std::array<uint32_t, 5> many{0xe4810004, 0xe4812004, 0xe4813004,
+        0xe4810004, 0xef000042};
+    CHECK(mem_write(mem, code, many.data(), sizeof(many)));
+    auto legacy_stores = vita3k::wasmjit::translate_block(mem, code, 0x10, 64, 0, &points);
+    CHECK(points.empty());
+    CHECK(Location(legacy_stores.EndLocation()).PC() == code + 4);
+    auto merged = vita3k::wasmjit::translate_block(mem, code, 0x10, 64, 0, &points, 64);
+    CHECK(points.size() == 4);
+    CHECK(Location(merged.EndLocation()).PC() == code + 20);
+    auto capped = vita3k::wasmjit::translate_block(mem, code, 0x10, 64, 0, &points, 2);
+    CHECK(points.size() == 2);
+    CHECK(Location(capped.EndLocation()).PC() == code + 12);
 }
 } // namespace
 

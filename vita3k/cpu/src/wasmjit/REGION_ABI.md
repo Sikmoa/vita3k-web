@@ -159,7 +159,7 @@ access rather than loading the same page-table entry twice.
 
 ## Store continuations (current implementation)
 
-Region formation requests `StoreContinuation` metadata from `translate_block`.
+Region formation requests `StoreContinuation` metadata from `translate_block`, up to an explicit per-call cap. The production default is 0 (legacy store-ending blocks): measured 2026-09-15, any inline continuation side exit costs more per-call entry time than the dispatch savings return (see `kDefaultMaxStoreContinuations` in `frontend.h`). The machinery stays tested via explicit caps; re-enable by reshaping the poll (e.g. routing it through the dispatch loop) rather than just raising the cap.
 For unconditional blocks, an ordinary store no longer terminates translation.
 At the next `PreCodeReadHook`, the frontend records the IR offset, cumulative
 completed tick count and full continuation location. This hook runs after
