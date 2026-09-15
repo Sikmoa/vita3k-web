@@ -11,6 +11,13 @@
 // Bench-only opt-in is read from the JS side (Node process.env), the same
 // channel as the existing VITA3K_DUMP_JIT hook in wasm_jit_cpu.cpp: C-level
 // getenv does not see Node env under Emscripten. Native builds use getenv.
+EM_JS(uint32_t, vita3k_ablate_entry_pc, (), {
+    const v = (typeof process !== 'undefined' && process.env) ? process.env.VITA3K_ABLATE_PC : null;
+    if (!v)
+        return 0;
+    const n = parseInt(String(v), 16);
+    return Number.isFinite(n) ? (n >>> 0) : 0;
+});
 EM_JS(uint32_t, vita3k_ablate_env_flags, (), {
     const v = (typeof process !== 'undefined' && process.env) ? process.env.VITA3K_ABLATE : null;
     if (!v)
@@ -172,6 +179,19 @@ uint32_t ablate_flags() {
     }();
     return env_flags | g_ablate_override;
 }
+uint32_t ablate_entry_env() {
+    static uint32_t entry = []() -> uint32_t {
+#ifdef __EMSCRIPTEN__
+        return vita3k_ablate_entry_pc();
+#else
+        if (const char *e = std::getenv("VITA3K_ABLATE_PC"))
+            return static_cast<uint32_t>(std::strtoul(e, nullptr, 16));
+        return 0;
+#endif
+    }();
+    return entry;
+}
+
 
 uint32_t entry_ticks(const RegionBlockMeta &meta) {
     // Continued blocks are unconditional. Admit the first store-delimited
@@ -855,10 +875,24 @@ private:
             m = std::max(m, (*metadata)[i].ticks);
         return m;
     }
+    // Single-region scope (Sol brief): E/G direct edges apply globally when
+    // VITA3K_ABLATE_PC is unset, otherwise only to regions containing the
+    // named block entry (ablation target chosen by profiling, not formation).
+    bool ablate_direct_here() const {
+        if (!(ablate_flags() & kAblateDirect))
+            return false;
+        const uint32_t want = ablate_entry_env();
+        if (want == 0)
+            return true;
+        for (size_t i = 0; i < members->size(); ++i)
+            if ((*metadata)[i].entry_pc == want)
+                return true;
+        return false;
+    }
     void light_redispatch(uint32_t target_index) {
         const uint32_t ablate = ablate_flags();
         // Direct-threaded back-edge (E/G): reachable iff target < body_index.
-        if ((ablate & kAblateDirect) && target_index < body_index) {
+        if (ablate_direct_here() && target_index < body_index) {
             // Budget at the joined edge. Exact successor cost normally (1:1
             // with the skipped leaf); MAXT slice bound under C/G so a call
             // still never reports more ticks than its budget (M16
