@@ -5,6 +5,66 @@ Dynarmic A32 IR**, not ARM bytes. The native fixture generator additionally uses
 Dynarmic's real ARM/Thumb translator; the JavaScript test executes raw emitted
 modules in Node's Wasm engine. It does not emulate Wasm or ARM.
 
+## Promoted-state candidate: validation pending
+
+The optional implementation and all new tests are **implemented but unvalidated
+in this source-only environment**. No build, generated-Wasm execution, tests or
+benchmarks were run. See [REGION_ABI.md](../src/wasmjit/REGION_ABI.md#optional-promoted-region-state-candidate-september-2026)
+for the state ABI, switches, access audit, limitations and required validation.
+
+The existing generator/harness now emits an explicit reference region and
+P/K/PK variants for every input corpus. Single-block architectural expectations
+remain checked through `block`; their additional region cases compare against
+reference `run`, since its cumulative accounting and exit ABI differ. Existing
+explicit region expectations are also checked. Each candidate receives the same
+fresh input and guest memory at both nonzero state offsets; return reason and
+the complete test memory image (including all JitState bytes) are compared.
+Module validation, imports/exports and OOB-state traps are checked per variant.
+The reference region is always emitted with `{false, false}`, independent of
+environment switches. These are source tests, not reported test results.
+
+New/extended unexecuted coverage:
+
+- The existing arithmetic random/edge corpus, carry/overflow SSA lifetime,
+  LSL/LSR/ASR/ROR/RRX counts 0..256, all EQ..AL conditions over all NZCV
+  combinations, selects, full CPSR reads, ARM/Thumb branches and IT faults,
+  memory probes, supported VFP/NEON data paths, now as A/P/K/PK regions.
+- Translated ADD/ADDS, ADC/ADCS, SUB/SUBS, SBC/SBCS, RSB/RSBS, CMP, CMN,
+  AND/ANDS, EOR/EORS, ORR/ORRS, MOV/MOVS and MVN/MVNS immediately followed
+  by SVC, over zero/negative/overflow/carry inputs and all incoming flags.
+- NZ-only writes preserving C/V, later carry consumption and full CPSR read;
+  ADDS immediately before read/write fault with a nonzero next_pc sentinel.
+- Existing rejection corpus for all four region policies, preserving the
+  unsupported opcode/terminal boundary. This adds no multiply, saturation,
+  Q/GE-write or FPSCR-write instruction support.
+- Backend region regressions, store continuations and M16 pump cases under
+  all four explicit policies: budgets 0/1/below/equal/above block cost,
+  non-divisible/exact exhaustion, zero progress, SVC/fault, stop, SMC, miss,
+  stale epoch, wraparound counters and continuation prefixes.
+- Cross-member flag production/conditional consumption/NZ-only update/full
+  read/SVC; flags before a continuation's Budget/Stop/Smc exit; mixed-policy
+  M16 carry production/consumption, true Miss and resumed invocation.
+
+In the real environment, use the commands below to build/generate/run the
+emitter suite. Then run the existing backend and InterpreterCPU integration
+test entry points in four fresh processes, setting both independent switches:
+
+| Mode | `VITA3K_WASMJIT_PROMOTE_FLAGS` | `VITA3K_WASMJIT_PROMOTE_ACCOUNTING` |
+| --- | --- | --- |
+| A | 0 | 0 |
+| P | 1 | 0 |
+| K | 0 | 1 |
+| PK | 1 | 1 |
+
+Unset `VITA3K_ABLATE`/`VITA3K_ABLATE_PC`. CPU integration tests use the process
+selection, while direct emitter/backend cases explicitly exercise the matrix.
+Run genuine exit-42 and display fixtures in each mode before benchmarking;
+repeat the hot-region WAT census on exactly that build. Record profile option
+fields so results cannot be mistaken for another policy. The public external
+cache-invalidation epoch discrepancy noted in REGION_ABI.md is pre-existing
+and requires separate investigation; a stale-epoch unit case is not a proof
+that every host eviction path bumps the epoch.
+
 ## Run from repository root
 
 Requires the existing native Dynarmic/mcl/fmt archives (paths may differ with
@@ -28,11 +88,12 @@ c++ -std=c++20 -O1 -Wall -Wextra -Werror \
 node vita3k/cpu/tests/wasmjit_emitter_test.mjs /tmp/wasmjit-emitter-fixtures
 ```
 
-Expected: 78 deterministic modules, 21,432 input/expected-state pairs,
+Historical pre-candidate counts: 78 deterministic modules, 21,432 input/expected-state pairs,
 42,856 successful **Wasm `call_indirect`** calls and 8 region calls at two
 nonzero state offsets. The fixture generator serializes the complete JitState;
 the harness derives the state and canary sizes from those arrays.
-The native generator/emitter was also run with UndefinedBehaviorSanitizer
+These are prior results, not results for the current patch; module/case counts
+now increase with the policy matrix. The previous generator/emitter was also run with UndefinedBehaviorSanitizer
 (`-fsanitize=undefined -fno-sanitize-recover=undefined`) without findings.
 Coverage includes:
 
@@ -100,12 +161,12 @@ machine with the toolchain; tests and builds were not run for this change.
 **empty on unsupported input**. It neither executes guest code nor invokes
 helper callbacks. No exception is used for ordinary rejection.
 
-The standard-layout `JitState` is 416 bytes. Its original fields in order are
+The standard-layout `JitState` is 420 bytes. Its original fields in order are
 `regs[16]`, `cpsr`, `fpscr`, `svc`, `exit_reason`, `executed`,
 `memory_cookie`, `fault_address`, `fault_write`, `memory_value[4]`,
 `fpu[64]` and `tpidruro`, followed by `next_pc`, `fault_pc`, `page_table_base`,
 `page_perms_base`, `smc_dirty`, `stop_flag`, `dispatches`, `code_pages_base`,
-`mem_fast_reads`, `mem_fast_writes` and `smc_page`, all `uint32_t`; static asserts pin the layout.
+`mem_fast_reads`, `mem_fast_writes`, `smc_page` and `tx_wasm`, all `uint32_t`; static asserts pin the layout.
 Extended registers overlay `fpu` exactly as the x64 backend's MJitStateExtReg:
 Sn is word n, Dn words 2n/2n+1, Qn words 4n..4n+3. The emitter uses
 `offsetof`, not native Dynarmic state layout. Export `block(i32 stateOffset)`

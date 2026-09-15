@@ -143,7 +143,11 @@ std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block);
 // across block boundaries. A shared exit epilogue publishes all registers
 // any member can write and the completed-block tick/dispatch counters,
 // including on faults and condition-failed paths. Checked helpers access
-// memory/fault/SMC fields only; they must not inspect or modify cached GPRs.
+// memory/fault/SMC fields only; they must not inspect or modify cached GPRs,
+// CPSR, PC or accounting, or reenter CPU/HLE/context/debug callbacks. Opt-in
+// RegionStateOptions also retain split CPSR and PC state within each run;
+// all region returns materialize it before M16/host inspection. Single-block
+// emission and step() always retain the reference representation.
 // `blocks` and `meta` must be parallel, non-empty, sorted strictly ascending
 // by entry_pc (formation guarantees at most one block per guest PC).
 // Dispatch validates each entry's
@@ -174,9 +178,21 @@ struct RegionBlockMeta {
     uint32_t ticks; // conservative: CycleCount + ConditionFailedCycleCount
     std::vector<StoreContinuation> store_continuations{};
 };
+// Candidate, unvalidated state representation. Defaults preserve reference
+// emission. Options are resolved at emission time, never by guest code.
+struct RegionStateOptions {
+    bool promote_flags = false;
+    bool promote_accounting = false;
+};
+// Read once per process/module. Native: getenv; Emscripten: Module properties
+// (same names) override process.env. Only the exact value "1" enables a flag.
+// VITA3K_WASMJIT_PROMOTED_STATE enables both; the two independent switches
+// VITA3K_WASMJIT_PROMOTE_FLAGS / VITA3K_WASMJIT_PROMOTE_ACCOUNTING override it.
+RegionStateOptions region_state_options();
 std::vector<uint8_t> emit_region(
     const std::vector<const Dynarmic::IR::Block *> &blocks,
-    const std::vector<RegionBlockMeta> &meta);
+    const std::vector<RegionBlockMeta> &meta,
+    RegionStateOptions options = region_state_options());
 
 // Checks whether a block can be lowered into a region body without assembling
 // a complete module. Region formation uses this to avoid repeatedly building

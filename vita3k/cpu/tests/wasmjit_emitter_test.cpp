@@ -107,13 +107,14 @@ public:
     ~Suite() { manifest << "]\n"; }
 
     void add(const std::string &name, const IR::Block &block, const std::vector<Case> &cases,
-        std::optional<uint32_t> region_budget = std::nullopt) {
-        const auto emit = [&] {
+        std::optional<uint32_t> region_budget = std::nullopt, bool differential = false) {
+        const auto emit = [&](vita3k::wasmjit::RegionStateOptions options = {}) {
             if (!region_budget) return emit_block(block);
             const A32::LocationDescriptor at(block.Location());
             return vita3k::wasmjit::emit_region({&block}, {{at.PC(),
-                A32::LocationDescriptor::CPSR_MODE_MASK, at.CPSR().Value(),
-                static_cast<uint32_t>(block.CycleCount() + block.ConditionFailedCycleCount())}});
+                A32::LocationDescriptor::CPSR_MODE_MASK,
+                at.CPSR().Value() & A32::LocationDescriptor::CPSR_MODE_MASK,
+                static_cast<uint32_t>(block.CycleCount() + block.ConditionFailedCycleCount())}}, options);
         };
         const auto bytes = emit();
         if (bytes.empty()) {
@@ -127,6 +128,23 @@ public:
         if (modules++) manifest << ',';
         manifest << "{\"name\":\"" << name << '"';
         if (region_budget) manifest << ",\"budget\":" << *region_budget;
+        if (differential) manifest << ",\"differential\":true";
+        if (region_budget) {
+            manifest << ",\"variants\":[";
+            for (unsigned mode = 1; mode <= 3; ++mode) {
+                const vita3k::wasmjit::RegionStateOptions options{(mode & 1) != 0, (mode & 2) != 0};
+                const auto variant = emit(options);
+                CHECK(!variant.empty() && variant == emit(options));
+                const auto filename = name + (mode == 1 ? "_P" : mode == 2 ? "_K" : "_PK") + ".wasm";
+                std::ofstream output(path / filename, std::ios::binary);
+                output.write(reinterpret_cast<const char *>(variant.data()), variant.size());
+                CHECK(output.good());
+                ++candidate_modules;
+                if (mode != 1) manifest << ',';
+                manifest << '"' << filename << '"';
+            }
+            manifest << ']';
+        }
         manifest << ",\"cases\":[";
         bool first = true;
         for (const auto &test : cases) {
@@ -153,9 +171,15 @@ public:
             ++runs;
         }
         manifest << "]}";
+        // Exercise the same actual IR and input corpus as a one-member region.
+        // Region accounting/exit ABI differs from block(), so these additional
+        // cases compare against reference run(), not block()'s expected bytes.
+        if (!region_budget)
+            add(name + "_region", block, cases,
+                static_cast<uint32_t>(block.CycleCount() + block.ConditionFailedCycleCount()), true);
     }
 
-    size_t modules = 0, runs = 0;
+    size_t modules = 0, candidate_modules = 0, runs = 0;
 private:
     std::filesystem::path path;
     std::ofstream manifest;
@@ -420,6 +444,102 @@ void frontend(Suite &suite) {
     in = initial(); in.regs[1] = 0x80000000; in.cpsr |= 0x30000000;
     auto out = next(in); out.regs[0] = in.regs[1]; out.cpsr |= 0x80000000;
     suite.add("arm_movs_reg", movs, {{in, out}});
+}
+
+// Real frontend flag producers immediately followed by SVC. Each case also
+// becomes an A/P/K/PK region differential via Suite::add. Unexecuted here.
+void frontend_flag_boundaries(Suite &suite) {
+    struct Operation { const char *name; unsigned opcode; bool writes_register; };
+    const std::array<Operation, 12> operations{{
+        {"and", 0, true}, {"eor", 1, true}, {"sub", 2, true},
+        {"rsb", 3, true}, {"add", 4, true}, {"adc", 5, true},
+        {"sbc", 6, true}, {"cmp", 10, false}, {"cmn", 11, false},
+        {"orr", 12, true}, {"mov", 13, true}, {"mvn", 15, true},
+    }};
+    for (const auto &operation : operations) {
+        for (const bool set_flags : {false, true}) {
+            if (!set_flags && !operation.writes_register) continue;
+            // AL data processing, Rn=r0, Rd=r2, unshifted Rm=r1.
+            const uint32_t instruction = 0xe0000001u | (operation.opcode << 21)
+                | (set_flags ? 1u << 20 : 0) | (operation.writes_register ? 2u << 12 : 0);
+            const auto block = translate({instruction, 0xef000042}, false);
+            std::vector<Case> cases;
+            for (const uint32_t a : {0u, 1u, 0x7fffffffu, 0x80000000u, 0xffffffffu}) {
+                for (const uint32_t b : {0u, 1u, 0x80000000u, 0xffffffffu}) {
+                    for (uint32_t flags = 0; flags < 16; ++flags) {
+                        auto in = initial();
+                        in.cpsr |= flags << 28;
+                        in.regs[0] = a; in.regs[1] = b;
+                        auto out = next(in, 2, 0x1008);
+                        out.svc = 0x42; out.exit_reason = 1;
+                        uint32_t result = 0, carry = (flags >> 1) & 1, overflow = flags & 1;
+                        const unsigned op = operation.opcode;
+                        if ((op >= 2 && op <= 6) || op == 10 || op == 11) {
+                            const bool sub = op == 2 || op == 3 || op == 6 || op == 10;
+                            const uint32_t lhs = op == 3 ? b : a, rhs = op == 3 ? a : b;
+                            const uint32_t cin = op == 5 || op == 6 ? carry : sub ? 1 : 0;
+                            const uint64_t wide = uint64_t(lhs) + (sub ? uint32_t(~rhs) : rhs) + cin;
+                            const int64_t signed_result = sub
+                                ? signed32(lhs) - signed32(rhs) - (1 - cin)
+                                : signed32(lhs) + signed32(rhs) + cin;
+                            result = static_cast<uint32_t>(wide); carry = wide >> 32;
+                            overflow = signed_result < INT32_MIN || signed_result > INT32_MAX;
+                        } else {
+                            switch (op) {
+                            case 0: result = a & b; break;
+                            case 1: result = a ^ b; break;
+                            case 12: result = a | b; break;
+                            case 13: result = b; break;
+                            case 15: result = ~b; break;
+                            default: CHECK(false);
+                            }
+                        }
+                        if (operation.writes_register) out.regs[2] = result;
+                        if (set_flags)
+                            out.cpsr = (in.cpsr & 0x0fffffff) | nz(result) | (carry << 29) | (overflow << 28);
+                        cases.push_back({in, out});
+                    }
+                }
+            }
+            suite.add(std::string("svc_flags_") + operation.name + (set_flags ? "_s" : ""), block, cases);
+        }
+    }
+
+    // NZ-only writes preserve BOTH C/V; subsequent carry consumption must
+    // see the local C, and a full CPSR read must merge every preserved field.
+    auto partial = blank();
+    append(partial, Opcode::A32SetCpsrNZCVRaw, {reg(partial, Reg::R0)});
+    append(partial, Opcode::A32SetCpsrNZ, {append(partial, Opcode::GetNZFromOp, {reg(partial, Reg::R1)})});
+    set(partial, Reg::R2, append(partial, Opcode::A32GetCpsr, {}));
+    const auto sum = append(partial, Opcode::Add32,
+        {Value{uint32_t(0)}, Value{uint32_t(0)}, append(partial, Opcode::A32GetCFlag, {})});
+    set(partial, Reg::R3, sum);
+    std::vector<Case> cases;
+    for (uint32_t flags = 0; flags < 16; ++flags) {
+        for (uint32_t value : {0u, 1u, 0x80000000u}) {
+            auto in = initial(); in.regs[0] = flags << 28; in.regs[1] = value;
+            auto out = next(in);
+            out.cpsr = (in.cpsr & 0x0fffffff) | (in.regs[0] & 0x30000000) | nz(value);
+            out.regs[2] = out.cpsr; out.regs[3] = (flags >> 1) & 1;
+            cases.push_back({in, out});
+        }
+    }
+    suite.add("partial_nz_preserves_cv", partial, cases);
+
+    // ADDS; LDR/STR fault: flags and completed IR survive, but this segment
+    // contributes no ticks. Fault next_pc remains the incoming sentinel.
+    for (bool write : {false, true}) {
+        auto fault_block = translate({0xe0900001, write ? 0xe5823000u : 0xe5923000u}, false);
+        auto in = initial(); in.regs[0] = 0x7fffffff; in.regs[1] = 1;
+        in.regs[2] = 0x80000000; in.next_pc = 0xabcdef00;
+        auto out = in; out.regs[0] = 0x80000000;
+        out.cpsr = (in.cpsr & 0x0fffffff) | 0x90000000;
+        out.fault_pc = 0x1004; out.fault_address = in.regs[2]; out.fault_write = write;
+        out.exit_reason = 2; out.dispatches = in.dispatches + 1;
+        if (write) out.memory_value[0] = in.regs[3];
+        suite.add(write ? "flags_then_write_fault" : "flags_then_read_fault",
+            fault_block, {{in, out}}, 2);
+    }
 }
 
 // The M14b stall: the fixture's NEON memset loop (VitaSDK libc, Thumb).
@@ -741,7 +861,17 @@ void region_it_faults(Suite &suite) {
 }
 
 void rejects() {
-    auto reject = [](const IR::Block &b) { CHECK(emit_block(b).empty()); };
+    auto reject = [](const IR::Block &b) {
+        CHECK(emit_block(b).empty());
+        const A32::LocationDescriptor at(b.Location());
+        for (unsigned mode = 0; mode < 4; ++mode) {
+            CHECK(vita3k::wasmjit::emit_region({&b}, {{at.PC(),
+                A32::LocationDescriptor::CPSR_MODE_MASK,
+                at.CPSR().Value() & A32::LocationDescriptor::CPSR_MODE_MASK,
+                static_cast<uint32_t>(b.CycleCount() + b.ConditionFailedCycleCount())}},
+                {(mode & 1) != 0, (mode & 2) != 0}).empty());
+        }
+    };
     auto block = blank(); append(block, Opcode::Breakpoint, {}); reject(block);
     block = blank(); append(block, Opcode::A32GetFpscr, {}); reject(block);
     block = blank(); block.ReplaceTerminal(IR::Term::Interpret{loc()}); reject(block);
@@ -802,6 +932,7 @@ int main(int argc, char **argv) {
     conditions(suite);
     scalars(suite);
     frontend(suite);
+    frontend_flag_boundaries(suite);
     vector_loop(suite);
     vfp_memory(suite);
     most_significant_word(suite);
@@ -809,5 +940,7 @@ int main(int argc, char **argv) {
     memory_bases(suite);
     memory_address_faults(suite);
     region_it_faults(suite);
-    std::cout << "Native rejection/determinism checks passed; generated " << suite.modules << " modules and " << suite.runs << " execution cases\n";
+    std::cout << "Native rejection/determinism checks passed; generated " << suite.modules
+              << " reference modules + " << suite.candidate_modules << " candidate modules and "
+              << suite.runs << " input cases (region inputs also run under P/K/PK)\n";
 }

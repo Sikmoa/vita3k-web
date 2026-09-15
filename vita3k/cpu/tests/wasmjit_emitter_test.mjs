@@ -69,6 +69,15 @@ for (const fixture of fixtures) {
     const exportName = isRegion ? 'run' : 'block';
     assert.deepEqual(WebAssembly.Module.exports(module), [{name: exportName, kind: 'function'}]);
     const block = new WebAssembly.Instance(module, {env: {memory, mem_read, mem_write}}).exports[exportName];
+    const variants = (fixture.variants ?? []).map(filename => {
+        const raw = readFileSync(join(directory, filename));
+        assert(WebAssembly.validate(raw), `${filename}: module must validate`);
+        const candidate = new WebAssembly.Module(raw);
+        assert.deepEqual(WebAssembly.Module.imports(candidate), WebAssembly.Module.imports(module));
+        assert.deepEqual(WebAssembly.Module.exports(candidate), WebAssembly.Module.exports(module));
+        return {filename, run: new WebAssembly.Instance(candidate,
+            {env: {memory, mem_read, mem_write}}).exports.run};
+    });
     // Wasm export is an actual typed function, not a JS trampoline.
     let invoke;
     if (isRegion) {
@@ -82,18 +91,22 @@ for (const fixture of fixtures) {
         for (const offset of [0x400, 0x10404]) {
             const whole = new Uint32Array(memory.buffer);
             const view = new Uint32Array(memory.buffer, offset, test.in.length);
-            whole.fill(0xcafebabe);
-            view.set(test.in);
-            // Guest-memory preconditions (loads): seed after the fill so only
-            // these words differ from the 0xcafebabe background.
-            if (test.pre)
-                for (const [address, word] of Object.entries(test.pre))
-                    new DataView(memory.buffer).setUint32(Number(address), word >>> 0, true);
+            const reset = () => {
+                whole.fill(0xcafebabe);
+                view.set(test.in);
+                // Seed guest memory after resetting the background/state.
+                if (test.pre)
+                    for (const [address, word] of Object.entries(test.pre))
+                        new DataView(memory.buffer).setUint32(Number(address), word >>> 0, true);
+            };
+            reset();
             const label = `${fixture.name} case ${index} @${offset}`;
             assert.equal(test.in.length, test.out.length, `${label}: state size`);
             const reason = invoke(offset);
-            assert.equal(reason >>> 0, test.out[19], `${label}: reason`);
-            assert.deepEqual(Array.from(view), test.out, `${label}: state`);
+            if (!fixture.differential) {
+                assert.equal(reason >>> 0, test.out[19], `${label}: reason`);
+                assert.deepEqual(Array.from(view), test.out, `${label}: state`);
+            }
             assert.equal(whole[offset / 4 - 1], 0xcafebabe, `${label}: leading canary`);
             assert.equal(whole[offset / 4 + view.length], 0xcafebabe, `${label}: trailing canary`);
             // Guest-memory expectations: checked AFTER execution so helper-
@@ -104,10 +117,27 @@ for (const fixture of fixtures) {
                     assert.equal(words.getUint32(Number(address), true), word,
                         `${label}: guest memory @${address}`);
             }
+            // Compare ALL JitState bytes and the complete test memory image,
+            // including guest stores, helper scratch, counters and canaries.
+            // Fresh inputs for every call also exercise spill/reload across
+            // invocation boundaries. No candidate becomes another's oracle.
+            if (variants.length) {
+                const reference = whole.slice();
+                for (const variant of variants) {
+                    reset();
+                    assert.equal(variant.run(offset, fixture.budget), reason,
+                        `${label} ${variant.filename}: differential reason`);
+                    assert.deepEqual(whole, reference,
+                        `${label} ${variant.filename}: differential memory/state`);
+                    ++regionRuns;
+                }
+            }
             if (isRegion) ++regionRuns;
             else ++runs;
         }
     }
     assert.throws(() => invoke(memory.buffer.byteLength - 4), WebAssembly.RuntimeError);
+    for (const variant of variants)
+        assert.throws(() => variant.run(memory.buffer.byteLength - 4, fixture.budget), WebAssembly.RuntimeError);
 }
-console.log(`Wasm execution passed: ${fixtures.length} modules, ${runs} call_indirect calls, ${regionRuns} region calls (two state offsets), table insertion and OOB traps`);
+console.log(`Wasm execution passed: ${fixtures.length} reference fixtures plus P/K/PK variants, ${runs} call_indirect calls, ${regionRuns} region calls (two state offsets), table insertion and OOB traps`);

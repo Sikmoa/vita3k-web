@@ -374,6 +374,9 @@ bool valid_memory_size(uint32_t bytes) noexcept {
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t checked_memory_read(JitState *state, uint32_t address, uint32_t bytes) noexcept {
+    // RegionState non-observer ABI: do not inspect/mutate CPSR, GPRs, PC or
+    // accounting here, or call HLE/debug/context callbacks. Those fields may
+    // be local until the region epilogue. Same rule applies to write below.
     ++g_mem_reads;
     account_slow_reason(bytes);
     bytes &= 0xffu; // Fast-path fallback reason rides in the high byte.
@@ -572,6 +575,7 @@ struct WasmJitCPU::Impl {
     // Region mode is the production path (M14c); single-block execution
     // remains for step() and the single-block module suite.
     bool region_mode = true;
+    const vita3k::wasmjit::RegionStateOptions region_options = vita3k::wasmjit::region_state_options();
     std::string error;
     std::map<Key, Block> cache;
     std::map<uint64_t, RegionEntry> region_cache;
@@ -707,7 +711,7 @@ struct WasmJitCPU::Impl {
                         region->blocks[i].psr_value, region->blocks[i].ticks,
                         region->blocks[i].store_continuations});
                 }
-                const auto bytes = vita3k::wasmjit::emit_region(block_ptrs, meta);
+                const auto bytes = vita3k::wasmjit::emit_region(block_ptrs, meta, region_options);
                 emit_ms += emscripten_get_now() - t0;
                 if (bytes.empty())
                     return fail("region emission rejected (no fallback)");
@@ -1101,7 +1105,7 @@ std::string WasmJitCPU::get_profile() const {
         "regions=%llu region_misses=%llu smc_exits=%llu budget_exits=%llu dispatches=%llu "
         "fast_reads=%llu fast_writes=%llu slow_unmapped=%llu slow_perms=%llu "
         "slow_cross=%llu slow_code=%llu slow_other=%llu "
-        "tx_wasm=%llu host_miss=%llu",
+        "tx_wasm=%llu host_miss=%llu promote_flags=%u promote_accounting=%u",
         impl->emit_ms, impl->install_ms, impl->run_js_ms,
         (unsigned long long)impl->js_calls, (unsigned long long)impl->misses,
         (unsigned long long)impl->svc_exits, (unsigned long long)impl->compiled,
@@ -1113,6 +1117,7 @@ std::string WasmJitCPU::get_profile() const {
         (unsigned long long)g_mem_slow_unmapped, (unsigned long long)g_mem_slow_perms,
         (unsigned long long)g_mem_slow_cross_page, (unsigned long long)g_mem_slow_code_page,
         (unsigned long long)g_mem_slow_other,
-        (unsigned long long)impl->tx_wasm, (unsigned long long)impl->host_miss);
+        (unsigned long long)impl->tx_wasm, (unsigned long long)impl->host_miss,
+        unsigned(impl->region_options.promote_flags), unsigned(impl->region_options.promote_accounting));
     return buffer;
 }

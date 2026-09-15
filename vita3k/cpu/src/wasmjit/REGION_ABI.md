@@ -4,6 +4,259 @@ Goal: one WebAssembly module per REGION (many guest basic blocks) with an
 in-module dispatch loop. No JS crossing and no C++ cache work per guest block.
 Only region-level exits return to the host.
 
+## Optional promoted region state (candidate, September 2026)
+
+**Implemented but unvalidated in this source-only environment.** No compilation,
+Wasm validation, tests, fixture execution, browser execution or performance
+measurement was possible for this patch. The default is the existing reference
+emission. This section describes the candidate and takes precedence over older
+design sketches below; it does not assert runtime correctness.
+
+### Selection and lifetime
+
+`RegionStateOptions` is an emission-time policy shared by `Emitter` and the
+region prologue, search tree and exit epilogue. No guest instruction checks a
+runtime option, and no second complete emitter exists. `emit_region(blocks,
+meta, {false, false})` explicitly selects reference emission; `{true, false}`,
+`{false, true}`, `{true, true}` select P, K and PK for differential tests using
+the same IR and metadata. `validate_region_block` uses the reference policy;
+formation, supported opcodes, memory probes and terminal routing are unchanged.
+`emit_block` / CPU `step()` always retain reference emission.
+
+The default argument and production CPU use `region_state_options()`, which
+reads configuration once per process/Emscripten module. Each CPU holds that
+immutable selection for its cache lifetime. Start a fresh process/Worker to
+change it; changing environment variables after first use has no effect.
+
+| Run | `VITA3K_WASMJIT_PROMOTE_FLAGS` | `VITA3K_WASMJIT_PROMOTE_ACCOUNTING` |
+| --- | --- | --- |
+| A, reference | `0` | `0` |
+| P, flags | `1` | `0` |
+| K, accounting | `0` | `1` |
+| PK, both | `1` | `1` |
+
+Unset options default to false. `VITA3K_WASMJIT_PROMOTED_STATE=1` supplies a
+true default for both; an explicitly present individual option overrides it.
+Only the exact string `1` enables an option. Native emission uses `getenv`.
+Emscripten reads identically named `Module` properties first, then Node's
+`process.env`; browser operators set the properties on the module configuration
+before creating the CPU. Browser frontend changes are not required by this ABI.
+CPU profile output includes `promote_flags=0/1 promote_accounting=0/1`.
+Keep the older `VITA3K_ABLATE` and `VITA3K_ABLATE_PC` unset for validation and
+measurement; the existing experimental guard/dispatch ablations are unrelated.
+
+Promoted locals live for **one region call only**. Before any return, including
+a cached region transfer in the M16 pump, the common epilogue materializes them.
+The next region reloads memory. `JitState` layout remains 420 bytes, including
+`tx_wasm` at +416. Function signatures, imports, table slots, map keys and
+dispatcher byte emission are unchanged.
+
+### Representations and dirty policy
+
+The reference stores architectural CPSR in `JitState.cpsr` (+64), with NZCV in
+bits 31..28. IR `NZCVFlags` values also use these packed CPSR positions (not the
+native backend's opaque flag representation). Carry/overflow pseudos are U1
+SSA values in producer slots +4/+5. Arithmetic/shift computation is unchanged.
+ITSTATE uses bits 26:25 and 15:10; T is bit 5, E bit 9. Descriptor updates use
+the existing `Location::CPSR_MODE_MASK`, which is statically required to exclude
+NZCV. It describes T/E/IT, not the processor mode bits in CPSR[4:0].
+
+P loads CPSR once at entry into four normalized i32 N/Z/C/V locals, plus a
+separate `other_psr` containing `cpsr & 0x0fffffff`. N/Z/C/V are never updated by
+reconstructing full CPSR. `other_psr` receives the same masked descriptor and
+BX.T updates as the reference, preserving Q (bit 27), GE (19:16), processor
+mode, interrupt bits and all other incoming bits. IT has no independent runtime
+state in this emitter; descriptors supply its advances/recovery. FPSCR/FPU
+remain memory-backed and their supported operations/validation are unchanged.
+
+Reference accounting already keeps `executed_call` in local 2, dispatch count
+in local 7, and budget in parameter 1. There is no additional memory-backed
+tick accumulator in region bodies in this revision. K retains `regs[15]` and
+`next_pc` in two more locals. Both load their own incoming memory value; they
+must NOT be aliased because faults can leave `next_pc` unchanged. PC is the
+pending/resume value used by the reference, not a synthesized per-instruction
+architectural PC+4/+8. The generic search's local 3 remains search scratch.
+
+Reference local numbering is unchanged (SSA begins at 26). Any promoted policy
+reserves 26=N, 27=Z, 28=C, 29=V, 30=other_psr, 31=PC, 32=next_pc, with SSA at
+33. An unused half of that small reservation is left unused in P/K runs.
+R0..R14 remain in the existing locals 11..25; this is not new GPR promotion.
+
+Dirty tracking is conservative: enabled locals become authoritative on entry
+and are always published at an observation boundary, even after zero work.
+There is no compile-time dirty bit that could incorrectly summarize a runtime
+branch or a later loop iteration. `materialize_flags` merges all four flag
+locals with `other_psr`; a full CPSR reader uses it before its memory read.
+That read does not invalidate locals. `reload_flags` is used at invocation
+entry; no supported in-body operation modifies CPSR outside this abstraction.
+`materialize_accounting` commits ticks/dispatch totals **only once at exit**;
+it is not an idempotent helper-call spill and must never be used as one.
+
+### CPSR access audit
+
+The six original logical CPSR access sites in region emission are accounted
+for below. The four extra direct CPSR loads in `emit_dispatch` remain unchanged
+because M16 reads the fully materialized T/E/IT key between region calls.
+
+| Existing operation/site | P behavior |
+| --- | --- |
+| `flag`, used by `A32GetCFlag`, entry/terminal conditions and conditional selects | `read_flag`: local.get N/Z/C/V; EQ/NE, CS/CC, MI/PL, VS/VC, HI/LS, GE/LT, GT/LE, AL expressions unchanged; NV still rejected |
+| `A32SetCpsrNZ`, `NZC`, `NZCV`, `NZCVRaw` common setter | `write_nzcv`: set only the selected locals; NZ preserves C/V, NZC preserves V |
+| `A32GetCpsr` | `read_full_cpsr`: materialize complete CPSR, then read memory; preserves full-state observation semantics |
+| `upper_location` from descriptor updates, terminals, condition failure, continuation exit, fault recovery | `write_psr_field`: update T/E/IT in `other_psr`, preserving all other bits and the four flags |
+| `A32BXWritePC` | Descriptor update, then masked T-bit update in `other_psr`; the aligned target goes through `write_pc`; late upper-location updates remain suppressed |
+| Generic entry search PSR check | Read `other_psr`, then the original descriptor mask/comparison; FPSCR load/comparison unchanged |
+
+ADD/ADC, SUB/SBC/RSB, CMP/CMN use the existing Add32/Sub32 result and carry/
+overflow pseudos, then the common flag setters. Logical/MOV/MVN and
+LSL/LSR/ASR/ROR/RRX use existing result/shift-carry SSA and the same setters.
+Packed flags, `GetNZFromOp`, `GetNZCVFromOp`, and `GetCFlagFromNZCV` keep their
+existing packed SSA representation; only architectural consumers change.
+No supported `Mul32`, saturation/Q writer, GE writer, full CPSR writer, or
+FPSCR writer case exists in this checkout's emitter. Such IR continues to
+fail closed; the presence of `GetGEFromOp`'s PackedAddU8 check does not make
+PackedAddU8 supported (its producer is rejected). This patch does not add
+instruction coverage or silently accept those operations. VMRS/VMSR/FP state
+interactions that require unsupported IR likewise remain rejected; supported
+VFP/NEON data moves and memory accesses do not change CPSR/FPSCR.
+
+### Bookkeeping and observation boundaries
+
+| Field or boundary | Candidate behavior |
+| --- | --- |
+| `executed_call`, budget checks | Original local arithmetic through `read_executed`/`add_ticks`; no changed formula or check placement |
+| `state.executed` (+80) | Original wrapping `state.executed + executed_call`, exactly once in shared epilogue |
+| `regs[15]` (+60) | K `read_pc`/`write_pc` for IR access, BX, terminals and generic search; initialized before any early exit; spilled on every return |
+| `next_pc` (+372) | K `set_next_pc` at the original publication sites; spilled on every return; incoming value retained when reference leaves it untouched |
+| `dispatches` (+396) | Existing local 7 tally, committed once at exit; profiling, not architectural instruction count |
+| `svc`, `exit_reason` | Existing memory stores; SVC is recorded IR, not an in-body HLE callback; exit reason set after state publication |
+| `fault_pc`, `fault_address`, `fault_write` | Existing memory fields; fault location comes from memory-op arg0, never from the promoted pending PC |
+| `stop_flag`, `smc_dirty`, code-page probes | Remain live memory reads at all existing poll points; never promoted or hoisted by this option |
+| `mem_fast_reads/writes`, `tx_wasm` | Profiling counters remain memory-backed; their traffic is not claimed as a semantic-state reduction |
+| SVC / HLE / host inspection / context save / process exit | Region returns through the common epilogue before the host or callback observes state |
+| Fault | Recover faulting T/E/IT, preserve current flags/IR effects, charge only earlier completed segments, then epilogue; host still sets regs[15]=fault_pc; next_pc keeps reference semantics |
+| Budget / Stop / Smc / true Miss / cached transfer | Original pending PC and reason, all enabled locals published by the common epilogue |
+| Unsupported IR / invalid terminal | Reject the entire emission; no partially generated guest execution |
+
+Checked `mem_read`/`mem_write` imports are explicitly **non-observers**:
+`memory_slow_call` goes through `before_checked_memory_helper`. The actual
+helpers use memory_cookie, memory_value, fault and SMC fields (plus process
+profiling counters), and cannot inspect/mutate cached CPU state or invoke
+CPU/HLE/debug/context callbacks. Thus they need no flag/PC flush or reload,
+including on fast-path fallbacks. A failing helper branches to the shared
+fault epilogue after mode recovery. Guest mappings must remain disjoint from
+JitState storage, as already required for the existing GPR cache.
+
+Any future helper that observes or modifies CPU state must terminate the
+region and run after the epilogue (as SVC does), with subsequent execution
+reentering through `load_region_state`. Do not reuse the non-observer import
+path for it. A future in-region full-CPSR writer also requires an explicit
+split/update or materialize/write/reload operation before adding its opcode
+to the whitelist; it is currently rejected. Asynchronous context observation
+inside a call is not supported by the existing single-worker ABI.
+
+### Tick, continuation and invalidation invariants
+
+Normal terminals add the entire block's CycleCount once. Condition-failed
+paths add ConditionFailedCycleCount once. Continued-store fallthrough adds
+nothing: side exits add their completed prefix once, while later faults add
+only `completed_store_ticks` (the earlier completed store-delimited prefix).
+No prefix is subtracted/re-added at materialization. Faulting segments and
+partial multi-access instructions retain the reference counting convention.
+
+Entry and linked-edge admission still compare executed_call plus successor
+cost with budget; continuation checks use the cumulative next-segment end.
+M16 still clamps slices to 131072, checks returned deltas and handles exact
+exhaustion, non-divisible slices and zero progress. Arbitrarily large direct
+`run` budgets should use the same slice bound: this patch does not change the
+reference's unsigned addition guards. The host's 64-bit total and wrapping
+32-bit delta logic are unchanged.
+
+No SMC mechanism, region formation, guest memory mapping or dispatcher was
+redesigned. Successful code-page stores still mark smc_dirty; existing
+continuation/loop/edge exits reach the epilogue before returning. M16 reads
+smc_dirty before chaining a Miss/Budget and the host normalizes pending SMC on
+other reasons, including Budget-before-loop-poll paths. Epoch lookup occurs
+between fully materialized calls. Local promotion cannot hide stop/SMC flags.
+
+Static review also noted a **pre-existing** discrepancy: the public
+`WasmJitCPU::invalidate_jit_cache` region-erasure loop does not bump
+`dispatch_epoch`, unlike `clear_regions`, `clear_regions_for_page`, LRU and
+byte-validation eviction. This candidate leaves that reference behavior
+unchanged; explicitly validate external invalidation and shared-table slot
+reuse before drawing correctness conclusions. The new matrix tests include
+stale-epoch lookup and mixed-policy transfers, but do not establish this
+pre-existing external invalidation path correct.
+
+### Expected structural effect (not a WAT measurement)
+
+Source-level replacements for P:
+
+```text
+flag read: OLD load cpsr; shift; mask       NEW local.get N/Z/C/V
+NZ write:  OLD load cpsr; merge; store      NEW extract SSA N/Z; local.set N/Z
+NZC write: OLD load cpsr; merge; store      NEW local.set N/Z/C (V untouched)
+mode/IT:   OLD load cpsr; mask/OR; store    NEW local.get/set other_psr
+```
+
+All four architectural NZCV setter opcodes share one changed lowering site;
+the two non-NZCV update sites and common condition/carry reader also route
+through RegionState. For P, those repeated CPSR memory operations disappear
+by source construction, replaced by one entry load, one exit store, and a
+store+load at each full CPSR read. The candidate still packs/unpacks IR flag
+SSA values and adds local operations; fewer memory accesses do not prove a
+speedup or lower native register pressure.
+
+For K, location/IR/BX PC stores and generic/exit PC loads become local.set/get;
+next_pc publication becomes local.set. Two entry loads and two exit stores
+replace those sites' memory accesses. Tick/dispatch totals were already
+local, so no new reduction in their hot-body traffic is claimed. Profiling
+memory counters remain untouched. No generated Wasm/WAT or dynamic counts
+were produced here; the earlier hot-region census must be repeated on this
+exact revision to reconcile traffic with the current source.
+
+### Required validation in the real environment
+
+1. Build this source with reference defaults, then enable P/K/PK using the
+   same binary (or equivalent separately configured builds). Disable ablations.
+2. Run backend tests in fresh A/P/K/PK processes; direct region tests also
+   exercise an explicit four-policy matrix in each process. Check counters,
+   continuation prefixes, 0/1/small/non-divisible budgets, SVC/fault/stop/SMC,
+   true misses, epoch invalidation and mixed-policy M16 transfers.
+3. Run the native emitter fixture generator and `wasmjit_emitter_test.mjs`.
+   It validates candidate modules and compares complete state and memory
+   images with reference regions for the existing input corpus and added
+   flag/SVC/fault cases. These test changes are **unexecuted** here.
+4. Run the existing InterpreterCPU differential integration suite in all four
+   modes, then genuine exit-42 and display fixtures including HLE context
+   visibility, ARM/Thumb/IT, Q/GE preservation, SMC and repeated invocation.
+5. Only after correctness checks, run repeated interleaved uncapped browser
+   benchmarks and the hot-region WAT/native census. Compare CPSR, PC, tick and
+   profiling traffic separately; record browser/version/options and raw data.
+
+Compilation, generated-Wasm validity, flag differential correctness, fixture
+correctness, browser execution, performance, FPS and MIPS remain unestablished.
+
+### Source-only review record
+
+Starting revision: `ba153401e5848b5fe5c2774a4db3c62f801568c1`, initially clean.
+The existing Task #10/#11 ablation controls were retained, default-off; no
+experimental patch was reverted and no fixture-specific selection was added.
+The external Dynarmic source/dependency directory is absent in this checkout;
+the review traced the checked-in frontend wrapper, complete Wasm lowering,
+backend helpers (including MemState copy paths) and test sources. Native
+Dynarmic internals and actual emitted modules require the real environment.
+
+After editing, a source search of `Emitter` through `emit_region` found zero
+direct `offsetof(JitState, cpsr)`, zero `offsetof(JitState, next_pc)`, and zero
+fixed R15-offset accesses outside RegionState. Variable-register access is
+explicitly routed through the abstraction when index is 15. The M16
+`emit_dispatch` function text matches the starting revision (ignoring line
+endings). The four single-block `executed` initialization/completion/fault
+store sites remain reference-only. Both region tick/dispatch commits reside
+in the single exit materializer. These are structural source observations,
+not generated-code or runtime results.
+
 ## JitState (emit_wasm.h) — append ONLY, existing offsets fixed
 
 Existing layout (regs[16], cpsr, fpscr, svc, exit_reason, executed,
@@ -135,9 +388,10 @@ dispatch counts, and returns the exit reason. Faults use this same epilogue:
 writes from earlier blocks and earlier IR in the faulting block survive;
 unexecuted writes retain their incoming values. Checked memory helpers use
 the memory, fault and SMC fields, and must not read or modify cached GPRs.
-PC, CPSR and extended registers still use their architectural state fields.
+In reference mode PC, CPSR and extended registers still use their architectural
+state fields. The optional candidate described above changes only PC/CPSR.
 
-Current local layout: 0=state, 1=budget, 2=executed_call, 3=dispatch PC,
+Reference local layout: 0=state, 1=budget, 2=executed_call, 3=dispatch PC,
 4=CheckBit, 5=i64 scratch, 6=dispatch index (exit reason after leaving the
 loop), 7=dispatch count, 8..10=memory bases, 11..25=R0..R14, 26..=SSA.
 Single-block emission reserves locals 3..17 for R0..R14 and starts SSA at

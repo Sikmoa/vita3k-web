@@ -5,9 +5,24 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+EM_JS(uint32_t, vita3k_promoted_state_options, (), {
+    const read = (name) => {
+        if (typeof Module !== 'undefined' && Module[name] !== undefined)
+            return String(Module[name]);
+        return (typeof process !== 'undefined' && process.env) ? process.env[name] : undefined;
+    };
+    const both = read('VITA3K_WASMJIT_PROMOTED_STATE') === '1';
+    const enabled = (name) => {
+        const value = read(name);
+        return value === undefined ? both : value === '1';
+    };
+    return (enabled('VITA3K_WASMJIT_PROMOTE_FLAGS') ? 1 : 0)
+        | (enabled('VITA3K_WASMJIT_PROMOTE_ACCOUNTING') ? 2 : 0);
+});
 // Bench-only opt-in is read from the JS side (Node process.env), the same
 // channel as the existing VITA3K_DUMP_JIT hook in wasm_jit_cpu.cpp: C-level
 // getenv does not see Node env under Emscripten. Native builds use getenv.
@@ -134,6 +149,154 @@ constexpr uint32_t kRegionRegBase = 11;
 constexpr uint32_t kCachedRegCount = 15;
 constexpr uint32_t kRegionSsaBase = kRegionRegBase + kCachedRegCount;
 
+// Emission-time policy shared by bodies, dispatch, entry and the epilogue.
+// Reference methods emit the original memory operations. Promoted state is
+// private to ONE run invocation; no locals cross M16 call_indirect boundaries.
+class RegionState {
+public:
+    explicit RegionState(RegionStateOptions options = {}) : options(options) {}
+
+    uint32_t ssa_base() const {
+        return options.promote_flags || options.promote_accounting ? kNextPc + 1 : kRegionSsaBase;
+    }
+    void load_region_state(Bytes &c) const {
+        reload_flags(c);
+        if (options.promote_accounting) {
+            b_load(c, kPcOffset); b_set(c, kPc);
+            // Fault exits intentionally leave next_pc untouched. Initialize
+            // from memory rather than synthesizing it from regs[15].
+            b_load(c, offsetof(JitState, next_pc)); b_set(c, kNextPc);
+        }
+    }
+    void reload_flags(Bytes &c) const {
+        if (!options.promote_flags) return;
+        b_load(c, offsetof(JitState, cpsr)); b_set(c, kOtherPsr);
+        for (unsigned bit = 28; bit <= 31; ++bit) {
+            b_get(c, kOtherPsr); b_imm(c, bit); b_op(c, ShrU);
+            b_imm(c, 1); b_op(c, And); b_set(c, flag_local(bit));
+        }
+        b_get(c, kOtherPsr); b_imm(c, ~kNzcv); b_op(c, And); b_set(c, kOtherPsr);
+    }
+    void read_flag(Bytes &c, unsigned bit) const {
+        if (options.promote_flags) {
+            b_get(c, flag_local(bit));
+        } else {
+            b_load(c, offsetof(JitState, cpsr)); b_imm(c, bit); b_op(c, ShrU);
+            b_imm(c, 1); b_op(c, And);
+        }
+    }
+    // packed() emits a CPSR-positioned NZ/NZCV value; carry() emits a U1.
+    // NZ and NZC must not overwrite preserved C/V locals.
+    template <typename Packed, typename Carry>
+    void write_nzcv(Bytes &c, uint32_t bits, const Packed &packed, const Carry &carry) const {
+        if (!options.promote_flags) {
+            b_get(c, 0); b_load(c, offsetof(JitState, cpsr)); b_imm(c, ~bits); b_op(c, And);
+            packed(); b_imm(c, bits == 0xe0000000 ? 0xc0000000 : bits); b_op(c, And); b_op(c, Or);
+            if (bits == 0xe0000000) { carry(); b_imm(c, 29); b_op(c, Shl); b_op(c, Or); }
+            b_store(c, offsetof(JitState, cpsr));
+            return;
+        }
+        for (unsigned bit = 28; bit <= 31; ++bit) {
+            if (!(bits & (1u << bit))) continue;
+            if (bits == 0xe0000000 && bit == 29) {
+                carry(); // IR U1; reference lowering also relies on this type.
+            } else {
+                packed(); b_imm(c, bit); b_op(c, ShrU); b_imm(c, 1); b_op(c, And);
+            }
+            b_set(c, flag_local(bit));
+        }
+    }
+    template <typename Value>
+    void write_psr_field(Bytes &c, uint32_t bits, const Value &value) const {
+        // Only modeled T/E/IT updates use this operation. NZCV have their
+        // own representation; full CPSR/Q/GE writers remain unsupported IR.
+        if (options.promote_flags) {
+            b_get(c, kOtherPsr); b_imm(c, ~bits); b_op(c, And);
+            value(); b_op(c, Or); b_set(c, kOtherPsr);
+        } else {
+            b_get(c, 0); b_load(c, offsetof(JitState, cpsr)); b_imm(c, ~bits); b_op(c, And);
+            value(); b_op(c, Or); b_store(c, offsetof(JitState, cpsr));
+        }
+    }
+    void read_dispatch_psr(Bytes &c) const {
+        // Entry masks contain only T/E/IT, never arithmetic flags.
+        if (options.promote_flags) b_get(c, kOtherPsr);
+        else b_load(c, offsetof(JitState, cpsr));
+    }
+    void materialize_flags(Bytes &c) const {
+        if (!options.promote_flags) return;
+        // Conservative dirty policy: initialized locals are authoritative
+        // until reload; publish them even on a zero-work exit. No path-sensitive
+        // C++ dirty bit may describe dynamically taken Wasm branches.
+        b_get(c, 0); b_get(c, kOtherPsr);
+        for (unsigned bit = 28; bit <= 31; ++bit) {
+            b_get(c, flag_local(bit)); b_imm(c, bit); b_op(c, Shl); b_op(c, Or);
+        }
+        b_store(c, offsetof(JitState, cpsr));
+    }
+    void read_full_cpsr(Bytes &c) const {
+        materialize_flags(c);
+        b_load(c, offsetof(JitState, cpsr));
+    }
+    void read_pc(Bytes &c) const {
+        if (options.promote_accounting) b_get(c, kPc);
+        else b_load(c, kPcOffset);
+    }
+    template <typename Value>
+    void write_pc(Bytes &c, const Value &value) const {
+        write_accounting(c, kPcOffset, kPc, value);
+    }
+    template <typename Value>
+    void set_next_pc(Bytes &c, const Value &value) const {
+        write_accounting(c, offsetof(JitState, next_pc), kNextPc, value);
+    }
+    void set_next_pc_from_pc(Bytes &c) const {
+        set_next_pc(c, [&] { read_pc(c); });
+    }
+    void read_executed(Bytes &c) const { b_get(c, 2); }
+    void add_ticks(Bytes &c, uint32_t ticks) const {
+        read_executed(c); b_imm(c, ticks); b_op(c, Add); b_set(c, 2);
+    }
+    void materialize_accounting(Bytes &c) const {
+        if (options.promote_accounting) {
+            b_get(c, 0); b_get(c, kPc); b_store(c, kPcOffset);
+            b_get(c, 0); b_get(c, kNextPc); b_store(c, offsetof(JitState, next_pc));
+        }
+        // These accumulators were already local in the reference path.
+        // Commit ONCE, only in the shared exit epilogue; never before helpers
+        // or full CPSR reads (which would double-account completed work).
+        b_get(c, 0); b_load(c, offsetof(JitState, executed)); read_executed(c); b_op(c, Add);
+        b_store(c, offsetof(JitState, executed));
+        b_get(c, 0); b_load(c, offsetof(JitState, dispatches)); b_get(c, 7); b_op(c, Add);
+        b_store(c, offsetof(JitState, dispatches));
+    }
+    void materialize_all_on_exit(Bytes &c) const {
+        materialize_flags(c);
+        materialize_accounting(c);
+    }
+    void before_checked_memory_helper() const {
+        // Explicit non-observer ABI: checked_memory_read/write may touch
+        // memory_value, fault and SMC fields only. They cannot inspect, mutate
+        // or reenter CPU state. Therefore no spill/reload is required.
+        // Any new observer/mutator helper requires a separate synchronized ABI;
+        // it must NOT be routed through this entry point.
+    }
+
+private:
+    static constexpr uint32_t kNzcv = 0xf0000000;
+    static_assert((Location::CPSR_MODE_MASK & kNzcv) == 0);
+    static constexpr uint32_t kOtherPsr = kRegionSsaBase + 4;
+    static constexpr uint32_t kPc = kOtherPsr + 1, kNextPc = kPc + 1;
+    static constexpr uint32_t kPcOffset = offsetof(JitState, regs) + 15 * sizeof(uint32_t);
+    static uint32_t flag_local(unsigned bit) { return kRegionSsaBase + (31 - bit); }
+    template <typename Value>
+    void write_accounting(Bytes &c, uint32_t offset, uint32_t local, const Value &value) const {
+        if (options.promote_accounting) { value(); b_set(c, local); }
+        else { b_get(c, 0); value(); b_store(c, offset); }
+    }
+    RegionStateOptions options;
+};
+
 // Task #10 benchmark-only ablation harness (fenced, default-off).
 // Bit-identical default: ablate_flags() == 0 unless VITA3K_ABLATE env or the
 // test-only set_ablate_flags() setter opts in. Letters: B=skip SMC polling,
@@ -151,6 +314,24 @@ constexpr uint32_t kAblateHoistSmc = 16u;
 // Anonymous-namespace constants above stay visible here (same TU).
 uint32_t g_ablate_override = 0;
 void set_ablate_flags(uint32_t flags) { g_ablate_override = flags; }
+RegionStateOptions region_state_options() {
+    static const RegionStateOptions options = [] {
+#ifdef __EMSCRIPTEN__
+        const uint32_t flags = vita3k_promoted_state_options();
+        return RegionStateOptions{(flags & 1) != 0, (flags & 2) != 0};
+#else
+        const char *both = std::getenv("VITA3K_WASMJIT_PROMOTED_STATE");
+        const bool fallback = both && std::strcmp(both, "1") == 0;
+        const auto enabled = [&](const char *name) {
+            const char *value = std::getenv(name);
+            return value ? std::strcmp(value, "1") == 0 : fallback;
+        };
+        return RegionStateOptions{enabled("VITA3K_WASMJIT_PROMOTE_FLAGS"),
+            enabled("VITA3K_WASMJIT_PROMOTE_ACCOUNTING")};
+#endif
+    }();
+    return options;
+}
 namespace {
 uint32_t ablate_flags() {
     static uint32_t env_flags = []() -> uint32_t {
@@ -208,11 +389,13 @@ public:
     // Region layout (REGION_ABI.md): run(state=0, budget=1) with locals
     // 2=executed_call, 3=pc, 4=CheckBit, 5=i64 scratch, 6=dispatch index,
     // 7=dispatch count, 8..10=hoisted memory bases, 11..25=registers
-    // retained across bodies, 26..=per-block SSA words.
+    // retained across bodies; RegionState reserves candidate locals above
+    // these only when enabled, followed by per-block SSA words.
     Emitter(const Dynarmic::IR::Block &block, unsigned index,
         const std::vector<const Dynarmic::IR::Block *> &members,
-        const std::vector<RegionBlockMeta> &metadata)
+        const std::vector<RegionBlockMeta> &metadata, RegionStateOptions options = {})
         : block(block), start(block.Location()), finish(block.EndLocation())
+        , state(options)
         , region(true), body_index(index), members(&members), metadata(&metadata) {
         check_bit_local = 4;
         scratch_local = 5;
@@ -220,7 +403,7 @@ public:
         page_perms_local = 9;
         code_pages_local = 10;
         reg_base = kRegionRegBase;
-        ssa_base = kRegionSsaBase;
+        ssa_base = state.ssa_base();
         next_local = ssa_base;
     }
 
@@ -301,6 +484,7 @@ private:
     const Dynarmic::IR::Block &block;
     Location start, finish;
     Bytes code;
+    RegionState state; // single-block emission always uses the reference policy
     std::unordered_map<const Inst *, uint32_t> locals;
     // Single-block layout: 1=CheckBit, 2=i64 scratch, 3..17=registers,
     // SSA from 18. Architectural registers must never alias SSA temporaries.
@@ -441,6 +625,7 @@ private:
                 op(Store); uleb(code, 2); uleb(code, offsetof(JitState, memory_value) + 4);
             }
         }
+        state.before_checked_memory_helper();
         get(0); value_word(inst.GetArg(1)); imm(bytes | (reason << 8)); op(Call); uleb(code, write ? 1 : 0);
         checked_status();
         if (!write) {
@@ -589,21 +774,18 @@ private:
             ok = false;
             return;
         }
-        get(0);
-        load(offsetof(JitState, cpsr));
-        mask(~Location::CPSR_MODE_MASK);
-        imm(loc.CPSR().Value() & Location::CPSR_MODE_MASK);
-        op(Or);
-        store(offsetof(JitState, cpsr));
+        state.write_psr_field(code, Location::CPSR_MODE_MASK, [&] {
+            imm(loc.CPSR().Value() & Location::CPSR_MODE_MASK);
+        });
     }
 
     void location(const Location &loc) {
         upper_location(loc);
-        store_constant(offsetof(JitState, regs) + 15 * sizeof(uint32_t), loc.PC());
+        state.write_pc(code, [&] { imm(loc.PC()); });
     }
 
     void flag(unsigned bit) {
-        load(offsetof(JitState, cpsr)); imm(bit); op(ShrU); mask(1);
+        state.read_flag(code, bit);
     }
 
     void condition(Cond cond) {
@@ -813,7 +995,7 @@ private:
     void add_ticks(uint32_t ticks) {
         // Keep per-call accounting in a local. The monotonic state counter is
         // committed once on exit rather than once per completed block.
-        get(2); imm(ticks); op(Add); set(2);
+        state.add_ticks(code, ticks);
     }
 
     void br_redispatch() {
@@ -833,8 +1015,7 @@ private:
     }
 
     void set_next_pc_runtime() {
-        get(0); load(offsetof(JitState, regs) + 15 * sizeof(uint32_t));
-        store(offsetof(JitState, next_pc));
+        state.set_next_pc_from_pc(code);
     }
 
     // Statically-chained edges know the successor's block index at emission
@@ -899,7 +1080,7 @@ private:
             // RegionOverrun invariant holds despite bypassing loop top).
             const uint32_t ticks = (ablate & kAblateBudget) ? region_max_ticks()
                                                             : entry_ticks((*metadata)[target_index]);
-            get(2); imm(ticks); op(Add);
+            state.read_executed(code); imm(ticks); op(Add);
             get(1); op(GtU);
             begin_if();
             set_next_pc_runtime();
@@ -936,7 +1117,7 @@ private:
         // unchanged. The skipped search leaf would have exited Budget with
         // next_pc = regs[15]; the pending target's PC is already there
         // (location(target) precedes every light edge).
-        get(2); imm(ticks); op(Add);
+        state.read_executed(code); imm(ticks); op(Add);
         get(1); op(GtU);
         begin_if();
         set_next_pc_runtime();
@@ -981,12 +1162,12 @@ private:
             load(offsetof(JitState, smc_dirty)); op(Or);
         }
         if (!(ablate & kAblateBudget)) {
-            get(2); imm(next_segment_end); op(Add); get(1); op(GtU); op(Or);
+            state.read_executed(code); imm(next_segment_end); op(Add); get(1); op(GtU); op(Or);
         }
         begin_if();
         const Location next{Dynarmic::IR::LocationDescriptor{point.next_location}};
         location(next);
-        store_constant(offsetof(JitState, next_pc), next.PC());
+        state.set_next_pc(code, [&] { imm(next.PC()); });
         add_ticks(point.completed_ticks);
         load(offsetof(JitState, stop_flag)); begin_if();
         ret(ExitReason::Stop);
@@ -1018,7 +1199,7 @@ private:
             if (const uint32_t idx = member_index(target); idx != kNoMember) {
                 light_redispatch(idx); // chained: constant index, no PC search
             } else {
-                store_constant(offsetof(JitState, next_pc), target.PC());
+                state.set_next_pc(code, [&] { imm(target.PC()); });
                 ret(ExitReason::Miss);
             }
         } else if (const auto *fast = boost::get<Term::LinkBlockFast>(&term)) {
@@ -1028,7 +1209,7 @@ private:
             if (const uint32_t idx = member_index(target); idx != kNoMember) {
                 light_redispatch(idx);
             } else {
-                store_constant(offsetof(JitState, next_pc), target.PC());
+                state.set_next_pc(code, [&] { imm(target.PC()); });
                 ret(ExitReason::Miss);
             }
         } else if (const auto *test = boost::get<Term::If>(&term)) {
@@ -1171,15 +1352,18 @@ private:
                 if (!region)
                     dirty_regs[index] = true;
             } else if (kind == Op::A32GetRegister) {
-                load(offset);
+                if (index == 15) state.read_pc(code);
+                else load(offset);
                 break;
+            } else if (index == 15) {
+                state.write_pc(code, [&] { arg(1); });
             } else {
                 get(0); arg(1); store(offset);
             }
             pc_written |= index == 15;
             return ok;
         }
-        case Op::A32GetCpsr: load(offsetof(JitState, cpsr)); break;
+        case Op::A32GetCpsr: state.read_full_cpsr(code); break;
         case Op::A32ReadMemory8: memory_call(inst, false, 1); return ok;
         case Op::A32ReadMemory16: memory_call(inst, false, 2); return ok;
         case Op::A32ReadMemory32: memory_call(inst, false, 4); return ok;
@@ -1195,10 +1379,7 @@ private:
         case Op::A32SetCpsrNZCVRaw: {
             const uint32_t bits = kind == Op::A32SetCpsrNZ ? 0xc0000000
                 : kind == Op::A32SetCpsrNZC ? 0xe0000000 : 0xf0000000;
-            get(0); load(offsetof(JitState, cpsr)); mask(~bits);
-            arg(0); mask(kind == Op::A32SetCpsrNZC ? 0xc0000000 : bits); op(Or);
-            if (kind == Op::A32SetCpsrNZC) { arg(1); imm(29); op(Shl); op(Or); }
-            store(offsetof(JitState, cpsr));
+            state.write_nzcv(code, bits, [&] { arg(0); }, [&] { arg(1); });
             return ok;
         }
         case Op::GetNZFromOp:
@@ -1255,11 +1436,10 @@ private:
             return ok;
         case Op::A32BXWritePC:
             upper_location(finish);
-            get(0); load(offsetof(JitState, cpsr)); mask(~uint32_t(0x20));
-            arg(0); mask(1); imm(5); op(Shl); op(Or); store(offsetof(JitState, cpsr));
-            get(0); arg(0);
-            imm(0xfffffffe); imm(0xfffffffc); arg(0); mask(1); op(Select); op(And);
-            store(offsetof(JitState, regs) + 15 * sizeof(uint32_t));
+            state.write_psr_field(code, 0x20, [&] { arg(0); mask(1); imm(5); op(Shl); });
+            state.write_pc(code, [&] {
+                arg(0); imm(0xfffffffe); imm(0xfffffffc); arg(0); mask(1); op(Select); op(And);
+            });
             pc_written = true;
             return ok;
         case Op::PushRSB:
@@ -1396,7 +1576,8 @@ bool validate_region_block(const Dynarmic::IR::Block &block,
 
 std::vector<uint8_t> emit_region(
     const std::vector<const Dynarmic::IR::Block *> &blocks,
-    const std::vector<RegionBlockMeta> &meta) {
+    const std::vector<RegionBlockMeta> &meta, RegionStateOptions options) {
+    const RegionState state(options);
     constexpr size_t kMaxBlocks = 512;
     constexpr uint64_t kMaxTicks = 32768;
     constexpr size_t kMaxModule = 4 << 20;
@@ -1443,7 +1624,7 @@ std::vector<uint8_t> emit_region(
     std::vector<Bytes> bodies(n);
     uint32_t max_ssa = 0;
     for (size_t i = 0; i < n; ++i) {
-        Emitter emitter(*blocks[i], unsigned(i), blocks, meta);
+        Emitter emitter(*blocks[i], unsigned(i), blocks, meta, options);
         bodies[i] = emitter.region_body();
         if (bodies[i].empty()) {
             return {};
@@ -1461,8 +1642,7 @@ std::vector<uint8_t> emit_region(
     // the HOST re-checks smc_dirty on every exit (see execute_regions).
     Bytes d;
     const auto exit_with = [&](ExitReason reason, uint32_t open_ifs) {
-        b_get(d, 0); b_load(d, offsetof(JitState, regs) + 15 * sizeof(uint32_t));
-        b_store(d, offsetof(JitState, next_pc));
+        state.set_next_pc_from_pc(d);
         b_imm(d, static_cast<uint32_t>(reason)); b_set(d, 6);
         // Skip the open ifs, $default, all n block labels and the loop to
         // reach $exit. All state publication is shared after that label.
@@ -1496,7 +1676,7 @@ std::vector<uint8_t> emit_region(
         uint32_t max_ticks = 0;
         for (size_t i = 0; i < n; ++i)
             max_ticks = std::max(max_ticks, meta[i].ticks);
-        b_get(d, 2); b_imm(d, max_ticks); b_op(d, Add);
+        state.read_executed(d); b_imm(d, max_ticks); b_op(d, Add);
         b_get(d, 1); b_op(d, GtU);
         b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Budget, 1); b_op(d, End);
     }
@@ -1507,7 +1687,7 @@ std::vector<uint8_t> emit_region(
     b_imm(d, kLightDispatchSentinel); b_op(d, Eq);
     b_op(d, If); b_op(d, 0x40);
     // Generic path: pc = regs[15]; idx = n (default)
-    b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, regs) + 15 * sizeof(uint32_t));
+    state.read_pc(d);
     b_set(d, 3);
     b_imm(d, static_cast<uint32_t>(n)); b_set(d, 6);
 
@@ -1521,7 +1701,7 @@ std::vector<uint8_t> emit_region(
             if (!(ablate_dispatch & kAblatePsr)) {
             {
                 // Entry PSR mismatch -> Miss (host re-dispatches at regs[15]).
-                b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, cpsr));
+                state.read_dispatch_psr(d);
                 b_imm(d, meta[lo].psr_mask); b_op(d, And);
                 b_imm(d, meta[lo].psr_value); b_op(d, Ne);
                 b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Miss, open_ifs + 2); b_op(d, End);
@@ -1538,7 +1718,7 @@ std::vector<uint8_t> emit_region(
                 // Budget: executed_call + ticks > budget -> Budget.
                 // ABLATE C: skipped (loop-top slice bound kept instead).
                 if (!(ablate_dispatch & kAblateBudget)) {
-                b_get(d, 2); b_imm(d, entry_ticks(meta[lo])); b_op(d, Add);
+                state.read_executed(d); b_imm(d, entry_ticks(meta[lo])); b_op(d, Add);
                 b_get(d, 1); b_op(d, GtU);
                 b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Budget, open_ifs + 2); b_op(d, End);
                 }
@@ -1569,6 +1749,7 @@ std::vector<uint8_t> emit_region(
 
     // Function body: nested block chain, bodies in reverse label order.
     Bytes code;
+    state.load_region_state(code);
     // Fresh entry selects the generic path: locals are zero-initialized per
     // invocation, so the dispatch-index local must start at the sentinel
     // (a stale 0 would wrongly route the first dispatch to block 0).
@@ -1590,7 +1771,7 @@ std::vector<uint8_t> emit_region(
     code.insert(code.end(), d.begin(), d.end());
     b_op(code, End); // close $default -> miss body
     {
-        b_get(code, 0); b_get(code, 3); b_store(code, offsetof(JitState, next_pc));
+        state.set_next_pc(code, [&] { b_get(code, 3); });
         b_imm(code, static_cast<uint32_t>(ExitReason::Miss)); b_set(code, 6);
         b_op(code, Br); uleb(code, static_cast<uint32_t>(n) + 1); // $exit ($default is closed)
     }
@@ -1607,10 +1788,7 @@ std::vector<uint8_t> emit_region(
             b_store(code, offsetof(JitState, regs) + i * sizeof(uint32_t));
         }
     }
-    b_get(code, 0); b_load(code, offsetof(JitState, executed)); b_get(code, 2); b_op(code, Add);
-    b_store(code, offsetof(JitState, executed));
-    b_get(code, 0); b_load(code, offsetof(JitState, dispatches)); b_get(code, 7); b_op(code, Add);
-    b_store(code, offsetof(JitState, dispatches));
+    state.materialize_all_on_exit(code);
     b_get(code, 0); b_get(code, 6); b_store(code, offsetof(JitState, exit_reason));
     b_get(code, 6); // function result
     b_op(code, End); // end function body
@@ -1619,7 +1797,7 @@ std::vector<uint8_t> emit_region(
     uleb(body, 3); // three local runs
     uleb(body, 3); body.push_back(0x7f); // locals 2,3,4: executed_call, pc, CheckBit
     uleb(body, 1); body.push_back(0x7e); // local 5: i64 scratch
-    uleb(body, kRegionSsaBase - 6 + max_ssa); body.push_back(0x7f); // 6: dispatch index / exit reason; 7: dispatch count; 8..10: memory bases; 11..25: cached regs; 26..: SSA
+    uleb(body, state.ssa_base() - 6 + max_ssa); body.push_back(0x7f); // fixed region locals, optional state locals, then SSA
     body.insert(body.end(), code.begin(), code.end());
     Bytes functions{1};
     uleb(functions, static_cast<uint32_t>(body.size()));

@@ -15,6 +15,15 @@ constexpr uint32_t page = 4096;
 
 void helpers(MemState &mem) {
     JitState state{};
+    // Non-observer helper ABI: architectural/cache-owned fields must not be
+    // mutated even when helpers fault. Their memory copy may be stale during
+    // a promoted region invocation, and a helper must not make it authoritative.
+    for (unsigned i = 0; i < 16; ++i) state.regs[i] = 0xabc00000 + i;
+    state.cpsr = 0xf80f00d0;
+    state.executed = 0xfffffff0;
+    state.next_pc = 0x81001234;
+    state.dispatches = 37;
+    const auto architectural = state;
     state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mem));
     const std::array<uint32_t, 4> lanes{0x76543210, 0xfedcba98, 0x89abcdef, 0x01234567};
     // Each valid size is deliberately unaligned; wider accesses cross pages.
@@ -57,6 +66,9 @@ void helpers(MemState &mem) {
     state.memory_cookie = 0;
     CHECK(checked_memory_read(&state, data, 4) == 2);
     CHECK(checked_memory_write(&state, data, 4) == 2);
+    CHECK(std::memcmp(state.regs, architectural.regs, sizeof(state.regs)) == 0);
+    CHECK(state.cpsr == architectural.cpsr && state.executed == architectural.executed);
+    CHECK(state.next_pc == architectural.next_pc && state.dispatches == architectural.dispatches);
 }
 
 void put(MemState &mem, WasmJitCPU &jit, std::initializer_list<uint32_t> words) {
@@ -414,7 +426,7 @@ void region_budget_continuations(MemState &mem) {
     CHECK(jit.get_last_error().find("budget") != std::string::npos);
 }
 
-void region_regressions(MemState &mem) {
+void region_regressions(MemState &mem, vita3k::wasmjit::RegionStateOptions options) {
     namespace A32 = Dynarmic::A32;
     namespace IR = Dynarmic::IR;
     using Op = IR::Opcode;
@@ -435,7 +447,7 @@ void region_regressions(MemState &mem) {
         block.AppendNewInst(op, args);
         return Value{&block.back()};
     };
-    const auto emit = [](std::initializer_list<const IR::Block *> input) {
+    const auto emit = [&](std::initializer_list<const IR::Block *> input) {
         std::vector<const IR::Block *> blocks(input);
         std::vector<vita3k::wasmjit::RegionBlockMeta> meta;
         for (const auto *block : blocks) {
@@ -445,7 +457,7 @@ void region_regressions(MemState &mem) {
                 static_cast<uint32_t>(block->CycleCount()
                     + block->ConditionFailedCycleCount())});
         }
-        return vita3k::wasmjit::emit_region(blocks, meta);
+        return vita3k::wasmjit::emit_region(blocks, meta, options);
     };
     const auto run = [](const std::vector<uint8_t> &bytes, JitState &state,
                          uint32_t budget) {
@@ -484,6 +496,44 @@ void region_regressions(MemState &mem) {
     CHECK(state.fpu[1] == 0xdeadbeef);
     CHECK(state.fpu[2] == 1 && state.fpu[3] == 0);
     CHECK(state.next_pc == code + 8 && state.executed == 2);
+
+    // Flags produced in one member feed a condition in another; an NZ-only
+    // update then preserves C/V into a third member's full CPSR read and SVC.
+    // Exhaustion before that SVC must publish exactly the pending member PC.
+    auto flags_a = blank(code), flags_b = blank(code + 4), flags_c = blank(code + 8);
+    append(flags_a, Op::A32SetCpsrNZCVRaw,
+        {append(flags_a, Op::A32GetRegister, {Value{A32::Reg::R0}})});
+    flags_b.SetCondition(IR::Cond::EQ);
+    flags_b.SetConditionFailedLocation(loc(code + 8));
+    flags_b.ConditionFailedCycleCount() = 1;
+    append(flags_b, Op::A32SetCpsrNZ,
+        {append(flags_b, Op::GetNZFromOp, {Value{uint32_t(0x80000000)}})});
+    append(flags_c, Op::A32SetRegister, {Value{A32::Reg::R3},
+        append(flags_c, Op::A32GetCpsr, {})});
+    append(flags_c, Op::A32SetRegister,
+        {Value{static_cast<A32::Reg>(15)}, Value{uint32_t(code + 12)}});
+    append(flags_c, Op::A32CallSupervisor, {Value{uint32_t(0x42)}});
+    flags_c.ReplaceTerminal(IR::Term::ReturnToDispatch{});
+    const auto flags_module = emit({&flags_a, &flags_b, &flags_c});
+    for (uint32_t flags = 0; flags < 16; ++flags) {
+        for (uint32_t budget = 0; budget <= 4; ++budget) {
+            state = JitState{};
+            state.regs[0] = flags << 28;
+            state.regs[3] = 0xbeef;
+            state.regs[15] = code;
+            state.cpsr = 0x080f00d0 | ((flags ^ 15) << 28); // preserve Q/GE/I/F/mode
+            state.executed = 0xfffffffe; // wrapping accumulated counter
+            const auto before_cpsr = state.cpsr;
+            CHECK(run(flags_module, state, budget) == (budget >= 3 ? Reason::Svc : Reason::Budget));
+            const uint32_t completed = budget >= 3 ? 3 : budget == 0 ? 0 : 1;
+            CHECK(counter_delta(0xfffffffe, state.executed) == completed);
+            uint32_t expected_flags = flags << 28;
+            if (budget >= 3 && (flags & 4)) expected_flags = (expected_flags & 0x30000000) | 0x80000000;
+            CHECK(state.cpsr == (completed ? (before_cpsr & 0x0fffffff) | expected_flags : before_cpsr));
+            CHECK(state.regs[15] == code + 4 * completed && state.next_pc == state.regs[15]);
+            CHECK(state.regs[3] == (budget >= 3 ? state.cpsr : 0xbeefu));
+        }
+    }
 
     // No side effects after SVC, including dead/invalidated IR markers.
     append(b, Op::Void, {});
@@ -709,7 +759,7 @@ void region_regressions(MemState &mem) {
     CHECK(jit.run() == 0 && parent.svc_called);
     CHECK(jit.regions_formed() == formed + 1);
 }
-void region_store_continuations(MemState &mem) {
+void region_store_continuations(MemState &mem, vita3k::wasmjit::RegionStateOptions options) {
     using Reason = vita3k::wasmjit::ExitReason;
     using Location = Dynarmic::A32::LocationDescriptor;
     Region region;
@@ -729,7 +779,7 @@ void region_store_continuations(MemState &mem) {
             meta.push_back({block.pc, block.psr_mask, block.psr_value, block.ticks,
                 block.store_continuations});
         }
-        const auto bytes = vita3k::wasmjit::emit_region(blocks, meta);
+        const auto bytes = vita3k::wasmjit::emit_region(blocks, meta, options);
         CHECK(!bytes.empty());
         const int slot = vita3k_jit_install_region(bytes.data(), bytes.size(),
             checked_memory_read, write_memory);
@@ -816,6 +866,22 @@ void region_store_continuations(MemState &mem) {
     CHECK(stopped.regs[1] == data + 4 && stopped.regs[3] == 0xcafe);
     CHECK(stopped.executed == 18 && stopped.next_pc == code + 4);
     release(slot);
+
+    // Flag production before a continuation must be visible on Stop/SMC/
+    // Budget and remain authoritative after a successful checked helper.
+    for (unsigned exit = 0; exit < 3; ++exit) {
+        slot = install({0xe0900002, 0xe4810004, 0xe3a03063, 0xef000042},
+            0x10, exit == 1 ? stop_after_write : checked_memory_write); // ADDS; STR!; MOV; SVC
+        auto flags = initial(false);
+        flags.regs[0] = 0x7fffffff; flags.regs[2] = 1;
+        flags.cpsr = 0x680f00d0;
+        if (exit == 2) flags.regs[1] = code + 8;
+        CHECK(run(slot, flags, 2) == (exit == 1 ? Reason::Stop : exit == 2 ? Reason::Smc : Reason::Budget));
+        CHECK(flags.cpsr == 0x980f00d0 && flags.executed == 19);
+        CHECK(flags.regs[15] == code + 8 && flags.next_pc == code + 8);
+        CHECK(flags.regs[1] == (exit == 2 ? code + 12 : data + 4) && flags.regs[3] == 0xcafe);
+        release(slot);
+    }
 
     // A self-modifying post-index store exits only after writeback, before
     // the overwritten next instruction. SMC also wins at a budget boundary.
@@ -919,7 +985,7 @@ void region_store_continuations(MemState &mem) {
 // Region A (LDR r1,[pc]; BX r1) Miss-exits with next_pc=codeB; region B adds
 // and SVCs. Loop region C and Thumb loop region T exercise slice/budget and
 // the location-hash key paths. All expectations mirror host semantics.
-void dispatch_pump(MemState &mem) {
+void dispatch_pump(MemState &mem, vita3k::wasmjit::RegionStateOptions options) {
     using Reason = vita3k::wasmjit::ExitReason;
     using Location = Dynarmic::A32::LocationDescriptor;
     static bool installed = false;
@@ -932,7 +998,8 @@ void dispatch_pump(MemState &mem) {
     constexpr uint32_t codeB = code + 0x100, codeC = code + 0x200, codeT = code + 0x300;
     std::vector<Region> kept;
     std::vector<int> slots;
-    const auto install_region = [&](uint32_t entry, uint32_t cpsr) {
+    const auto install_region = [&](uint32_t entry, uint32_t cpsr,
+                                   std::optional<vita3k::wasmjit::RegionStateOptions> selected = std::nullopt) {
         Region region;
         std::vector<Dynarmic::IR::Block> ir;
         CHECK(form_region(mem, entry, cpsr, 0, region, ir));
@@ -945,7 +1012,7 @@ void dispatch_pump(MemState &mem) {
             meta.push_back({b.pc, b.psr_mask, b.psr_value, b.ticks, b.store_continuations});
             ticks += b.ticks;
         }
-        const auto bytes = vita3k::wasmjit::emit_region(blocks, meta);
+        const auto bytes = vita3k::wasmjit::emit_region(blocks, meta, selected.value_or(options));
         CHECK(!bytes.empty());
         const int slot = vita3k_jit_install_region(bytes.data(), bytes.size(),
             checked_memory_read, checked_memory_write);
@@ -1046,6 +1113,37 @@ void dispatch_pump(MemState &mem) {
     CHECK(drun(state, 2 * tTicks) == Reason::Budget);
     CHECK(state.executed == 2 * tTicks && state.regs[0] == 2);
     CHECK(state.regs[15] == codeT);
+
+    // Mixed-policy region calls must communicate through materialized state:
+    // F produces carry/zero, G consumes carry after call_indirect. Then remove
+    // G's mapping to exercise a true Miss with the same produced flags/PC.
+    constexpr uint32_t codeF = code + 0x400, codeG = code + 0x500;
+    CHECK(mem_write(mem, codeF, std::array<uint32_t, 2>{0xe2900001, 0xe12fff11}.data(), 8)); // ADDS; BX r1
+    CHECK(mem_write(mem, codeG, std::array<uint32_t, 2>{0xe2a22000, 0xef000042}.data(), 8)); // ADC r2,r2,#0; SVC
+    CHECK(install_region(codeF, 0x10) == 2);
+    CHECK(install_region(codeG, 0x10, vita3k::wasmjit::RegionStateOptions{
+        !options.promote_flags, !options.promote_accounting}) == 2);
+    const auto flags_input = [&] {
+        auto input = fresh(codeF, 0x980f00d0);
+        input.regs[0] = UINT32_MAX;
+        input.regs[1] = codeG;
+        return input;
+    };
+    state = flags_input();
+    CHECK(drun(state, 4) == Reason::Svc);
+    CHECK(state.executed == 4 && state.tx_wasm == 1 && state.regs[2] == 1);
+    CHECK(state.cpsr == 0x680f00d0 && state.next_pc == codeG + 8);
+    dispatch_bump_epoch();
+    const uint64_t fkey = Location(codeF, Dynarmic::A32::PSR{0x10}, Dynarmic::A32::FPSCR{0}).UniqueHash();
+    const uint64_t gkey = Location(codeG, Dynarmic::A32::PSR{0x10}, Dynarmic::A32::FPSCR{0}).UniqueHash();
+    CHECK(dispatch_map_insert(fkey, static_cast<uint32_t>(slots[slots.size() - 2])));
+    state = flags_input();
+    CHECK(drun(state, 4) == Reason::Miss);
+    CHECK(state.executed == 2 && state.next_pc == codeG && state.regs[15] == codeG);
+    CHECK(state.cpsr == 0x680f00d0 && state.regs[2] == 0);
+    CHECK(dispatch_map_insert(gkey, static_cast<uint32_t>(slots.back())));
+    CHECK(drun(state, 2) == Reason::Svc);
+    CHECK(state.executed == 4 && state.regs[2] == 1 && state.cpsr == 0x680f00d0);
     for (int slot : slots)
         vita3k_jit_release_region(slot);
     for (auto &r : kept)
@@ -1063,9 +1161,17 @@ int main() {
     formation(mem);
     region_exec(mem);
     region_budget_continuations(mem);
-    region_regressions(mem);
-    region_store_continuations(mem);
-    dispatch_pump(mem);
+    // Direct-emitter matrix is independent of the process environment. CPU
+    // integration cases above use the process's selected representation;
+    // run this executable in four fresh processes to cover that layer too.
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        const vita3k::wasmjit::RegionStateOptions options{(mode & 1) != 0, (mode & 2) != 0};
+        dispatch_bump_epoch(); // released slots from prior cases must not resolve
+        region_regressions(mem, options);
+        region_store_continuations(mem, options);
+        dispatch_bump_epoch();
+        dispatch_pump(mem, options);
+    }
     deinit_mem(mem);
     std::printf("WasmJit backend: %u checks passed (real memory, no interpreter)\n", checks);
 }
