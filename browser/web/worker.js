@@ -82,6 +82,7 @@ self.onmessage = async ({ data }) => {
           // the guest run is suspended would mutate the Wasm heap under a
           // suspended stack. One input buffer per worker run is bounded.
           module._vita3k_web_set_trace?.(data.trace ? 1 : 0);
+          module._vita3k_web_set_fast_vblank?.(data.fastVblank ? 1 : 0);
           module._vita3k_web_run_vita(allocation, input.byteLength);
         } else {
           const exitCode = module._vita3k_web_run_elf_probe(allocation, input.byteLength);

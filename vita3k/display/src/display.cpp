@@ -141,6 +141,19 @@ void wait_vblank(EmuEnvState &emuenv, const ThreadStatePtr &wait_thread, const u
         // at a realistic cadence; everything runs on the Worker's single thread
         // so no host-thread data races are possible.
         while (wait_thread->status != ThreadStatus::run && !display.abort.load()) {
+            if (display.fast_vblank) {
+                // Headroom mode: one vblank per wait, no wall-clock gating.
+                // Waiting threads whose target vcount is reached wake via
+                // the normal advance_vblank path below; others loop and
+                // advance again. next_vblank_time tracks now so leaving fast
+                // mode (or concurrent readers) never sees a stale deadline.
+                advance_vblank(emuenv);
+                display.next_vblank_time = std::chrono::steady_clock::now();
+                thread_lock.unlock();
+                emscripten_sleep(1);
+                thread_lock.lock();
+                continue;
+            }
             const auto now = std::chrono::steady_clock::now();
             if (display.next_vblank_time.time_since_epoch().count() == 0) {
                 // First cooperative wait: seed the cadence so the first vblank

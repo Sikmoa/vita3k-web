@@ -2,6 +2,7 @@
 // This is a synchronous, non-graphical launch entrypoint, not another kernel.
 #include <cpu/functions.h>
 #include <cpu/impl/interpreter_cpu.h>
+#include <display/state.h>
 #ifdef VITA3K_USE_WASM_JIT
 #include <cpu/impl/wasm_jit_cpu.h>
 #endif
@@ -48,6 +49,12 @@ static bool vita3k_web_trace_cpu = false;
 extern "C" EMSCRIPTEN_KEEPALIVE
 void vita3k_web_set_trace(int enabled) { vita3k_web_trace_cpu = enabled != 0; }
 
+// Debug-only vblank headroom mode, mirrored into DisplayState per run.
+// See DisplayState::fast_vblank; default off, enabled by ?fastvblank=1.
+static bool vita3k_web_fast_vblank = false;
+extern "C" EMSCRIPTEN_KEEPALIVE
+void vita3k_web_set_fast_vblank(int enabled) { vita3k_web_fast_vblank = enabled != 0; }
+
 static void trace_cpu(CPUState &cpu, uint32_t nid) {
     if (!vita3k_web_trace_cpu) return;
     const auto context = save_context(cpu);
@@ -70,6 +77,7 @@ static int run_vita(const uint8_t *bytes, uint32_t size) {
     if (!bytes || !size) return -1;
     auto env = std::make_unique<EmuEnvState>();
     if (!init(env->mem, true)) return -2;
+    env->display.fast_vblank = vita3k_web_fast_vblank;
     ThreadStatePtr thread;
     bool exited = false;
     int exit_code = 0;

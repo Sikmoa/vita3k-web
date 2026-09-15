@@ -47,10 +47,16 @@ function present(frame) {
 window.addEventListener('DOMContentLoaded', () => {
   // Optional backend selection: display.html?backend=jit runs the animated
   // homebrew through the M14 WasmJitCPU module instead of the interpreter.
-  const backend = new URLSearchParams(self.location.search).get('backend');
-  const workerUrl = backend === 'jit' ? './worker.js?backend=jit' : './worker.js';
+  const params = new URLSearchParams(self.location.search);
+  const backend = params.get('backend');
+  // Debug headroom mode: ?fastvblank=1 free-runs the vblank clock so the
+  // FPS readout below measures true guest throughput, not the 60Hz cadence.
+  const fastVblank = params.get('fastvblank') === '1';
+  const workerUrl = (backend === 'jit' ? './worker.js?backend=jit' : './worker.js')
+    + (fastVblank ? (backend === 'jit' ? '&' : '?') + 'fastvblank=1' : '');
   const backendLabel = document.querySelector('#backend-label');
-  if (backendLabel) backendLabel.textContent = backend === 'jit' ? '(WasmJitCPU)' : '(InterpreterCPU)';
+  if (backendLabel) backendLabel.textContent = (backend === 'jit' ? '(WasmJitCPU)' : '(InterpreterCPU)')
+    + (fastVblank ? ' [fast vblank: uncapped]' : '');
   const worker = new Worker(workerUrl, { type: 'module' });
   worker.onmessage = ({ data }) => {
     if (data.type === 'lifecycle') console.log('[vita3k-web] lifecycle:', data.state);
@@ -59,7 +65,7 @@ window.addEventListener('DOMContentLoaded', () => {
       // Prefer a fixture staged next to the page; fall back to user upload.
       fetch('./display-eboot.bin')
         .then((response) => (response.ok ? response.arrayBuffer() : Promise.reject(new Error('no staged fixture'))))
-        .then((bytes) => worker.postMessage({ type: 'run-vita', file: new File([bytes], 'display-eboot.bin') }))
+        .then((bytes) => worker.postMessage({ type: 'run-vita', file: new File([bytes], 'display-eboot.bin'), fastVblank }))
         .catch(() => { status.textContent = 'Select a Vita eboot.bin to run.'; });
     }
     if (data.type === 'vita-frame') present(data);
@@ -77,7 +83,7 @@ window.addEventListener('DOMContentLoaded', () => {
   worker.onerror = (event) => { status.textContent = `Worker error: ${event.message || 'unknown'}`; };
   document.querySelector('#elf-file')?.addEventListener('change', () => {
     const [file] = document.querySelector('#elf-file').files;
-    if (file) worker.postMessage({ type: 'run-vita', file });
+    if (file) worker.postMessage({ type: 'run-vita', file, fastVblank });
   });
   window.vita3kWeb = { worker, frames };
 });

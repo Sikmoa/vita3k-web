@@ -91,6 +91,13 @@ struct DisplayState {
     // or run twice as fast (if they only rely on these function calls for their timings)
     bool fps_hack = false;
 
+    // Debug-only headroom meter (browser ?fastvblank=1): the __EMSCRIPTEN__
+    // wait_vblank branch advances one vblank per wait with no wall-clock
+    // gating, so the guest free-runs and the page FPS readout shows true
+    // throughput instead of the 60Hz vblank cadence. Vcount stays monotonic
+    // and waiters still wake on their target vcount; only the pacing changes.
+    bool fast_vblank = false;
+
     // should contain the list of sync objects / swapchain images (in the order they appear in the cycle)
     std::vector<PredictedDisplayFrame> predicted_frames;
     // position in the predicted_frame cycle (the -1 is needed)
