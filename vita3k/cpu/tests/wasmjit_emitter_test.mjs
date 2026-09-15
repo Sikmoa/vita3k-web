@@ -12,8 +12,10 @@ const bytes = new Uint8Array(memory.buffer);
 // Helper contract (wasm_jit_cpu.cpp checked_memory_read/write): reads zero
 // memory_value[0..3] then fill the addressed guest bytes little-endian;
 // writes consume bytes across all four words, so 8-byte transfers use two.
-const mem_read = (stateOffset, address, width) => {
+// The fast-path fallback encodes a reason in the width's high byte; mask it.
+const mem_read = (stateOffset, address, rawWidth) => {
     const view = new DataView(memory.buffer);
+    const width = rawWidth & 0xff;
     if (address + width > bytes.length) {
         view.setUint32(stateOffset + 88, address >>> 0, true);
         view.setUint32(stateOffset + 92, 0, true);
@@ -27,8 +29,9 @@ const mem_read = (stateOffset, address, width) => {
     }
     return 0;
 };
-const mem_write = (stateOffset, address, width) => {
+const mem_write = (stateOffset, address, rawWidth) => {
     const view = new DataView(memory.buffer);
+    const width = rawWidth & 0xff;
     if (address + width > bytes.length) {
         view.setUint32(stateOffset + 88, address >>> 0, true);
         view.setUint32(stateOffset + 92, 1, true);

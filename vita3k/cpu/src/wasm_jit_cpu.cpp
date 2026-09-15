@@ -240,7 +240,31 @@ uint32_t memory_fault(JitState &state, uint32_t address, bool write) noexcept {
 }
 
 // Profiling counters (worker is single-threaded; no atomics needed).
+// g_mem_* are process-lifetime totals; the fast-path per-call scratch lives
+// in JitState (REGION_ABI.md) and is accumulated here between calls.
 uint64_t g_mem_reads = 0, g_mem_writes = 0;
+uint64_t g_mem_fast_reads = 0, g_mem_fast_writes = 0;
+// Slow-fallback reasons (high byte of the helper `bytes` argument).
+uint64_t g_mem_slow_unmapped = 0, g_mem_slow_perms = 0, g_mem_slow_cross_page = 0,
+    g_mem_slow_code_page = 0, g_mem_slow_other = 0;
+
+void account_slow_reason(uint32_t bytes_arg) noexcept {
+    switch (bytes_arg >> 8) {
+    case 1: ++g_mem_slow_unmapped; break;
+    case 2: ++g_mem_slow_perms; break;
+    case 3: ++g_mem_slow_cross_page; break;
+    case 4: ++g_mem_slow_code_page; break;
+    case 5: ++g_mem_slow_other; break;
+    default: break;
+    }
+}
+
+void account_fast_counters(JitState &state) noexcept {
+    g_mem_fast_reads += state.mem_fast_reads;
+    g_mem_fast_writes += state.mem_fast_writes;
+    state.mem_fast_reads = 0;
+    state.mem_fast_writes = 0;
+}
 
 bool valid_memory_size(uint32_t bytes) noexcept {
     return bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8 || bytes == 16;
@@ -248,6 +272,8 @@ bool valid_memory_size(uint32_t bytes) noexcept {
 
 EMSCRIPTEN_KEEPALIVE uint32_t checked_memory_read(JitState *state, uint32_t address, uint32_t bytes) noexcept {
     ++g_mem_reads;
+    account_slow_reason(bytes);
+    bytes &= 0xffu; // Fast-path fallback reason rides in the high byte.
     if (!valid_memory_size(bytes) || !state->memory_cookie)
         return memory_fault(*state, address, false);
     const auto *mem = reinterpret_cast<const MemState *>(static_cast<uintptr_t>(state->memory_cookie));
@@ -264,6 +290,8 @@ EMSCRIPTEN_KEEPALIVE uint32_t checked_memory_read(JitState *state, uint32_t addr
 
 EMSCRIPTEN_KEEPALIVE uint32_t checked_memory_write(JitState *state, uint32_t address, uint32_t bytes) noexcept {
     ++g_mem_writes;
+    account_slow_reason(bytes);
+    bytes &= 0xffu; // Fast-path fallback reason rides in the high byte.
     if (!valid_memory_size(bytes) || !state->memory_cookie)
         return memory_fault(*state, address, true);
     auto *mem = reinterpret_cast<MemState *>(static_cast<uintptr_t>(state->memory_cookie));
@@ -512,6 +540,20 @@ struct WasmJitCPU::Impl {
                     pc, found->second.region->blocks.size());
             // Refresh per-run state fields (bases are stable but cheap).
             state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent->mem));
+            // M15 inline memory fast path (REGION_ABI.md): expose MemState's
+            // page table, permission bytes and the code-page refcounts as
+            // linear-memory offsets. The two arrays never reallocate after
+            // init and g_code_pages is process-static, so the bases outlive
+            // every compiled region. A zero page_table_base disables the
+            // fast path (emitted code probes it first). The table entries
+            // must be SPARSE page pointers (host offset of the page start);
+            // native non-sparse tables hold address biases instead, so they
+            // must not enable the fast path.
+            const auto *mem_state = parent->mem;
+            state.page_table_base = mem_state->sparse_host_memory
+                ? reinterpret_cast<uint32_t>(mem_state->page_table.get()) : 0;
+            state.page_perms_base = reinterpret_cast<uint32_t>(mem_state->page_permissions.get());
+            state.code_pages_base = reinterpret_cast<uint32_t>(g_code_pages.data());
             state.smc_dirty = 0;
             // stop() owns an atomic request. Mirror it at entry and return
             // to the atomic host check at least every REGION_CALL_TICKS.
@@ -527,6 +569,7 @@ struct WasmJitCPU::Impl {
             const uint32_t reason = vita3k_jit_run(found->second.table_index, state_offset, call_budget);
             run_js_ms += emscripten_get_now() - t2;
             ++js_calls;
+            account_fast_counters(state);
             dispatches += counter_delta(dispatches_before, state.dispatches);
             const uint32_t delta = counter_delta(executed_before, state.executed);
             if (delta > call_budget)
@@ -649,6 +692,17 @@ struct WasmJitCPU::Impl {
             state.fault_address = 0;
             state.fault_write = 0;
             state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent->mem));
+            // M15 fast-path bases, exactly as in region mode above.
+            const auto *mem_state = parent->mem;
+            state.page_table_base = mem_state->sparse_host_memory
+                ? reinterpret_cast<uint32_t>(mem_state->page_table.get()) : 0;
+            state.page_perms_base = reinterpret_cast<uint32_t>(mem_state->page_permissions.get());
+            state.code_pages_base = reinterpret_cast<uint32_t>(g_code_pages.data());
+            // Fast-path tallies are per-call scratch (REGION_ABI.md): zero
+            // them before the snapshot so the fault rollback below cannot
+            // resurrect stale counts.
+            state.mem_fast_reads = 0;
+            state.mem_fast_writes = 0;
             const State before = state;
             // Host entry currently uses the EM_JS trampoline below.
             // Guest faults use return reasons; checked helpers are Wasm imports.
@@ -657,6 +711,7 @@ struct WasmJitCPU::Impl {
             const uint32_t reason = vita3k_jit_call(found->second.table_index, state_offset);
             run_js_ms += emscripten_get_now() - t2;
             ++js_calls;
+            account_fast_counters(state);
             if (reason == static_cast<uint32_t>(vita3k::wasmjit::ExitReason::Fault)) {
                 const uint32_t address = state.fault_address, write = state.fault_write;
                 state = before;
@@ -801,13 +856,19 @@ std::string WasmJitCPU::get_profile() const {
     std::snprintf(buffer, sizeof(buffer),
         "emit_ms=%.1f install_ms=%.1f run_js_ms=%.1f js_calls=%llu misses=%llu "
         "svc_exits=%llu blocks=%llu mem_reads=%llu mem_writes=%llu "
-        "regions=%llu region_misses=%llu smc_exits=%llu budget_exits=%llu dispatches=%llu",
+        "regions=%llu region_misses=%llu smc_exits=%llu budget_exits=%llu dispatches=%llu "
+        "fast_reads=%llu fast_writes=%llu slow_unmapped=%llu slow_perms=%llu "
+        "slow_cross=%llu slow_code=%llu slow_other=%llu",
         impl->emit_ms, impl->install_ms, impl->run_js_ms,
         (unsigned long long)impl->js_calls, (unsigned long long)impl->misses,
         (unsigned long long)impl->svc_exits, (unsigned long long)impl->compiled,
         (unsigned long long)g_mem_reads, (unsigned long long)g_mem_writes,
         (unsigned long long)impl->regions, (unsigned long long)impl->region_misses,
         (unsigned long long)impl->smc_exits, (unsigned long long)impl->budget_exits,
-        (unsigned long long)impl->dispatches);
+        (unsigned long long)impl->dispatches,
+        (unsigned long long)g_mem_fast_reads, (unsigned long long)g_mem_fast_writes,
+        (unsigned long long)g_mem_slow_unmapped, (unsigned long long)g_mem_slow_perms,
+        (unsigned long long)g_mem_slow_cross_page, (unsigned long long)g_mem_slow_code_page,
+        (unsigned long long)g_mem_slow_other);
     return buffer;
 }

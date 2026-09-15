@@ -48,6 +48,15 @@ struct JitState {
     uint32_t smc_dirty;       // +388 set by checked writes into code pages
     uint32_t stop_flag;       // +392 host sets 1 to request a return
     uint32_t dispatches;      // +396 region dispatch-loop iterations (profiling)
+    // M15 memory fast-path appends (REGION_ABI.md; offsets are contractual).
+    // Host offsets into linear memory; 0 disables the fast path entirely.
+    uint32_t code_pages_base; // +400 host offset of code-page refcounts, 0=off
+    // Per-call fast-path tallies (generated Wasm increments; host accumulates
+    // into process counters and zeroes before each call). Fallback reasons are
+    // NOT state fields: the emitter encodes the reason in the high byte of the
+    // helper's `bytes` argument and the helper accounts it.
+    uint32_t mem_fast_reads;  // +404 inline fast-path reads this call
+    uint32_t mem_fast_writes; // +408 inline fast-path writes this call
 };
 static_assert(std::is_standard_layout_v<JitState>);
 static_assert(offsetof(JitState, memory_cookie) == 84);
@@ -61,7 +70,10 @@ static_assert(offsetof(JitState, page_perms_base) == 384);
 static_assert(offsetof(JitState, smc_dirty) == 388);
 static_assert(offsetof(JitState, stop_flag) == 392);
 static_assert(offsetof(JitState, dispatches) == 396);
-static_assert(sizeof(JitState) == 400);
+static_assert(offsetof(JitState, code_pages_base) == 400);
+static_assert(offsetof(JitState, mem_fast_reads) == 404);
+static_assert(offsetof(JitState, mem_fast_writes) == 408);
+static_assert(sizeof(JitState) == 412);
 
 // Emits an MVP Wasm module importing env.memory (unshared, min 1 page)
 // and env.mem_read/env.mem_write: (stateOffset i32, address i32, bytes i32)->i32.
@@ -82,7 +94,26 @@ static_assert(sizeof(JitState) == 400);
 // A failing memory helper returns Fault with executed=0 and the instruction PC.
 // Parent MUST snapshot/restore architectural regs/CPSR/FPU on Fault (not the
 // fault fields). Earlier stores of a multi-access instruction may have completed.
-// No guest data address is ever used directly as a host linear-memory offset.
+//
+// M15 inline memory fast path: when page_table_base/page_perms_base are
+// populated (0=off), 1/2/4-byte A32 memory IR lowers INLINE instead of calling
+// the checked helpers: page-table lookup + permission/refcount probe + direct
+// Wasm load/store against the sparse page backing. The fast path is taken only
+// when it is provably equivalent to the checked path: fast-path disabled,
+// guest page 0 (the checked path rejects addr < host_page_size even when a
+// sparse backing was force-allocated there), page-crossing access, unmapped
+// page, missing Read/Write permission and stores into code-tracked pages all
+// fall back to the imported checked helper with identical fault semantics.
+// Fallback reasons are encoded in the high byte of the helper's
+// `bytes` argument (1=unmapped, 2=perms, 3=cross-page, 4=code page, 5=other);
+// the helper masks them off before use. Fast successes increment
+// mem_fast_reads/mem_fast_writes in JitState. Alignment is never checked:
+// Wasm unaligned access is a little-endian byte-wise access, exactly the
+// semantics of mem_read/mem_write copies; narrow loads are zero-extending,
+// matching every A32/ReadMemoryN producer (sign extension is separate IR).
+// No guest data address is ever used as a host offset OUTSIDE this probe: the
+// generated code never dereferences a page-table entry without validating the
+// mapped page first.
 //
 // Frontend MUST use one tick per guest instruction: CycleCount and
 // ConditionFailedCycleCount become executed. Caller must translate at most its

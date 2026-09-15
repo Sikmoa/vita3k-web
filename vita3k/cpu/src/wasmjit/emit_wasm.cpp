@@ -27,7 +27,8 @@ namespace Term = Dynarmic::IR::Term;
 enum Wasm : uint8_t {
     Block = 0x02, Loop = 0x03, If = 0x04, Else = 0x05, End = 0x0b,
     Br = 0x0c, BrTable = 0x0e, Return = 0x0f, Call = 0x10, Select = 0x1b,
-    Get = 0x20, Set = 0x21, Load = 0x28, Store = 0x36, Const = 0x41,
+    Get = 0x20, Set = 0x21, Load = 0x28, Load8U = 0x2d, Load16U = 0x2f,
+    Store = 0x36, Store8 = 0x3a, Store16 = 0x3b, Const = 0x41,
     Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtU = 0x49, GtU = 0x4b, LeU = 0x4d,
     Clz = 0x67, Add = 0x6a, Sub = 0x6b, Mul = 0x6c, And = 0x71, Or = 0x72, Xor = 0x73,
     Shl = 0x74, ShrS = 0x75, ShrU = 0x76, RotR = 0x78,
@@ -232,10 +233,29 @@ private:
     // address (its low word is the instruction's own PC). Write helpers
     // consume memory_value, so the value must be published BEFORE the call.
     uint32_t pending_fault_pc = 0;
-    void memory_call(const Inst &inst, bool write, unsigned bytes) {
-        if (inst.GetArg(1).GetType() != Type::U32) { reject("memory_call arg1 not U32"); return; }
-        if (!inst.GetArg(0).IsImmediate()) { reject("memory_call arg0 not imm"); return; }
-        pending_fault_pc = static_cast<uint32_t>(inst.GetArg(0).GetImmediateAsU64());
+
+    // M15 inline memory fast path (REGION_ABI.md "Inline memory fast path").
+    // 1/2/4-byte accesses lower INLINE when provably equivalent to the checked
+    // path: page-table lookup + permission/refcount probes + direct Wasm
+    // load/store against the sparse page backing. Any doubt falls back to the
+    // imported helper, which keeps whole-range preflight, fault and SMC
+    // semantics; the fallback REASON is encoded in the high byte of the
+    // helper's `bytes` argument (1=unmapped, 2=perms, 3=cross-page, 4=code
+    // page, 5=other/disabled) and masked off by the helper. Alignment is
+    // never checked: Wasm unaligned access is a little-endian byte-wise access
+    // with zero-extending narrow loads, exactly mem_read/mem_write semantics
+    // (every A32 load width lowers to a raw zero-extending ReadMemoryN;
+    // sign extension is separate IR).
+    enum : uint32_t {
+        kSlowUnmapped = 1,
+        kSlowPerms = 2,
+        kSlowCrossPage = 3,
+        kSlowCodePage = 4,
+        kSlowOther = 5,
+    };
+    // The checked-helper call, shared by the always-slow widths and every
+    // fast-path fallback. `reason` rides in the `bytes` argument's high byte.
+    void memory_slow_call(const Inst &inst, bool write, unsigned bytes, uint32_t reason = 0) {
         if (write) {
             const auto &value = inst.GetArg(2);
             get(0); value_word(value, 0);
@@ -245,11 +265,114 @@ private:
                 op(Store); uleb(code, 2); uleb(code, offsetof(JitState, memory_value) + 4);
             }
         }
-        get(0); value_word(inst.GetArg(1)); imm(bytes); op(Call); uleb(code, write ? 1 : 0);
+        get(0); value_word(inst.GetArg(1)); imm(bytes | (reason << 8)); op(Call); uleb(code, write ? 1 : 0);
         checked_status();
         if (!write) {
             for (unsigned i = 0; i < (bytes + 3) / 4; ++i) { get(0); op(Load); uleb(code, 2); uleb(code, offsetof(JitState, memory_value) + i * 4); set(next_local + i); }
         }
+    }
+    // Probe chain: page 0 -> fast-path enabled -> permissions -> mapped ->
+    // page boundary -> (stores) code-page refcount. All ifs are void; every
+    // arm fully defines the IR result (fast load sets it directly, fallbacks
+    // via the helper's memory_value), so nothing stays on the cross-arm stack.
+    // addr/page live in the two SPARE SSA words of this instruction's
+    // ten-word slot (existing lowerings use words 1..6 only).
+    void memory_fast_or_slow(const Inst &inst, bool write, unsigned bytes) {
+        const uint32_t addr_local = next_local + 9; // spare SSA word; page is
+        // recomputed per probe from the table base, so it needs no spill slot.
+        // MemPerm::ReadOnly(1) / WriteOnly(2): the bits mem_read/mem_write
+        // require of every touched page (mem/functions.h).
+        const uint32_t required = write ? 2 : 1;
+        value_word(inst.GetArg(1));
+        set(addr_local);
+
+        // Guest page 0: the checked path rejects addr < host_page_size even
+        // when sparse backing was force-allocated there.
+        get(addr_local); imm(12); op(ShrU); op(Eqz);
+        begin_if();
+        memory_slow_call(inst, write, bytes, kSlowOther);
+        op(Else);
+        // Fast path enabled? A zero base means the host did not populate the
+        // probes; skipping this guard would dereference guest-controlled
+        // linear memory as a host offset.
+        load(offsetof(JitState, page_table_base)); op(Eqz);
+        begin_if();
+        memory_slow_call(inst, write, bytes, kSlowOther);
+        op(Else);
+        // Permission probe: (perms[page] & required) != required. The
+        // condition ends alone on the stack for begin_if (no staging).
+        load(offsetof(JitState, page_perms_base));
+        get(addr_local); imm(12); op(ShrU); op(Add);
+        op(Load8U); uleb(code, 0); uleb(code, 0);
+        imm(required); op(And); imm(required); op(Ne);
+        begin_if();
+        memory_slow_call(inst, write, bytes, kSlowPerms);
+        op(Else);
+        // Mapping probe: null page-table entry = unallocated page (sparse
+        // backing initializes the table to null and frees null entries).
+        load(offsetof(JitState, page_table_base));
+        get(addr_local); imm(12); op(ShrU); imm(2); op(Shl); op(Add);
+        op(Load); uleb(code, 2); uleb(code, 0);
+        op(Eqz);
+        begin_if();
+        memory_slow_call(inst, write, bytes, kSlowUnmapped);
+        op(Else);
+        // Page-boundary probe: page offset + size > 4096 crosses. (8/16-bit
+        // offsets 0xfff/0xffe are last-valid; only 4-byte can actually cross.)
+        get(addr_local); imm(0xfff); op(And); imm(4096 - bytes); op(GtU);
+        begin_if();
+        memory_slow_call(inst, write, bytes, kSlowCrossPage);
+        op(Else);
+        if (write) {
+            // Code-page probe: nonzero refcount = page holds cached JIT code;
+            // the checked helper must own the store so smc_dirty stays exact.
+            load(offsetof(JitState, code_pages_base));
+            get(addr_local); imm(12); op(ShrU); imm(2); op(Shl); op(Add);
+            op(Load); uleb(code, 2); uleb(code, 0);
+            op(Eqz); op(Eqz);
+            begin_if();
+            memory_slow_call(inst, write, bytes, kSlowCodePage);
+            op(Else);
+            // Direct store: base + (addr & 0xfff).
+            load(offsetof(JitState, page_table_base));
+            get(addr_local); imm(12); op(ShrU); imm(2); op(Shl); op(Add);
+            op(Load); uleb(code, 2); uleb(code, 0);
+            get(addr_local); imm(0xfff); op(And); op(Add);
+            value_word(inst.GetArg(2), 0);
+            if (bytes == 1) { op(Store8); uleb(code, 0); uleb(code, 0); }
+            else if (bytes == 2) { op(Store16); uleb(code, 1); uleb(code, 0); }
+            else { op(Store); uleb(code, 2); uleb(code, 0); }
+            get(0); load(offsetof(JitState, mem_fast_writes)); imm(1); op(Add);
+            store(offsetof(JitState, mem_fast_writes));
+            op(End);
+        } else {
+            // Direct load: base + (addr & 0xfff); 8/16-bit zero-extending.
+            load(offsetof(JitState, page_table_base));
+            get(addr_local); imm(12); op(ShrU); imm(2); op(Shl); op(Add);
+            op(Load); uleb(code, 2); uleb(code, 0);
+            get(addr_local); imm(0xfff); op(And); op(Add);
+            if (bytes == 1) { op(Load8U); uleb(code, 0); uleb(code, 0); }
+            else if (bytes == 2) { op(Load16U); uleb(code, 1); uleb(code, 0); }
+            else { op(Load); uleb(code, 2); uleb(code, 0); }
+            set(next_local);
+            get(0); load(offsetof(JitState, mem_fast_reads)); imm(1); op(Add);
+            store(offsetof(JitState, mem_fast_reads));
+        }
+        op(End); // page boundary
+        op(End); // mapping
+        op(End); // permissions
+        op(End); // fast-path enabled
+        op(End); // guest page 0
+    }
+
+    void memory_call(const Inst &inst, bool write, unsigned bytes) {
+        if (inst.GetArg(1).GetType() != Type::U32) { reject("memory_call arg1 not U32"); return; }
+        if (!inst.GetArg(0).IsImmediate()) { reject("memory_call arg0 not imm"); return; }
+        pending_fault_pc = static_cast<uint32_t>(inst.GetArg(0).GetImmediateAsU64());
+        if (bytes <= 4)
+            memory_fast_or_slow(inst, write, bytes);
+        else
+            memory_slow_call(inst, write, bytes);
     }
 
     void value_word(const Value &v, unsigned word = 0) {

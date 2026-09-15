@@ -18,6 +18,9 @@ uint32_t page_perms_base;// +384 host offset of page permission bytes, 0=off
 uint32_t smc_dirty;      // +388 host sets 1 after a store hits a code page
 uint32_t stop_flag;      // +392 host sets 1 to request a return
 uint32_t dispatches;     // +396 count of dispatch iterations (profiling)
+uint32_t code_pages_base;// +400 host offset of code-page refcounts, 0=off
+uint32_t mem_fast_reads; // +404 fast-path reads this call (host accumulates)
+uint32_t mem_fast_writes;// +408 fast-path writes this call (host accumulates)
 ```
 
 ExitReason extended: Continue=0, Svc=1, Fault=2, Unsupported=3, Miss=4,
@@ -192,33 +195,55 @@ Limits (scale existing): 4096 IR instructions PER BLOCK unchanged; region
 cap 512 blocks, 32768 total ticks, 4 MiB module bytes. Empty vector =
 unsupported, no partial module.
 
-## Inline memory fast path (task #10) — verified against mem/state.h
+## Inline memory fast path (task #10, implemented) — verified against mem/state.h
 
-`page_table_base` / `page_perms_base` point at `MemState`'s fixed arrays:
+`page_table_base` / `page_perms_base` / `code_pages_base` point at MemState's
+fixed arrays (backend refreshes all three before EVERY run call; a zero base
+disables the fast path and every access uses the checked helper):
 - `page_table`: `unique_ptr<PagePtr[]>`, **1,048,576 entries × 4 bytes** (wasm32
   pointers), indexed by guest page. Sparse (browser) entries point at the
   page's own backing start, so the host address of guest byte `addr` is
-  `i32.load(page_table_base + (addr>>12)*4) + (addr & 0xFFF)`. A null entry
-  means unmapped.
+  `i32.load(page_table_base + (addr>>12)*4) + (addr & 0xFFF)`. Under
+  Emscripten `MemState::memory.get()` is null, the table is initialized to
+  null, alloc fills live entries and free/trim nulls them — so a NULL entry
+  is exactly an unallocated page (the allocator bitmap adds nothing).
 - `page_permissions`: `unique_ptr<MemPerm[]>`, **1,048,576 × 1 byte**;
-  `MemPerm : uint8_t` with Read=1, Write=2, Execute=4.
+  `MemPerm : uint8_t` with Read=1, Write=2, Execute=4. mem_read requires Read
+  on every touched page, mem_write requires Write.
+- `code_pages`: backend refcount array (`g_code_pages`, 1,048,576 × 4 bytes);
+  nonzero = page holds cached JIT code. Writes to such pages MUST use the
+  checked helper so smc_dirty/invalidation stays exact.
 
-Fast-path shape for an aligned 1/2/4-byte access:
+Fast-path shape for a 1/2/4-byte access (probe ORDER matters: permission
+first — it is the only check whose failure the checked path detects BEFORE
+any mapping question, and it costs one byte load):
 ```
 page   = addr >>> 12
+if page == 0 -> fall back (checked path rejects addr < host_page_size)
 perm   = i32.load8_u(page_perms_base + page)
-if (perm & required) != required -> slow helper
+if (perm & required) != required -> fall back (reason 2)
 base   = i32.load(page_table_base + page*4)
-if base == 0 -> slow helper
-if (addr & 0xFFF) + size > 4096 -> slow helper   // cross-page
-value  = i32.load(base + (addr & 0xFFF))          // or i32.store
+if base == 0 -> fall back (reason 1, unmapped)
+if (addr & 0xFFF) > 4096 - size -> fall back (reason 3, cross-page)
+// stores only: if i32.load(code_pages_base + page*4) != 0 -> fall back (4)
+value  = i32.load8_u/16_u/load(base + (addr & 0xFFF))   // or matching store
+++state.mem_fast_reads (or mem_fast_writes)
 ```
-Both arrays exist for the MemState's lifetime, but the HOST refreshes the
-two JitState base fields before every region run (2 stores) — no generation
-tracking needed for the bases. 8-byte (i64) and 16-byte accesses, and any
-unaligned access crossing a page boundary, always take the slow helper.
-Slow helper keeps today's checked semantics: whole-range preflight,
-permissions, fault_address/fault_write, LE lanes in memory_value.
+Alignment is NOT checked: Wasm unaligned access is a little-endian byte-wise
+access, identical to mem_read/mem_write's per-page memcpy, and every A32/Thumb
+load width lowers to a raw zero-extending ReadMemoryN (sign extension is a
+separate IR op), so load8_u/load16_u preserve exact semantics. Narrow loads
+(8/16-bit) additionally cannot cross a page (offset ≤ 0xFFF-1/0xFFF-2 cannot
+exceed 0xFFF), so only 4-byte accesses can take the cross-page fallback.
+
+Fallbacks call the imported helper with `bytes = size | reason<<8`
+(1=unmapped, 2=perms, 3=cross-page, 4=code page, 5=other/disabled); the
+helpers mask the reason off (`bytes & 0xff`) and account it in
+process-lifetime counters (g_mem_slow_*). Fault semantics are unchanged:
+helpers still validate the whole range, set fault_address/fault_write and
+return 2. Fast successes increment state.mem_fast_reads/mem_fast_writes
+(JitState), which the host accumulates and zeroes per call — they are
+per-call scratch, NOT saved across fault rollbacks.
 
 ## Backend (implemented by parent)
 

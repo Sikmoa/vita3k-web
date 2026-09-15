@@ -139,9 +139,12 @@ must match the full frontend location/mode; entry state must match that mode.
   words; S registers are rejected), `A32GetExtendedRegister64`/
   `A32SetExtendedRegister64` with explicit D registers only (both words;
   S/Q rejected).
-- `A32ReadMemory8/16/32/64` and `A32WriteMemory8/16/32/64` (checked helper
-  calls; arg0 is the location immediate, arg1 the guest address, writes
-  publish their value first). `A32UpdateUpperLocationDescriptor`,
+- `A32ReadMemory8/16/32/64` and `A32WriteMemory8/16/32/64`. 1/2/4-byte accesses
+  lower INLINE when the M15 fast path is armed (see REGION_ABI.md); every
+  fallback and the 64-bit width call the checked helpers (arg0 is the location
+  immediate, arg1 the guest address, writes publish their value first). The
+  helper's `bytes` argument carries a fallback reason in its HIGH byte (1..5,
+  see emit_wasm.h) which the host must mask off before use. `A32UpdateUpperLocationDescriptor`,
   `A32BXWritePC`, `A32SetCheckBit`, `PushRSB` (prediction-only hint; no RSB),
   `A32CallSupervisor` (must follow PC write and be final IR op).
 
