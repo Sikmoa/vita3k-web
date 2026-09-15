@@ -68,6 +68,31 @@ and run. The `[display-bench] JSON {...}` line contains `fps`,
 `slow_*` fallback-reason counters). Interpreter variant:
 `--target vita3k_display_bench_interp`.
 
+## CPU profiling the JIT bench (V8 sampling profiler, no code changes)
+
+```sh
+node --cpu-prof --cpu-prof-dir=/tmp/prof browser/tests/display_bench_node.mjs \
+  build/web/browser/vita3k_display_bench_jit_node.js \
+  build/web/browser/tests/vita_display_fixture/eboot-short.bin jit
+```
+
+Writes `/tmp/prof/CPU.*.cpuprofile` — opens in Chrome DevTools (Performance →
+Load profile) or VS Code. Useful because each generated region module is a
+dynamically compiled script with its own `wasm://wasm/<hash>` URL, so guest
+code time is separable from host C++ time. The host module is a minified
+Emscripten build without a Wasm name section, so frames appear as anonymous
+`wasm-function[N]`; attribute them with:
+
+```sh
+wasm-objdump -d build/web/browser/vita3k_display_bench_jit_node.wasm > /tmp/host.dis
+```
+
+then map each hot function index (`func[N]`) to its code range and fingerprint
+it by its `i32.const`/load/store mix (JitState field offsets, page masks).
+Baseline shape (2026-09-15, light-dispatch build): host module 44% self time
+(run loop 17.7%, state movers ~11%, region lookup 3.8%), generated region
+modules 24%, Wasm↔JS trampolines 7%, timers 6%, idle (ASYNCIFY vblank) 4.5%.
+
 ## Browser (Playwright) smokes
 
 ```sh
