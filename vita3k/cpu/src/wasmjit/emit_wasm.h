@@ -134,14 +134,18 @@ std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block);
 // guarantees at most one block per guest PC). Dispatch validates each entry's
 // CPSR mode bits (psr_mask/psr_value) and FPSCR mode bits against the block's
 // own location. LinkBlock terminals chaining to a member with the SAME full
-// location descriptor become direct branches; others set next_pc and return
-// Miss. Memory IR is accepted at any CycleCount: a faulting helper sets
-// fault_pc and CPSR mode bits (including IT) from the faulting memory op's
-// own location immediate (arg0), preserving arithmetic flags, and returns
-// Fault WITHOUT rollback or executed adjustment. Per-call budget is
-// the `budget` argument (max additional ticks); dispatch refuses a block whose
-// meta.ticks would exceed it and returns Budget with next_pc set. Limits: 512
-// blocks, 32768 total ticks, 4 MiB module. EMPTY vector = unsupported.
+// location descriptor take the LIGHT dispatch path (REGION_ABI.md v1.2): the
+// edge preloads the successor's constant block index and skips the regs[15]
+// reload and the static PC search; per-iteration dispatches++/stop/smc
+// polling still run, and the edge itself performs the successor's budget
+// check. Non-member links set next_pc and return Miss. Memory IR is accepted
+// at any CycleCount: a faulting helper sets fault_pc and CPSR mode bits
+// (including IT) from the faulting memory op's own location immediate (arg0),
+// preserving arithmetic flags, and returns Fault WITHOUT rollback or executed
+// adjustment. Per-call budget is the `budget` argument (max additional
+// ticks); dispatch refuses a block whose meta.ticks would exceed it and
+// returns Budget with next_pc set. Limits: 512 blocks, 32768 total ticks,
+// 4 MiB module. EMPTY vector = unsupported.
 struct RegionBlockMeta {
     uint32_t entry_pc;
     uint32_t psr_mask;

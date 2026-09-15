@@ -1,4 +1,4 @@
-# M14c region JIT ABI (parent-owned spec, v1.1)
+# M14c region JIT ABI (parent-owned spec, v1.2)
 
 Goal: one WebAssembly module per REGION (many guest basic blocks) with an
 in-module dispatch loop. No JS crossing and no C++ cache work per guest block.
@@ -49,16 +49,25 @@ loop $dispatch:
   dispatches++
   if (load state.stop_flag) { next_pc=pc; return Stop }
   if (load state.smc_dirty) { next_pc=pc; return Smc }
-  pc = load regs[15]
-  binary-search pc in the region's sorted entry table
-    entry = {pc, psr_mask, psr_value, tick_cost, block_index}
-  if not found OR ((load cpsr) & psr_mask) != psr_value:
-    next_pc = pc; return Miss
-  // v1.1: formation guarantees AT MOST ONE entry per guest PC per region, so
-  // the binary search never needs to disambiguate same-PC entries. A PC
-  // reached with a different PSR is simply not a member; dispatch Misses and
-  // the host forms a separate region keyed at that full location.
-  if executed_this_call + tick_cost > budget: next_pc = pc; return Budget
+  ;; v1.2 light dispatch path: a statically-chained edge preloaded local 6
+  ;; with the successor's CONSTANT block index (full LocationDescriptor match
+  ;; at emission: PC + CPSR mode/IT + FPSCR mode bits). Only fresh entries
+  ;; and non-member edges carry kLightDispatchSentinel and run the search.
+  if (dispatch_index == kLightDispatchSentinel):
+    pc = load regs[15]
+    binary-search pc in the region's sorted entry table
+      entry = {pc, psr_mask, psr_value, tick_cost, block_index}
+    if not found OR ((load cpsr) & psr_mask) != psr_value:
+      next_pc = pc; return Miss
+    // v1.1: formation guarantees AT MOST ONE entry per guest PC per region, so
+    // the binary search never needs to disambiguate same-PC entries. A PC
+    // reached with a different PSR is simply not a member; dispatch Misses and
+    // the host forms a separate region keyed at that full location.
+  ;; v1.2: the budget check moved ONTO the chained edge (executed_call +
+  ;; target.ticks > budget -> next_pc = pending target PC; return Budget), so
+  ;; a budget-failing chained iteration is NOT counted as a dispatch. The
+  ;; generic path still checks at its search leaf. br_table remains the only
+  ;; block transfer; stop/smc polling stays per-iteration (2 loads).
   br block_label[block_index]   // br_table or nested ifs over block_index
 ```
 
@@ -69,8 +78,10 @@ passes them via RegionMeta.
 ## Terminals
 
 - `LinkBlock{target}`: if target (pc, psr-match) resolves to a block in this
-  region → emit a DIRECT `br` to it (block chaining, no dispatch). Otherwise
-  store next_pc=target.PC, `br $dispatch` (dispatch returns Miss to host).
+  region → LIGHT PATH (v1.2): store the successor's constant block index and
+  `br $dispatch` (PC reload + search skipped; PSR/FPSCR checks redundant by
+  the emission-time full-Location match). Otherwise store next_pc=target.PC,
+  `br $dispatch` (dispatch returns Miss to host).
 - `If{then_, else_}` / `CheckBit{then_, else_}`: evaluate as today, then each
   arm follows the LinkBlock rule above.
 - `ReturnToDispatch` → `br $dispatch`.
@@ -113,22 +124,28 @@ std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block); // = 1-block 
 `(i32,i32)->i32`):
 ```
 locals: 0=state, 1=budget, 2=executed_call, 3=pc, 4=CheckBit,
-        5=i64 scratch, 6..=per-block SSA words
+        5=i64 scratch, 6=dispatch index, 7..=per-block SSA words
 body:
   executed_call = 0
+  dispatch_index = kLightDispatchSentinel   ;; locals zero-init per call
   loop $dispatch:
     state.dispatches++
     if (load state.stop_flag) { next_pc=load pc; return Stop }
-    if (load state.smc_dirty) { next_pc=load pc; return Smc }
-    pc = load state.regs[15]
-    ;; STATIC PC SEARCH: nested if/else tree over CONSTANT entry PCs
-    ;; (entries are compile-time known — no runtime table/binary search).
-    ;; Balanced tree: ≤9 comparisons for 512 entries. Each comparison:
-    ;;   if (i32.lt_u $pc, CONST_MID) <left subtree> else <right subtree>
-    ;; Leaf: pc == entry_pc → check (cpsr & mask) == value → block idx or Miss
-    ;; Miss leaf: next_pc = pc; return Miss
-    ;; Budget check per entry (ticks are static): 
-    ;;   if (executed_call + CONST_TICKS) > budget → next_pc=pc; return Budget
+    if (load state.smc_dirty) { next_pc=pc; return Smc }
+    ;; v1.2 light path: chained edges prewrite dispatch_index = CONST successor
+    ;; block index; only the sentinel still runs the generic path below.
+    if (dispatch_index == kLightDispatchSentinel):
+      pc = load state.regs[15]
+      ;; STATIC PC SEARCH: nested if/else tree over CONSTANT entry PCs
+      ;; (entries are compile-time known — no runtime table/binary search).
+      ;; Balanced tree: ≤9 comparisons for 512 entries. Each comparison:
+      ;;   if (i32.lt_u $pc, CONST_MID) <left subtree> else <right subtree>
+      ;; Leaf: pc == entry_pc → check (cpsr & mask) == value → block idx or Miss
+      ;; Miss leaf: next_pc = pc; return Miss
+      ;; Budget check per entry (ticks are static): 
+      ;;   if (executed_call + CONST_TICKS) > budget → next_pc=pc; return Budget
+      ;; v1.2: light iterations skip ALL of this — the edge already paid the
+      ;; successor's budget check and wrote the constant index.
     br_table → $b0..$bN, default Miss-return
   ;; Block bodies: each AFTER its label's `end` in the nested-block chain:
   block $default  ;; default → return Miss
@@ -150,13 +167,17 @@ values are dead at its terminal. Max locals = 6 + max per-block words.
 ;; block entry (after br_table lands here):
 ;; IF conditional block: condition check;
 ;;   fail path: state.executed += CondFailTicks; location(fail_loc);
-;;              br $dispatch   ;; NOT return — fail target may be in-region!
+;;              v1.2: member fail target → LIGHT PATH (index const; budget
+;;              check target.ticks); else br $dispatch   ;; NOT return —
+;;              fail target may be in-region!
 ;;   pass path: fall through
 ;; body instructions (memory IR at ANY CycleCount now)
 ;; terminal:
 ;;   LinkBlock{target} in-region (pc matches a member AND that member's
 ;;     psr_mask/psr_value match the target descriptor):
-;;       state.executed += CycleCount; location(target); br $dispatch
+;;       state.executed += CycleCount; location(target); v1.2 LIGHT PATH:
+;;       budget-check target.ticks (Budget exit on fail); block_index = CONST;
+;;       br $dispatch (PC reload + PC search skipped)
 ;;   LinkBlock out-of-region: state.executed += CycleCount;
 ;;       next_pc = target.PC; return Miss
 ;;   SVC path (CallSupervisor seen): state.executed += CycleCount;

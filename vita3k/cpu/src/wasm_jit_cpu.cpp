@@ -576,6 +576,16 @@ struct WasmJitCPU::Impl {
                 return fail("generated region overran its budget");
             executed += delta;
             remaining_budget -= delta;
+            // Light-path chained edges can leave the loop (Budget/Stop/Miss/
+            // Svc/Fault) without a loop-top smc poll after a code-page store
+            // (REGION_ABI.md v1.2): the edge's budget check may exit first.
+            // Normalize any pending smc_dirty on EVERY non-Smc exit so
+            // "SMC wins over the dispatch budget check" holds everywhere.
+            if (reason != static_cast<uint32_t>(ExitReason::Smc) && state.smc_dirty) {
+                ++smc_exits;
+                clear_regions();
+                state.smc_dirty = 0;
+            }
             switch (static_cast<ExitReason>(reason)) {
             case ExitReason::Svc:
                 parent->svc = state.svc;

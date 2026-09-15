@@ -85,6 +85,15 @@ bool shift(Op op) {
         || op == Op::ArithmeticShiftRight32 || op == Op::RotateRight32 || op == Op::RotateRightExtended;
 }
 
+// Region dispatch-index sentinel (light dispatch path, REGION_ABI.md v1.2):
+// loop iterations start with local 6 holding this value, which routes them
+// through the generic PC reload + static search. Statically-chained edges
+// overwrite local 6 with the successor's constant block index before
+// branching, so they skip the reload and the search entirely.
+constexpr uint32_t kLightDispatchSentinel = 0xffffffffu;
+// member_index() result for a location that is not a region member.
+constexpr uint32_t kNoMember = 0xffffffffu;
+
 class Emitter {
 public:
     explicit Emitter(const Dynarmic::IR::Block &block)
@@ -647,6 +656,47 @@ private:
         return false;
     }
 
+    // Statically-chained edges know the successor's block index at emission
+    // time: is_member() required full LocationDescriptor equality (PC + CPSR
+    // mode/IT + FPSCR mode bits), so the dispatch leaf's PC/PSR/FPSCR checks
+    // are redundant for them. FULL PSR+FPSCR match, or not a member.
+    uint32_t member_index(const Location &loc) const {
+        for (size_t i = 0; i < members->size(); ++i)
+            if (Location((*members)[i]->Location()) == loc)
+                return static_cast<uint32_t>(i);
+        return kNoMember;
+    }
+
+    // Light dispatch path (REGION_ABI.md v1.2): the chained edge preloads the
+    // successor's constant block index into the dispatch-index local (6) and
+    // branches to the loop top. The next iteration skips the regs[15] reload
+    // and the static PC search tree entirely; the per-iteration stop/smc
+    // polling and the br_table still run. The edge ALSO pays the successor's
+    // budget check (executed_call + ticks > budget -> Budget) with the SAME
+    // arithmetic and exit values the skipped search leaf would have used,
+    // so budget behavior is 1:1 with the old prologue except that a failing
+    // chained iteration is not counted as a dispatch-loop trip.
+    void light_redispatch(uint32_t target_index) {
+        const uint32_t ticks = static_cast<uint32_t>((*members)[target_index]->CycleCount()
+            + (*members)[target_index]->ConditionFailedCycleCount());
+        // Guard-style budget check (not if/else): the chained branch below
+        // must stay OUTSIDE the if so br_redispatch's label depth is
+        // unchanged. The skipped search leaf would have exited Budget with
+        // next_pc = regs[15]; the pending target's PC is already there
+        // (location(target) precedes every light edge).
+        get(2); imm(ticks); op(Add);
+        get(1); op(GtU);
+        begin_if();
+        set_next_pc_runtime();
+        store_constant(offsetof(JitState, exit_reason), static_cast<uint32_t>(ExitReason::Budget));
+        imm(static_cast<uint32_t>(ExitReason::Budget));
+        op(Return);
+        op(End);
+        // Chained: successor's constant index, then redispatch.
+        imm(target_index); set(6);
+        br_redispatch();
+    }
+
     void terminal_region(const Term::Terminal &term, unsigned depth) {
         if (depth > 16 || ++terminal_nodes > 256) {
             reject("generic 517");
@@ -657,8 +707,8 @@ private:
             const Location target(link->next);
             location(target);
             add_ticks(ticks);
-            if (is_member(target))
-                br_redispatch(); // in-region chaining: no host crossing
+            if (const uint32_t idx = member_index(target); idx != kNoMember)
+                light_redispatch(idx); // chained: constant index, no PC search
             else {
                 store_constant(offsetof(JitState, next_pc), target.PC());
                 ret(ExitReason::Miss);
@@ -667,8 +717,8 @@ private:
             const Location target(fast->next);
             location(target);
             add_ticks(ticks);
-            if (is_member(target))
-                br_redispatch();
+            if (const uint32_t idx = member_index(target); idx != kNoMember)
+                light_redispatch(idx);
             else {
                 store_constant(offsetof(JitState, next_pc), target.PC());
                 ret(ExitReason::Miss);
@@ -731,10 +781,18 @@ public:
             begin_if();
             ++extra_labels;
             // Condition failed: account its ticks and re-dispatch (the fail
-            // target may be another member of this same region).
+            // target may be another member of this same region). A member
+            // fail target takes the light path; a non-member keeps the full
+            // PC write (the generic search needs the architectural regs[15]).
             add_ticks(static_cast<uint32_t>(block.ConditionFailedCycleCount()));
-            location(Location(block.ConditionFailedLocation()));
-            br_redispatch();
+            const Location fail_loc(block.ConditionFailedLocation());
+            // The architectural PC ALWAYS moves to the failed instruction
+            // (fault/exit contract); the light path only skips the search.
+            location(fail_loc);
+            if (const uint32_t fail_idx = member_index(fail_loc); fail_idx != kNoMember)
+                light_redispatch(fail_idx);
+            else
+                br_redispatch();
             op(Else);
             emit_instructions_and_terminal();
             --extra_labels;
@@ -1027,7 +1085,14 @@ std::vector<uint8_t> emit_region(
         max_ssa = std::max(max_ssa, emitter.ssa_words());
     }
 
-    // Dispatch prologue + static PC search tree + br_table.
+    // Dispatch prologue + static PC search tree + br_table (REGION_ABI.md
+    // v1.2 light dispatch path). Every iteration runs dispatches++ and the
+    // stop/smc polls; then EITHER the successor block index was preloaded by
+    // a statically-chained edge (light path: straight to br_table) OR local 6
+    // holds kLightDispatchSentinel (fresh entry or non-member edge) and the
+    // generic path reloads regs[15] and runs the static PC search. A chained
+    // edge whose budget check fails exits BEFORE the next loop-top poll, so
+    // the HOST re-checks smc_dirty on every exit (see execute_regions).
     Bytes d;
     const auto exit_with = [&](ExitReason reason) {
         b_get(d, 0); b_load(d, offsetof(JitState, regs) + 15 * sizeof(uint32_t));
@@ -1045,7 +1110,13 @@ std::vector<uint8_t> emit_region(
     // if (state.smc_dirty) { next_pc = regs[15]; return Smc }
     b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, smc_dirty));
     b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Smc); b_op(d, End);
-    // pc = regs[15]; idx = n (default)
+    // Generic-path selector: fresh entries and non-member edges carry the
+    // sentinel in the dispatch-index local; chained edges overwrite it with
+    // a constant block index and skip the reload + search entirely.
+    b_get(d, 6);
+    b_imm(d, kLightDispatchSentinel); b_op(d, Eq);
+    b_op(d, If); b_op(d, 0x40);
+    // Generic path: pc = regs[15]; idx = n (default)
     b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, regs) + 15 * sizeof(uint32_t));
     b_set(d, 3);
     b_imm(d, static_cast<uint32_t>(n)); b_set(d, 6);
@@ -1086,6 +1157,7 @@ std::vector<uint8_t> emit_region(
         b_op(d, End);
     };
     tree(0, n);
+    b_op(d, End); // close generic-path if
 
     // br_table: vec of n labels then the default. Index i -> $bI (depth n-i
     // at this position); default -> $default (depth 0, innermost).
@@ -1098,6 +1170,10 @@ std::vector<uint8_t> emit_region(
 
     // Function body: nested block chain, bodies in reverse label order.
     Bytes code;
+    // Fresh entry selects the generic path: locals are zero-initialized per
+    // invocation, so the dispatch-index local must start at the sentinel
+    // (a stale 0 would wrongly route the first dispatch to block 0).
+    b_imm(code, kLightDispatchSentinel); b_set(code, 6);
     b_op(code, Loop); b_op(code, 0x40); // $outer: br here = redispatch
     for (size_t i = 0; i < n; ++i) { b_op(code, Block); b_op(code, 0x40); } // $b0..$b(n-1)
     b_op(code, Block); b_op(code, 0x40); // $default (innermost)

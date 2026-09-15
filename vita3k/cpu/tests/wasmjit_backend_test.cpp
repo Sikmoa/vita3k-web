@@ -524,7 +524,10 @@ void region_regressions(MemState &mem) {
     CHECK(run(emit({&loop}), state, 32) == Reason::Budget);
     CHECK(state.regs[0] == 32 && state.executed == 0x10);
     CHECK(counter_delta(0xfffffff0, state.executed) == 32);
-    CHECK(counter_delta(0xfffffff0, state.dispatches) == 33);
+    // Light dispatch path: the loop-back edge pre-checks the next block's
+    // budget (REGION_ABI.md v1.2), so the failing iteration is NOT counted;
+    // the old search-leaf check consumed one extra dispatch-loop trip (33).
+    CHECK(counter_delta(0xfffffff0, state.dispatches) == 32);
 
     // Reference counts, cross-page writes, and full-width address rounding.
     Region tracked;
