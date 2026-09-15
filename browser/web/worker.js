@@ -83,6 +83,10 @@ self.onmessage = async ({ data }) => {
           // suspended stack. One input buffer per worker run is bounded.
           module._vita3k_web_set_trace?.(data.trace ? 1 : 0);
           module._vita3k_web_set_fast_vblank?.(data.fastVblank ? 1 : 0);
+          // R1 validation: the JIT env hook reads these Module props first
+          // (before process.env), once per process. Set before first run.
+          module['VITA3K_WASMJIT_PROMOTE_FLAGS'] = (data.promote === 'p' || data.promote === 'pk') ? '1' : '0';
+          module['VITA3K_WASMJIT_PROMOTE_ACCOUNTING'] = (data.promote === 'k' || data.promote === 'pk') ? '1' : '0';
           module._vita3k_web_run_vita(allocation, input.byteLength);
         } else {
           const exitCode = module._vita3k_web_run_elf_probe(allocation, input.byteLength);

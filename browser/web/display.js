@@ -52,11 +52,19 @@ window.addEventListener('DOMContentLoaded', () => {
   // Debug headroom mode: ?fastvblank=1 free-runs the vblank clock so the
   // FPS readout below measures true guest throughput, not the 60Hz cadence.
   const fastVblank = params.get('fastvblank') === '1';
+  // R1 validation: ?promote=p|k|pk selects promoted region state
+  // (flags/accounting/both; default A reference). Forwarded to the worker,
+  // which sets the Module props the JIT env hook reads first.
+  const promoteRaw = (params.get('promote') || '').toLowerCase();
+  const promote = promoteRaw === 'p' || promoteRaw === 'flags' ? 'p'
+    : promoteRaw === 'k' || promoteRaw === 'accounting' ? 'k'
+    : promoteRaw === 'pk' || promoteRaw === 'both' ? 'pk' : '';
   const workerUrl = (backend === 'jit' ? './worker.js?backend=jit' : './worker.js')
     + (fastVblank ? (backend === 'jit' ? '&' : '?') + 'fastvblank=1' : '');
   const backendLabel = document.querySelector('#backend-label');
   if (backendLabel) backendLabel.textContent = (backend === 'jit' ? '(WasmJitCPU)' : '(InterpreterCPU)')
-    + (fastVblank ? ' [fast vblank: uncapped]' : '');
+    + (fastVblank ? ' [fast vblank: uncapped]' : '')
+    + (promote ? ` [promote:${promote}]` : '');
   const worker = new Worker(workerUrl, { type: 'module' });
   worker.onmessage = ({ data }) => {
     if (data.type === 'lifecycle') console.log('[vita3k-web] lifecycle:', data.state);
@@ -65,7 +73,7 @@ window.addEventListener('DOMContentLoaded', () => {
       // Prefer a fixture staged next to the page; fall back to user upload.
       fetch('./display-eboot.bin')
         .then((response) => (response.ok ? response.arrayBuffer() : Promise.reject(new Error('no staged fixture'))))
-        .then((bytes) => worker.postMessage({ type: 'run-vita', file: new File([bytes], 'display-eboot.bin'), fastVblank }))
+        .then((bytes) => worker.postMessage({ type: 'run-vita', file: new File([bytes], 'display-eboot.bin'), fastVblank, promote }))
         .catch(() => { status.textContent = 'Select a Vita eboot.bin to run.'; });
     }
     if (data.type === 'vita-frame') present(data);
@@ -83,7 +91,7 @@ window.addEventListener('DOMContentLoaded', () => {
   worker.onerror = (event) => { status.textContent = `Worker error: ${event.message || 'unknown'}`; };
   document.querySelector('#elf-file')?.addEventListener('change', () => {
     const [file] = document.querySelector('#elf-file').files;
-    if (file) worker.postMessage({ type: 'run-vita', file, fastVblank });
+    if (file) worker.postMessage({ type: 'run-vita', file, fastVblank, promote });
   });
   window.vita3kWeb = { worker, frames };
 });
