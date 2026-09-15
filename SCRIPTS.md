@@ -13,7 +13,7 @@ node build/web/browser/vita3k_jit_backend_test_node.js
 Compiles `vita3k/cpu/tests/wasmjit_backend_test.cpp` (which includes the backend
 `wasm_jit_cpu.cpp` so it can call the checked helpers directly) to a Node
 executable and runs it in Node's Wasm engine. Expected last line:
-`WasmJit backend: 510 checks passed (real memory, no interpreter)`.
+`WasmJit backend: 591 checks passed (real memory, no interpreter)`.
 
 ## Emitter fixture suite (real Dynarmic IR → Wasm modules, run in Node)
 
@@ -35,7 +35,7 @@ node vita3k/cpu/tests/wasmjit_emitter_test.mjs /tmp/wasmjit-emitter-fixtures
 Step 1 builds the native fixture generator (no CMake target exists for it —
 recipe from `vita3k/cpu/tests/wasmjit_emitter_README.md`). Step 2 translates
 real ARM/Thumb and emits `.wasm` fixtures + expected-state JSON. Step 3 executes
-every module in Node. Expected: ~77 modules, ~21k cases, "Wasm execution passed".
+every module in Node. Expected: 78 modules, ~21k cases, "Wasm execution passed".
 
 ## Exit-42 homebrew fixture (end-to-end JIT, cold start)
 

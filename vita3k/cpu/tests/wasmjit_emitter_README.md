@@ -28,8 +28,8 @@ c++ -std=c++20 -O1 -Wall -Wextra -Werror \
 node vita3k/cpu/tests/wasmjit_emitter_test.mjs /tmp/wasmjit-emitter-fixtures
 ```
 
-Expected: 77 deterministic modules, 21,431 input/expected-state pairs,
-42,854 successful **Wasm `call_indirect`** calls and 8 region calls at two
+Expected: 78 deterministic modules, 21,432 input/expected-state pairs,
+42,856 successful **Wasm `call_indirect`** calls and 8 region calls at two
 nonzero state offsets. The fixture generator serializes the complete JitState;
 the harness derives the state and canary sizes from those arrays.
 The native generator/emitter was also run with UndefinedBehaviorSanitizer
