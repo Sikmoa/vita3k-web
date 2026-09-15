@@ -22,8 +22,8 @@
 #include <limits>
 #include <map>
 #include <optional>
-#include <set>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -51,7 +51,7 @@ constexpr uint64_t REGION_MAX_TICKS = 32768;
 constexpr uint32_t REGION_BLOCK_INSTR_LIMIT = 64;
 constexpr size_t REGION_MAX_CODE_BYTES = REGION_BLOCK_INSTR_LIMIT * 4;
 constexpr size_t REGION_CACHE_LIMIT = 128;
-constexpr uint32_t REGION_CALL_TICKS = 32768; // Bound latency of host stop checks.
+constexpr uint32_t REGION_CALL_TICKS = 131072; // Bound latency of host stop checks.
 
 uint32_t counter_delta(uint32_t before, uint32_t after) noexcept {
     return after - before; // A call cannot execute a full 2^32 ticks.
@@ -127,7 +127,8 @@ bool form_region(MemState &mem, uint32_t entry_pc, uint32_t entry_cpsr,
     ir_out.clear();
     std::vector<LocationDescriptor> stack;
     std::vector<Dynarmic::IR::Block> ir_blocks;
-    std::set<uint32_t> member_pcs;
+    std::unordered_set<uint32_t> member_pcs;
+    member_pcs.reserve(REGION_MAX_BLOCKS * 2);
     stack.emplace_back(entry_pc, Dynarmic::A32::PSR{entry_cpsr},
         Dynarmic::A32::FPSCR{entry_fpscr});
     while (!stack.empty() && region.blocks.size() < REGION_MAX_BLOCKS
@@ -154,11 +155,11 @@ bool form_region(MemState &mem, uint32_t entry_pc, uint32_t entry_cpsr,
                 block.psr_mask = PSR_DISPATCH_MASK;
                 block.psr_value = location.CPSR().Value() & PSR_DISPATCH_MASK;
                 block.ticks = static_cast<uint32_t>(ticks);
-                // Use the actual region emitter to validate this member.
-                // No browser compilation or interpreter fallback occurs here.
-                const vita3k::wasmjit::RegionBlockMeta meta{
-                    pc, block.psr_mask, block.psr_value, block.ticks};
-                if (vita3k::wasmjit::emit_region({&translated}, {meta}).empty())
+                // Validate only the member body here. Building a complete
+                // one-block module for every candidate duplicates the most
+                // expensive part of region formation and is discarded as
+                // soon as the next candidate is examined.
+                if (!vita3k::wasmjit::validate_region_block(translated))
                     return false;
                 block.original.resize(static_cast<size_t>(end - pc));
                 if (!mem_fetch(mem, pc, block.original.data(), block.original.size()))
@@ -223,12 +224,59 @@ void mark_code_pages(const Region &region, int delta) {
 // stores into code pages set g_code_pages, letting checked_memory_write flag
 // smc_dirty for an immediate Smc exit instead of waiting for this check.
 bool region_unchanged(const Region &region, MemState &mem) {
-    std::array<uint8_t, REGION_MAX_CODE_BYTES> bytes{};
+    struct PageSnapshot {
+        uint32_t page = 0;
+        uint32_t begin = 0;
+        uint32_t end = 0;
+        std::vector<uint8_t> bytes;
+    };
+    // Blocks are sorted by PC, so the ranges are naturally grouped by page.
+    // Fetch each touched page range once instead of invoking mem_fetch for
+    // every member block (which repeats page-table and permission checks).
+    std::vector<PageSnapshot> pages;
+    pages.reserve(region.code_pages.size());
     for (const auto &block : region.blocks) {
-        if (!mem_fetch(mem, block.pc, bytes.data(), block.original.size()))
+        const uint64_t start = block.pc;
+        const uint64_t end = start + block.original.size();
+        for (uint64_t page = start >> 12; page < (end + 4095) / 4096; ++page) {
+            const uint32_t begin = page == (start >> 12) ? static_cast<uint32_t>(start & 0xfff) : 0;
+            const uint32_t finish = page == ((end - 1) >> 12)
+                ? static_cast<uint32_t>(((end - 1) & 0xfff) + 1) : 4096;
+            if (pages.empty() || pages.back().page != page)
+                pages.push_back({static_cast<uint32_t>(page), begin, finish, {}});
+            else {
+                pages.back().begin = std::min(pages.back().begin, begin);
+                pages.back().end = std::max(pages.back().end, finish);
+            }
+        }
+    }
+    for (auto &page : pages) {
+        page.bytes.resize(page.end - page.begin);
+        if (!mem_fetch(mem, page.page * 4096 + page.begin,
+                page.bytes.data(), page.bytes.size()))
             return false;
-        if (!std::equal(block.original.begin(), block.original.end(), bytes.begin()))
-            return false;
+    }
+    for (const auto &block : region.blocks) {
+        size_t offset = 0;
+        while (offset < block.original.size()) {
+            const uint32_t address = block.pc + static_cast<uint32_t>(offset);
+            const uint32_t page = address >> 12;
+            const auto it = std::lower_bound(pages.begin(), pages.end(), page,
+                [](const PageSnapshot &snapshot, uint32_t value) {
+                    return snapshot.page < value;
+                });
+            if (it == pages.end() || it->page != page)
+                return false;
+            const size_t page_offset = address & 0xfff;
+            const size_t count = std::min(block.original.size() - offset,
+                size_t(4096 - page_offset));
+            if (page_offset < it->begin || page_offset - it->begin + count > it->bytes.size()
+                || !std::equal(block.original.begin() + offset,
+                    block.original.begin() + offset + count,
+                    it->bytes.begin() + (page_offset - it->begin)))
+                return false;
+            offset += count;
+        }
     }
     return true;
 }
@@ -304,8 +352,11 @@ EMSCRIPTEN_KEEPALIVE uint32_t checked_memory_write(JitState *state, uint32_t add
     const uint64_t end = uint64_t(address) + bytes;
     for (uint64_t page = address >> 12; page < (end + 4095) / 4096; ++page) {
         if (g_code_pages[page]) {
+            if (!state->smc_dirty)
+                state->smc_page = static_cast<uint32_t>(page);
+            else if (state->smc_page != page)
+                state->smc_page = std::numeric_limits<uint32_t>::max();
             state->smc_dirty = 1;
-            break;
         }
     }
     return 0;
@@ -352,7 +403,7 @@ EM_JS(int, vita3k_jit_install_region, (const uint8_t *bytes, unsigned length,
     MemoryFunction read_memory, MemoryFunction write_memory), {
     const regions = Module['vita3kJitRegions'] || (Module['vita3kJitRegions'] = new Map());
     let slot = -1;
-    const freeSlots = Module['vita3kJitFreeSlots'] || (Module['vita3kJitFreeSlots'] = []);
+    const freeSlots = Module['vita3kJitFreeRegionSlots'] || (Module['vita3kJitFreeRegionSlots'] = []);
     try {
         const raw = HEAPU8.slice(bytes, bytes + length);
         if (typeof process !== 'undefined' && process.env?.VITA3K_DUMP_JIT) require('fs').writeFileSync('/tmp/jit-region-' + arguments[2] + '-' + Date.now() + '.wasm', raw);
@@ -364,13 +415,14 @@ EM_JS(int, vita3k_jit_install_region, (const uint8_t *bytes, unsigned length,
         }});
         const run = instance.exports.run;
         if (typeof run !== 'function') throw new Error('region module does not export run');
-        slot = regions.size
-            ? Array.from({length: regions.size}, (_, i) => i).find(i => !regions.has(i)) ?? regions.size
-            : 0;
+        slot = freeSlots.length ? freeSlots.pop() : regions.size;
         regions.set(slot, run);
         return slot;
     } catch (error) {
-        if (slot >= 0) regions.delete(slot);
+        if (slot >= 0) {
+            regions.delete(slot);
+            freeSlots.push(slot);
+        }
         console.error('Vita3K JIT region compilation failed:', error);
         return -1;
     }
@@ -381,6 +433,7 @@ EM_JS(uint32_t, vita3k_jit_run, (int slot, uint32_t state, uint32_t budget), {
 });
 EM_JS(void, vita3k_jit_release_region, (int slot), {
     Module['vita3kJitRegions'].delete(slot);
+    (Module['vita3kJitFreeRegionSlots'] || (Module['vita3kJitFreeRegionSlots'] = [])).push(slot);
 });
 
 struct WasmJitCPU::Impl {
@@ -433,6 +486,20 @@ struct WasmJitCPU::Impl {
         }
         invalidated += region_cache.size();
         region_cache.clear();
+    }
+    void clear_regions_for_page(uint32_t page) {
+        for (auto it = region_cache.begin(); it != region_cache.end();) {
+            const Region &region = *it->second.region;
+            if (!std::binary_search(region.code_pages.begin(), region.code_pages.end(), page)) {
+                ++it;
+                continue;
+            }
+            if (it->second.table_index >= 0)
+                vita3k_jit_release_region(it->second.table_index);
+            mark_code_pages(region, -1);
+            it = region_cache.erase(it);
+            ++invalidated;
+        }
     }
     void clear() {
         for (const auto &[key, block] : cache) vita3k_jit_release(block.table_index);
@@ -555,6 +622,7 @@ struct WasmJitCPU::Impl {
             state.page_perms_base = reinterpret_cast<uint32_t>(mem_state->page_permissions.get());
             state.code_pages_base = reinterpret_cast<uint32_t>(g_code_pages.data());
             state.smc_dirty = 0;
+            state.smc_page = 0;
             // stop() owns an atomic request. Mirror it at entry and return
             // to the atomic host check at least every REGION_CALL_TICKS.
             // Event-loop yielding remains the worker scheduler's job.
@@ -583,7 +651,10 @@ struct WasmJitCPU::Impl {
             // "SMC wins over the dispatch budget check" holds everywhere.
             if (reason != static_cast<uint32_t>(ExitReason::Smc) && state.smc_dirty) {
                 ++smc_exits;
-                clear_regions();
+                if (state.smc_page == std::numeric_limits<uint32_t>::max())
+                    clear_regions();
+                else
+                    clear_regions_for_page(state.smc_page);
                 state.smc_dirty = 0;
             }
             switch (static_cast<ExitReason>(reason)) {
@@ -627,8 +698,12 @@ struct WasmJitCPU::Impl {
             case ExitReason::Smc:
                 ++smc_exits;
                 // next_pc is a continuation, not the modified address.
-                // A Boolean dirty flag requires conservative invalidation.
-                clear_regions();
+                // Invalidate only regions that actually cover the dirty code
+                // page; unrelated hot regions remain reusable.
+                if (state.smc_page == std::numeric_limits<uint32_t>::max())
+                    clear_regions();
+                else
+                    clear_regions_for_page(state.smc_page);
                 state.smc_dirty = 0;
                 continue;
             case ExitReason::Stop:

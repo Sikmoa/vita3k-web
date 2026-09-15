@@ -86,12 +86,12 @@ covered separately by `browser/tests/wasm_jit_tests.cpp` and `jit_smoke.mjs`.
 **empty on unsupported input**. It neither executes guest code nor invokes
 helper callbacks. No exception is used for ordinary rejection.
 
-The standard-layout `JitState` is 412 bytes. Its original fields in order are
+The standard-layout `JitState` is 416 bytes. Its original fields in order are
 `regs[16]`, `cpsr`, `fpscr`, `svc`, `exit_reason`, `executed`,
 `memory_cookie`, `fault_address`, `fault_write`, `memory_value[4]`,
 `fpu[64]` and `tpidruro`, followed by `next_pc`, `fault_pc`, `page_table_base`,
 `page_perms_base`, `smc_dirty`, `stop_flag`, `dispatches`, `code_pages_base`,
-`mem_fast_reads` and `mem_fast_writes`, all `uint32_t`; static asserts pin the layout.
+`mem_fast_reads`, `mem_fast_writes` and `smc_page`, all `uint32_t`; static asserts pin the layout.
 Extended registers overlay `fpu` exactly as the x64 backend's MJitStateExtReg:
 Sn is word n, Dn words 2n/2n+1, Qn words 4n..4n+3. The emitter uses
 `offsetof`, not native Dynarmic state layout. Export `block(i32 stateOffset)`

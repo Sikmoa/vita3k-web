@@ -57,6 +57,7 @@ struct JitState {
     // helper's `bytes` argument and the helper accounts it.
     uint32_t mem_fast_reads;  // +404 inline fast-path reads this call
     uint32_t mem_fast_writes; // +408 inline fast-path writes this call
+    uint32_t smc_page;        // +412 code page that triggered smc_dirty
 };
 static_assert(std::is_standard_layout_v<JitState>);
 static_assert(offsetof(JitState, memory_cookie) == 84);
@@ -73,7 +74,8 @@ static_assert(offsetof(JitState, dispatches) == 396);
 static_assert(offsetof(JitState, code_pages_base) == 400);
 static_assert(offsetof(JitState, mem_fast_reads) == 404);
 static_assert(offsetof(JitState, mem_fast_writes) == 408);
-static_assert(sizeof(JitState) == 412);
+static_assert(offsetof(JitState, smc_page) == 412);
+static_assert(sizeof(JitState) == 416);
 
 // Emits an MVP Wasm module importing env.memory (unshared, min 1 page)
 // and env.mem_read/env.mem_write: (stateOffset i32, address i32, bytes i32)->i32.
@@ -155,5 +157,10 @@ struct RegionBlockMeta {
 std::vector<uint8_t> emit_region(
     const std::vector<const Dynarmic::IR::Block *> &blocks,
     const std::vector<RegionBlockMeta> &meta);
+
+// Checks whether a block can be lowered into a region body without assembling
+// a complete module. Region formation uses this to avoid repeatedly building
+// and discarding one-block Wasm modules for every candidate successor.
+bool validate_region_block(const Dynarmic::IR::Block &block);
 
 } // namespace vita3k::wasmjit

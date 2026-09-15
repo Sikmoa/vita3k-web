@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <array>
+#include <iterator>
+#include <optional>
 #include <stdexcept>
 
 #include <dynarmic/frontend/A32/a32_ir_emitter.h>
@@ -38,7 +40,9 @@ public:
         // End after a complete guest store, including all its IR and
         // writeback. The dispatcher must check SMC before the next guest
         // instruction. Do not exit between the elements of STM/VST1.
-        const bool wrote_memory = std::any_of(ir.block.begin(), ir.block.end(),
+        const auto scan_begin = previous_boundary && *previous_boundary != ir.block.cend()
+            ? std::next(*previous_boundary) : ir.block.cbegin();
+        const bool wrote_memory = std::any_of(scan_begin, ir.block.cend(),
             [](const Dynarmic::IR::Inst &inst) {
                 using Op = Dynarmic::IR::Opcode;
                 const auto op = inst.GetOpcode();
@@ -51,6 +55,13 @@ public:
             ir.SetTerm(Dynarmic::IR::Term::LinkBlock{ir.current_location});
             return false;
         }
+        // The hook runs before Dynarmic translates the next instruction. Keep
+        // the beginning of just the preceding instruction's IR so the store
+        // check stays linear in the translation instead of rescanning the
+        // entire accumulated block on every frontend iteration.
+        previous_boundary = ir.block.empty()
+            ? std::optional<Dynarmic::IR::Block::const_iterator>{ir.block.cend()}
+            : std::optional<Dynarmic::IR::Block::const_iterator>{std::prev(ir.block.cend())};
         return true;
     }
 
@@ -65,6 +76,7 @@ public:
 private:
     MemState &mem;
     uint32_t remaining;
+    std::optional<Dynarmic::IR::Block::const_iterator> previous_boundary;
 };
 
 } // namespace

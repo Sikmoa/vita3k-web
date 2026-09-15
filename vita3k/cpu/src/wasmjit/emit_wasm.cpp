@@ -3,6 +3,7 @@
 #include "emit_wasm.h"
 
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <limits>
 #include <unordered_map>
@@ -101,15 +102,21 @@ public:
 
     // Region layout (REGION_ABI.md): run(state=0, budget=1) with locals
     // 2=executed_call, 3=pc, 4=CheckBit, 5=i64 scratch, 6=dispatch index,
-    // 7..=per-block SSA words (reused across bodies).
+    // 7=dispatch count, 8..10=hoisted memory bases, 11..=per-block SSA
+    // words (reused across bodies).
     Emitter(const Dynarmic::IR::Block &block, unsigned index,
         const std::vector<const Dynarmic::IR::Block *> &members)
         : block(block), start(block.Location()), finish(block.EndLocation())
         , region(true), body_index(index), members(&members) {
         check_bit_local = 4;
         scratch_local = 5;
-        ssa_base = 7;
-        next_local = 7;
+        dispatch_count_local = 7;
+        page_table_local = 8;
+        page_perms_local = 9;
+        code_pages_local = 10;
+        reg_base = 11;
+        ssa_base = 26;
+        next_local = 26;
     }
 
     uint32_t meta_entry_pc_for_dbg() const { return start.PC(); }
@@ -127,6 +134,7 @@ public:
         if (block.size() > 4096 || block.CycleCount() == 0 || block.CycleCount() > 4096
             || block.ConditionFailedCycleCount() > 4096 || !valid_location(start) || !valid_location(finish))
             return {};
+        analyze_register_cache();
 
         store_constant(offsetof(JitState, svc), 0);
         store_constant(offsetof(JitState, exit_reason), 0);
@@ -146,6 +154,7 @@ public:
 
         for (const Inst &inst : block)
             has_bx |= inst.GetOpcode() == Op::A32BXWritePC;
+        initialize_register_cache();
         for (const Inst &inst : block) {
             // SVC must be the final side effect: the host handles it on return.
             if (svc || !instruction(inst)) {
@@ -190,6 +199,11 @@ private:
     std::unordered_map<const Inst *, uint32_t> locals;
     // Single-block layout: 1=CheckBit, 2=i64 scratch, SSA from 3.
     uint32_t check_bit_local = 1, scratch_local = 2, ssa_base = 3;
+    uint32_t dispatch_count_local = 0;
+    uint32_t page_table_local = 0, page_perms_local = 0, code_pages_local = 0;
+    uint32_t reg_base = 3;
+    std::array<bool, 15> cached_regs{};
+    std::array<bool, 15> dirty_regs{};
     uint32_t next_local = 3;
     unsigned terminal_nodes = 0;
     bool ok = true;
@@ -216,6 +230,47 @@ private:
     void store(uint32_t offset) { op(Store); uleb(code, 2); uleb(code, offset); }
     void store_constant(uint32_t offset, uint32_t n) { get(0); imm(n); store(offset); }
     void mask(uint32_t bits) { imm(bits); op(And); }
+    void commit_counters() {
+        if (!region)
+            return;
+        // Keep hot-loop accounting in Wasm locals. The state fields are part
+        // of the ABI, but only need to be published when control returns to
+        // the host, removing two linear-memory read/modify/write sequences
+        // from every dispatched guest block.
+        get(0); load(offsetof(JitState, executed)); get(2); op(Add);
+        store(offsetof(JitState, executed));
+        get(0); load(offsetof(JitState, dispatches)); get(dispatch_count_local); op(Add);
+        store(offsetof(JitState, dispatches));
+    }
+    void analyze_register_cache() {
+        for (const Inst &inst : block) {
+            if (inst.GetOpcode() != Op::A32GetRegister
+                && inst.GetOpcode() != Op::A32SetRegister)
+                continue;
+            const auto reg = inst.GetArg(0);
+            if (reg.IsImmediate() && reg.GetType() == Type::A32Reg) {
+                const auto index = static_cast<uint32_t>(reg.GetA32RegRef());
+                if (index < cached_regs.size())
+                    cached_regs[index] = true;
+            }
+        }
+    }
+    void initialize_register_cache() {
+        for (uint32_t i = 0; i < cached_regs.size(); ++i) {
+            if (!cached_regs[i])
+                continue;
+            load(offsetof(JitState, regs) + i * sizeof(uint32_t));
+            set(reg_base + i);
+        }
+    }
+    void flush_register_cache() {
+        for (uint32_t i = 0; i < dirty_regs.size(); ++i) {
+            if (!dirty_regs[i])
+                continue;
+            get(0); get(reg_base + i);
+            store(offsetof(JitState, regs) + i * sizeof(uint32_t));
+        }
+    }
     void checked_status() {
         // The helper result is still on the stack: branch on it directly
         // without staging through a local (in region layout local 1 is the
@@ -225,13 +280,16 @@ private:
         if (region) {
             // Fault mid-region: recover the faulting instruction's mode and PC
             // (arg0 of the memory op is its own U64 location descriptor) and
-            // return WITHOUT touching executed (it holds prior blocks' ticks)
-            // and WITHOUT rollback (REGION_ABI fault contract).
+            // return after publishing completed-block ticks (the current
+            // block has not reached its terminal) and WITHOUT rollback
+            // (REGION_ABI fault contract).
             const Location fault_location{Dynarmic::IR::LocationDescriptor{pending_fault_location}};
             // IT may have advanced since block entry. Preserve the current
             // arithmetic flags while restoring the faulting instruction's mode.
+            flush_register_cache();
             upper_location(fault_location);
             store_constant(offsetof(JitState, fault_pc), fault_location.PC());
+            commit_counters();
         } else {
             store_constant(offsetof(JitState, executed), 0);
         }
@@ -284,6 +342,12 @@ private:
             for (unsigned i = 0; i < (bytes + 3) / 4; ++i) { get(0); op(Load); uleb(code, 2); uleb(code, offsetof(JitState, memory_value) + i * 4); set(next_local + i); }
         }
     }
+    void memory_base(uint32_t local, uint32_t offset) {
+        if (region)
+            get(local);
+        else
+            load(offset);
+    }
     // Probe chain: page 0 -> fast-path enabled -> permissions -> mapped ->
     // page boundary -> (stores) code-page refcount. All ifs are void; every
     // arm fully defines the IR result (fast load sets it directly, fallbacks
@@ -291,33 +355,34 @@ private:
     // addr/page live in the two SPARE SSA words of this instruction's
     // ten-word slot (existing lowerings use words 1..6 only).
     void memory_fast_or_slow(const Inst &inst, bool write, unsigned bytes) {
-        const uint32_t addr_local = next_local + 9; // spare SSA word; page is
-        // recomputed per probe from the table base, so it needs no spill slot.
+        const uint32_t page_local = next_local + 8;
+        const uint32_t addr_local = next_local + 9;
         // MemPerm::ReadOnly(1) / WriteOnly(2): the bits mem_read/mem_write
         // require of every touched page (mem/functions.h).
         const uint32_t required = write ? 2 : 1;
         value_word(inst.GetArg(1));
         set(addr_local);
+        get(addr_local); imm(12); op(ShrU); set(page_local);
 
         // Guest page 0: the checked path rejects addr < host_page_size even
         // when sparse backing was force-allocated there.
-        get(addr_local); imm(12); op(ShrU); op(Eqz);
+        get(page_local); op(Eqz);
         begin_if();
         memory_slow_call(inst, write, bytes, kSlowOther);
         op(Else);
         // Fast path enabled? A zero base means the host did not populate the
         // probes; skipping this guard would dereference guest-controlled
         // linear memory as a host offset.
-        load(offsetof(JitState, page_table_base)); op(Eqz);
-        load(offsetof(JitState, page_perms_base)); op(Eqz); op(Or);
-        load(offsetof(JitState, code_pages_base)); op(Eqz); op(Or);
+        memory_base(page_table_local, offsetof(JitState, page_table_base)); op(Eqz);
+        memory_base(page_perms_local, offsetof(JitState, page_perms_base)); op(Eqz); op(Or);
+        memory_base(code_pages_local, offsetof(JitState, code_pages_base)); op(Eqz); op(Or);
         begin_if();
         memory_slow_call(inst, write, bytes, kSlowOther);
         op(Else);
         // Permission probe: (perms[page] & required) != required. The
         // condition ends alone on the stack for begin_if (no staging).
-        load(offsetof(JitState, page_perms_base));
-        get(addr_local); imm(12); op(ShrU); op(Add);
+        memory_base(page_perms_local, offsetof(JitState, page_perms_base));
+        get(page_local); op(Add);
         op(Load8U); uleb(code, 0); uleb(code, 0);
         imm(required); op(And); imm(required); op(Ne);
         begin_if();
@@ -325,8 +390,8 @@ private:
         op(Else);
         // Mapping probe: null page-table entry = unallocated page (sparse
         // backing initializes the table to null and frees null entries).
-        load(offsetof(JitState, page_table_base));
-        get(addr_local); imm(12); op(ShrU); imm(2); op(Shl); op(Add);
+        memory_base(page_table_local, offsetof(JitState, page_table_base));
+        get(page_local); imm(2); op(Shl); op(Add);
         op(Load); uleb(code, 2); uleb(code, 0);
         op(Eqz);
         begin_if();
@@ -341,16 +406,16 @@ private:
         if (write) {
             // Code-page probe: nonzero refcount = page holds cached JIT code;
             // the checked helper must own the store so smc_dirty stays exact.
-            load(offsetof(JitState, code_pages_base));
-            get(addr_local); imm(12); op(ShrU); imm(2); op(Shl); op(Add);
+            memory_base(code_pages_local, offsetof(JitState, code_pages_base));
+            get(page_local); imm(2); op(Shl); op(Add);
             op(Load); uleb(code, 2); uleb(code, 0);
             op(Eqz); op(Eqz);
             begin_if();
             memory_slow_call(inst, write, bytes, kSlowCodePage);
             op(Else);
             // Direct store: base + (addr & 0xfff).
-            load(offsetof(JitState, page_table_base));
-            get(addr_local); imm(12); op(ShrU); imm(2); op(Shl); op(Add);
+            memory_base(page_table_local, offsetof(JitState, page_table_base));
+            get(page_local); imm(2); op(Shl); op(Add);
             op(Load); uleb(code, 2); uleb(code, 0);
             get(addr_local); imm(0xfff); op(And); op(Add);
             value_word(inst.GetArg(2), 0);
@@ -362,8 +427,8 @@ private:
             op(End);
         } else {
             // Direct load: base + (addr & 0xfff); 8/16-bit zero-extending.
-            load(offsetof(JitState, page_table_base));
-            get(addr_local); imm(12); op(ShrU); imm(2); op(Shl); op(Add);
+            memory_base(page_table_local, offsetof(JitState, page_table_base));
+            get(page_local); imm(2); op(Shl); op(Add);
             op(Load); uleb(code, 2); uleb(code, 0);
             get(addr_local); imm(0xfff); op(And); op(Add);
             if (bytes == 1) { op(Load8U); uleb(code, 0); uleb(code, 0); }
@@ -459,6 +524,8 @@ private:
     }
 
     void ret(ExitReason reason) {
+        flush_register_cache();
+        commit_counters();
         store_constant(offsetof(JitState, exit_reason), static_cast<uint32_t>(reason));
         imm(static_cast<uint32_t>(reason));
         op(Return);
@@ -632,10 +699,9 @@ private:
     // --- Region mode (REGION_ABI.md) ---------------------------------
 
     void add_ticks(uint32_t ticks) {
-        // Per-call budget local and the monotonic state counter both advance
-        // by exactly the completed block's (or cond-fail's) tick count.
+        // Keep per-call accounting in a local. The monotonic state counter is
+        // committed once on exit rather than once per completed block.
         get(2); imm(ticks); op(Add); set(2);
-        get(0); load(offsetof(JitState, executed)); imm(ticks); op(Add); store(offsetof(JitState, executed));
     }
 
     void br_redispatch() {
@@ -698,6 +764,7 @@ private:
         get(1); op(GtU);
         begin_if();
         set_next_pc_runtime();
+        commit_counters();
         store_constant(offsetof(JitState, exit_reason), static_cast<uint32_t>(ExitReason::Budget));
         imm(static_cast<uint32_t>(ExitReason::Budget));
         op(Return);
@@ -717,9 +784,10 @@ private:
             const Location target(link->next);
             location(target);
             add_ticks(ticks);
-            if (const uint32_t idx = member_index(target); idx != kNoMember)
+            if (const uint32_t idx = member_index(target); idx != kNoMember) {
+                flush_register_cache();
                 light_redispatch(idx); // chained: constant index, no PC search
-            else {
+            } else {
                 store_constant(offsetof(JitState, next_pc), target.PC());
                 ret(ExitReason::Miss);
             }
@@ -727,9 +795,10 @@ private:
             const Location target(fast->next);
             location(target);
             add_ticks(ticks);
-            if (const uint32_t idx = member_index(target); idx != kNoMember)
+            if (const uint32_t idx = member_index(target); idx != kNoMember) {
+                flush_register_cache();
                 light_redispatch(idx);
-            else {
+            } else {
                 store_constant(offsetof(JitState, next_pc), target.PC());
                 ret(ExitReason::Miss);
             }
@@ -816,6 +885,8 @@ public:
     }
 
     void emit_instructions_and_terminal() {
+        analyze_register_cache();
+        initialize_register_cache();
         for (const Inst &inst : block)
             has_bx |= inst.GetOpcode() == Op::A32BXWritePC;
         for (const Inst &inst : block) {
@@ -850,8 +921,19 @@ private:
             const auto index = static_cast<uint32_t>(reg.GetA32RegRef());
             if (index >= 16) return false;
             const uint32_t offset = offsetof(JitState, regs) + index * sizeof(uint32_t);
-            if (kind == Op::A32GetRegister) { load(offset); break; }
-            get(0); arg(1); store(offset);
+            if (index < cached_regs.size()) {
+                if (kind == Op::A32GetRegister) {
+                    get(reg_base + index);
+                    break;
+                }
+                arg(1); set(reg_base + index);
+                dirty_regs[index] = true;
+            } else if (kind == Op::A32GetRegister) {
+                load(offset);
+                break;
+            } else {
+                get(0); arg(1); store(offset);
+            }
             pc_written |= index == 15;
             return ok;
         }
@@ -1059,6 +1141,12 @@ std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block) {
     return Emitter(block).run();
 }
 
+bool validate_region_block(const Dynarmic::IR::Block &block) {
+    const std::vector<const Dynarmic::IR::Block *> members{&block};
+    Emitter emitter(block, 0, members);
+    return !emitter.region_body().empty();
+}
+
 std::vector<uint8_t> emit_region(
     const std::vector<const Dynarmic::IR::Block *> &blocks,
     const std::vector<RegionBlockMeta> &meta) {
@@ -1105,15 +1193,17 @@ std::vector<uint8_t> emit_region(
     // the HOST re-checks smc_dirty on every exit (see execute_regions).
     Bytes d;
     const auto exit_with = [&](ExitReason reason) {
+        b_get(d, 0); b_load(d, offsetof(JitState, executed)); b_get(d, 2); b_op(d, Add);
+        b_store(d, offsetof(JitState, executed));
+        b_get(d, 0); b_load(d, offsetof(JitState, dispatches)); b_get(d, 7); b_op(d, Add);
+        b_store(d, offsetof(JitState, dispatches));
         b_get(d, 0); b_load(d, offsetof(JitState, regs) + 15 * sizeof(uint32_t));
         b_store(d, offsetof(JitState, next_pc));
         b_get(d, 0); b_imm(d, static_cast<uint32_t>(reason)); b_store(d, offsetof(JitState, exit_reason));
         b_imm(d, static_cast<uint32_t>(reason)); b_op(d, Return);
     };
-    // state.dispatches++
-    b_get(d, 0);
-    b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, dispatches));
-    b_imm(d, 1); b_op(d, Add); b_store(d, offsetof(JitState, dispatches));
+    // Keep dispatch accounting in local 7 and publish it only on return.
+    b_get(d, 7); b_imm(d, 1); b_op(d, Add); b_set(d, 7);
     // if (state.stop_flag) { next_pc = regs[15]; return Stop }
     b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, stop_flag));
     b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Stop); b_op(d, End);
@@ -1184,12 +1274,20 @@ std::vector<uint8_t> emit_region(
     // invocation, so the dispatch-index local must start at the sentinel
     // (a stale 0 would wrongly route the first dispatch to block 0).
     b_imm(code, kLightDispatchSentinel); b_set(code, 6);
+    b_imm(code, 0); b_set(code, 7);
+    b_load(code, offsetof(JitState, page_table_base)); b_set(code, 8);
+    b_load(code, offsetof(JitState, page_perms_base)); b_set(code, 9);
+    b_load(code, offsetof(JitState, code_pages_base)); b_set(code, 10);
     b_op(code, Loop); b_op(code, 0x40); // $outer: br here = redispatch
     for (size_t i = 0; i < n; ++i) { b_op(code, Block); b_op(code, 0x40); } // $b0..$b(n-1)
     b_op(code, Block); b_op(code, 0x40); // $default (innermost)
     code.insert(code.end(), d.begin(), d.end());
     b_op(code, End); // close $default -> miss body
     {
+        b_get(code, 0); b_load(code, offsetof(JitState, executed)); b_get(code, 2); b_op(code, Add);
+        b_store(code, offsetof(JitState, executed));
+        b_get(code, 0); b_load(code, offsetof(JitState, dispatches)); b_get(code, 7); b_op(code, Add);
+        b_store(code, offsetof(JitState, dispatches));
         b_get(code, 0); b_get(code, 3); b_store(code, offsetof(JitState, next_pc));
         b_get(code, 0); b_imm(code, static_cast<uint32_t>(ExitReason::Miss)); b_store(code, offsetof(JitState, exit_reason));
         b_imm(code, static_cast<uint32_t>(ExitReason::Miss)); b_op(code, Return);
@@ -1206,7 +1304,7 @@ std::vector<uint8_t> emit_region(
     uleb(body, 3); // three local runs
     uleb(body, 3); body.push_back(0x7f); // locals 2,3,4: executed_call, pc, CheckBit
     uleb(body, 1); body.push_back(0x7e); // local 5: i64 scratch
-    uleb(body, 1 + max_ssa); body.push_back(0x7f); // local 6: dispatch index; 7..: SSA
+    uleb(body, 20 + max_ssa); body.push_back(0x7f); // local 6: dispatch index; 7: dispatch count; 8..10: memory bases; 11..25: cached regs; 26..: SSA
     body.insert(body.end(), code.begin(), code.end());
     Bytes functions{1};
     uleb(functions, static_cast<uint32_t>(body.size()));

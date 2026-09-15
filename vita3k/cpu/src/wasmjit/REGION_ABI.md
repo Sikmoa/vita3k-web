@@ -21,6 +21,7 @@ uint32_t dispatches;     // +396 count of dispatch iterations (profiling)
 uint32_t code_pages_base;// +400 host offset of code-page refcounts, 0=off
 uint32_t mem_fast_reads; // +404 fast-path reads this call (host accumulates)
 uint32_t mem_fast_writes;// +408 fast-path writes this call (host accumulates)
+uint32_t smc_page;       // +412 code page that set smc_dirty
 ```
 
 ExitReason extended: Continue=0, Svc=1, Fault=2, Unsupported=3, Miss=4,
@@ -38,8 +39,9 @@ Contract:
   block whose emitted tick cost is T: if executed_this_call + T > budget,
   set next_pc=that block's PC and return Budget.
 - `state.executed` accumulates monotonically across calls (host tracks
-  deltas). Incremented exactly as today (one tick per guest instruction,
-  including condition-failed ticks).
+  deltas). The generated loop keeps the count in a Wasm local and commits it
+  on exit; the value is still one tick per guest instruction, including
+  condition-failed ticks.
 - `state.dispatches` incremented once per dispatch-loop iteration.
 
 ## Dispatch loop (inside `run`)
