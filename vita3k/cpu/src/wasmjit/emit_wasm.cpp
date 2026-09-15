@@ -98,6 +98,13 @@ constexpr uint32_t kRegionRegBase = 11;
 constexpr uint32_t kCachedRegCount = 15;
 constexpr uint32_t kRegionSsaBase = kRegionRegBase + kCachedRegCount;
 
+uint32_t entry_ticks(const RegionBlockMeta &meta) {
+    // Continued blocks are unconditional. Admit the first store-delimited
+    // segment; each continuation checks the cumulative cost of the next one.
+    return meta.store_continuations.empty() ? meta.ticks
+                                          : meta.store_continuations.front().completed_ticks;
+}
+
 class Emitter {
 public:
     explicit Emitter(const Dynarmic::IR::Block &block)
@@ -108,9 +115,10 @@ public:
     // 7=dispatch count, 8..10=hoisted memory bases, 11..25=registers
     // retained across bodies, 26..=per-block SSA words.
     Emitter(const Dynarmic::IR::Block &block, unsigned index,
-        const std::vector<const Dynarmic::IR::Block *> &members)
+        const std::vector<const Dynarmic::IR::Block *> &members,
+        const std::vector<RegionBlockMeta> &metadata)
         : block(block), start(block.Location()), finish(block.EndLocation())
-        , region(true), body_index(index), members(&members) {
+        , region(true), body_index(index), members(&members), metadata(&metadata) {
         check_bit_local = 4;
         scratch_local = 5;
         page_table_local = 8;
@@ -222,6 +230,8 @@ private:
     unsigned body_index = 0;   // br-to-dispatch depth equals the body index
     unsigned extra_labels = 0; // all open ifs, including memory probes
     const std::vector<const Dynarmic::IR::Block *> *members = nullptr;
+    const std::vector<RegionBlockMeta> *metadata = nullptr;
+    uint32_t completed_store_ticks = 0;
 
     void op(uint8_t byte) { code.push_back(byte); }
     void imm(uint32_t n) { constant(code, n); }
@@ -285,6 +295,11 @@ private:
             // arithmetic flags while restoring the faulting instruction's mode.
             upper_location(fault_location);
             store_constant(offsetof(JitState, fault_pc), fault_location.PC());
+            // Earlier store-delimited segments have completed, exactly as
+            // they did when every store ended a separate block. The current
+            // segment (and any partial multi-access instruction) is uncounted.
+            if (completed_store_ticks)
+                add_ticks(completed_store_ticks);
         } else {
             store_constant(offsetof(JitState, executed), 0);
         }
@@ -751,8 +766,7 @@ private:
     // so budget behavior is 1:1 with the old prologue except that a failing
     // chained iteration is not counted as a dispatch-loop trip.
     void light_redispatch(uint32_t target_index) {
-        const uint32_t ticks = static_cast<uint32_t>((*members)[target_index]->CycleCount()
-            + (*members)[target_index]->ConditionFailedCycleCount());
+        const uint32_t ticks = entry_ticks((*metadata)[target_index]);
         // Guard-style budget check (not if/else): the chained branch below
         // must stay OUTSIDE the if so br_redispatch's label depth is
         // unchanged. The skipped search leaf would have exited Budget with
@@ -767,6 +781,50 @@ private:
         // Chained: successor's constant index, then redispatch.
         imm(target_index); set(6);
         br_redispatch();
+    }
+
+    bool valid_store_continuations() const {
+        const auto &continuations = (*metadata)[body_index].store_continuations;
+        if (!continuations.empty() && block.GetCondition() != Cond::AL)
+            return false;
+        uint32_t previous_offset = 0, previous_ticks = 0, previous_pc = start.PC();
+        for (const auto &point : continuations) {
+            const Location next{Dynarmic::IR::LocationDescriptor{point.next_location}};
+            if (point.ir_offset <= previous_offset || point.ir_offset > block.size()
+                || point.completed_ticks <= previous_ticks || point.completed_ticks >= block.CycleCount()
+                || !valid_location(next) || next.TFlag() != start.TFlag()
+                || next.PC() <= previous_pc || next.PC() >= finish.PC())
+                return false;
+            previous_offset = point.ir_offset;
+            previous_ticks = point.completed_ticks;
+            previous_pc = next.PC();
+        }
+        return true;
+    }
+
+    void store_continuation(const StoreContinuation &point, uint32_t next_segment_end) {
+        // Normal stores fall through with no PC/CPSR writes, accounting
+        // updates or dispatcher transfer. Poll after the whole instruction,
+        // including writeback, and before executing any following guest IR.
+        load(offsetof(JitState, stop_flag));
+        load(offsetof(JitState, smc_dirty)); op(Or);
+        get(2); imm(next_segment_end); op(Add); get(1); op(GtU); op(Or);
+        begin_if();
+        const Location next{Dynarmic::IR::LocationDescriptor{point.next_location}};
+        location(next);
+        store_constant(offsetof(JitState, next_pc), next.PC());
+        add_ticks(point.completed_ticks);
+        load(offsetof(JitState, stop_flag)); begin_if();
+        ret(ExitReason::Stop);
+        end_if();
+        load(offsetof(JitState, smc_dirty)); begin_if();
+        ret(ExitReason::Smc);
+        end_if();
+        ret(ExitReason::Budget);
+        end_if();
+        // This is compile-time bookkeeping only. The terminal accounts the
+        // full block once; faults account only earlier completed segments.
+        completed_store_ticks = point.completed_ticks;
     }
 
     void terminal_region(const Term::Terminal &term, unsigned depth) {
@@ -841,6 +899,8 @@ public:
         if (block.size() > 4096 || block.CycleCount() == 0 || block.CycleCount() > 4096
             || block.ConditionFailedCycleCount() > 4096 || !valid_location(start) || !valid_location(finish))
             return {};
+        if (!valid_store_continuations())
+            return {};
         if (block.GetCondition() != Cond::AL) {
             if (!block.HasConditionFailedLocation() || block.ConditionFailedCycleCount() == 0)
                 return {};
@@ -876,6 +936,9 @@ public:
         // live through every linked or condition-failed block boundary.
         for (const Inst &inst : block)
             has_bx |= inst.GetOpcode() == Op::A32BXWritePC;
+        const auto &continuations = (*metadata)[body_index].store_continuations;
+        size_t continuation_index = 0;
+        uint32_t ir_offset = 0;
         for (const Inst &inst : block) {
             if (svc || !instruction(inst)) {
                 ok = false; // Never publish a partially emitted body.
@@ -885,6 +948,19 @@ public:
             }
             locals.emplace(&inst, next_local);
             next_local += 10;
+            ++ir_offset;
+            if (continuation_index < continuations.size()
+                && continuations[continuation_index].ir_offset == ir_offset) {
+                const uint32_t next_end = continuation_index + 1 < continuations.size()
+                    ? continuations[continuation_index + 1].completed_ticks
+                    : static_cast<uint32_t>(block.CycleCount());
+                if (svc) { reject("store continuation after SVC"); return; }
+                store_continuation(continuations[continuation_index++], next_end);
+            }
+        }
+        if (continuation_index != continuations.size()) {
+            reject("store continuation offset not emitted");
+            return;
         }
         terminal_region(block.GetTerminal(), 0);
     }
@@ -1129,9 +1205,14 @@ std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block) {
     return Emitter(block).run();
 }
 
-bool validate_region_block(const Dynarmic::IR::Block &block) {
+bool validate_region_block(const Dynarmic::IR::Block &block,
+    const std::vector<StoreContinuation> &store_continuations) {
     const std::vector<const Dynarmic::IR::Block *> members{&block};
-    Emitter emitter(block, 0, members);
+    const Location at(block.Location());
+    const std::vector<RegionBlockMeta> metadata{{at.PC(), Location::CPSR_MODE_MASK,
+        at.CPSR().Value() & Location::CPSR_MODE_MASK,
+        static_cast<uint32_t>(block.CycleCount() + block.ConditionFailedCycleCount()), store_continuations}};
+    Emitter emitter(block, 0, members, metadata);
     return !emitter.region_body().empty();
 }
 
@@ -1184,7 +1265,7 @@ std::vector<uint8_t> emit_region(
     std::vector<Bytes> bodies(n);
     uint32_t max_ssa = 0;
     for (size_t i = 0; i < n; ++i) {
-        Emitter emitter(*blocks[i], unsigned(i), blocks);
+        Emitter emitter(*blocks[i], unsigned(i), blocks, meta);
         bodies[i] = emitter.region_body();
         if (bodies[i].empty()) {
             return {};
@@ -1247,7 +1328,7 @@ std::vector<uint8_t> emit_region(
                 b_imm(d, fpscr); b_op(d, Ne);
                 b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Miss, open_ifs + 2); b_op(d, End);
                 // Budget: executed_call + ticks > budget -> Budget.
-                b_get(d, 2); b_imm(d, meta[lo].ticks); b_op(d, Add);
+                b_get(d, 2); b_imm(d, entry_ticks(meta[lo])); b_op(d, Add);
                 b_get(d, 1); b_op(d, GtU);
                 b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Budget, open_ifs + 2); b_op(d, End);
                 b_imm(d, static_cast<uint32_t>(lo)); b_set(d, 6);

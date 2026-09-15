@@ -2,16 +2,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "frontend.h"
 
-#include <algorithm>
 #include <array>
 #include <iterator>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 
 #include <dynarmic/frontend/A32/a32_ir_emitter.h>
 #include <dynarmic/frontend/A32/a32_location_descriptor.h>
 #include <dynarmic/frontend/A32/translate/a32_translate.h>
 #include <dynarmic/frontend/A32/translate/translate_callbacks.h>
+#include <dynarmic/ir/cond.h>
 #include <dynarmic/ir/opcodes.h>
 #include <fmt/format.h>
 #include <mem/functions.h>
@@ -21,8 +22,11 @@ namespace {
 
 class FetchCallbacks final : public Dynarmic::A32::TranslateCallbacks {
 public:
-    FetchCallbacks(MemState &mem, uint32_t budget)
-        : mem(mem), remaining(budget) {}
+    using BlockIterator = decltype(std::declval<Dynarmic::IR::Block>().cbegin());
+
+    FetchCallbacks(MemState &mem, uint32_t budget,
+        std::vector<StoreContinuation> *store_continuations)
+        : mem(mem), remaining(budget), store_continuations(store_continuations) {}
 
     std::optional<uint32_t> MemoryReadCode(uint32_t address) override {
         std::array<uint8_t, 4> bytes{};
@@ -37,31 +41,40 @@ public:
     }
 
     bool PreCodeReadHook(bool, uint32_t, Dynarmic::A32::IREmitter &ir) override {
-        // End after a complete guest store, including all its IR and
-        // writeback. The dispatcher must check SMC before the next guest
-        // instruction. Do not exit between the elements of STM/VST1.
+        // This boundary follows a COMPLETE guest instruction, including all
+        // elements of STM/VST1 and register writeback. Region emission can
+        // put an SMC side exit here without returning to the dispatcher for
+        // ordinary stores. Predicated blocks retain their original boundary
+        // so their condition-failed tick/budget contract is unchanged.
         const auto scan_begin = previous_boundary && *previous_boundary != ir.block.cend()
             ? std::next(*previous_boundary) : ir.block.cbegin();
-        const bool wrote_memory = std::any_of(scan_begin, ir.block.cend(),
-            [](const Dynarmic::IR::Inst &inst) {
-                using Op = Dynarmic::IR::Opcode;
-                const auto op = inst.GetOpcode();
-                return op == Op::A32WriteMemory8 || op == Op::A32WriteMemory16
-                    || op == Op::A32WriteMemory32 || op == Op::A32WriteMemory64;
-            });
-        if (remaining == 0 || wrote_memory) {
+        bool wrote_memory = false;
+        for (auto it = scan_begin; it != ir.block.cend(); ++it) {
+            using Op = Dynarmic::IR::Opcode;
+            const auto op = it->GetOpcode();
+            wrote_memory |= op == Op::A32WriteMemory8 || op == Op::A32WriteMemory16
+                || op == Op::A32WriteMemory32 || op == Op::A32WriteMemory64;
+            ++ir_count;
+        }
+        if (remaining == 0 || (wrote_memory
+                && (!store_continuations || ir.block.GetCondition() != Dynarmic::IR::Cond::AL))) {
             // current_location already includes the previous instruction's PC
             // and IT advance; reconstructing from the initial CPSR loses this.
             ir.SetTerm(Dynarmic::IR::Term::LinkBlock{ir.current_location});
             return false;
+        }
+        if (wrote_memory) {
+            store_continuations->push_back({ir_count,
+                Dynarmic::IR::LocationDescriptor{ir.current_location}.Value(),
+                static_cast<uint32_t>(ir.block.CycleCount())});
         }
         // The hook runs before Dynarmic translates the next instruction. Keep
         // the beginning of just the preceding instruction's IR so the store
         // check stays linear in the translation instead of rescanning the
         // entire accumulated block on every frontend iteration.
         previous_boundary = ir.block.empty()
-            ? std::optional<Dynarmic::IR::Block::const_iterator>{ir.block.cend()}
-            : std::optional<Dynarmic::IR::Block::const_iterator>{std::prev(ir.block.cend())};
+            ? std::optional<BlockIterator>{ir.block.cend()}
+            : std::optional<BlockIterator>{std::prev(ir.block.cend())};
         return true;
     }
 
@@ -76,13 +89,18 @@ public:
 private:
     MemState &mem;
     uint32_t remaining;
-    std::optional<Dynarmic::IR::Block::const_iterator> previous_boundary;
+    std::vector<StoreContinuation> *store_continuations;
+    uint32_t ir_count = 0;
+    std::optional<BlockIterator> previous_boundary;
 };
 
 } // namespace
 
 Dynarmic::IR::Block translate_block(MemState &mem, uint32_t pc, uint32_t cpsr,
-    uint32_t max_instructions, uint32_t fpscr) {
+    uint32_t max_instructions, uint32_t fpscr,
+    std::vector<StoreContinuation> *store_continuations) {
+    if (store_continuations)
+        store_continuations->clear();
     if (max_instructions == 0) {
         throw std::invalid_argument("wasmjit translation budget must be nonzero");
     }
@@ -98,8 +116,16 @@ Dynarmic::IR::Block translate_block(MemState &mem, uint32_t pc, uint32_t cpsr,
         .define_unpredictable_behaviour = false,
         .hook_hint_instructions = false,
     };
-    FetchCallbacks callbacks{mem, max_instructions};
-    return Dynarmic::A32::Translate(location, &callbacks, options);
+    FetchCallbacks callbacks{mem, max_instructions, store_continuations};
+    auto block = Dynarmic::A32::Translate(location, &callbacks, options);
+    // The next decoded instruction may have forced a conditional split
+    // without contributing any ticks. The ordinary terminal owns that exit.
+    if (store_continuations) {
+        while (!store_continuations->empty()
+            && store_continuations->back().completed_ticks >= block.CycleCount())
+            store_continuations->pop_back();
+    }
+    return block;
 }
 
 } // namespace vita3k::wasmjit

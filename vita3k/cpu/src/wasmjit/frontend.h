@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
+#include "block_metadata.h"
+
 #include <cstdint>
+#include <vector>
 #include <dynarmic/ir/basic_block.h>
 
 struct MemState;
@@ -26,7 +29,12 @@ namespace vita3k::wasmjit {
 // Unsupported guest instructions may translate to ExceptionRaised/Interpret;
 // the emitter must reject unsupported IR/terminals rather than silently skip.
 // The budget is an upper bound; conditional instructions can split earlier.
+// With store_continuations, unconditional region blocks may continue after
+// stores. The output is replaced on every call and must accompany the IR to
+// the region emitter. Conditional blocks and calls without this output keep
+// the conservative store-ending behavior (including the single-step path).
 Dynarmic::IR::Block translate_block(MemState &mem, uint32_t pc, uint32_t cpsr,
-    uint32_t max_instructions = 32, uint32_t fpscr = 0);
+    uint32_t max_instructions = 32, uint32_t fpscr = 0,
+    std::vector<StoreContinuation> *store_continuations = nullptr);
 
 } // namespace vita3k::wasmjit

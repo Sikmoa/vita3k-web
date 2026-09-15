@@ -62,6 +62,7 @@ struct RegionBlock {
     uint32_t psr_mask = 0, psr_value = 0; // dispatch validation bits
     uint32_t ticks = 0;                    // conservative tick cost
     std::vector<uint8_t> original;         // guest bytes [pc, EndLocation.PC)
+    std::vector<vita3k::wasmjit::StoreContinuation> store_continuations;
 };
 struct RegionPage {
     struct Span {
@@ -170,10 +171,12 @@ bool form_region(MemState &mem, uint32_t entry_pc, uint32_t entry_cpsr,
             continue;
         std::optional<Dynarmic::IR::Block> ir;
         RegionBlock block;
-        const auto candidate = [&](uint32_t limit) {
+        const auto candidate = [&](uint32_t limit, bool continue_stores) {
+            block.store_continuations.clear();
             try {
                 auto translated = vita3k::wasmjit::translate_block(mem, pc,
-                    location.CPSR().Value(), limit, location.FPSCR().Value());
+                    location.CPSR().Value(), limit, location.FPSCR().Value(),
+                    continue_stores ? &block.store_continuations : nullptr);
                 const uint64_t end = LocationDescriptor(translated.EndLocation()).PC();
                 if (end <= pc || end - pc > REGION_MAX_CODE_BYTES)
                     return false;
@@ -189,7 +192,7 @@ bool form_region(MemState &mem, uint32_t entry_pc, uint32_t entry_cpsr,
                 // one-block module for every candidate duplicates the most
                 // expensive part of region formation and is discarded as
                 // soon as the next candidate is examined.
-                if (!vita3k::wasmjit::validate_region_block(translated))
+                if (!vita3k::wasmjit::validate_region_block(translated, block.store_continuations))
                     return false;
                 block.original.resize(static_cast<size_t>(end - pc));
                 if (!mem_fetch(mem, pc, block.original.data(), block.original.size()))
@@ -202,7 +205,13 @@ bool form_region(MemState &mem, uint32_t entry_pc, uint32_t entry_cpsr,
         };
         // A supported first instruction must not be poisoned by later
         // unsupported IR or speculative fetches across an unmapped boundary.
-        if (!candidate(REGION_BLOCK_INSTR_LIMIT) && !candidate(1)) {
+        bool accepted = candidate(REGION_BLOCK_INSTR_LIMIT, true);
+        // If continuing past a store exposed an unsupported suffix or fetch
+        // fault, recover the original supported store-ending block before
+        // falling back to a single instruction.
+        if (!accepted && !block.store_continuations.empty())
+            accepted = candidate(REGION_BLOCK_INSTR_LIMIT, false);
+        if (!accepted && !candidate(1, false)) {
             if (region.blocks.empty())
                 return false;
             continue; // This edge becomes a runtime Miss.
@@ -570,7 +579,8 @@ struct WasmJitCPU::Impl {
                 for (size_t i = 0; i < region->blocks.size(); ++i) {
                     block_ptrs.push_back(&ir_blocks[i]);
                     meta.push_back({region->blocks[i].pc, region->blocks[i].psr_mask,
-                        region->blocks[i].psr_value, region->blocks[i].ticks});
+                        region->blocks[i].psr_value, region->blocks[i].ticks,
+                        region->blocks[i].store_continuations});
                 }
                 const auto bytes = vita3k::wasmjit::emit_region(block_ptrs, meta);
                 emit_ms += emscripten_get_now() - t0;

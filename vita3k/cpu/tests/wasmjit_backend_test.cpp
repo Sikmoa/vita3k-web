@@ -709,6 +709,194 @@ void region_regressions(MemState &mem) {
     CHECK(jit.run() == 0 && parent.svc_called);
     CHECK(jit.regions_formed() == formed + 1);
 }
+void region_store_continuations(MemState &mem) {
+    using Reason = vita3k::wasmjit::ExitReason;
+    using Location = Dynarmic::A32::LocationDescriptor;
+    Region region;
+    std::vector<Dynarmic::IR::Block> ir;
+    std::vector<vita3k::wasmjit::RegionBlockMeta> meta;
+    const auto install = [&](std::initializer_list<uint32_t> words, uint32_t cpsr = 0x10,
+                            MemoryFunction write_memory = checked_memory_write) {
+        CHECK(mem_write(mem, code, words.begin(), words.size() * sizeof(uint32_t)));
+        CHECK(form_region(mem, code, cpsr, 0, region, ir));
+        std::vector<const Dynarmic::IR::Block *> blocks;
+        meta.clear();
+        for (size_t i = 0; i < ir.size(); ++i) {
+            blocks.push_back(&ir[i]);
+            const auto &block = region.blocks[i];
+            meta.push_back({block.pc, block.psr_mask, block.psr_value, block.ticks,
+                block.store_continuations});
+        }
+        const auto bytes = vita3k::wasmjit::emit_region(blocks, meta);
+        CHECK(!bytes.empty());
+        const int slot = vita3k_jit_install_region(bytes.data(), bytes.size(),
+            checked_memory_read, write_memory);
+        CHECK(slot >= 0);
+        mark_code_pages(region, +1);
+        return slot;
+    };
+    const auto release = [&](int slot) {
+        vita3k_jit_release_region(slot);
+        mark_code_pages(region, -1);
+    };
+    const auto initial = [&](bool fast) {
+        JitState state{};
+        state.regs[0] = 0x11;
+        state.regs[1] = data;
+        state.regs[2] = 0x22;
+        state.regs[3] = 0xcafe;
+        state.regs[15] = code;
+        state.cpsr = 0x10;
+        state.executed = 17;
+        state.dispatches = 29;
+        state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mem));
+        if (fast) {
+            state.page_table_base = reinterpret_cast<uint32_t>(mem.page_table.get());
+            state.page_perms_base = reinterpret_cast<uint32_t>(mem.page_permissions.get());
+            state.code_pages_base = reinterpret_cast<uint32_t>(g_code_pages.data());
+        }
+        return state;
+    };
+    const auto run = [&](int slot, JitState &state, uint32_t budget) {
+        return static_cast<Reason>(vita3k_jit_run(slot,
+            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&state)), budget));
+    };
+
+    // STR r0,[r1],#4; STR r2,[r1],#4; ADD r3,r0,r2; SVC.
+    // Both stores and all following work now fit in ONE dispatch body.
+    int slot = install({0xe4810004, 0xe4812004, 0xe0803002, 0xef000042});
+    CHECK(region.blocks.size() == 1 && meta[0].store_continuations.size() == 2);
+    CHECK(meta[0].ticks == 4);
+    CHECK(meta[0].store_continuations[0].completed_ticks == 1);
+    CHECK(meta[0].store_continuations[1].completed_ticks == 2);
+    for (const bool fast : {false, true}) {
+        for (uint32_t budget = 0; budget <= 4; ++budget) {
+            const std::array<uint32_t, 2> sentinels{0xaaaa, 0xbbbb};
+            CHECK(mem_write(mem, data, sentinels.data(), sizeof(sentinels)));
+            auto state = initial(fast);
+            CHECK(run(slot, state, budget) == (budget == 4 ? Reason::Svc : Reason::Budget));
+            const uint32_t completed = budget == 4 ? 4 : std::min(budget, 2u);
+            const uint32_t stores = std::min(completed, 2u);
+            CHECK(state.executed == 17 + completed && state.dispatches == 30);
+            CHECK(state.regs[1] == data + 4 * stores); // post-index writeback
+            CHECK(state.regs[3] == (budget == 4 ? 0x33u : 0xcafeu));
+            CHECK(state.regs[15] == code + 4 * completed && state.next_pc == state.regs[15]);
+            std::array<uint32_t, 2> actual{};
+            CHECK(mem_read(mem, data, actual.data(), sizeof(actual)));
+            CHECK(actual[0] == (stores >= 1 ? 0x11u : sentinels[0]));
+            CHECK(actual[1] == (stores >= 2 ? 0x22u : sentinels[1]));
+            CHECK(!state.smc_dirty);
+        }
+    }
+    // The emitter must reject malformed boundaries before producing a module.
+    auto invalid = meta[0].store_continuations;
+    invalid[0].ir_offset = 0;
+    CHECK(!vita3k::wasmjit::validate_region_block(ir[0], invalid));
+    invalid = meta[0].store_continuations;
+    invalid[1].completed_ticks = invalid[0].completed_ticks;
+    CHECK(!vita3k::wasmjit::validate_region_block(ir[0], invalid));
+    // Legacy translation still ends after the first complete store.
+    auto legacy = vita3k::wasmjit::translate_block(mem, code, 0x10, 64);
+    CHECK(legacy.CycleCount() == 1 && Location(legacy.EndLocation()).PC() == code + 4);
+    release(slot);
+
+    // Request stop from a successful checked store. Its base writeback must
+    // complete before the continuation exits, and the next store must not run.
+    const MemoryFunction stop_after_write = +[](JitState *state, uint32_t address, uint32_t bytes) noexcept {
+        const auto result = checked_memory_write(state, address, bytes);
+        if (!result)
+            state->stop_flag = 1;
+        return result;
+    };
+    slot = install({0xe4810004, 0xe4812004, 0xe0803002, 0xef000042}, 0x10, stop_after_write);
+    auto stopped = initial(false);
+    CHECK(run(slot, stopped, 4) == Reason::Stop);
+    CHECK(stopped.regs[1] == data + 4 && stopped.regs[3] == 0xcafe);
+    CHECK(stopped.executed == 18 && stopped.next_pc == code + 4);
+    release(slot);
+
+    // A self-modifying post-index store exits only after writeback, before
+    // the overwritten next instruction. SMC also wins at a budget boundary.
+    for (const uint32_t budget : {1u, 4u}) {
+        slot = install({0xe4810004, 0xe4812004, 0xe0803002, 0xef000042});
+        auto state = initial(true);
+        state.regs[0] = 0xe3a0202a; // patch the following instruction
+        state.regs[1] = code + 4;
+        CHECK(run(slot, state, budget) == Reason::Smc);
+        CHECK(state.regs[1] == code + 8 && state.regs[2] == 0x22);
+        CHECK(state.regs[3] == 0xcafe && state.executed == 18);
+        CHECK(state.regs[15] == code + 4 && state.next_pc == code + 4);
+        CHECK(state.smc_dirty && state.smc_page == code / page);
+        release(slot);
+    }
+
+    // STMIA r1!,{r0,r2}; MOV r3,#99; SVC. Both store elements and the
+    // base writeback must finish before the SMC side exit.
+    slot = install({0xe8a10005, 0xe3a03063, 0xef000042});
+    CHECK(meta[0].store_continuations.size() == 1);
+    auto state = initial(true);
+    state.regs[1] = code + 4;
+    CHECK(run(slot, state, 3) == Reason::Smc);
+    CHECK(state.regs[1] == code + 12 && state.regs[3] == 0xcafe);
+    CHECK(state.executed == 18 && state.next_pc == code + 4);
+    std::array<uint32_t, 2> stored{};
+    CHECK(mem_read(mem, code + 4, stored.data(), sizeof(stored)));
+    CHECK(stored[0] == 0x11 && stored[1] == 0x22);
+    release(slot);
+
+    // Faults after an earlier store retain its writeback and tick, without
+    // accounting or executing the faulting segment or subsequent MOV/SVC.
+    for (const bool write_fault : {false, true}) {
+        slot = install({0xe4810004, write_fault ? 0xe5842000u : 0xe5942000u,
+            0xe3a03063, 0xef000042}); // STR/LDR r2,[r4]
+        state = initial(true);
+        state.regs[4] = 0x83000000;
+        CHECK(run(slot, state, 4) == Reason::Fault);
+        CHECK(state.regs[1] == data + 4 && state.regs[3] == 0xcafe);
+        CHECK(state.executed == 18 && state.fault_pc == code + 4);
+        CHECK(state.fault_address == 0x83000000 && state.fault_write == write_fault);
+        release(slot);
+    }
+
+    // Thumb continuations use the actual instruction width. A 32-bit store
+    // to the following halfword may modify two instructions; neither runs.
+    slot = install({0x604a6008, 0xdf422363}, 0x30); // STR; STR; MOVS; SVC
+    CHECK(region.blocks.size() == 1 && meta[0].store_continuations.size() == 2);
+    state = initial(true);
+    state.cpsr = 0x30;
+    state.regs[1] = code + 2;
+    CHECK(run(slot, state, 4) == Reason::Smc);
+    CHECK(state.regs[15] == code + 2 && state.next_pc == code + 2);
+    CHECK(state.cpsr == 0x30 && state.executed == 18);
+    release(slot);
+
+    // Predicated stores retain their existing block/IT boundary, even when
+    // callers request continuations. Also verify output from a prior call
+    // does not leak into a single-instruction retry.
+    const uint32_t thumb_stores = 0x604a6008;
+    CHECK(mem_write(mem, code, &thumb_stores, sizeof(thumb_stores)));
+    std::vector<vita3k::wasmjit::StoreContinuation> points{{1, 0, 1}};
+    auto predicated = vita3k::wasmjit::translate_block(mem, code, 0x40000430, 64, 0, &points);
+    CHECK(predicated.GetCondition() == Dynarmic::IR::Cond::EQ && predicated.CycleCount() == 1);
+    CHECK(points.empty() && Location(predicated.EndLocation()).IT().Value() == 0x08);
+    auto single = vita3k::wasmjit::translate_block(mem, code, 0x30, 1, 0, &points);
+    CHECK(single.CycleCount() == 1 && points.empty());
+
+    // A conditional split discovered AFTER recording a store boundary makes
+    // that store terminal again; its now-final continuation must be removed.
+    const std::array<uint32_t, 3> split{0xe5810000, 0x02822001, 0xef000042};
+    CHECK(mem_write(mem, code, split.data(), sizeof(split)));
+    auto before_cond = vita3k::wasmjit::translate_block(mem, code, 0x10, 64, 0, &points);
+    CHECK(before_cond.CycleCount() == 1 && points.empty());
+    CHECK(Location(before_cond.EndLocation()).PC() == code + 4);
+
+    // Continuing into UDF must preserve the supported prefix rather than
+    // reducing its arithmetic instructions to separate one-tick blocks.
+    const std::array<uint32_t, 3> suffix{0xe2800001, 0xe5810000, 0xe7f000f0};
+    CHECK(mem_write(mem, code, suffix.data(), sizeof(suffix)));
+    CHECK(form_region(mem, code, 0x10, 0, region, ir));
+    CHECK(region.blocks.front().ticks == 2 && region.blocks.front().store_continuations.empty());
+}
 } // namespace
 
 int main() {
@@ -722,6 +910,7 @@ int main() {
     region_exec(mem);
     region_budget_continuations(mem);
     region_regressions(mem);
+    region_store_continuations(mem);
     deinit_mem(mem);
     std::printf("WasmJit backend: %u checks passed (real memory, no interpreter)\n", checks);
 }

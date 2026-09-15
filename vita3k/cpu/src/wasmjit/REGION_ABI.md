@@ -36,8 +36,8 @@ table-compatible is NOT required — the backend calls it via its own slot with
 Contract:
 - Begins at `regs[15]`; loops internally over blocks; NEVER falls through.
 - `budget` = max ADDITIONAL executed ticks this call. Before executing a
-  block whose emitted tick cost is T: if executed_this_call + T > budget,
-  set next_pc=that block's PC and return Budget.
+  block or store-delimited segment whose emitted tick cost is T: if its
+  completion would exceed budget, set next_pc to its PC and return Budget.
 - `state.executed` accumulates monotonically across calls (host tracks
   deltas). The generated loop keeps the count in a Wasm local and commits it
   on exit; the value is still one tick per guest instruction, including
@@ -113,6 +113,7 @@ Memory IR is accepted at ANY CycleCount. Fault handling inside a region:
 ```cpp
 struct RegionBlockMeta {
     uint32_t entry_pc, psr_mask, psr_value, ticks;
+    std::vector<StoreContinuation> store_continuations;
 };
 std::vector<uint8_t> emit_region(
     const std::vector<const Dynarmic::IR::Block *> &blocks,
@@ -155,6 +156,40 @@ scratch buffer and compares those spans without allocations or searches.
 Permission and mapping checks still run on every entry, including after HLE
 writes. Memory fast paths retain the probed page pointer for the actual
 access rather than loading the same page-table entry twice.
+
+## Store continuations (current implementation)
+
+Region formation requests `StoreContinuation` metadata from `translate_block`.
+For unconditional blocks, an ordinary store no longer terminates translation.
+At the next `PreCodeReadHook`, the frontend records the IR offset, cumulative
+completed tick count and full continuation location. This hook runs after
+the entire previous guest instruction, including all STM/VST1 elements,
+writeback and Thumb IT advance. The metadata must remain paired with the
+unmodified IR; it uses indices rather than pointers so block moves are safe.
+
+The emitter inserts a side exit at each recorded boundary. Ordinary stores
+fall through without PC/CPSR writes, tick/dispatch updates or `br_table`.
+Stop and SMC flags are still polled after every completed store instruction.
+On an exit, the boundary's PC/mode and completed ticks are published through
+the shared region epilogue. SMC is handled before a subsequent instruction,
+including when that instruction's bytes were overwritten in this same body.
+The existing host invalidation path then recompiles the continuation.
+
+Budget checks preserve the former store boundaries: entry checks only the
+first segment's ticks; each continuation checks the cumulative cost through
+the end of the next segment against the per-call budget. No ticks are added
+on the fallthrough path. A normal terminal adds the full block count once;
+a side exit adds its completed prefix once. On a memory fault, completed
+segments before the faulting segment are counted, matching the former
+separate-block accounting. Partial effects of a faulting multi-access
+instruction retain the existing no-rollback semantics.
+
+`meta.ticks` remains the conservative full-block cost for region-size limits.
+Predicated blocks retain the original store-ending behavior and condition-fail
+budget rules. Single-block translation and stepping do not request metadata
+and retain their original boundaries. Final stores use the ordinary terminal;
+metadata at a boundary where translation subsequently stops is discarded.
+`dispatches` counts actual dispatcher visits, so continued stores reduce it.
 
 ## Original implementation design (v1; superseded above where noted)
 

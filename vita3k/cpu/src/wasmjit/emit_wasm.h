@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
+#include "block_metadata.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
@@ -149,16 +151,23 @@ std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block);
 // check. Non-member links set next_pc and return Miss. Memory IR is accepted
 // at any CycleCount: a faulting helper sets fault_pc and CPSR mode bits
 // (including IT) from the faulting memory op's own location immediate (arg0),
-// preserving arithmetic flags, and returns Fault WITHOUT rollback or executed
-// adjustment. Per-call budget is the `budget` argument (max additional
-// ticks); dispatch refuses a block whose meta.ticks would exceed it and
-// returns Budget with next_pc set. Limits: 512 blocks, 32768 total ticks,
+// preserving arithmetic flags, and returns Fault without rollback. Counts
+// include completed blocks and earlier completed store-delimited segments;
+// the faulting segment is uncounted. Per-call budget is the `budget` argument
+// (max additional ticks). Without continuations, dispatch checks meta.ticks.
+// With frontend-provided store_continuations (unconditional blocks only),
+// dispatch checks the first segment and each continuation checks the next.
+// Store boundaries fall through unless stop/SMC/budget requires an exit;
+// those exits publish the boundary's location and completed ticks. Metadata
+// must describe the exact, unmodified IR returned by translate_block.
+// Limits: 512 blocks, 32768 total ticks,
 // 4 MiB module. EMPTY vector = unsupported.
 struct RegionBlockMeta {
     uint32_t entry_pc;
     uint32_t psr_mask;
     uint32_t psr_value;
     uint32_t ticks; // conservative: CycleCount + ConditionFailedCycleCount
+    std::vector<StoreContinuation> store_continuations{};
 };
 std::vector<uint8_t> emit_region(
     const std::vector<const Dynarmic::IR::Block *> &blocks,
@@ -167,6 +176,7 @@ std::vector<uint8_t> emit_region(
 // Checks whether a block can be lowered into a region body without assembling
 // a complete module. Region formation uses this to avoid repeatedly building
 // and discarding one-block Wasm modules for every candidate successor.
-bool validate_region_block(const Dynarmic::IR::Block &block);
+bool validate_region_block(const Dynarmic::IR::Block &block,
+    const std::vector<StoreContinuation> &store_continuations = {});
 
 } // namespace vita3k::wasmjit

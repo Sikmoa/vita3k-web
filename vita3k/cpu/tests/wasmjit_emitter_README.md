@@ -87,6 +87,13 @@ later-block faults with and without memory probes, and code validation for
 overlapping blocks across a page boundary. These added cases have not been
 run in the environment used for the register-cache fix.
 
+Store-continuation cases in `wasmjit_backend_test.cpp` cover two ordinary
+stores in one dispatcher visit, checked and inline memory paths, budgets
+0..4, post-index writeback, SMC at an exhausted budget, all elements of STM,
+faults after a completed store, Thumb continuation PCs, and preservation of
+predicated/single-instruction boundaries. They are added for execution on a
+machine with the toolchain; tests and builds were not run for this change.
+
 ## ABI / integration
 
 `vita3k::wasmjit::emit_block(const Dynarmic::IR::Block&)` returns raw Wasm bytes,
