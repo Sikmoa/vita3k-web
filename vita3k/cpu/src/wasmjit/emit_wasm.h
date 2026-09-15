@@ -131,9 +131,15 @@ std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block);
 // M14c region emission (REGION_ABI.md). One WebAssembly.Module per REGION:
 // many guest basic blocks with an in-module dispatch loop, so hot loops never
 // return to the host. The module exports run(state:i32, budget:i32)->i32 and
-// exits only for Svc/Fault/Miss/Budget/Smc/Stop. `blocks` and `meta` must be
-// parallel, non-empty, sorted strictly ascending by entry_pc (formation
-// guarantees at most one block per guest PC). Dispatch validates each entry's
+// exits only for Svc/Fault/Miss/Budget/Smc/Stop.
+// GPRs R0..R14 used by any member are loaded once at run entry and retained
+// across block boundaries. A shared exit epilogue publishes all registers
+// any member can write and the completed-block tick/dispatch counters,
+// including on faults and condition-failed paths. Checked helpers access
+// memory/fault/SMC fields only; they must not inspect or modify cached GPRs.
+// `blocks` and `meta` must be parallel, non-empty, sorted strictly ascending
+// by entry_pc (formation guarantees at most one block per guest PC).
+// Dispatch validates each entry's
 // CPSR mode bits (psr_mask/psr_value) and FPSCR mode bits against the block's
 // own location. LinkBlock terminals chaining to a member with the SAME full
 // location descriptor take the LIGHT dispatch path (REGION_ABI.md v1.2): the

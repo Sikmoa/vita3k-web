@@ -529,6 +529,121 @@ void region_regressions(MemState &mem) {
     // the old search-leaf check consumed one extra dispatch-loop trip (33).
     CHECK(counter_delta(0xfffffff0, state.dispatches) == 32);
 
+    // Registers written in A survive B, including its condition-failed edge.
+    // B's write-only register must retain the host value when B is skipped.
+    auto cached_a = blank(code), cached_b = blank(code + 4);
+    const auto cached_r0 = append(cached_a, Op::A32GetRegister, {Value{A32::Reg::R0}});
+    const auto increment = append(cached_a, Op::Add32,
+        {cached_r0, Value{uint32_t(1)}, Value{false}});
+    append(cached_a, Op::A32SetRegister, {Value{A32::Reg::R0}, increment});
+    append(cached_a, Op::A32SetRegister, {Value{A32::Reg::R1}, Value{uint32_t(123)}});
+    cached_b.SetCondition(IR::Cond::EQ);
+    cached_b.SetConditionFailedLocation(loc(code));
+    cached_b.ConditionFailedCycleCount() = 1;
+    const auto from_a = append(cached_b, Op::A32GetRegister, {Value{A32::Reg::R0}});
+    append(cached_b, Op::A32SetRegister, {Value{A32::Reg::R2}, from_a});
+    cached_b.ReplaceTerminal(IR::Term::LinkBlockFast{loc(code)});
+    const auto cached_module = emit({&cached_a, &cached_b});
+    for (const bool pass : {false, true}) {
+        state = JitState{};
+        state.regs[0] = 7;
+        state.regs[1] = 0xbeef;
+        state.regs[2] = 0x87654321;
+        state.regs[15] = code;
+        state.cpsr = 0x10 | (pass ? 0x40000000 : 0);
+        state.executed = 17;
+        state.dispatches = 29;
+        // A, B, A fit; the conservative cost of the next B is two ticks.
+        CHECK(run(cached_module, state, 4) == Reason::Budget);
+        CHECK(state.regs[0] == 9 && state.regs[1] == 123);
+        CHECK(state.regs[2] == (pass ? 8u : 0x87654321u));
+        CHECK(state.executed == 20 && state.dispatches == 32);
+        CHECK(state.regs[15] == code + 4 && state.next_pc == code + 4);
+    }
+    // Every entry initializes the cache even when no member body executes:
+    // stop/SMC, generic budget failure, PC miss, CPSR mismatch, FPSCR mismatch.
+    for (unsigned entry = 0; entry < 6; ++entry) {
+        state = JitState{};
+        state.regs[0] = 71;
+        state.regs[1] = 72;
+        state.regs[2] = 73;
+        state.regs[15] = entry == 3 ? code + 8 : code;
+        state.cpsr = entry == 4 ? 0x30 : 0x10;
+        state.fpscr = entry == 5 ? 0x01000000 : 0;
+        state.stop_flag = entry == 0;
+        state.smc_dirty = entry == 1;
+        state.executed = 17;
+        state.dispatches = 29;
+        const auto expected = entry == 0 ? Reason::Stop : entry == 1 ? Reason::Smc
+            : entry == 2 ? Reason::Budget : Reason::Miss;
+        CHECK(run(cached_module, state, entry == 2 ? 0 : 4) == expected);
+        CHECK(state.regs[0] == 71 && state.regs[1] == 72 && state.regs[2] == 73);
+        CHECK(state.executed == 17 && state.dispatches == 30);
+        CHECK(state.next_pc == state.regs[15]);
+    }
+    // Enter a member directly with fresh host registers, then publish both
+    // blocks' writes on the next budget exit.
+    state = JitState{};
+    state.regs[0] = 100;
+    state.regs[15] = code + 4;
+    state.cpsr = 0x40000010;
+    CHECK(run(cached_module, state, 2) == Reason::Budget);
+    CHECK(state.regs[0] == 101 && state.regs[1] == 123 && state.regs[2] == 100);
+    CHECK(state.executed == 2 && state.dispatches == 2);
+
+    // A fault in B must publish A's writes and preserve B's unexecuted
+    // destination. Exercise both the disabled and permission-probe fallbacks.
+    auto fault_a = blank(code);
+    append(fault_a, Op::A32SetRegister, {Value{A32::Reg::R0}, Value{uint32_t(42)}});
+    const uint32_t ldr = 0xe5912000; // LDR r2,[r1]
+    CHECK(mem_write(mem, code + 4, &ldr, sizeof(ldr)));
+    auto fault_b = vita3k::wasmjit::translate_block(mem, code + 4, 0x10, 1);
+    const auto fault_module = emit({&fault_a, &fault_b});
+    for (const bool probes : {false, true}) {
+        state = JitState{};
+        state.regs[1] = 0x83000000; // unallocated page
+        state.regs[2] = 77;
+        state.regs[15] = code;
+        state.cpsr = 0x10;
+        state.executed = 17;
+        state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mem));
+        if (probes) {
+            state.page_table_base = reinterpret_cast<uint32_t>(mem.page_table.get());
+            state.page_perms_base = reinterpret_cast<uint32_t>(mem.page_permissions.get());
+            state.code_pages_base = reinterpret_cast<uint32_t>(g_code_pages.data());
+        }
+        CHECK(run(fault_module, state, 2) == Reason::Fault);
+        CHECK(state.regs[0] == 42 && state.regs[2] == 77);
+        CHECK(state.fault_pc == code + 4 && state.fault_address == 0x83000000);
+        CHECK(state.executed == 18 && state.dispatches == 2);
+    }
+
+    // Sorted, overlapping blocks can produce page fragments in the order
+    // P, P+1, P. Revalidation must still check each block's original bytes.
+    CHECK(mem_set_permissions(mem, data, 2 * page, MemPerm::ReadWriteExecute));
+    Region overlapping;
+    for (const auto address : {data + page - 8, data + page - 4}) {
+        RegionBlock block;
+        block.pc = address;
+        block.original.resize(address == data + page - 8 ? 16 : 4);
+        CHECK(mem_fetch(mem, address, block.original.data(), block.original.size()));
+        overlapping.blocks.push_back(std::move(block));
+    }
+    collect_code_pages(overlapping);
+    CHECK(overlapping.validation_pages.size() == 2);
+    CHECK(region_unchanged(overlapping, mem));
+    overlapping.blocks[1].original[0] ^= 1;
+    CHECK(!region_unchanged(overlapping, mem));
+    overlapping.blocks[1].original[0] ^= 1;
+    const uint8_t changed = overlapping.blocks[0].original[8] ^ 1;
+    CHECK(mem_write(mem, data + page, &changed, 1));
+    CHECK(!region_unchanged(overlapping, mem));
+    CHECK(mem_write(mem, data + page, &overlapping.blocks[0].original[8], 1));
+    CHECK(region_unchanged(overlapping, mem));
+    CHECK(mem_set_permissions(mem, data + page, page, MemPerm::ReadWrite));
+    CHECK(!region_unchanged(overlapping, mem));
+    CHECK(mem_set_permissions(mem, data, 2 * page, MemPerm::ReadWrite));
+
     // Reference counts, cross-page writes, and full-width address rounding.
     Region tracked;
     RegionBlock tracked_block;

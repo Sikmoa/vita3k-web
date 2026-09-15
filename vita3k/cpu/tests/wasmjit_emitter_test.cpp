@@ -332,6 +332,23 @@ void scalars(Suite &suite) {
     exchange.ReplaceTerminal(IR::Term::ReturnToDispatch{});
     auto out = next(in, 1, 0x2000); out.cpsr |= 0x20;
     suite.add("bx_late_upper", exchange, {{in, out}});
+
+    // An architectural write must not overwrite an older SSA value. R10
+    // also used to alias the second instruction's ten-word temporary slot.
+    auto cached = blank();
+    const auto old_r0 = reg(cached, Reg::R0);
+    const auto old_r1 = reg(cached, Reg::R1);
+    const auto old_r10 = reg(cached, Reg::R10);
+    set(cached, Reg::R0, Value{uint32_t(1)});
+    set(cached, Reg::R2, old_r0);
+    set(cached, Reg::R3, old_r1);
+    set(cached, Reg::R4, old_r10);
+    out = next(in);
+    out.regs[0] = 1;
+    out.regs[2] = in.regs[0];
+    out.regs[3] = in.regs[1];
+    out.regs[4] = in.regs[10];
+    suite.add("register_ssa_isolation", cached, {{in, out}});
 }
 
 struct Code final : A32::TranslateCallbacks {

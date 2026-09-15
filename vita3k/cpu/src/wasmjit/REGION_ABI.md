@@ -120,7 +120,43 @@ std::vector<uint8_t> emit_region(
 std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block); // = 1-block region
 ```
 
-## Implementation design (v1, worked out — follow this)
+## Register cache and exit publication (current implementation)
+
+R0..R14 have fixed Wasm locals shared by all region members. `run` loads
+the union of registers read or written by any member once, before dispatch.
+Write-only registers are initialized too: a conditional skip or an early
+Stop/Smc/Budget/Miss exit must preserve their incoming values. Linked and
+condition-failed edges neither flush nor reload these registers.
+
+Every exit branches to one epilogue outside the dispatch loop. It stores
+the union of registers any member can write, publishes executed ticks and
+dispatch counts, and returns the exit reason. Faults use this same epilogue:
+writes from earlier blocks and earlier IR in the faulting block survive;
+unexecuted writes retain their incoming values. Checked memory helpers use
+the memory, fault and SMC fields, and must not read or modify cached GPRs.
+PC, CPSR and extended registers still use their architectural state fields.
+
+Current local layout: 0=state, 1=budget, 2=executed_call, 3=dispatch PC,
+4=CheckBit, 5=i64 scratch, 6=dispatch index (exit reason after leaving the
+loop), 7=dispatch count, 8..10=memory bases, 11..25=R0..R14, 26..=SSA.
+Single-block emission reserves locals 3..17 for R0..R14 and starts SSA at
+18, preventing architectural registers from aliasing instruction results.
+
+The exit label surrounds the dispatch loop, so existing `br_table` and
+loop-back depths are unchanged. A body exit uses depth
+`body_index + open_ifs + 1`; `open_ifs` includes memory-probe and helper-status
+ifs as well as terminal and entry-condition ifs. Dispatcher exits also skip
+the default label, all member labels and their search-tree ifs.
+
+Region validation groups code ranges by page once during formation, with a
+comparison span for every member's original bytes, including overlapping
+blocks. Each subsequent entry fetches each page range into a reusable 4 KiB
+scratch buffer and compares those spans without allocations or searches.
+Permission and mapping checks still run on every entry, including after HLE
+writes. Memory fast paths retain the probed page pointer for the actual
+access rather than loading the same page-table entry twice.
+
+## Original implementation design (v1; superseded above where noted)
 
 **Wasm structure** (one function `run(state:i32, budget:i32) -> i32`, type
 `(i32,i32)->i32`):
@@ -160,9 +196,10 @@ body:
   end($default) → return Miss (br_table default target)
 ```
 
-**SSA locals are REUSED per block**: reset `next_local = SSA_BASE (6)` before
+**SSA locals are REUSED per block**: reset `next_local = SSA_BASE (26)` before
 each block's body. Blocks chain sequentially, never nest, so a block's SSA
-values are dead at its terminal. Max locals = 6 + max per-block words.
+values are dead at its terminal. First SSA index = 26; the declared local
+count uses the maximum per-block SSA requirement.
 
 **Per-block emission** (reuses existing instruction() machinery unchanged):
 ```

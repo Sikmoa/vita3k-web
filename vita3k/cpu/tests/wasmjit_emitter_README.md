@@ -80,6 +80,13 @@ Coverage includes:
 These tests isolate emission. CPUInterface and browser-Worker integration are
 covered separately by `browser/tests/wasm_jit_tests.cpp` and `jit_smoke.mjs`.
 
+Register-cache regression coverage includes single-block architectural/SSA
+local isolation. `wasmjit_backend_test.cpp` additionally covers linked and
+condition-failed region edges, entry at an interior member, early exits,
+later-block faults with and without memory probes, and code validation for
+overlapping blocks across a page boundary. These added cases have not been
+run in the environment used for the register-cache fix.
+
 ## ABI / integration
 
 `vita3k::wasmjit::emit_block(const Dynarmic::IR::Block&)` returns raw Wasm bytes,

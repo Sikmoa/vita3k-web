@@ -94,6 +94,9 @@ bool shift(Op op) {
 constexpr uint32_t kLightDispatchSentinel = 0xffffffffu;
 // member_index() result for a location that is not a region member.
 constexpr uint32_t kNoMember = 0xffffffffu;
+constexpr uint32_t kRegionRegBase = 11;
+constexpr uint32_t kCachedRegCount = 15;
+constexpr uint32_t kRegionSsaBase = kRegionRegBase + kCachedRegCount;
 
 class Emitter {
 public:
@@ -102,21 +105,20 @@ public:
 
     // Region layout (REGION_ABI.md): run(state=0, budget=1) with locals
     // 2=executed_call, 3=pc, 4=CheckBit, 5=i64 scratch, 6=dispatch index,
-    // 7=dispatch count, 8..10=hoisted memory bases, 11..=per-block SSA
-    // words (reused across bodies).
+    // 7=dispatch count, 8..10=hoisted memory bases, 11..25=registers
+    // retained across bodies, 26..=per-block SSA words.
     Emitter(const Dynarmic::IR::Block &block, unsigned index,
         const std::vector<const Dynarmic::IR::Block *> &members)
         : block(block), start(block.Location()), finish(block.EndLocation())
         , region(true), body_index(index), members(&members) {
         check_bit_local = 4;
         scratch_local = 5;
-        dispatch_count_local = 7;
         page_table_local = 8;
         page_perms_local = 9;
         code_pages_local = 10;
-        reg_base = 11;
-        ssa_base = 26;
-        next_local = 26;
+        reg_base = kRegionRegBase;
+        ssa_base = kRegionSsaBase;
+        next_local = ssa_base;
     }
 
     uint32_t meta_entry_pc_for_dbg() const { return start.PC(); }
@@ -149,7 +151,7 @@ public:
             location(Location(block.ConditionFailedLocation()));
             store_constant(offsetof(JitState, executed), static_cast<uint32_t>(block.ConditionFailedCycleCount()));
             ret(ExitReason::Continue);
-            op(End);
+            end_if();
         }
 
         for (const Inst &inst : block)
@@ -170,7 +172,7 @@ public:
         op(End);
 
         Bytes body;
-        uleb(body, 3); // local 1: CheckBit, local 2: i64 scratch, then i32 SSA words
+        uleb(body, 3); // CheckBit, i64 scratch, then cached registers and SSA words
         uleb(body, 1); body.push_back(0x7f);
         uleb(body, 1); body.push_back(0x7e);
         uleb(body, next_local - 3); body.push_back(0x7f);
@@ -197,14 +199,14 @@ private:
     Location start, finish;
     Bytes code;
     std::unordered_map<const Inst *, uint32_t> locals;
-    // Single-block layout: 1=CheckBit, 2=i64 scratch, SSA from 3.
-    uint32_t check_bit_local = 1, scratch_local = 2, ssa_base = 3;
-    uint32_t dispatch_count_local = 0;
+    // Single-block layout: 1=CheckBit, 2=i64 scratch, 3..17=registers,
+    // SSA from 18. Architectural registers must never alias SSA temporaries.
+    uint32_t check_bit_local = 1, scratch_local = 2, ssa_base = 3 + kCachedRegCount;
     uint32_t page_table_local = 0, page_perms_local = 0, code_pages_local = 0;
     uint32_t reg_base = 3;
-    std::array<bool, 15> cached_regs{};
-    std::array<bool, 15> dirty_regs{};
-    uint32_t next_local = 3;
+    std::array<bool, kCachedRegCount> cached_regs{};
+    std::array<bool, kCachedRegCount> dirty_regs{};
+    uint32_t next_local = ssa_base;
     unsigned terminal_nodes = 0;
     bool ok = true;
 public:
@@ -218,30 +220,19 @@ private:
     // Region mode state.
     bool region = false;
     unsigned body_index = 0;   // br-to-dispatch depth equals the body index
-    unsigned extra_labels = 0; // if/else nesting inside this body
+    unsigned extra_labels = 0; // all open ifs, including memory probes
     const std::vector<const Dynarmic::IR::Block *> *members = nullptr;
 
     void op(uint8_t byte) { code.push_back(byte); }
     void imm(uint32_t n) { constant(code, n); }
     void get(uint32_t index) { op(Get); uleb(code, index); }
     void set(uint32_t index) { op(Set); uleb(code, index); }
-    void begin_if(bool result = false) { op(If); op(result ? 0x7f : 0x40); }
+    void begin_if(bool result = false) { op(If); op(result ? 0x7f : 0x40); ++extra_labels; }
+    void end_if() { op(End); --extra_labels; }
     void load(uint32_t offset) { get(0); op(Load); uleb(code, 2); uleb(code, offset); }
     void store(uint32_t offset) { op(Store); uleb(code, 2); uleb(code, offset); }
     void store_constant(uint32_t offset, uint32_t n) { get(0); imm(n); store(offset); }
     void mask(uint32_t bits) { imm(bits); op(And); }
-    void commit_counters() {
-        if (!region)
-            return;
-        // Keep hot-loop accounting in Wasm locals. The state fields are part
-        // of the ABI, but only need to be published when control returns to
-        // the host, removing two linear-memory read/modify/write sequences
-        // from every dispatched guest block.
-        get(0); load(offsetof(JitState, executed)); get(2); op(Add);
-        store(offsetof(JitState, executed));
-        get(0); load(offsetof(JitState, dispatches)); get(dispatch_count_local); op(Add);
-        store(offsetof(JitState, dispatches));
-    }
     void analyze_register_cache() {
         // The cache is a region-mode optimization: its locals (11..25) are
         // reserved by the region constructor above the SSA range. In
@@ -292,15 +283,13 @@ private:
             const Location fault_location{Dynarmic::IR::LocationDescriptor{pending_fault_location}};
             // IT may have advanced since block entry. Preserve the current
             // arithmetic flags while restoring the faulting instruction's mode.
-            flush_register_cache();
             upper_location(fault_location);
             store_constant(offsetof(JitState, fault_pc), fault_location.PC());
-            commit_counters();
         } else {
             store_constant(offsetof(JitState, executed), 0);
         }
-        store_constant(offsetof(JitState, exit_reason), static_cast<uint32_t>(ExitReason::Fault));
-        imm(static_cast<uint32_t>(ExitReason::Fault)); op(Return); op(End);
+        ret(ExitReason::Fault);
+        end_if();
     }
     // This Dynarmic IR prefixes every A32 memory op with the translation
     // location as an immediate and appends the access type after the data:
@@ -358,9 +347,10 @@ private:
     // page boundary -> (stores) code-page refcount. All ifs are void; every
     // arm fully defines the IR result (fast load sets it directly, fallbacks
     // via the helper's memory_value), so nothing stays on the cross-arm stack.
-    // addr/page live in the two SPARE SSA words of this instruction's
-    // ten-word slot (existing lowerings use words 1..6 only).
+    // The mapped base, page and address live in three SPARE SSA words of
+    // this instruction's ten-word slot (other lowerings use words 0..6).
     void memory_fast_or_slow(const Inst &inst, bool write, unsigned bytes) {
+        const uint32_t base_local = next_local + 7;
         const uint32_t page_local = next_local + 8;
         const uint32_t addr_local = next_local + 9;
         // MemPerm::ReadOnly(1) / WriteOnly(2): the bits mem_read/mem_write
@@ -399,6 +389,8 @@ private:
         memory_base(page_table_local, offsetof(JitState, page_table_base));
         get(page_local); imm(2); op(Shl); op(Add);
         op(Load); uleb(code, 2); uleb(code, 0);
+        set(base_local);
+        get(base_local);
         op(Eqz);
         begin_if();
         memory_slow_call(inst, write, bytes, kSlowUnmapped);
@@ -420,9 +412,7 @@ private:
             memory_slow_call(inst, write, bytes, kSlowCodePage);
             op(Else);
             // Direct store: base + (addr & 0xfff).
-            memory_base(page_table_local, offsetof(JitState, page_table_base));
-            get(page_local); imm(2); op(Shl); op(Add);
-            op(Load); uleb(code, 2); uleb(code, 0);
+            get(base_local);
             get(addr_local); imm(0xfff); op(And); op(Add);
             value_word(inst.GetArg(2), 0);
             if (bytes == 1) { op(Store8); uleb(code, 0); uleb(code, 0); }
@@ -430,12 +420,10 @@ private:
             else { op(Store); uleb(code, 2); uleb(code, 0); }
             get(0); load(offsetof(JitState, mem_fast_writes)); imm(1); op(Add);
             store(offsetof(JitState, mem_fast_writes));
-            op(End);
+            end_if();
         } else {
             // Direct load: base + (addr & 0xfff); 8/16-bit zero-extending.
-            memory_base(page_table_local, offsetof(JitState, page_table_base));
-            get(page_local); imm(2); op(Shl); op(Add);
-            op(Load); uleb(code, 2); uleb(code, 0);
+            get(base_local);
             get(addr_local); imm(0xfff); op(And); op(Add);
             if (bytes == 1) { op(Load8U); uleb(code, 0); uleb(code, 0); }
             else if (bytes == 2) { op(Load16U); uleb(code, 1); uleb(code, 0); }
@@ -444,11 +432,11 @@ private:
             get(0); load(offsetof(JitState, mem_fast_reads)); imm(1); op(Add);
             store(offsetof(JitState, mem_fast_reads));
         }
-        op(End); // page boundary
-        op(End); // mapping
-        op(End); // permissions
-        op(End); // fast-path enabled
-        op(End); // guest page 0
+        end_if(); // page boundary
+        end_if(); // mapping
+        end_if(); // permissions
+        end_if(); // fast-path enabled
+        end_if(); // guest page 0
     }
 
     void memory_call(const Inst &inst, bool write, unsigned bytes) {
@@ -530,8 +518,16 @@ private:
     }
 
     void ret(ExitReason reason) {
+        if (region) {
+            // All exits join the epilogue outside the dispatch loop. Reuse
+            // the dispatch-index local for the return reason once dispatch
+            // has finished. This also keeps register spills out of each
+            // memory fallback and each search-tree leaf.
+            imm(static_cast<uint32_t>(reason)); set(6);
+            op(Br); uleb(code, body_index + extra_labels + 1);
+            return;
+        }
         flush_register_cache();
-        commit_counters();
         store_constant(offsetof(JitState, exit_reason), static_cast<uint32_t>(reason));
         imm(static_cast<uint32_t>(reason));
         op(Return);
@@ -557,7 +553,7 @@ private:
             terminal(test->then_, depth + 1);
             op(Else);
             terminal(test->else_, depth + 1);
-            op(End);
+            end_if();
             // Both arms return; Wasm's validator still requires a value after
             // a void if when validating the enclosing function's result type.
             op(0x00); // unreachable
@@ -567,7 +563,7 @@ private:
             terminal(test->then_, depth + 1);
             op(Else);
             terminal(test->else_, depth + 1);
-            op(End); op(0x00);
+            end_if(); op(0x00);
         } else if (boost::get<Term::ReturnToDispatch>(&term) || boost::get<Term::PopRSBHint>(&term)
             || boost::get<Term::FastDispatchHint>(&term)) {
             if (!pc_written)
@@ -655,11 +651,11 @@ private:
                 value(a);
                 if (kind == Op::LogicalShiftRight32) { imm(31); op(ShrU); }
                 else { mask(1); }
-                op(Else); imm(0); op(End); set(next_local + 4);
+                op(Else); imm(0); end_if(); set(next_local + 4);
             }
-            op(End);
+            end_if();
         }
-        op(End);
+        end_if();
     }
 
     bool pseudo(const Inst &inst) {
@@ -731,21 +727,17 @@ private:
         store(offsetof(JitState, next_pc));
     }
 
-    bool is_member(const Location &loc) const {
-        for (const Dynarmic::IR::Block *m : *members)
-            if (Location(m->Location()) == loc)
-                return true;
-        return false;
-    }
-
     // Statically-chained edges know the successor's block index at emission
-    // time: is_member() required full LocationDescriptor equality (PC + CPSR
+    // time: member_index() requires full LocationDescriptor equality (PC + CPSR
     // mode/IT + FPSCR mode bits), so the dispatch leaf's PC/PSR/FPSCR checks
     // are redundant for them. FULL PSR+FPSCR match, or not a member.
     uint32_t member_index(const Location &loc) const {
-        for (size_t i = 0; i < members->size(); ++i)
-            if (Location((*members)[i]->Location()) == loc)
-                return static_cast<uint32_t>(i);
+        const auto it = std::lower_bound(members->begin(), members->end(), loc.PC(),
+            [](const Dynarmic::IR::Block *candidate, uint32_t pc) {
+                return Location(candidate->Location()).PC() < pc;
+            });
+        if (it != members->end() && Location((*it)->Location()) == loc)
+            return static_cast<uint32_t>(it - members->begin());
         return kNoMember;
     }
 
@@ -770,11 +762,8 @@ private:
         get(1); op(GtU);
         begin_if();
         set_next_pc_runtime();
-        commit_counters();
-        store_constant(offsetof(JitState, exit_reason), static_cast<uint32_t>(ExitReason::Budget));
-        imm(static_cast<uint32_t>(ExitReason::Budget));
-        op(Return);
-        op(End);
+        ret(ExitReason::Budget);
+        end_if();
         // Chained: successor's constant index, then redispatch.
         imm(target_index); set(6);
         br_redispatch();
@@ -791,7 +780,6 @@ private:
             location(target);
             add_ticks(ticks);
             if (const uint32_t idx = member_index(target); idx != kNoMember) {
-                flush_register_cache();
                 light_redispatch(idx); // chained: constant index, no PC search
             } else {
                 store_constant(offsetof(JitState, next_pc), target.PC());
@@ -802,7 +790,6 @@ private:
             location(target);
             add_ticks(ticks);
             if (const uint32_t idx = member_index(target); idx != kNoMember) {
-                flush_register_cache();
                 light_redispatch(idx);
             } else {
                 store_constant(offsetof(JitState, next_pc), target.PC());
@@ -811,21 +798,17 @@ private:
         } else if (const auto *test = boost::get<Term::If>(&term)) {
             condition(test->if_);
             begin_if();
-            ++extra_labels;
             terminal_region(test->then_, depth + 1);
             op(Else);
             terminal_region(test->else_, depth + 1);
-            --extra_labels;
-            op(End); op(0x00);
+            end_if(); op(0x00);
         } else if (const auto *test = boost::get<Term::CheckBit>(&term)) {
             if (!check_bit_written) { reject("region check_bit unwritten"); return; }
             get(check_bit_local); begin_if();
-            ++extra_labels;
             terminal_region(test->then_, depth + 1);
             op(Else);
             terminal_region(test->else_, depth + 1);
-            --extra_labels;
-            op(End); op(0x00);
+            end_if(); op(0x00);
         } else if (boost::get<Term::ReturnToDispatch>(&term) || boost::get<Term::PopRSBHint>(&term)
             || boost::get<Term::FastDispatchHint>(&term)) {
             if (!pc_written)
@@ -864,7 +847,6 @@ public:
             condition(block.GetCondition());
             op(Eqz);
             begin_if();
-            ++extra_labels;
             // Condition failed: account its ticks and re-dispatch (the fail
             // target may be another member of this same region). A member
             // fail target takes the light path; a non-member keeps the full
@@ -880,8 +862,7 @@ public:
                 generic_redispatch();
             op(Else);
             emit_instructions_and_terminal();
-            --extra_labels;
-            op(End);
+            end_if();
         } else {
             emit_instructions_and_terminal();
         }
@@ -891,8 +872,8 @@ public:
     }
 
     void emit_instructions_and_terminal() {
-        analyze_register_cache();
-        initialize_register_cache();
+        // Region registers are initialized once by run's prologue and stay
+        // live through every linked or condition-failed block boundary.
         for (const Inst &inst : block)
             has_bx |= inst.GetOpcode() == Op::A32BXWritePC;
         for (const Inst &inst : block) {
@@ -933,7 +914,8 @@ private:
                     break;
                 }
                 arg(1); set(reg_base + index);
-                dirty_regs[index] = true;
+                if (!region)
+                    dirty_regs[index] = true;
             } else if (kind == Op::A32GetRegister) {
                 load(offset);
                 break;
@@ -1177,6 +1159,27 @@ std::vector<uint8_t> emit_region(
     if (total_ticks > kMaxTicks)
         return {};
 
+    // The cache belongs to the entire invocation, not an individual body.
+    // Initialize even write-only registers: an early exit or a skipped
+    // conditional body must preserve the incoming value. The epilogue spills
+    // every register any member can write, including writes in prior blocks.
+    std::array<bool, kCachedRegCount> used_regs{}, written_regs{};
+    for (const auto *block : blocks) {
+        for (const Inst &inst : *block) {
+            const Op kind = inst.GetOpcode();
+            if (kind != Op::A32GetRegister && kind != Op::A32SetRegister)
+                continue;
+            const auto reg = inst.GetArg(0);
+            if (!reg.IsImmediate() || reg.GetType() != Type::A32Reg)
+                continue; // The body emitter rejects malformed operands.
+            const auto index = static_cast<uint32_t>(reg.GetA32RegRef());
+            if (index < used_regs.size()) {
+                used_regs[index] = true;
+                written_regs[index] |= kind == Op::A32SetRegister;
+            }
+        }
+    }
+
     // Per-block bodies share the region local layout; SSA words are reused.
     std::vector<Bytes> bodies(n);
     uint32_t max_ssa = 0;
@@ -1198,24 +1201,22 @@ std::vector<uint8_t> emit_region(
     // edge whose budget check fails exits BEFORE the next loop-top poll, so
     // the HOST re-checks smc_dirty on every exit (see execute_regions).
     Bytes d;
-    const auto exit_with = [&](ExitReason reason) {
-        b_get(d, 0); b_load(d, offsetof(JitState, executed)); b_get(d, 2); b_op(d, Add);
-        b_store(d, offsetof(JitState, executed));
-        b_get(d, 0); b_load(d, offsetof(JitState, dispatches)); b_get(d, 7); b_op(d, Add);
-        b_store(d, offsetof(JitState, dispatches));
+    const auto exit_with = [&](ExitReason reason, uint32_t open_ifs) {
         b_get(d, 0); b_load(d, offsetof(JitState, regs) + 15 * sizeof(uint32_t));
         b_store(d, offsetof(JitState, next_pc));
-        b_get(d, 0); b_imm(d, static_cast<uint32_t>(reason)); b_store(d, offsetof(JitState, exit_reason));
-        b_imm(d, static_cast<uint32_t>(reason)); b_op(d, Return);
+        b_imm(d, static_cast<uint32_t>(reason)); b_set(d, 6);
+        // Skip the open ifs, $default, all n block labels and the loop to
+        // reach $exit. All state publication is shared after that label.
+        b_op(d, Br); uleb(d, static_cast<uint32_t>(n) + 2 + open_ifs);
     };
     // Keep dispatch accounting in local 7 and publish it only on return.
     b_get(d, 7); b_imm(d, 1); b_op(d, Add); b_set(d, 7);
     // if (state.stop_flag) { next_pc = regs[15]; return Stop }
     b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, stop_flag));
-    b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Stop); b_op(d, End);
+    b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Stop, 1); b_op(d, End);
     // if (state.smc_dirty) { next_pc = regs[15]; return Smc }
     b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, smc_dirty));
-    b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Smc); b_op(d, End);
+    b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Smc, 1); b_op(d, End);
     // Generic-path selector: fresh entries and non-member edges carry the
     // sentinel in the dispatch-index local; chained edges overwrite it with
     // a constant block index and skip the reload + search entirely.
@@ -1228,7 +1229,7 @@ std::vector<uint8_t> emit_region(
     b_imm(d, static_cast<uint32_t>(n)); b_set(d, 6);
 
     // Balanced static search over the sorted, constant entry PCs.
-    std::function<void(size_t, size_t)> tree = [&](size_t lo, size_t hi) {
+    std::function<void(size_t, size_t, uint32_t)> tree = [&](size_t lo, size_t hi, uint32_t open_ifs) {
         if (hi - lo == 1) {
             b_get(d, 3); b_imm(d, meta[lo].entry_pc); b_op(d, Eq);
             b_op(d, If); b_op(d, 0x40);
@@ -1237,18 +1238,18 @@ std::vector<uint8_t> emit_region(
                 b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, cpsr));
                 b_imm(d, meta[lo].psr_mask); b_op(d, And);
                 b_imm(d, meta[lo].psr_value); b_op(d, Ne);
-                b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Miss); b_op(d, End);
+                b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Miss, open_ifs + 2); b_op(d, End);
                 // FPSCR mode bits are part of the block's translation key.
                 const uint32_t fpscr = Location(blocks[lo]->Location()).FPSCR().Value()
                     & Location::FPSCR_MODE_MASK;
                 b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, fpscr));
                 b_imm(d, Location::FPSCR_MODE_MASK); b_op(d, And);
                 b_imm(d, fpscr); b_op(d, Ne);
-                b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Miss); b_op(d, End);
+                b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Miss, open_ifs + 2); b_op(d, End);
                 // Budget: executed_call + ticks > budget -> Budget.
                 b_get(d, 2); b_imm(d, meta[lo].ticks); b_op(d, Add);
                 b_get(d, 1); b_op(d, GtU);
-                b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Budget); b_op(d, End);
+                b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Budget, open_ifs + 2); b_op(d, End);
                 b_imm(d, static_cast<uint32_t>(lo)); b_set(d, 6);
             }
             b_op(d, End);
@@ -1257,12 +1258,12 @@ std::vector<uint8_t> emit_region(
         const size_t mid = (lo + hi) / 2;
         b_get(d, 3); b_imm(d, meta[mid].entry_pc); b_op(d, LtU);
         b_op(d, If); b_op(d, 0x40);
-        tree(lo, mid);
+        tree(lo, mid, open_ifs + 1);
         b_op(d, Else);
-        tree(mid, hi);
+        tree(mid, hi, open_ifs + 1);
         b_op(d, End);
     };
-    tree(0, n);
+    tree(0, n, 1); // the generic-path if is already open
     b_op(d, End); // close generic-path if
 
     // br_table: vec of n labels then the default. Index i -> $bI (depth n-i
@@ -1284,19 +1285,22 @@ std::vector<uint8_t> emit_region(
     b_load(code, offsetof(JitState, page_table_base)); b_set(code, 8);
     b_load(code, offsetof(JitState, page_perms_base)); b_set(code, 9);
     b_load(code, offsetof(JitState, code_pages_base)); b_set(code, 10);
+    for (uint32_t i = 0; i < used_regs.size(); ++i) {
+        if (used_regs[i]) {
+            b_load(code, offsetof(JitState, regs) + i * sizeof(uint32_t));
+            b_set(code, kRegionRegBase + i);
+        }
+    }
+    b_op(code, Block); b_op(code, 0x40); // $exit: publish state once per call
     b_op(code, Loop); b_op(code, 0x40); // $outer: br here = redispatch
     for (size_t i = 0; i < n; ++i) { b_op(code, Block); b_op(code, 0x40); } // $b0..$b(n-1)
     b_op(code, Block); b_op(code, 0x40); // $default (innermost)
     code.insert(code.end(), d.begin(), d.end());
     b_op(code, End); // close $default -> miss body
     {
-        b_get(code, 0); b_load(code, offsetof(JitState, executed)); b_get(code, 2); b_op(code, Add);
-        b_store(code, offsetof(JitState, executed));
-        b_get(code, 0); b_load(code, offsetof(JitState, dispatches)); b_get(code, 7); b_op(code, Add);
-        b_store(code, offsetof(JitState, dispatches));
         b_get(code, 0); b_get(code, 3); b_store(code, offsetof(JitState, next_pc));
-        b_get(code, 0); b_imm(code, static_cast<uint32_t>(ExitReason::Miss)); b_store(code, offsetof(JitState, exit_reason));
-        b_imm(code, static_cast<uint32_t>(ExitReason::Miss)); b_op(code, Return);
+        b_imm(code, static_cast<uint32_t>(ExitReason::Miss)); b_set(code, 6);
+        b_op(code, Br); uleb(code, static_cast<uint32_t>(n) + 1); // $exit ($default is closed)
     }
     for (size_t i = n; i-- > 0;) { // close $b(i) -> body i
         b_op(code, End);
@@ -1304,13 +1308,26 @@ std::vector<uint8_t> emit_region(
     }
     b_op(code, End); // close loop
     b_op(code, 0x00); // unreachable: every body ends in br/return; the loop never falls through
+    b_op(code, End); // close $exit -> shared epilogue
+    for (uint32_t i = 0; i < written_regs.size(); ++i) {
+        if (written_regs[i]) {
+            b_get(code, 0); b_get(code, kRegionRegBase + i);
+            b_store(code, offsetof(JitState, regs) + i * sizeof(uint32_t));
+        }
+    }
+    b_get(code, 0); b_load(code, offsetof(JitState, executed)); b_get(code, 2); b_op(code, Add);
+    b_store(code, offsetof(JitState, executed));
+    b_get(code, 0); b_load(code, offsetof(JitState, dispatches)); b_get(code, 7); b_op(code, Add);
+    b_store(code, offsetof(JitState, dispatches));
+    b_get(code, 0); b_get(code, 6); b_store(code, offsetof(JitState, exit_reason));
+    b_get(code, 6); // function result
     b_op(code, End); // end function body
 
     Bytes body;
     uleb(body, 3); // three local runs
     uleb(body, 3); body.push_back(0x7f); // locals 2,3,4: executed_call, pc, CheckBit
     uleb(body, 1); body.push_back(0x7e); // local 5: i64 scratch
-    uleb(body, 20 + max_ssa); body.push_back(0x7f); // local 6: dispatch index; 7: dispatch count; 8..10: memory bases; 11..25: cached regs; 26..: SSA
+    uleb(body, kRegionSsaBase - 6 + max_ssa); body.push_back(0x7f); // 6: dispatch index / exit reason; 7: dispatch count; 8..10: memory bases; 11..25: cached regs; 26..: SSA
     body.insert(body.end(), code.begin(), code.end());
     Bytes functions{1};
     uleb(functions, static_cast<uint32_t>(body.size()));

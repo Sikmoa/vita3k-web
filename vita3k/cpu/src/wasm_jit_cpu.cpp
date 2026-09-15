@@ -63,25 +63,55 @@ struct RegionBlock {
     uint32_t ticks = 0;                    // conservative tick cost
     std::vector<uint8_t> original;         // guest bytes [pc, EndLocation.PC)
 };
+struct RegionPage {
+    struct Span {
+        size_t block_index, block_offset;
+        uint32_t page_offset, size;
+    };
+    uint32_t page = 0;
+    uint32_t begin = 4096, end = 0;
+    std::vector<Span> spans;
+};
 struct Region {
     std::vector<RegionBlock> blocks; // sorted by pc
     uint64_t total_ticks = 0;
     Address page_begin = 0, page_end = 0; // Half-open page-index bounds.
     std::vector<uint32_t> code_pages;     // Only pages actually containing code.
+    std::vector<RegionPage> validation_pages; // Built once, reused on every entry.
 };
 
 void collect_code_pages(Region &region) {
     region.code_pages.clear();
-    for (const auto &block : region.blocks) {
-        const uint64_t end = uint64_t(block.pc) + block.original.size();
-        for (uint64_t p = block.pc / 4096; p < (end + 4095) / 4096; ++p)
-            region.code_pages.push_back(static_cast<uint32_t>(p));
+    region.validation_pages.clear();
+    // Overlapping blocks can cross a page and then start on the preceding
+    // page again. Group by page explicitly; sorted block PCs alone do not
+    // guarantee that their page fragments arrive in sorted order.
+    std::map<uint32_t, RegionPage> pages;
+    for (size_t i = 0; i < region.blocks.size(); ++i) {
+        const auto &block = region.blocks[i];
+        size_t offset = 0;
+        while (offset < block.original.size()) {
+            const uint64_t address = uint64_t(block.pc) + offset;
+            const uint32_t page_number = static_cast<uint32_t>(address >> 12);
+            const uint32_t page_offset = static_cast<uint32_t>(address & 0xfff);
+            const uint32_t count = static_cast<uint32_t>(std::min(
+                block.original.size() - offset, size_t(4096 - page_offset)));
+            auto &page = pages[page_number];
+            page.page = page_number;
+            page.begin = std::min(page.begin, page_offset);
+            page.end = std::max(page.end, page_offset + count);
+            page.spans.push_back({i, offset, page_offset, count});
+            offset += count;
+        }
     }
-    auto &pages = region.code_pages;
-    std::sort(pages.begin(), pages.end());
-    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
-    region.page_begin = pages.empty() ? 0 : pages.front();
-    region.page_end = pages.empty() ? 0 : pages.back() + 1;
+    region.code_pages.reserve(pages.size());
+    region.validation_pages.reserve(pages.size());
+    for (auto &[number, page] : pages) {
+        region.code_pages.push_back(number);
+        region.validation_pages.push_back(std::move(page));
+    }
+    region.page_begin = region.code_pages.empty() ? 0 : region.code_pages.front();
+    region.page_end = region.code_pages.empty() ? 0 : region.code_pages.back() + 1;
 }
 
 // Static successor targets of a terminal tree. ReturnToDispatch, PopRSBHint
@@ -221,61 +251,22 @@ void mark_code_pages(const Region &region, int delta) {
 
 // Region-entry validation (replaces per-block unchanged()): revalidate the
 // guest bytes of EVERY member block once per region entry. Between entries,
-// stores into code pages set g_code_pages, letting checked_memory_write flag
+// cached code pages are marked in g_code_pages, letting checked_memory_write flag
 // smc_dirty for an immediate Smc exit instead of waiting for this check.
 bool region_unchanged(const Region &region, MemState &mem) {
-    struct PageSnapshot {
-        uint32_t page = 0;
-        uint32_t begin = 0;
-        uint32_t end = 0;
-        std::vector<uint8_t> bytes;
-    };
-    // Blocks are sorted by PC, so the ranges are naturally grouped by page.
-    // Fetch each touched page range once instead of invoking mem_fetch for
-    // every member block (which repeats page-table and permission checks).
-    std::vector<PageSnapshot> pages;
-    pages.reserve(region.code_pages.size());
-    for (const auto &block : region.blocks) {
-        const uint64_t start = block.pc;
-        const uint64_t end = start + block.original.size();
-        for (uint64_t page = start >> 12; page < (end + 4095) / 4096; ++page) {
-            const uint32_t begin = page == (start >> 12) ? static_cast<uint32_t>(start & 0xfff) : 0;
-            const uint32_t finish = page == ((end - 1) >> 12)
-                ? static_cast<uint32_t>(((end - 1) & 0xfff) + 1) : 4096;
-            if (pages.empty() || pages.back().page != page)
-                pages.push_back({static_cast<uint32_t>(page), begin, finish, {}});
-            else {
-                pages.back().begin = std::min(pages.back().begin, begin);
-                pages.back().end = std::max(pages.back().end, finish);
-            }
-        }
-    }
-    for (auto &page : pages) {
-        page.bytes.resize(page.end - page.begin);
+    // No per-entry allocations, page grouping or binary searches. Only the
+    // fetched range is read, so the scratch page needs no zero-initialization.
+    std::array<uint8_t, 4096> bytes;
+    for (const auto &page : region.validation_pages) {
         if (!mem_fetch(mem, page.page * 4096 + page.begin,
-                page.bytes.data(), page.bytes.size()))
+                bytes.data(), page.end - page.begin))
             return false;
-    }
-    for (const auto &block : region.blocks) {
-        size_t offset = 0;
-        while (offset < block.original.size()) {
-            const uint32_t address = block.pc + static_cast<uint32_t>(offset);
-            const uint32_t page = address >> 12;
-            const auto it = std::lower_bound(pages.begin(), pages.end(), page,
-                [](const PageSnapshot &snapshot, uint32_t value) {
-                    return snapshot.page < value;
-                });
-            if (it == pages.end() || it->page != page)
+        for (const auto &span : page.spans) {
+            const auto &original = region.blocks[span.block_index].original;
+            if (!std::equal(original.begin() + span.block_offset,
+                    original.begin() + span.block_offset + span.size,
+                    bytes.begin() + (span.page_offset - page.begin)))
                 return false;
-            const size_t page_offset = address & 0xfff;
-            const size_t count = std::min(block.original.size() - offset,
-                size_t(4096 - page_offset));
-            if (page_offset < it->begin || page_offset - it->begin + count > it->bytes.size()
-                || !std::equal(block.original.begin() + offset,
-                    block.original.begin() + offset + count,
-                    it->bytes.begin() + (page_offset - it->begin)))
-                return false;
-            offset += count;
         }
     }
     return true;
