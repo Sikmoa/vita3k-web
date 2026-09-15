@@ -159,7 +159,7 @@ access rather than loading the same page-table entry twice.
 
 ## Store continuations (current implementation)
 
-Region formation requests `StoreContinuation` metadata from `translate_block`, up to an explicit per-call cap. The production default is 0 (legacy store-ending blocks): measured 2026-09-15, any inline continuation side exit costs more per-call entry time than the dispatch savings return (see `kDefaultMaxStoreContinuations` in `frontend.h`). The machinery stays tested via explicit caps; re-enable by reshaping the poll (e.g. routing it through the dispatch loop) rather than just raising the cap.
+Region formation requests `StoreContinuation` metadata from `translate_block`, up to an explicit per-call cap (production default: 2, i.e. three store-delimited segments per block). Measured 2026-09-15: uncapped merging cuts dispatcher visits ~60% but its inline side exits raise per-call Wasm entry cost past the break-even point on the Node bench; the cap-2 default keeps roughly half the dispatch reduction near pre-continuation entry cost, and local browser testing showed +2 FPS over both the uncapped and the disabled variants (see `kDefaultMaxStoreContinuations` in `frontend.h`).
 For unconditional blocks, an ordinary store no longer terminates translation.
 At the next `PreCodeReadHook`, the frontend records the IR offset, cumulative
 completed tick count and full continuation location. This hook runs after

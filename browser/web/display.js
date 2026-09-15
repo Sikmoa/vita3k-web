@@ -7,6 +7,21 @@ const canvas = document.querySelector('#vita-canvas');
 const ctx = canvas.getContext('2d', { alpha: false });
 
 const frames = { received: 0, lastGeneration: -1, lastChecksum: 0, checksums: new Set() };
+const fpsEl = document.querySelector('#fps');
+const fps = { start: 0, windowStart: 0, windowCount: 0 };
+
+function tickFps() {
+  const now = performance.now();
+  if (!fps.start) { fps.start = now; fps.windowStart = now; }
+  fps.windowCount++;
+  if (now - fps.windowStart >= 1000) {
+    const windowFps = (fps.windowCount * 1000) / (now - fps.windowStart);
+    const avgFps = (frames.received * 1000) / (now - fps.start);
+    if (fpsEl) fpsEl.textContent = `FPS: ${windowFps.toFixed(1)} (avg ${avgFps.toFixed(1)}, ${frames.received} frames)`;
+    fps.windowStart = now;
+    fps.windowCount = 0;
+  }
+}
 
 function checksum(view) {
   // Cheap content fingerprint over the frame; frames must differ over time.
@@ -26,6 +41,7 @@ function present(frame) {
   const sum = checksum(new Uint8Array(frame.data));
   if (sum !== frames.lastChecksum) frames.checksums.add(sum);
   frames.lastChecksum = sum;
+  tickFps();
 }
 
 window.addEventListener('DOMContentLoaded', () => {
@@ -50,6 +66,10 @@ window.addEventListener('DOMContentLoaded', () => {
     if (data.type === 'vita-exit') {
       console.log('[vita3k-web] vita exit:', data.exitCode);
       status.textContent = `Vita process exited with code ${data.exitCode} after ${frames.received} frames.`;
+      if (fpsEl && fps.start) {
+        const avgFps = (frames.received * 1000) / (performance.now() - fps.start);
+        fpsEl.textContent = `FPS: final avg ${avgFps.toFixed(1)} over ${frames.received} frames.`;
+      }
     }
     if (data.type === 'log') console.log('[vita3k-web]', data.message);
     if (data.type === 'error') status.textContent = `Error: ${data.message}`;

@@ -32,11 +32,13 @@ namespace vita3k::wasmjit {
 // With store_continuations, unconditional region blocks may continue after
 // stores, up to max_store_continuations boundaries per block. The output is
 // replaced on every call and must accompany the IR to the region emitter.
-// The default cap is 0 (legacy store-ending behavior): measured 2026-09-15,
-// any inline continuation side exit costs more per-call entry time than the
-// dispatch savings return. Conditional blocks and calls without this output
-// keep the conservative store-ending behavior (including the single-step path).
-constexpr size_t kDefaultMaxStoreContinuations = 0;
+// The default cap is 2 (three store-delimited segments per block): measured
+// 2026-09-15 this keeps roughly half the dispatcher-visit reduction while
+// staying near pre-continuation entry cost, and local browser testing showed
+// +2 FPS over both the uncapped and the disabled variants on real devices.
+// Conditional blocks and calls without this output keep the conservative
+// store-ending behavior (including the single-step path).
+constexpr size_t kDefaultMaxStoreContinuations = 2;
 Dynarmic::IR::Block translate_block(MemState &mem, uint32_t pc, uint32_t cpsr,
     uint32_t max_instructions = 32, uint32_t fpscr = 0,
     std::vector<StoreContinuation> *store_continuations = nullptr,
