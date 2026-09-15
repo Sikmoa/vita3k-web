@@ -900,8 +900,12 @@ private:
             op(ExtendU); op(Add64);
             value(inst.GetArg(2)); op(ExtendU); op(Add64);
         };
-        sum(); op(Wrap); set(next_local);
-        sum(); op(0x42); op(32); op(ShrU64); op(Wrap); set(next_local + 4);
+        // Emit the widened sum once into the i64 scratch local (dead across
+        // IR-op boundaries; Pack/LSR64 use it write-before-read the same way)
+        // instead of materializing it twice: saves ~7 Wasm ops per Add/Sub.
+        sum(); set(scratch_local);
+        get(scratch_local); op(Wrap); set(next_local);
+        get(scratch_local); op(0x42); op(32); op(ShrU64); op(Wrap); set(next_local + 4);
         // V = (~(a ^ b) & (a ^ result)) >> 31 for add; for subtract
         // use (a ^ b) instead. This also accounts for carry/borrow input.
         value(inst.GetArg(0)); value(inst.GetArg(1)); op(Xor);
