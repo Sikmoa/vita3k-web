@@ -137,6 +137,15 @@ assert.equal(typeof module._vita3k_web_last_run_instructions, 'function',
   'module does not export _vita3k_web_last_run_instructions');
 assert.equal(typeof module._vita3k_web_last_frame_instructions, 'function',
   'module does not export _vita3k_web_last_frame_instructions (bridge seam missing)');
+// Uncapped headroom mode (mirrors ?fastvblank=1 in the browser): the emulated
+// vblank clock advances once per wait with only a 1ms yield instead of
+// wall-clock 60Hz gating, so steady instructions/sec measures CPU throughput.
+// Guest semantics are unchanged (same frames, same 156399069 instructions).
+if (process.env.VITA3K_FAST_VBLANK === '1') {
+  assert.equal(typeof module._vita3k_web_set_fast_vblank, 'function',
+    'module does not export _vita3k_web_set_fast_vblank (rebuild bench module)');
+  module._vita3k_web_set_fast_vblank(1);
+}
 
 const allocation = module._malloc(ebootBytes.length);
 assert.ok(allocation, 'unable to allocate the eboot input buffer');

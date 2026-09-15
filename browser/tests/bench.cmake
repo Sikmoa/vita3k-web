@@ -50,7 +50,7 @@ set(VITA3K_DISPLAY_BENCH_LINK_OPTIONS
     -sALLOW_MEMORY_GROWTH=1
     -sINITIAL_MEMORY=67108864
     -sSTACK_SIZE=1048576
-    "-sEXPORTED_FUNCTIONS=['_malloc','_free','_fflush','_vita3k_web_run_vita','_vita3k_web_last_run_instructions','_vita3k_web_last_frame_instructions']")
+    "-sEXPORTED_FUNCTIONS=['_malloc','_free','_fflush','_vita3k_web_run_vita','_vita3k_web_last_run_instructions','_vita3k_web_last_frame_instructions','_vita3k_web_set_fast_vblank']")
 
 add_executable(vita3k_display_bench_node EXCLUDE_FROM_ALL
     ${VITA3K_DISPLAY_BENCH_SOURCES})
