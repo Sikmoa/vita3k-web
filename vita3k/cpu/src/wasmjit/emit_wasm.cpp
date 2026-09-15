@@ -644,6 +644,16 @@ private:
         op(Br); uleb(code, body_index + extra_labels);
     }
 
+    // Re-enter the dispatcher through the generic PC lookup path.  The
+    // dispatch index is normally left holding the block selected by the
+    // previous iteration; retaining it here would make a non-member edge
+    // branch straight back to that same block and skip the PC search.
+    void generic_redispatch() {
+        imm(kLightDispatchSentinel);
+        set(6);
+        br_redispatch();
+    }
+
     void set_next_pc_runtime() {
         get(0); load(offsetof(JitState, regs) + 15 * sizeof(uint32_t));
         store(offsetof(JitState, next_pc));
@@ -792,7 +802,7 @@ public:
             if (const uint32_t fail_idx = member_index(fail_loc); fail_idx != kNoMember)
                 light_redispatch(fail_idx);
             else
-                br_redispatch();
+                generic_redispatch();
             op(Else);
             emit_instructions_and_terminal();
             --extra_labels;
