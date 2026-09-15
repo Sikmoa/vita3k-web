@@ -169,7 +169,9 @@ values are dead at its terminal. Max locals = 6 + max per-block words.
 
 **Fault path change** (memory_call/checked_status in region mode):
 - Helper nonzero → set fault_pc = arg0 of the faulting memory op (its low
-  32 bits = the instruction PC — VERIFIED); do NOT touch state.executed
+  32 bits = the instruction PC — VERIFIED). Restore CPSR mode bits, including
+  IT, from that full location descriptor while preserving arithmetic flags;
+  earlier instructions in the block may have advanced IT. Do NOT touch state.executed
   (it holds ticks of all PREVIOUS blocks; the faulting block's earlier
   instructions are not counted — undercount ≤ block ticks, fault_pc exact);
   return Fault.
@@ -220,6 +222,7 @@ any mapping question, and it costs one byte load):
 ```
 page   = addr >>> 12
 if page == 0 -> fall back (checked path rejects addr < host_page_size)
+if any of page_table_base, page_perms_base, code_pages_base is zero -> fall back (5)
 perm   = i32.load8_u(page_perms_base + page)
 if (perm & required) != required -> fall back (reason 2)
 base   = i32.load(page_table_base + page*4)
@@ -232,9 +235,9 @@ value  = i32.load8_u/16_u/load(base + (addr & 0xFFF))   // or matching store
 Alignment is NOT checked: Wasm unaligned access is a little-endian byte-wise
 access, identical to mem_read/mem_write's per-page memcpy, and every A32/Thumb
 load width lowers to a raw zero-extending ReadMemoryN (sign extension is a
-separate IR op), so load8_u/load16_u preserve exact semantics. Narrow loads
-(8/16-bit) additionally cannot cross a page (offset ≤ 0xFFF-1/0xFFF-2 cannot
-exceed 0xFFF), so only 4-byte accesses can take the cross-page fallback.
+separate IR op), so load8_u/load16_u preserve exact semantics. An unaligned
+16-bit access at offset 0xFFF crosses a page and takes the checked fallback,
+as do 32-bit accesses at offsets 0xFFD through 0xFFF.
 
 Fallbacks call the imported helper with `bytes = size | reason<<8`
 (1=unmapped, 2=perms, 3=cross-page, 4=code page, 5=other/disabled); the

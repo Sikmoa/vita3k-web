@@ -199,6 +199,37 @@ void backend(MemState &mem) {
         CHECK(mem_read(mem, data + i * 4, &word, sizeof(word)));
         CHECK(word == 0x5a5a5a5a);
     }
+
+    // A speculative fetch beyond the last mapped instruction must not discard
+    // that instruction. Retrying run also reuses the shortened cached block.
+    for (const bool thumb : {false, true}) {
+        const uint32_t last_word = thumb ? 0x3001bf00 : 0xe2800001; // ADD r0,#1
+        CHECK(mem_write(mem, code + page - 4, &last_word, sizeof(last_word)));
+        jit.invalidate_jit_cache(code, page);
+        const Address entry = code + page - (thumb ? 2 : 4);
+        uint64_t compiled_after_first = 0;
+        for (unsigned run = 0; run < 2; ++run) {
+            jit.set_cpsr(0x10);
+            jit.set_pc(entry | (thumb ? 1 : 0));
+            jit.set_reg(0, 41);
+            const auto count = jit.instructions_executed();
+            const auto old_hits = jit.cache_hits();
+            CHECK(jit.run() == -1 && !parent.svc_called);
+            CHECK(jit.get_reg(0) == 42 && jit.get_pc() == code + page);
+            CHECK(jit.instructions_executed() == count + 1);
+            CHECK(jit.get_last_error().find("instruction fetch failed") != std::string::npos);
+            if (run == 0) compiled_after_first = jit.compiled_blocks();
+            else {
+                CHECK(jit.compiled_blocks() == compiled_after_first);
+                CHECK(jit.cache_hits() > old_hits);
+            }
+        }
+        const auto at_fault = jit.save_context();
+        const auto count = jit.instructions_executed();
+        CHECK(jit.run() == -1); // The first instruction itself is now unmapped.
+        equal_context(jit.save_context(), at_fault);
+        CHECK(jit.instructions_executed() == count);
+    }
 }
 // M14c region formation: DFS membership, one-block-per-PC, PSR metadata,
 // tick accounting and sorted output on a real Thumb CFG with a loop, an
@@ -339,6 +370,47 @@ void region_exec(MemState &mem) {
     jit.set_cpsr(0x30);
     jit.set_pc(code | 1);
     CHECK(jit.run() == -1);
+    CHECK(jit.get_last_error().find("budget") != std::string::npos);
+}
+
+void region_budget_continuations(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(1);
+
+    // A dynamic branch consumes the last tick and returns Miss, not Budget.
+    put(mem, jit, {0xe12fff11, 0xef000042}); // BX r1; SVC 0x42
+    jit.set_reg(1, code + 4);
+    auto count = jit.instructions_executed();
+    CHECK(jit.run() == -1 && !parent.svc_called);
+    CHECK(jit.instructions_executed() == count + 1 && jit.get_pc() == code + 4);
+    CHECK(jit.get_last_error().find("budget") != std::string::npos);
+
+    // SMC wins over the dispatch budget check. Exhaustion must still be an
+    // error after invalidating code, before executing the modified instruction.
+    put(mem, jit, {0xe5810000, 0xe3a02001, 0xef000042});
+    jit.set_reg(0, 0xe3a0202a); // Replace MOV r2,#1 with MOV r2,#42.
+    jit.set_reg(1, code + 4);
+    jit.set_reg(2, 9);
+    count = jit.instructions_executed();
+    const auto invalidated = jit.invalidated_blocks();
+    CHECK(jit.run() == -1 && !parent.svc_called);
+    CHECK(jit.instructions_executed() == count + 1 && jit.get_pc() == code + 4);
+    CHECK(jit.get_reg(2) == 9 && jit.invalidated_blocks() > invalidated);
+    CHECK(jit.get_last_error().find("budget") != std::string::npos);
+    jit.set_instruction_budget(2);
+    CHECK(jit.run() == 0 && parent.svc_called && jit.get_reg(2) == 42);
+
+    // A completed SVC still succeeds when it consumes exactly the last tick.
+    put(mem, jit, {0xef000042});
+    jit.set_instruction_budget(1);
+    CHECK(jit.run() == 0 && parent.svc_called);
+    jit.set_pc(code);
+    jit.set_instruction_budget(0);
+    count = jit.instructions_executed();
+    CHECK(jit.run() == -1 && !parent.svc_called);
+    CHECK(jit.instructions_executed() == count && jit.get_pc() == code);
     CHECK(jit.get_last_error().find("budget") != std::string::npos);
 }
 
@@ -530,6 +602,7 @@ int main() {
     backend(mem);
     formation(mem);
     region_exec(mem);
+    region_budget_continuations(mem);
     region_regressions(mem);
     deinit_mem(mem);
     std::printf("WasmJit backend: %u checks passed (real memory, no interpreter)\n", checks);

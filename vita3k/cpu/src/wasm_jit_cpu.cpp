@@ -473,7 +473,7 @@ struct WasmJitCPU::Impl {
             if (stopped || breakpoint)
                 return 1;
             if (remaining_budget == 0)
-                return 0;
+                return fail("instruction budget exhausted");
             const uint32_t pc = state.regs[15];
             const auto loc = Dynarmic::A32::LocationDescriptor{pc,
                 Dynarmic::A32::PSR{state.cpsr}, Dynarmic::A32::FPSCR{state.fpscr}};
@@ -645,8 +645,19 @@ struct WasmJitCPU::Impl {
                 if (cache.size() >= 1024) clear(); // bounded prototype cache
                 uint32_t translation_limit = limit;
                 const double t0 = emscripten_get_now();
-                auto ir = vita3k::wasmjit::translate_block(*parent->mem,
-                    state.regs[15], state.cpsr, translation_limit, state.fpscr);
+                auto ir = [&] {
+                    try {
+                        return vita3k::wasmjit::translate_block(*parent->mem,
+                            state.regs[15], state.cpsr, translation_limit, state.fpscr);
+                    } catch (const std::runtime_error &) {
+                        // Speculative fetches beyond a valid first instruction
+                        // may fault before the emitter can request a retry.
+                        if (translation_limit == 1) throw;
+                        translation_limit = 1;
+                        return vita3k::wasmjit::translate_block(*parent->mem,
+                            state.regs[15], state.cpsr, translation_limit, state.fpscr);
+                    }
+                }();
                 auto bytes = vita3k::wasmjit::emit_block(ir);
                 if (bytes.empty() && translation_limit > 1) {
                     // Memory IR is initially safe only in a single guest

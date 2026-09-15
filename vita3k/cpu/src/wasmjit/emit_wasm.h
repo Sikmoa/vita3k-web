@@ -95,10 +95,11 @@ static_assert(sizeof(JitState) == 412);
 // Parent MUST snapshot/restore architectural regs/CPSR/FPU on Fault (not the
 // fault fields). Earlier stores of a multi-access instruction may have completed.
 //
-// M15 inline memory fast path: when page_table_base/page_perms_base are
-// populated (0=off), 1/2/4-byte A32 memory IR lowers INLINE instead of calling
-// the checked helpers: page-table lookup + permission/refcount probe + direct
-// Wasm load/store against the sparse page backing. The fast path is taken only
+// M15 inline memory fast path: when page_table_base, page_perms_base and
+// code_pages_base are all populated (any 0=off), 1/2/4-byte A32 memory IR lowers
+// INLINE instead of calling the checked helpers: page-table lookup +
+// permission/refcount probe + direct Wasm load/store against the sparse page
+// backing. The fast path is taken only
 // when it is provably equivalent to the checked path: fast-path disabled,
 // guest page 0 (the checked path rejects addr < host_page_size even when a
 // sparse backing was force-allocated there), page-crossing access, unmapped
@@ -135,8 +136,9 @@ std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block);
 // own location. LinkBlock terminals chaining to a member with the SAME full
 // location descriptor become direct branches; others set next_pc and return
 // Miss. Memory IR is accepted at any CycleCount: a faulting helper sets
-// fault_pc from the faulting memory op's own location immediate (arg0) and
-// returns Fault WITHOUT rollback or executed adjustment. Per-call budget is
+// fault_pc and CPSR mode bits (including IT) from the faulting memory op's
+// own location immediate (arg0), preserving arithmetic flags, and returns
+// Fault WITHOUT rollback or executed adjustment. Per-call budget is
 // the `budget` argument (max additional ticks); dispatch refuses a block whose
 // meta.ticks would exceed it and returns Budget with next_pc set. Limits: 512
 // blocks, 32768 total ticks, 4 MiB module. EMPTY vector = unsupported.

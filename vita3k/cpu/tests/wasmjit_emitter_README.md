@@ -28,8 +28,10 @@ c++ -std=c++20 -O1 -Wall -Wextra -Werror \
 node vita3k/cpu/tests/wasmjit_emitter_test.mjs /tmp/wasmjit-emitter-fixtures
 ```
 
-Expected: 60 deterministic modules, 20,339 input/expected-state pairs, and
-40,678 successful **Wasm `call_indirect`** calls at two nonzero state offsets.
+Expected: 77 deterministic modules, 21,431 input/expected-state pairs,
+42,854 successful **Wasm `call_indirect`** calls and 8 region calls at two
+nonzero state offsets. The fixture generator serializes the complete JitState;
+the harness derives the state and canary sizes from those arrays.
 The native generator/emitter was also run with UndefinedBehaviorSanitizer
 (`-fsanitize=undefined -fno-sanitize-recover=undefined`) without findings.
 Coverage includes:
@@ -52,6 +54,15 @@ Coverage includes:
   seeded random inputs. Pseudos are read after registers/CPSR have been changed.
 - LSL/LSR/ASR/ROR/RRX result/carry and NZ; counts 0..256 (U8 truncation), all
   boundary distinctions at 0, 31, 32, 33 and multiples of 32.
+- LSR64 with register counts 0..256 and immediate boundary counts: shifts of
+  64 or more produce zero, including both result words.
+- Inline 8/16/32-bit reads and writes with every table base populated or one
+  missing; distinct guest/backing values and counters verify the chosen path.
+- Upper-half guest addresses and accesses crossing the end of test memory
+  fault through the JS helpers, which normalize signed Wasm i32 arguments.
+- Region read/write faults inside ITT EQ preserve arithmetic flags and prior
+  instructions while recovering the faulting slot's IT state and PC metadata;
+  condition-failed paths skip both slots and advance IT normally.
 - All 15 supported conditions with all 16 NZCV combinations, separately at
   block entry and terminal; entry conditions are not rechecked after a write.
 - Identity, scalar bit operations, packed NZCV, selects, narrowing, and the
@@ -75,10 +86,12 @@ covered separately by `browser/tests/wasm_jit_tests.cpp` and `jit_smoke.mjs`.
 **empty on unsupported input**. It neither executes guest code nor invokes
 helper callbacks. No exception is used for ordinary rejection.
 
-The standard-layout `JitState` is 372 bytes. Its fields in order are
+The standard-layout `JitState` is 412 bytes. Its original fields in order are
 `regs[16]`, `cpsr`, `fpscr`, `svc`, `exit_reason`, `executed`,
 `memory_cookie`, `fault_address`, `fault_write`, `memory_value[4]`,
-`fpu[64]` and `tpidruro`, all `uint32_t`; static asserts pin the layout.
+`fpu[64]` and `tpidruro`, followed by `next_pc`, `fault_pc`, `page_table_base`,
+`page_perms_base`, `smc_dirty`, `stop_flag`, `dispatches`, `code_pages_base`,
+`mem_fast_reads` and `mem_fast_writes`, all `uint32_t`; static asserts pin the layout.
 Extended registers overlay `fpu` exactly as the x64 backend's MJitStateExtReg:
 Sn is word n, Dn words 2n/2n+1, Qn words 4n..4n+3. The emitter uses
 `offsetof`, not native Dynarmic state layout. Export `block(i32 stateOffset)`

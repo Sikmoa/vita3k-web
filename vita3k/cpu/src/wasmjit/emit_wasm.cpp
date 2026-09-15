@@ -214,11 +214,15 @@ private:
         op(Eqz); begin_if();
         op(Else);
         if (region) {
-            // Fault mid-region: record the faulting guest instruction's PC
+            // Fault mid-region: recover the faulting instruction's mode and PC
             // (arg0 of the memory op is its own U64 location descriptor) and
             // return WITHOUT touching executed (it holds prior blocks' ticks)
             // and WITHOUT rollback (REGION_ABI fault contract).
-            get(0); imm(pending_fault_pc); store(offsetof(JitState, fault_pc));
+            const Location fault_location{Dynarmic::IR::LocationDescriptor{pending_fault_location}};
+            // IT may have advanced since block entry. Preserve the current
+            // arithmetic flags while restoring the faulting instruction's mode.
+            upper_location(fault_location);
+            store_constant(offsetof(JitState, fault_pc), fault_location.PC());
         } else {
             store_constant(offsetof(JitState, executed), 0);
         }
@@ -232,7 +236,7 @@ private:
     // address is therefore arg1 and the stored data arg2; arg0 is NOT the
     // address (its low word is the instruction's own PC). Write helpers
     // consume memory_value, so the value must be published BEFORE the call.
-    uint32_t pending_fault_pc = 0;
+    uint64_t pending_fault_location = 0;
 
     // M15 inline memory fast path (REGION_ABI.md "Inline memory fast path").
     // 1/2/4-byte accesses lower INLINE when provably equivalent to the checked
@@ -296,6 +300,8 @@ private:
         // probes; skipping this guard would dereference guest-controlled
         // linear memory as a host offset.
         load(offsetof(JitState, page_table_base)); op(Eqz);
+        load(offsetof(JitState, page_perms_base)); op(Eqz); op(Or);
+        load(offsetof(JitState, code_pages_base)); op(Eqz); op(Or);
         begin_if();
         memory_slow_call(inst, write, bytes, kSlowOther);
         op(Else);
@@ -317,8 +323,8 @@ private:
         begin_if();
         memory_slow_call(inst, write, bytes, kSlowUnmapped);
         op(Else);
-        // Page-boundary probe: page offset + size > 4096 crosses. (8/16-bit
-        // offsets 0xfff/0xffe are last-valid; only 4-byte can actually cross.)
+        // Page-boundary probe: page offset + size > 4096 crosses, including
+        // an unaligned 16-bit access at offset 0xfff.
         get(addr_local); imm(0xfff); op(And); imm(4096 - bytes); op(GtU);
         begin_if();
         memory_slow_call(inst, write, bytes, kSlowCrossPage);
@@ -368,7 +374,7 @@ private:
     void memory_call(const Inst &inst, bool write, unsigned bytes) {
         if (inst.GetArg(1).GetType() != Type::U32) { reject("memory_call arg1 not U32"); return; }
         if (!inst.GetArg(0).IsImmediate()) { reject("memory_call arg0 not imm"); return; }
-        pending_fault_pc = static_cast<uint32_t>(inst.GetArg(0).GetImmediateAsU64());
+        pending_fault_location = inst.GetArg(0).GetImmediateAsU64();
         if (bytes <= 4)
             memory_fast_or_slow(inst, write, bytes);
         else
@@ -830,6 +836,10 @@ private:
             // exactly like Pack2x32To1x64, so word-1 consumers never see a
             // stale/unset slot.
             value64(inst.GetArg(0)); value(inst.GetArg(1)); op(ExtendU); op(ShrU64);
+            // Wasm masks the shift count modulo 64; Dynarmic requires zero
+            // for every U8 count >= 64.
+            op(0x42); op(0); // i64.const 0
+            value(inst.GetArg(1)); imm(64); op(LtU); op(Select);
             set(scratch_local);
             get(scratch_local); op(Wrap); set(next_local);
             get(scratch_local); op(0x42); uleb(code, 32); op(ShrU64); op(Wrap); set(next_local + 1);

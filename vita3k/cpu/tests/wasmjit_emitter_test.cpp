@@ -4,11 +4,13 @@
 #include "../src/wasmjit/emit_wasm.h"
 
 #include <array>
+#include <bit>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <random>
 #include <vector>
 
@@ -86,14 +88,13 @@ struct Case {
 };
 
 void json_state(std::ostream &os, const JitState &s) {
+    const auto words = std::bit_cast<std::array<uint32_t, sizeof(JitState) / sizeof(uint32_t)>>(s);
     os << '[';
-    for (const auto r : s.regs)
-        os << r << ',';
-    os << s.cpsr << ',' << s.fpscr << ',' << s.svc << ',' << s.exit_reason << ',' << s.executed;
-    os << ',' << s.memory_cookie << ',' << s.fault_address << ',' << s.fault_write;
-    for (auto v : s.memory_value) os << ',' << v;
-    for (auto v : s.fpu) os << ',' << v;
-    os << ',' << s.tpidruro << ']';
+    for (size_t i = 0; i < words.size(); ++i) {
+        if (i) os << ',';
+        os << words[i];
+    }
+    os << ']';
 }
 
 class Suite {
@@ -105,18 +106,28 @@ public:
     }
     ~Suite() { manifest << "]\n"; }
 
-    void add(const std::string &name, const IR::Block &block, const std::vector<Case> &cases) {
-        const auto bytes = emit_block(block);
+    void add(const std::string &name, const IR::Block &block, const std::vector<Case> &cases,
+        std::optional<uint32_t> region_budget = std::nullopt) {
+        const auto emit = [&] {
+            if (!region_budget) return emit_block(block);
+            const A32::LocationDescriptor at(block.Location());
+            return vita3k::wasmjit::emit_region({&block}, {{at.PC(),
+                A32::LocationDescriptor::CPSR_MODE_MASK, at.CPSR().Value(),
+                static_cast<uint32_t>(block.CycleCount() + block.ConditionFailedCycleCount())}});
+        };
+        const auto bytes = emit();
         if (bytes.empty()) {
             std::cerr << "Unexpected rejection: " << name << '\n' << IR::DumpBlock(block);
             std::abort();
         }
-        CHECK(bytes == emit_block(block)); // deterministic, no IR mutation
+        CHECK(bytes == emit()); // deterministic, no IR mutation
         std::ofstream wasm(path / (name + ".wasm"), std::ios::binary);
         wasm.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
         CHECK(wasm.good());
         if (modules++) manifest << ',';
-        manifest << "{\"name\":\"" << name << "\",\"cases\":[";
+        manifest << "{\"name\":\"" << name << '"';
+        if (region_budget) manifest << ",\"budget\":" << *region_budget;
+        manifest << ",\"cases\":[";
         bool first = true;
         for (const auto &test : cases) {
             if (!first) manifest << ',';
@@ -571,6 +582,147 @@ void most_significant_word(Suite &suite) {
     suite.add("most_significant_word_carry", block, cases);
 }
 
+void shifts64(Suite &suite) {
+    const std::array<uint64_t, 4> values{0, 1, 0x8000000012345678ULL, UINT64_MAX};
+    const auto make_block = [](std::optional<uint8_t> count) {
+        auto block = blank();
+        const auto input = append(block, Opcode::Pack2x32To1x64,
+            {reg(block, Reg::R0), reg(block, Reg::R1)});
+        const auto amount = count ? Value{*count}
+            : append(block, Opcode::LeastSignificantByte, {reg(block, Reg::R2)});
+        const auto shifted = append(block, Opcode::LogicalShiftRight64, {input, amount});
+        set(block, Reg::R3, append(block, Opcode::LeastSignificantWord, {shifted}));
+        set(block, Reg::R4, append(block, Opcode::MostSignificantWord, {shifted}));
+        return block;
+    };
+    const auto make_case = [](uint64_t value, unsigned count) {
+        auto in = initial();
+        in.regs[0] = static_cast<uint32_t>(value);
+        in.regs[1] = static_cast<uint32_t>(value >> 32);
+        in.regs[2] = count;
+        auto out = next(in);
+        const unsigned shift = static_cast<uint8_t>(count);
+        const uint64_t expected = shift < 64 ? value >> shift : 0;
+        out.regs[3] = static_cast<uint32_t>(expected);
+        out.regs[4] = static_cast<uint32_t>(expected >> 32);
+        return Case{in, out};
+    };
+    std::vector<Case> cases;
+    for (unsigned count = 0; count <= 256; ++count)
+        for (const auto value : values)
+            cases.push_back(make_case(value, count));
+    suite.add("lsr64_register", make_block(std::nullopt), cases);
+    for (const uint8_t count : {0, 63, 64, 65, 255}) {
+        cases.clear();
+        for (const auto value : values)
+            cases.push_back(make_case(value, count));
+        suite.add("lsr64_immediate_" + std::to_string(count), make_block(count), cases);
+    }
+}
+
+void memory_bases(Suite &suite) {
+    // Distinct guest and sparse backing values reveal which path actually ran.
+    constexpr uint32_t guest = 0x3000, backing = 0xb000;
+    constexpr uint32_t guest_word = 0xaabbccdd, backing_word = 0x11223344;
+    for (const unsigned width : {1u, 2u, 4u}) {
+        const uint32_t mask = width == 4 ? UINT32_MAX : (1u << (width * 8)) - 1;
+        for (const bool write : {false, true}) {
+            const uint32_t opcode = width == 1 ? (write ? 0xe5c10000 : 0xe5d10000)
+                : width == 2 ? (write ? 0xe1c100b0 : 0xe1d100b0)
+                             : (write ? 0xe5810000 : 0xe5910000);
+            const auto block = translate({opcode}, false);
+            std::vector<Case> cases;
+            for (unsigned missing = 0; missing < 4; ++missing) {
+                auto in = initial();
+                in.regs[0] = 0xe5b6c7d8;
+                in.regs[1] = guest;
+                in.page_table_base = missing == 1 ? 0 : 0x8000;
+                in.page_perms_base = missing == 2 ? 0 : 0x9000;
+                in.code_pages_base = missing == 3 ? 0 : 0xa000;
+                auto out = next(in);
+                const bool fast = missing == 0;
+                if (write) {
+                    if (fast) out.mem_fast_writes = 1;
+                    else out.memory_value[0] = in.regs[0] & mask;
+                } else {
+                    out.regs[0] = (fast ? backing_word : guest_word) & mask;
+                    if (fast) out.mem_fast_reads = 1;
+                    else out.memory_value[0] = out.regs[0];
+                }
+                Case test{in, out};
+                // The low addresses deliberately resemble valid metadata.
+                // Missing bases must disable probing regardless of those bytes.
+                test.pre = {{0, 0x03000000}, {12, 0}, {0x800c, backing},
+                    {0x9000, 0x03000000}, {0xa00c, 0},
+                    {guest, guest_word}, {backing, backing_word}};
+                test.mem = {{guest, guest_word}, {backing, backing_word}};
+                if (write) {
+                    const uint32_t old = fast ? backing_word : guest_word;
+                    test.mem[fast ? backing : guest] = (old & ~mask) | (in.regs[0] & mask);
+                }
+                cases.push_back(test);
+            }
+            suite.add(std::string(write ? "memory_bases_write" : "memory_bases_read")
+                    + std::to_string(width * 8), block, cases);
+        }
+    }
+}
+
+void memory_address_faults(Suite &suite) {
+    for (const bool write : {false, true}) {
+        const auto block = translate({write ? 0xe5810000u : 0xe5910000u}, false);
+        std::vector<Case> cases;
+        // Upper-half addresses arrive at JS imports as negative i32 values.
+        for (const uint32_t address : {0x1ffffu, 0x80000000u, 0xfffffffcu, UINT32_MAX}) {
+            auto in = initial();
+            in.regs[1] = address;
+            auto out = in;
+            out.svc = out.executed = 0;
+            out.exit_reason = 2;
+            out.fault_address = address;
+            out.fault_write = write;
+            if (write) out.memory_value[0] = in.regs[0];
+            cases.push_back({in, out});
+        }
+        suite.add(write ? "write32_address_faults" : "read32_address_faults", block, cases);
+    }
+}
+
+void region_it_faults(Suite &suite) {
+    for (const bool write : {false, true}) {
+        // Start in ITT EQ: MOV r0,r3 completes, then LDR/STR r2,[r1] faults.
+        Code code({0x4618, write ? 0x600au : 0x680au}, true);
+        const auto at = loc(true).SetIT(A32::ITState{0x04});
+        const auto block = A32::Translate(at, &code, {A32::ArchVersion::v7, false, false});
+        CHECK(block.CycleCount() == 2 && block.GetCondition() == Cond::EQ);
+        auto in = initial(true);
+        in.cpsr = 0xf80f0430; // NZCV, Q and GE must survive the mode recovery.
+        in.svc = in.exit_reason = 0;
+        in.executed = 17;
+        in.regs[1] = 0x80000000;
+        auto fault = in;
+        fault.regs[0] = in.regs[3]; // Completed instruction remains committed.
+        fault.cpsr = 0xf80f0830; // IT advanced to the second slot.
+        fault.exit_reason = 2;
+        fault.fault_pc = 0x1002;
+        fault.fault_address = in.regs[1];
+        fault.fault_write = write;
+        fault.dispatches = 1;
+        if (write) fault.memory_value[0] = in.regs[2];
+
+        auto skipped_in = in;
+        skipped_in.cpsr &= ~0x40000000u;
+        auto skipped = skipped_in;
+        skipped.cpsr &= ~0x400u; // Both IT slots are skipped.
+        skipped.regs[15] = skipped.next_pc = 0x1004;
+        skipped.executed += 2;
+        skipped.exit_reason = 4;
+        skipped.dispatches = 2;
+        suite.add(write ? "region_it_write_fault" : "region_it_read_fault", block,
+            {{in, fault}, {skipped_in, skipped}}, 4);
+    }
+}
+
 void rejects() {
     auto reject = [](const IR::Block &b) { CHECK(emit_block(b).empty()); };
     auto block = blank(); append(block, Opcode::Breakpoint, {}); reject(block);
@@ -636,5 +788,9 @@ int main(int argc, char **argv) {
     vector_loop(suite);
     vfp_memory(suite);
     most_significant_word(suite);
+    shifts64(suite);
+    memory_bases(suite);
+    memory_address_faults(suite);
+    region_it_faults(suite);
     std::cout << "Native rejection/determinism checks passed; generated " << suite.modules << " modules and " << suite.runs << " execution cases\n";
 }
