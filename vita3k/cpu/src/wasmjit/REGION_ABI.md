@@ -31,13 +31,16 @@ change it; changing environment variables after first use has no effect.
 | Run | `VITA3K_WASMJIT_PROMOTE_FLAGS` | `VITA3K_WASMJIT_PROMOTE_ACCOUNTING` |
 | --- | --- | --- |
 | A, reference | `0` | `0` |
-| P, flags | `1` | `0` |
+| P, flags (production default) | unset | `0` |
 | K, accounting | `0` | `1` |
 | PK, both | `1` | `1` |
 
-Unset options default to false. `VITA3K_WASMJIT_PROMOTED_STATE=1` supplies a
-true default for both; an explicitly present individual option overrides it.
-Only the exact string `1` enables an option. Native emission uses `getenv`.
+Since R2, `PROMOTE_FLAGS` defaults to true (production); set it to `0` for
+the reference representation. `PROMOTE_ACCOUNTING` defaults to false;
+`VITA3K_WASMJIT_PROMOTED_STATE=1` supplies a true default for accounting
+(flags are already on); an explicitly present individual option overrides the
+umbrella. Only the exact string `1` enables an option; any other present
+value (including `0`) disables it. Native emission uses `getenv`.
 Emscripten reads identically named `Module` properties first, then Node's
 `process.env`; browser operators set the properties on the module configuration
 before creating the CPU. Browser frontend changes are not required by this ABI.

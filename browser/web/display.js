@@ -52,13 +52,14 @@ window.addEventListener('DOMContentLoaded', () => {
   // Debug headroom mode: ?fastvblank=1 free-runs the vblank clock so the
   // FPS readout below measures true guest throughput, not the 60Hz cadence.
   const fastVblank = params.get('fastvblank') === '1';
-  // R1 validation: ?promote=p|k|pk selects promoted region state
-  // (flags/accounting/both; default A reference). Forwarded to the worker,
+  // R2: promoted flags are the production default. ?promote=a selects the
+  // A reference; p/k/pk force flags/accounting/both. Forwarded to the worker,
   // which sets the Module props the JIT env hook reads first.
   const promoteRaw = (params.get('promote') || '').toLowerCase();
-  const promote = promoteRaw === 'p' || promoteRaw === 'flags' ? 'p'
+  const promote = promoteRaw === 'a' || promoteRaw === 'reference' ? 'a'
     : promoteRaw === 'k' || promoteRaw === 'accounting' ? 'k'
-    : promoteRaw === 'pk' || promoteRaw === 'both' ? 'pk' : '';
+    : promoteRaw === 'pk' || promoteRaw === 'both' ? 'pk'
+    : promoteRaw === 'p' || promoteRaw === 'flags' ? 'p' : '';
   const workerUrl = (backend === 'jit' ? './worker.js?backend=jit' : './worker.js')
     + (fastVblank ? (backend === 'jit' ? '&' : '?') + 'fastvblank=1' : '');
   const backendLabel = document.querySelector('#backend-label');

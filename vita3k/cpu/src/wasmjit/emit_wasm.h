@@ -185,9 +185,11 @@ struct RegionStateOptions {
     bool promote_accounting = false;
 };
 // Read once per process/module. Native: getenv; Emscripten: Module properties
-// (same names) override process.env. Only the exact value "1" enables a flag.
-// VITA3K_WASMJIT_PROMOTED_STATE enables both; the two independent switches
-// VITA3K_WASMJIT_PROMOTE_FLAGS / VITA3K_WASMJIT_PROMOTE_ACCOUNTING override it.
+// (same names) override process.env. PROMOTE_FLAGS defaults ON (production);
+// set it to "0" for the reference representation. PROMOTE_ACCOUNTING
+// defaults OFF; the exact value "1" (or VITA3K_WASMJIT_PROMOTED_STATE=1 as
+// umbrella default) enables it. The two independent switches override the
+// umbrella whenever present.
 RegionStateOptions region_state_options();
 std::vector<uint8_t> emit_region(
     const std::vector<const Dynarmic::IR::Block *> &blocks,

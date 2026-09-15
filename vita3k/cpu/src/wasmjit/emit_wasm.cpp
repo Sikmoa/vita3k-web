@@ -16,12 +16,15 @@ EM_JS(uint32_t, vita3k_promoted_state_options, (), {
         return (typeof process !== 'undefined' && process.env) ? process.env[name] : undefined;
     };
     const both = read('VITA3K_WASMJIT_PROMOTED_STATE') === '1';
-    const enabled = (name) => {
+    // Production default (R2): promoted flags are ON unless explicitly set
+    // to "0" (reference A kept behind that diagnostic switch). Accounting
+    // promotion stays opt-in ("1", or the PROMOTED_STATE umbrella).
+    const enabled = (name, def) => {
         const value = read(name);
-        return value === undefined ? both : value === '1';
+        return value === undefined ? def : value === '1';
     };
-    return (enabled('VITA3K_WASMJIT_PROMOTE_FLAGS') ? 1 : 0)
-        | (enabled('VITA3K_WASMJIT_PROMOTE_ACCOUNTING') ? 2 : 0);
+    return (enabled('VITA3K_WASMJIT_PROMOTE_FLAGS', true) ? 1 : 0)
+        | (enabled('VITA3K_WASMJIT_PROMOTE_ACCOUNTING', both) ? 2 : 0);
 });
 // Bench-only opt-in is read from the JS side (Node process.env), the same
 // channel as the existing VITA3K_DUMP_JIT hook in wasm_jit_cpu.cpp: C-level
@@ -322,12 +325,13 @@ RegionStateOptions region_state_options() {
 #else
         const char *both = std::getenv("VITA3K_WASMJIT_PROMOTED_STATE");
         const bool fallback = both && std::strcmp(both, "1") == 0;
-        const auto enabled = [&](const char *name) {
+        const auto enabled = [&](const char *name, bool def) {
             const char *value = std::getenv(name);
-            return value ? std::strcmp(value, "1") == 0 : fallback;
+            return value ? std::strcmp(value, "1") == 0 : def;
         };
-        return RegionStateOptions{enabled("VITA3K_WASMJIT_PROMOTE_FLAGS"),
-            enabled("VITA3K_WASMJIT_PROMOTE_ACCOUNTING")};
+        // Production default (R2): promoted flags ON unless explicitly "0".
+        return RegionStateOptions{enabled("VITA3K_WASMJIT_PROMOTE_FLAGS", true),
+            enabled("VITA3K_WASMJIT_PROMOTE_ACCOUNTING", fallback)};
 #endif
     }();
     return options;
