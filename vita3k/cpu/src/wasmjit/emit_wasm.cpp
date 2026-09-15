@@ -4,7 +4,35 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <functional>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+// Bench-only opt-in is read from the JS side (Node process.env), the same
+// channel as the existing VITA3K_DUMP_JIT hook in wasm_jit_cpu.cpp: C-level
+// getenv does not see Node env under Emscripten. Native builds use getenv.
+EM_JS(uint32_t, vita3k_ablate_env_flags, (), {
+    const v = (typeof process !== 'undefined' && process.env) ? process.env.VITA3K_ABLATE : null;
+    if (!v)
+        return 0;
+    let f = 0;
+    for (const ch of String(v).toUpperCase()) {
+        if (ch === 'B')
+            f |= 1;
+        else if (ch === 'C')
+            f |= 2;
+        else if (ch === 'D')
+            f |= 4;
+        else if (ch === 'F')
+            f |= 7;
+        else if (ch === 'E')
+            f |= 8;
+        else if (ch === 'G')
+            f |= 30;
+    }
+    return f;
+});
+#endif
 #include <limits>
 #include <unordered_map>
 
@@ -31,7 +59,7 @@ enum Wasm : uint8_t {
     CallIndirect = 0x11, Select = 0x1b,
     Get = 0x20, Set = 0x21, Load = 0x28, Load8U = 0x2d, Load16U = 0x2f,
     Store = 0x36, Store8 = 0x3a, Store16 = 0x3b, Const = 0x41,
-    Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtU = 0x49, GtU = 0x4b, LeU = 0x4d,
+    Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtU = 0x49, GtU = 0x4b, LeU = 0x4d, GeU = 0x4e,
     Clz = 0x67, Add = 0x6a, Sub = 0x6b, Mul = 0x6c, And = 0x71, Or = 0x72, Xor = 0x73,
     Shl = 0x74, ShrS = 0x75, ShrU = 0x76, RotR = 0x78,
     Add64 = 0x7c, Mul64 = 0x7e, Or64 = 0x84, Shl64 = 0x86, ShrU64 = 0x88, ShrS64 = 0x87, Wrap = 0xa7, ExtendU = 0xad,
@@ -98,6 +126,52 @@ constexpr uint32_t kNoMember = 0xffffffffu;
 constexpr uint32_t kRegionRegBase = 11;
 constexpr uint32_t kCachedRegCount = 15;
 constexpr uint32_t kRegionSsaBase = kRegionRegBase + kCachedRegCount;
+
+// Task #10 benchmark-only ablation harness (fenced, default-off).
+// Bit-identical default: ablate_flags() == 0 unless VITA3K_ABLATE env or the
+// test-only set_ablate_flags() setter opts in. Letters: B=skip SMC polling,
+// C=skip per-edge budget checks (single slice bound kept), D=skip PSR/FPSCR
+// entry validation, F=B+C+D, E=direct-thread member back-edges,
+// G=E+C+D+loop-top-SMC-hoist (never B: store-point SMC kept). Read once per process for the env part so runs
+// stay deterministic; the setter ORs in (bench uses env only).
+constexpr uint32_t kAblateSmc = 1u;
+constexpr uint32_t kAblateBudget = 2u;
+constexpr uint32_t kAblatePsr = 4u;
+constexpr uint32_t kAblateDirect = 8u;
+constexpr uint32_t kAblateHoistSmc = 16u;
+} // namespace
+// Exported override + flag reader live in wasmjit scope (header-declared).
+// Anonymous-namespace constants above stay visible here (same TU).
+uint32_t g_ablate_override = 0;
+void set_ablate_flags(uint32_t flags) { g_ablate_override = flags; }
+namespace {
+uint32_t ablate_flags() {
+    static uint32_t env_flags = []() -> uint32_t {
+#ifdef __EMSCRIPTEN__
+        return vita3k_ablate_env_flags();
+#else
+        uint32_t f = 0;
+        if (const char *e = std::getenv("VITA3K_ABLATE")) {
+            for (const char *p = e; *p; ++p) {
+                if (*p == 'B' || *p == 'b')
+                    f |= kAblateSmc;
+                else if (*p == 'C' || *p == 'c')
+                    f |= kAblateBudget;
+                else if (*p == 'D' || *p == 'd')
+                    f |= kAblatePsr;
+                else if (*p == 'F' || *p == 'f')
+                    f |= (kAblateSmc | kAblateBudget | kAblatePsr);
+                else if (*p == 'E' || *p == 'e')
+                    f |= kAblateDirect;
+                else if (*p == 'G' || *p == 'g')
+                    f |= (kAblateDirect | kAblateHoistSmc | kAblateBudget | kAblatePsr);
+            }
+        }
+        return f;
+#endif
+    }();
+    return env_flags | g_ablate_override;
+}
 
 uint32_t entry_ticks(const RegionBlockMeta &meta) {
     // Continued blocks are unconditional. Admit the first store-delimited
@@ -766,8 +840,63 @@ private:
     // arithmetic and exit values the skipped search leaf would have used,
     // so budget behavior is 1:1 with the old prologue except that a failing
     // chained iteration is not counted as a dispatch-loop trip.
+    // ABLATE E (direct thread): a member edge whose target body is directly
+    // reachable with one Wasm br (target index < body_index: br to $b(t)
+    // lands at BODY(t), since each body sits just past its block's End)
+    // skips the dispatch loop entirely: no dispatches++, no regs[15] reload,
+    // no PC search, no br_table. The joined edge keeps the budget check and
+    // the stop/smc polls inline (same exit values as the loop top), so exit
+    // granularity and the next_pc/regs15 contract are unchanged; only the
+    // routing changes. Forward/self edges keep the light path (unreachable
+    // by construction: their labels are already closed at this point).
+    uint32_t region_max_ticks() const {
+        uint32_t m = 0;
+        for (size_t i = 0; i < members->size(); ++i)
+            m = std::max(m, (*metadata)[i].ticks);
+        return m;
+    }
     void light_redispatch(uint32_t target_index) {
+        const uint32_t ablate = ablate_flags();
+        // Direct-threaded back-edge (E/G): reachable iff target < body_index.
+        if ((ablate & kAblateDirect) && target_index < body_index) {
+            // Budget at the joined edge. Exact successor cost normally (1:1
+            // with the skipped leaf); MAXT slice bound under C/G so a call
+            // still never reports more ticks than its budget (M16
+            // RegionOverrun invariant holds despite bypassing loop top).
+            const uint32_t ticks = (ablate & kAblateBudget) ? region_max_ticks()
+                                                            : entry_ticks((*metadata)[target_index]);
+            get(2); imm(ticks); op(Add);
+            get(1); op(GtU);
+            begin_if();
+            set_next_pc_runtime();
+            ret(ExitReason::Budget);
+            end_if();
+            // Loop-top polls, inlined: stop always; smc unless B/G-hoist.
+            // regs[15] already holds the pending target PC (location()
+            // precedes every light edge), so next_pc publication is exact.
+            load(offsetof(JitState, stop_flag));
+            begin_if();
+            set_next_pc_runtime();
+            ret(ExitReason::Stop);
+            end_if();
+            if (!(ablate & (kAblateSmc | kAblateHoistSmc))) {
+                load(offsetof(JitState, smc_dirty));
+                begin_if();
+                set_next_pc_runtime();
+                ret(ExitReason::Smc);
+                end_if();
+            }
+            // Direct: br to $b(target); its End is immediately followed by
+            // BODY(target). Depth from BODY(body_index): enclosing labels
+            // are $b(body_index-1)..$b0, so $b(target) sits
+            // (body_index-1-target) labels out, plus open ifs.
+            op(Br); uleb(code, (body_index - 1 - target_index) + extra_labels);
+            return;
+        }
         const uint32_t ticks = entry_ticks((*metadata)[target_index]);
+        // ABLATE C: per-edge budget checks are skipped; a single slice bound
+        // at the dispatch loop top keeps runs terminating (documented).
+        if (!(ablate_flags() & kAblateBudget)) {
         // Guard-style budget check (not if/else): the chained branch below
         // must stay OUTSIDE the if so br_redispatch's label depth is
         // unchanged. The skipped search leaf would have exited Budget with
@@ -779,6 +908,7 @@ private:
         set_next_pc_runtime();
         ret(ExitReason::Budget);
         end_if();
+        }
         // Chained: successor's constant index, then redispatch.
         imm(target_index); set(6);
         br_redispatch();
@@ -807,9 +937,18 @@ private:
         // Normal stores fall through with no PC/CPSR writes, accounting
         // updates or dispatcher transfer. Poll after the whole instruction,
         // including writeback, and before executing any following guest IR.
+        // ABLATE B: smc_dirty poll skipped (stop kept). ABLATE C: budget term
+        // skipped (loop-top slice bound kept instead); the trailing Budget
+        // return is then omitted so a stop/smc exit still works and a
+        // budget-only trip falls through to the slice bound.
+        const uint32_t ablate = ablate_flags();
         load(offsetof(JitState, stop_flag));
-        load(offsetof(JitState, smc_dirty)); op(Or);
-        get(2); imm(next_segment_end); op(Add); get(1); op(GtU); op(Or);
+        if (!(ablate & kAblateSmc)) {
+            load(offsetof(JitState, smc_dirty)); op(Or);
+        }
+        if (!(ablate & kAblateBudget)) {
+            get(2); imm(next_segment_end); op(Add); get(1); op(GtU); op(Or);
+        }
         begin_if();
         const Location next{Dynarmic::IR::LocationDescriptor{point.next_location}};
         location(next);
@@ -818,10 +957,14 @@ private:
         load(offsetof(JitState, stop_flag)); begin_if();
         ret(ExitReason::Stop);
         end_if();
-        load(offsetof(JitState, smc_dirty)); begin_if();
-        ret(ExitReason::Smc);
-        end_if();
-        ret(ExitReason::Budget);
+        if (!(ablate & kAblateSmc)) {
+            load(offsetof(JitState, smc_dirty)); begin_if();
+            ret(ExitReason::Smc);
+            end_if();
+        }
+        if (!(ablate & kAblateBudget)) {
+            ret(ExitReason::Budget);
+        }
         end_if();
         // This is compile-time bookkeeping only. The terminal accounts the
         // full block once; faults account only earlier completed segments.
@@ -1296,9 +1439,33 @@ std::vector<uint8_t> emit_region(
     // if (state.stop_flag) { next_pc = regs[15]; return Stop }
     b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, stop_flag));
     b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Stop, 1); b_op(d, End);
+    // ABLATE B: smc_dirty loop-top poll skipped (stop poll kept). The host
+    // still re-checks smc_dirty on every exit, and the display fixture has
+    // zero SMC events, so smc_exits must stay 0 or the run is invalid.
+    const uint32_t ablate_dispatch = ablate_flags();
+    if (!(ablate_dispatch & (kAblateSmc | kAblateHoistSmc))) {
     // if (state.smc_dirty) { next_pc = regs[15]; return Smc }
     b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, smc_dirty));
     b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Smc, 1); b_op(d, End);
+    }
+    // ABLATE C: per-entry budget checks (search leaf + chained edges) are
+    // skipped; this single slice bound is what keeps runs terminating.
+    // It MUST never let executed_call exceed budget: the M16 dispatcher
+    // fails a region call that reports more ticks than its slice
+    // (RegionOverrun). So the bound uses the region's maximum single-block
+    // cost: if (executed_call + MAXT > budget) { next_pc = regs[15];
+    // return Budget }. Placed before the generic-path selector so an
+    // over-budget iteration exits before selecting or executing any block.
+    // Resume is exact (regs[15] already holds the pending target PC), so
+    // only exit granularity changes, never the instruction count.
+    if (ablate_dispatch & kAblateBudget) {
+        uint32_t max_ticks = 0;
+        for (size_t i = 0; i < n; ++i)
+            max_ticks = std::max(max_ticks, meta[i].ticks);
+        b_get(d, 2); b_imm(d, max_ticks); b_op(d, Add);
+        b_get(d, 1); b_op(d, GtU);
+        b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Budget, 1); b_op(d, End);
+    }
     // Generic-path selector: fresh entries and non-member edges carry the
     // sentinel in the dispatch-index local; chained edges overwrite it with
     // a constant block index and skip the reload + search entirely.
@@ -1315,6 +1482,9 @@ std::vector<uint8_t> emit_region(
         if (hi - lo == 1) {
             b_get(d, 3); b_imm(d, meta[lo].entry_pc); b_op(d, Eq);
             b_op(d, If); b_op(d, 0x40);
+            // ABLATE D: entry PSR/FPSCR validation skipped; the PC search
+            // itself is kept (br_table routing unchanged).
+            if (!(ablate_dispatch & kAblatePsr)) {
             {
                 // Entry PSR mismatch -> Miss (host re-dispatches at regs[15]).
                 b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, cpsr));
@@ -1328,10 +1498,16 @@ std::vector<uint8_t> emit_region(
                 b_imm(d, Location::FPSCR_MODE_MASK); b_op(d, And);
                 b_imm(d, fpscr); b_op(d, Ne);
                 b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Miss, open_ifs + 2); b_op(d, End);
+            }
+            }
+            {
                 // Budget: executed_call + ticks > budget -> Budget.
+                // ABLATE C: skipped (loop-top slice bound kept instead).
+                if (!(ablate_dispatch & kAblateBudget)) {
                 b_get(d, 2); b_imm(d, entry_ticks(meta[lo])); b_op(d, Add);
                 b_get(d, 1); b_op(d, GtU);
                 b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Budget, open_ifs + 2); b_op(d, End);
+                }
                 b_imm(d, static_cast<uint32_t>(lo)); b_set(d, 6);
             }
             b_op(d, End);

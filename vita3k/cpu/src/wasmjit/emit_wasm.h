@@ -228,4 +228,10 @@ enum class DispatchReason : uint32_t {
 };
 std::vector<uint8_t> emit_dispatch();
 
+// Task #10 benchmark-only ablation harness (fenced, default-off). Bitmask:
+// B/C/D = 1/2/4 (see emit_wasm.cpp). Task #11 adds E = 8 (direct-thread
+// member back-edges) and G = 30 (E+C+D+loop-top-SMC-hoist, never B).
+// bit-identical unless VITA3K_ABLATE env or this test-only setter opts in.
+void set_ablate_flags(uint32_t flags);
+
 } // namespace vita3k::wasmjit
