@@ -243,6 +243,12 @@ private:
         store(offsetof(JitState, dispatches));
     }
     void analyze_register_cache() {
+        // The cache is a region-mode optimization: its locals (11..25) are
+        // reserved by the region constructor above the SSA range. In
+        // single-block mode SSA words start at 3 and would collide, so the
+        // cache stays disabled there (get/set touch state.regs directly).
+        if (!region)
+            return;
         for (const Inst &inst : block) {
             if (inst.GetOpcode() != Op::A32GetRegister
                 && inst.GetOpcode() != Op::A32SetRegister)
@@ -921,7 +927,7 @@ private:
             const auto index = static_cast<uint32_t>(reg.GetA32RegRef());
             if (index >= 16) return false;
             const uint32_t offset = offsetof(JitState, regs) + index * sizeof(uint32_t);
-            if (index < cached_regs.size()) {
+            if (region && index < cached_regs.size()) {
                 if (kind == Op::A32GetRegister) {
                     get(reg_base + index);
                     break;
