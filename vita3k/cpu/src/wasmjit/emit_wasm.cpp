@@ -883,6 +883,23 @@ private:
         upper_location(loc);
         state.write_pc(code, [&] { imm(loc.PC()); });
     }
+    // Member-edge publish: when the target's CPSR mode bits equal the
+    // block's end-of-body bits, the mode RMW is idempotent and skipped.
+    // The PC write always stays: edge Budget/Stop/Smc exits publish
+    // next_pc from regs[15], and the next block consumes the pending PC.
+    // Sound by the light-edge invariant (member_index requires full
+    // descriptor equality; other_psr provably holds the current end bits
+    // via run-entry reload, in-body maintenance and chained exact-match
+    // induction), and member targets are validated at their own emission.
+    // Non-member (Miss) paths keep the full location() write.
+    void location_member(const Location &loc) {
+        constexpr uint32_t mask = Location::CPSR_MODE_MASK;
+        if ((loc.CPSR().Value() & mask) == (finish.CPSR().Value() & mask)) {
+            state.write_pc(code, [&] { imm(loc.PC()); });
+            return;
+        }
+        location(loc);
+    }
 
     void flag(unsigned bit) {
         state.read_flag(code, bit);
@@ -1346,9 +1363,16 @@ private:
         const uint32_t ticks = static_cast<uint32_t>(block.CycleCount());
         if (const auto *link = boost::get<Term::LinkBlock>(&term)) {
             const Location target(link->next);
-            location(target);
+            // Publish PC up front (edge exits read regs[15]); fold the
+            // mode RMW when the member target provably matches end bits.
+            const uint32_t idx = member_index(target);
+            if (idx != kNoMember) {
+                location_member(target);
+            } else {
+                location(target);
+            }
             add_ticks(ticks);
-            if (const uint32_t idx = member_index(target); idx != kNoMember) {
+            if (idx != kNoMember) {
                 light_redispatch(idx); // chained: constant index, no PC search
             } else {
                 state.set_next_pc(code, [&] { imm(target.PC()); });
@@ -1356,9 +1380,14 @@ private:
             }
         } else if (const auto *fast = boost::get<Term::LinkBlockFast>(&term)) {
             const Location target(fast->next);
-            location(target);
+            const uint32_t idx = member_index(target);
+            if (idx != kNoMember) {
+                location_member(target);
+            } else {
+                location(target);
+            }
             add_ticks(ticks);
-            if (const uint32_t idx = member_index(target); idx != kNoMember) {
+            if (idx != kNoMember) {
                 light_redispatch(idx);
             } else {
                 state.set_next_pc(code, [&] { imm(target.PC()); });
