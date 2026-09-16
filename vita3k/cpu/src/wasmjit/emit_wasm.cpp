@@ -60,6 +60,7 @@ EM_JS(uint32_t, vita3k_ablate_env_flags, (), {
 #endif
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <dynarmic/frontend/A32/a32_location_descriptor.h>
 #include <dynarmic/frontend/A32/a32_types.h>
@@ -899,7 +900,35 @@ private:
         value(v); op(Eqz); imm(30); op(Shl); op(Or);
     }
 
+    // Flag-word consumer pre-scan: arithmetic/shift producers write carry
+    // (+4) and overflow (+5) SSA words unconditionally, but only the
+    // GetCarry/GetOverflow/GetNZCV pseudo-ops read them (GetGE is included
+    // though its non-PackedAddU8 producer is rejected). The scan runs once
+    // per block and marks a superset of real readers; skipping a marked
+    // word never happens, and every reader marks its producer, so eliding
+    // unmarked words is exact. Measured 75-79% of dynamic carry/overflow
+    // writes dead (lower bound) on the display workload.
+    bool consumers_scanned = false;
+    std::unordered_set<const Inst *> carry_needed, overflow_needed;
+    void scan_flag_consumers() {
+        if (consumers_scanned) return;
+        consumers_scanned = true;
+        for (const Inst &inst : block) {
+            const auto opcode = inst.GetOpcode();
+            const bool carry = opcode == Op::GetCarryFromOp || opcode == Op::GetNZCVFromOp
+                || opcode == Op::GetGEFromOp;
+            const bool overflow = opcode == Op::GetOverflowFromOp || opcode == Op::GetNZCVFromOp;
+            if (!carry && !overflow) continue;
+            const auto arg = inst.GetArg(0);
+            if (arg.IsImmediate()) continue;
+            const auto *producer = arg.GetInstRecursive();
+            if (carry) carry_needed.insert(producer);
+            if (overflow) overflow_needed.insert(producer);
+        }
+    }
+
     void add_sub(const Inst &inst) {
+        scan_flag_consumers(); // idempotent; instruction() also scans first
         const bool sub = inst.GetOpcode() == Op::Sub32;
         // ARM subtraction is a + NOT(b) + carry_in. Widen *after* NOT to
         // compute no-borrow carry exactly, including 0xffffffff + 1 cases.
@@ -913,9 +942,20 @@ private:
         // Emit the widened sum once into the i64 scratch local (dead across
         // IR-op boundaries; Pack/LSR64 use it write-before-read the same way)
         // instead of materializing it twice: saves ~7 Wasm ops per Add/Sub.
-        sum(); set(scratch_local);
-        get(scratch_local); op(Wrap); set(next_local);
-        get(scratch_local); op(0x42); op(32); op(ShrU64); op(Wrap); set(next_local + 4);
+        // Dead flag words are elided (see scan_flag_consumers): a plain ADD
+        // with no flag consumer keeps only the widened-sum result, saving
+        // ~19 Wasm ops (carry extraction, overflow idiom, scratch traffic).
+        const bool need_carry = carry_needed.count(&inst) != 0;
+        const bool need_overflow = overflow_needed.count(&inst) != 0;
+        sum();
+        if (need_carry) {
+            set(scratch_local);
+            get(scratch_local); op(Wrap); set(next_local);
+            get(scratch_local); op(0x42); op(32); op(ShrU64); op(Wrap); set(next_local + 4);
+        } else {
+            op(Wrap); set(next_local);
+        }
+        if (!need_overflow) return;
         // V = (~(a ^ b) & (a ^ result)) >> 31 for add; for subtract
         // use (a ^ b) instead. This also accounts for carry/borrow input.
         value(inst.GetArg(0)); value(inst.GetArg(1)); op(Xor);
@@ -929,39 +969,48 @@ private:
         const auto n = inst.GetArg(1);
         const auto carry = inst.GetArg(inst.GetOpcode() == Op::RotateRightExtended ? 1 : 2);
         const Op kind = inst.GetOpcode();
+        // Dead shift carry (+4) is elided per arm below (see
+        // scan_flag_consumers); the result computation is unchanged.
+        scan_flag_consumers(); // idempotent; instruction() also scans first
+        const bool need_carry = carry_needed.count(&inst) != 0;
         if (kind == Op::RotateRightExtended) {
             value(a); imm(1); op(ShrU); value(carry); imm(31); op(Shl); op(Or); set(next_local);
-            value(a); mask(1); set(next_local + 4);
+            if (need_carry) { value(a); mask(1); set(next_local + 4); }
             return;
         }
         // Every shift count is U8, not Wasm's count modulo 32. Handle zero,
         // exactly 32 and >32 explicitly; only ROR may use modulo semantics.
         value(n); op(Eqz); begin_if();
-        value(a); set(next_local); value(carry); set(next_local + 4);
+        value(a); set(next_local);
+        if (need_carry) { value(carry); set(next_local + 4); }
         op(Else);
         if (kind == Op::RotateRight32) {
             value(a); value(n); op(RotR); set(next_local);
-            get(next_local); imm(31); op(ShrU); set(next_local + 4);
+            if (need_carry) { get(next_local); imm(31); op(ShrU); set(next_local + 4); }
         } else {
             value(n); imm(32); op(LtU); begin_if();
             value(a); value(n);
             op(kind == Op::LogicalShiftLeft32 ? Shl : kind == Op::LogicalShiftRight32 ? ShrU : ShrS);
             set(next_local);
-            value(a);
-            if (kind == Op::LogicalShiftLeft32) { imm(32); value(n); op(Sub); }
-            else { value(n); imm(1); op(Sub); }
-            op(ShrU); mask(1); set(next_local + 4);
+            if (need_carry) {
+                value(a);
+                if (kind == Op::LogicalShiftLeft32) { imm(32); value(n); op(Sub); }
+                else { value(n); imm(1); op(Sub); }
+                op(ShrU); mask(1); set(next_local + 4);
+            }
             op(Else);
             if (kind == Op::ArithmeticShiftRight32) {
                 value(a); imm(31); op(ShrS); set(next_local);
-                value(a); imm(31); op(ShrU); set(next_local + 4);
+                if (need_carry) { value(a); imm(31); op(ShrU); set(next_local + 4); }
             } else {
                 imm(0); set(next_local);
-                value(n); imm(32); op(Eq); begin_if(true);
-                value(a);
-                if (kind == Op::LogicalShiftRight32) { imm(31); op(ShrU); }
-                else { mask(1); }
-                op(Else); imm(0); end_if(); set(next_local + 4);
+                if (need_carry) {
+                    value(n); imm(32); op(Eq); begin_if(true);
+                    value(a);
+                    if (kind == Op::LogicalShiftRight32) { imm(31); op(ShrU); }
+                    else { mask(1); }
+                    op(Else); imm(0); end_if(); set(next_local + 4);
+                }
             }
             end_if();
         }
@@ -1347,6 +1396,9 @@ public:
 private:
     bool instruction(const Inst &inst) {
         const Op kind = inst.GetOpcode();
+        // One consumer pre-scan per block (short-circuits after the first
+        // instruction); producers below consult it for dead flag words.
+        scan_flag_consumers();
         if (arithmetic(kind)) { add_sub(inst); return ok; }
         if (shift(kind)) { shifted(inst); return ok; }
         const auto arg = [&](size_t n) { value(inst.GetArg(n)); };
@@ -1420,7 +1472,9 @@ private:
         case Op::MostSignificantWord:
             // SHR by 32 returns word 1; its carry is original bit 31.
             value_word(inst.GetArg(0), 1); set(next_local);
-            value_word(inst.GetArg(0), 0); imm(31); op(ShrU); set(next_local + 4);
+            if (carry_needed.count(&inst) != 0) {
+                value_word(inst.GetArg(0), 0); imm(31); op(ShrU); set(next_local + 4);
+            }
             return ok;
         case Op::LogicalShiftRight64:
             // U64 result: publish both words via the i64 scratch local,
