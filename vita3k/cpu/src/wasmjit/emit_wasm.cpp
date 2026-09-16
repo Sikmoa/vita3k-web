@@ -1066,11 +1066,87 @@ private:
         imm(31); op(ShrU); set(next_local + 5);
     }
 
+    // Constant-count shift body. Returns false for ROR #0 (RRX encoding;
+    // the generic path implements n==0 as passthrough) so the caller falls
+    // back. Every other (kind, k) lowers straight-line; carry exact per
+    // the generic arms (verified class by class).
+    bool shift_imm(const Inst &inst, Op kind, const Value &a, const Value &carry_in, uint32_t k) {
+        scan_flag_consumers(); // idempotent; instruction() also scans first
+        const bool need_carry = carry_needed.count(&inst) != 0;
+        const auto carry_bit = [&](uint32_t bit) {
+            value(a); imm(bit); op(ShrU); mask(1); set(next_local + 4);
+        };
+        if (kind == Op::RotateRight32) {
+            const uint32_t s = k & 31;
+            if (k == 0) return false;
+            if (s == 0) {
+                value(a); set(next_local);
+                if (need_carry) carry_bit(31);
+            } else {
+                value(a); imm(s); op(RotR); set(next_local);
+                if (need_carry) carry_bit(s - 1);
+            }
+            return true;
+        }
+        if (k == 0) {
+            value(a); set(next_local);
+            if (need_carry) { value(carry_in); set(next_local + 4); }
+            return true;
+        }
+        if (kind == Op::LogicalShiftLeft32) {
+            if (k < 32) {
+                value(a); imm(k); op(Shl); set(next_local);
+                if (need_carry) carry_bit(32 - k);
+            } else {
+                imm(0); set(next_local);
+                if (need_carry) {
+                    if (k == 32) { value(a); mask(1); set(next_local + 4); }
+                    else { imm(0); set(next_local + 4); }
+                }
+            }
+            return true;
+        }
+        if (kind == Op::LogicalShiftRight32) {
+            if (k < 32) {
+                value(a); imm(k); op(ShrU); set(next_local);
+                if (need_carry) carry_bit(k - 1);
+            } else {
+                imm(0); set(next_local);
+                if (need_carry) {
+                    if (k == 32) { value(a); imm(31); op(ShrU); set(next_local + 4); }
+                    else { imm(0); set(next_local + 4); }
+                }
+            }
+            return true;
+        }
+        if (kind == Op::ArithmeticShiftRight32) {
+            if (k < 32) {
+                value(a); imm(k); op(ShrS); set(next_local);
+                if (need_carry) carry_bit(k - 1);
+            } else {
+                value(a); imm(31); op(ShrS); set(next_local);
+                if (need_carry) { value(a); imm(31); op(ShrU); set(next_local + 4); }
+            }
+            return true;
+        }
+        return false;
+    }
     void shifted(const Inst &inst) {
         const auto a = inst.GetArg(0);
         const auto n = inst.GetArg(1);
         const auto carry = inst.GetArg(inst.GetOpcode() == Op::RotateRightExtended ? 1 : 2);
         const Op kind = inst.GetOpcode();
+        // Constant-count specialization (R3h): the generic path spends two
+        // runtime branches (zero check, <32 check) plus branchy >32 arms on
+        // a static outcome. Straight-line per class below; result and carry
+        // verified arm-for-arm against the generic sequences. RRX keeps its
+        // branchless generic path; ROR #0 (RRX encoding) never reaches here
+        // as ROR from the frontend and falls back defensively.
+        if (kind != Op::RotateRightExtended && n.IsImmediate() && n.GetType() == Type::U8) {
+            const uint64_t raw = n.GetImmediateAsU64();
+            if (raw <= 255 && shift_imm(inst, kind, a, carry, static_cast<uint32_t>(raw)))
+                return;
+        }
         // Dead shift carry (+4) is elided per arm below (see
         // scan_flag_consumers); the result computation is unchanged.
         scan_flag_consumers(); // idempotent; instruction() also scans first

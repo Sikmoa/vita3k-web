@@ -281,6 +281,59 @@ void shifts(Suite &suite) {
     }
 }
 
+void shifts_imm(Suite &suite) {
+    // Constant-count specialization (R3h): immediate U8 amounts for the four
+    // counted shift ops, across every lowering class (0, 1..31, 32, 33+),
+    // each with carry consumed and carry dead (R3d interaction). Expected
+    // values mirror shifts() above.
+    const std::array<Opcode, 4> ops{Opcode::LogicalShiftLeft32, Opcode::LogicalShiftRight32,
+        Opcode::ArithmeticShiftRight32, Opcode::RotateRight32};
+    for (size_t k = 0; k < ops.size(); ++k) {
+        for (const bool carry_live : {false, true}) {
+            // One block per amount (immediates are per-instruction).
+            for (uint32_t amount : {0u, 1u, 2u, 5u, 8u, 16u, 31u, 32u, 33u, 64u, 255u}) {
+                auto block = blank();
+                const auto a = reg(block, Reg::R0);
+                const auto c = append(block, Opcode::A32GetCFlag, {});
+                const auto r = append(block, ops[k], {a, Value{uint8_t(amount)}, c});
+                set(block, Reg::R0, r);
+                if (carry_live)
+                    append(block, Opcode::A32SetCpsrNZC, {append(block, Opcode::GetNZFromOp, {r}), append(block, Opcode::GetCarryFromOp, {r})});
+                else
+                    append(block, Opcode::A32SetCpsrNZ, {append(block, Opcode::GetNZFromOp, {r})});
+                std::vector<Case> cases;
+                for (uint32_t av : {0u, 1u, 0x80000000u, 0xffffffffu, 0x12345678u}) {
+                    for (uint32_t cv : {0u, 1u}) {
+                        auto in = initial();
+                        in.regs[0] = av; in.cpsr |= (cv << 29) | 0x10000000;
+                        auto out = next(in);
+                        uint32_t result = av, carry = cv;
+                        if (amount != 0) {
+                            if (k == 0) { result = amount < 32 ? av << amount : 0; carry = amount <= 32 ? (av >> (32 - amount)) & 1 : 0; }
+                            if (k == 1) { result = amount < 32 ? av >> amount : 0; carry = amount <= 32 ? (av >> (amount - 1)) & 1 : 0; }
+                            if (k == 2) {
+                                const uint32_t s = std::min(amount, 31u);
+                                result = av >> s;
+                                if (av & 0x80000000) result |= ~(0xffffffffu >> s);
+                                carry = (av >> std::min(amount - 1, 31u)) & 1;
+                            }
+                            if (k == 3) {
+                                const auto s = amount % 32;
+                                result = s ? (av >> s) | (av << (32 - s)) : av;
+                                carry = result >> 31;
+                            }
+                        }
+                        out.regs[0] = result;
+                        out.cpsr = (in.cpsr & 0x1fffffff) | nz(result) | ((carry_live ? carry : cv) << 29);
+                        cases.push_back({in, out});
+                    }
+                }
+                suite.add("shiftimm" + std::to_string(k) + (carry_live ? "c" : "n") + "_" + std::to_string(amount), block, cases);
+            }
+        }
+    }
+}
+
 bool passes(unsigned cond, uint32_t flags) {
     const bool n = flags & 8, z = flags & 4, c = flags & 2, v = flags & 1;
     const bool table[]{z, !z, c, !c, n, !n, v, !v, c && !z, !c || z, n == v, n != v, !z && n == v, z || n != v, true};
@@ -935,6 +988,7 @@ int main(int argc, char **argv) {
     Suite suite{argv[1]};
     arithmetic(suite);
     shifts(suite);
+    shifts_imm(suite);
     conditions(suite);
     scalars(suite);
     frontend(suite);
