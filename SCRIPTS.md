@@ -13,7 +13,11 @@ node build/web/browser/vita3k_jit_backend_test_node.js
 Compiles `vita3k/cpu/tests/wasmjit_backend_test.cpp` (which includes the backend
 `wasm_jit_cpu.cpp` so it can call the checked helpers directly) to a Node
 executable and runs it in Node's Wasm engine. Expected last line:
-`WasmJit backend: 834 checks passed (real memory, no interpreter)`.
+`WasmJit backend: 9157 checks passed (real memory, no interpreter)`
+(8-mode direct-emitter matrix: P/K/PK flags x fast-bases guard shape;
+also run with `VITA3K_WASMJIT_PROMOTE_FLAGS=0` to cover the reference
+process default, and with `VITA3K_WASMJIT_SLOW_REASONS=1` to cover the
+diagnostic slow-reason shape).
 
 ## Emitter fixture suite (real Dynarmic IR → Wasm modules, run in Node)
 
@@ -35,7 +39,9 @@ node vita3k/cpu/tests/wasmjit_emitter_test.mjs /tmp/wasmjit-emitter-fixtures
 Step 1 builds the native fixture generator (no CMake target exists for it —
 recipe from `vita3k/cpu/tests/wasmjit_emitter_README.md`). Step 2 translates
 real ARM/Thumb and emits `.wasm` fixtures + expected-state JSON. Step 3 executes
-every module in Node. Expected: 78 modules, ~21k cases, "Wasm execution passed".
+every module in Node. Expected: 378 reference + 1146 candidate modules,
+~59k cases, "Wasm execution passed" (P/K/PK x fast-bases variants plus
+the shifts_imm immediate-count suite; counts grow with coverage).
 
 ## Exit-42 homebrew fixture (end-to-end JIT, cold start)
 
@@ -67,6 +73,21 @@ and run. The `[display-bench] JSON {...}` line contains `fps`,
 `instructionsPerSec` and the JIT profile (`fast_reads`, `fast_writes`,
 `slow_*` fallback-reason counters). Interpreter variant:
 `--target vita3k_display_bench_interp`.
+
+For CPU-throughput measurement (not vblank-capped FPS), drive the module
+directly with the fast-vblank headroom mode:
+```sh
+VITA3K_FAST_VBLANK=1 node browser/tests/display_bench_node.mjs \
+  build/web/browser/vita3k_display_bench_jit_node.js \
+  build/web/browser/tests/vita_display_fixture/eboot-short.bin jit
+```
+Guest work is identical (60 frames, 156399069 instructions, exit 77);
+steady `instructionsPerSec` (~330 MIPS Node) and the `run_js_ms` profile
+field (pure Wasm dispatch time) are the CPU signals. The box is noisy
+(±15% run-to-run): stage each variant under its own directory (the
+Emscripten glue hardcodes the `.wasm` filename), run A/B interleaved
+with alternating order and `nice -n -15`, compare medians over ≥8
+samples each, and require consistent pair agreement for large claims.
 
 ## CPU profiling the JIT bench (V8 sampling profiler, no code changes)
 
