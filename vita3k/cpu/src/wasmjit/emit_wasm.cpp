@@ -158,6 +158,10 @@ bool shift(Op op) {
 // overwrite local 6 with the successor's constant block index before
 // branching, so they skip the reload and the search entirely.
 constexpr uint32_t kLightDispatchSentinel = 0xffffffffu;
+// Function index space counts IMPORTED functions first: mem_read=0,
+// mem_write=1, run=2, and the R3j outlined fault function=3 (never
+// exported; called only from run()'s fault arms).
+constexpr uint32_t kFaultFuncIndex = 3;
 // member_index() result for a location that is not a region member.
 constexpr uint32_t kNoMember = 0xffffffffu;
 constexpr uint32_t kRegionRegBase = 11;
@@ -174,6 +178,11 @@ public:
     uint32_t ssa_base() const {
         return options.promote_flags || options.promote_accounting ? kNextPc + 1 : kRegionSsaBase;
     }
+    // Fault-trampoline shape (R3j): promoted flag locals live in run()'s
+    // frame, so the out-of-line fault function round-trips other_psr
+    // through a param/return; reference emission RMWs memory instead.
+    bool uses_flag_locals() const { return options.promote_flags; }
+    uint32_t other_psr_local() const { return kOtherPsr; }
     // True when the emitter may drop the per-access fast-path-enabled
     // guard (T3): the host proved all bases nonzero for this module's
     // lifetime. Single-block emission always keeps the guard.
@@ -604,10 +613,26 @@ private:
             // block has not reached its terminal) and WITHOUT rollback
             // (REGION_ABI fault contract).
             const Location fault_location{Dynarmic::IR::LocationDescriptor{pending_fault_location}};
+            // Outlined fault path (R3j): per-site fault arms share one
+            // per-module cold function (state, fault pc, mode bits, and
+            // other_psr in promoted mode), keeping hot functions small
+            // enough to tier up. Ticks (site-const) accumulate in the
+            // caller's executed_call; reason and epilogue branch stay
+            // inline (depth-sensitive). Mode validation runs here at
+            // emission, as it did inside upper_location.
             // IT may have advanced since block entry. Preserve the current
             // arithmetic flags while restoring the faulting instruction's mode.
-            upper_location(fault_location);
-            store_constant(offsetof(JitState, fault_pc), fault_location.PC());
+            if (!valid_location(fault_location))
+                ok = false;
+            get(0);
+            imm(fault_location.PC());
+            imm(fault_location.CPSR().Value() & Location::CPSR_MODE_MASK);
+            if (state.uses_flag_locals())
+                get(state.other_psr_local());
+            op(Call);
+            uleb(code, kFaultFuncIndex);
+            if (state.uses_flag_locals())
+                set(state.other_psr_local());
             // Earlier store-delimited segments have completed, exactly as
             // they did when every store ended a separate block. The current
             // segment (and any partial multi-access instruction) is uncounted.
@@ -2061,21 +2086,49 @@ std::vector<uint8_t> emit_region(
     uleb(body, 1); body.push_back(0x7e); // local 5: i64 scratch
     uleb(body, state.ssa_base() - 6 + max_ssa); body.push_back(0x7f); // fixed region locals, optional state locals, then SSA
     body.insert(body.end(), code.begin(), code.end());
-    Bytes functions{1};
+    // Outlined region fault path (R3j): one cold function per module shared
+    // by every fault arm. Promoted mode round-trips other_psr through a
+    // param/return ((state, pc, bits, other) -> other'); reference emission
+    // RMWs memory ((state, pc, bits) -> ()). Ticks stay caller-side (the
+    // executed_call local is run()'s frame); reason and epilogue branch
+    // stay at the call site (depth-sensitive).
+    Bytes fault;
+    uleb(fault, 0); // no additional locals beyond the params
+    if (state.uses_flag_locals()) {
+        b_get(fault, 3); b_imm(fault, ~Location::CPSR_MODE_MASK); b_op(fault, And);
+        b_get(fault, 2); b_op(fault, Or); b_set(fault, 3);
+        b_get(fault, 0); b_get(fault, 1); b_store(fault, offsetof(JitState, fault_pc));
+        b_get(fault, 3);
+    } else {
+        b_get(fault, 0); b_load(fault, offsetof(JitState, cpsr));
+        b_imm(fault, ~Location::CPSR_MODE_MASK); b_op(fault, And);
+        b_get(fault, 2); b_op(fault, Or); b_store(fault, offsetof(JitState, cpsr));
+        b_get(fault, 0); b_get(fault, 1); b_store(fault, offsetof(JitState, fault_pc));
+    }
+    b_op(fault, End);
+    Bytes functions{2};
     uleb(functions, static_cast<uint32_t>(body.size()));
     functions.insert(functions.end(), body.begin(), body.end());
+    uleb(functions, static_cast<uint32_t>(fault.size()));
+    functions.insert(functions.end(), fault.begin(), fault.end());
 
     Bytes module{0, 'a', 's', 'm', 1, 0, 0, 0};
-    section(module, 1, {2,
+    Bytes types{3,
         0x60, 2, 0x7f, 0x7f, 1, 0x7f, // type 0: (i32,i32)->i32 for run
-        0x60, 3, 0x7f, 0x7f, 0x7f, 1, 0x7f}); // type 1: checked helpers
+        0x60, 3, 0x7f, 0x7f, 0x7f, 1, 0x7f}; // type 1: checked helpers
+    if (state.uses_flag_locals()) {
+        types.insert(types.end(), {0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f}); // type 2: fault (P)
+    } else {
+        types.insert(types.end(), {0x60, 3, 0x7f, 0x7f, 0x7f, 0}); // type 2: fault (A)
+    }
+    section(module, 1, types);
     section(module, 2, {3,
         3, 'e', 'n', 'v', 6, 'm', 'e', 'm', 'o', 'r', 'y', 2, 0, 1,
         3, 'e', 'n', 'v', 8, 'm', 'e', 'm', '_', 'r', 'e', 'a', 'd', 0, 1,
         3, 'e', 'n', 'v', 9, 'm', 'e', 'm', '_', 'w', 'r', 'i', 't', 'e', 0, 1});
-    section(module, 3, {1, 0}); // one function, type 0
+    section(module, 3, {2, 0, 2}); // run (type 0), fault (type 2)
     // Function index space counts IMPORTED functions first: mem_read=0,
-    // mem_write=1, our run=2. (Same layout as the single-block module.)
+    // mem_write=1, our run=2, fault=3. (Same layout as the single-block module.)
     section(module, 7, {1, 3, 'r', 'u', 'n', 0, 2});
     section(module, 10, functions);
     if (module.size() > kMaxModule)

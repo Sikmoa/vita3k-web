@@ -527,6 +527,14 @@ count uses the maximum per-block SSA requirement.
   (it holds ticks of all PREVIOUS blocks; the faulting block's earlier
   instructions are not counted — undercount ≤ block ticks, fault_pc exact);
   return Fault.
+- R3j: the per-site fault arm (mode recovery + fault_pc store, ~20 cold ops
+  at every memory site) is outlined into one per-module cold function
+  (func index 3, never exported; run keeps index 2). Sites pass compile-time
+  fault pc/bits (+ other_psr round-trip in promoted mode); site-const
+  completed ticks still accumulate caller-side; reason and epilogue branch
+  stay inline. Mode validation runs at emission. Single-block emission keeps
+  the inline arm. Keeps hot functions small enough to tier up; zero dynamic
+  change (fault arms never execute in production).
 - NO rollback of any kind (region ABI).
 
 **executed accounting summary**: adds happen ONLY at terminals/cond-fail
