@@ -29,6 +29,17 @@ EM_JS(uint32_t, vita3k_promoted_state_options, (), {
 // Bench-only opt-in is read from the JS side (Node process.env), the same
 // channel as the existing VITA3K_DUMP_JIT hook in wasm_jit_cpu.cpp: C-level
 // getenv does not see Node env under Emscripten. Native builds use getenv.
+// Diagnostic only (default off): re-derive the exact slow-path fallback reason
+// in the probe's cold arm. The production shape reports kSlowOther for every
+// fallback; enabling this doubles module size and halves speed (cold bloat
+// blocks Wasm tier-up), so it is strictly a fallback-storm debugging aid.
+// Same channel as the ablate hooks: Module prop first, then Node process.env.
+EM_JS(uint32_t, vita3k_slow_reason_detail, (), {
+    if (typeof Module !== 'undefined' && Module['VITA3K_WASMJIT_SLOW_REASONS'] !== undefined)
+        return String(Module['VITA3K_WASMJIT_SLOW_REASONS']) === '1' ? 1 : 0;
+    const v = (typeof process !== 'undefined' && process.env) ? process.env.VITA3K_WASMJIT_SLOW_REASONS : null;
+    return v === '1' ? 1 : 0;
+});
 EM_JS(uint32_t, vita3k_ablate_entry_pc, (), {
     const v = (typeof process !== 'undefined' && process.env) ? process.env.VITA3K_ABLATE_PC : null;
     if (!v)
@@ -381,6 +392,20 @@ uint32_t ablate_entry_env() {
     }();
     return entry;
 }
+namespace {
+bool slow_reason_detail() {
+    static bool detail = []() -> bool {
+#ifdef __EMSCRIPTEN__
+        return vita3k_slow_reason_detail() != 0;
+#else
+        if (const char *e = std::getenv("VITA3K_WASMJIT_SLOW_REASONS"))
+            return std::strcmp(e, "1") == 0;
+        return false;
+#endif
+    }();
+    return detail;
+}
+} // namespace
 
 
 uint32_t entry_ticks(const RegionBlockMeta &meta) {
@@ -664,17 +689,23 @@ private:
         set(addr_local);
         get(addr_local); imm(12); op(ShrU); set(page_local);
 
-        // Guest page 0: the checked path rejects addr < host_page_size even
-        // when sparse backing was force-allocated there.
-        get(page_local); op(Eqz);
-        begin_if();
-        memory_slow_call(inst, write, bytes, kSlowOther);
-        op(Else);
-        // Fast path enabled? A zero base means the host did not populate the
-        // probes; skipping this guard would dereference guest-controlled
-        // linear memory as a host offset. Region emission drops it when the
-        // host proved all bases nonzero for the module's lifetime
-        // (RegionStateOptions::assume_fast_bases); single-block keeps it.
+        // Branchless single-gate probe (R3f). Every probe load below is
+        // provably in-bounds: the page index is 20 bits into fixed
+        // 1M-entry/4M-byte arrays whose bases are either proven nonzero
+        // for the module's lifetime (assume_fast_bases, region) or
+        // re-checked by the kept enabled guard just below. Evaluating all
+        // predicates speculatively has no observable effect (pure loads),
+        // so the five nested taken-never branches collapse into one hot
+        // gate. The cold arm re-derives the first-failing reason in probe
+        // order (exact profiling) and takes the identical slow path.
+        //
+        // Predicate order matches the checked helper's preflight: page
+        // nonzero (addr < host_page_size rejects even when sparse backing
+        // was force-allocated at page 0), permissions (the only failure
+        // detected before mapping), mapped (null PTE = unallocated),
+        // in-page (offset + size <= 4096; the only cross-page path) and,
+        // for stores, code-page refcount == 0 (cached code stores must own
+        // smc_dirty via the helper).
         const bool emit_fast_guard = !(region && state.skip_fast_guard());
         if (emit_fast_guard) {
             memory_base(page_table_local, offsetof(JitState, page_table_base)); op(Eqz);
@@ -684,42 +715,33 @@ private:
             memory_slow_call(inst, write, bytes, kSlowOther);
             op(Else);
         }
-        // Permission probe: (perms[page] & required) != required. The
-        // condition ends alone on the stack for begin_if (no staging).
+        // ok = page_nonzero & perm_ok & mapped & in_page [& code_ok].
+        get(page_local); op(Eqz); op(Eqz);
         memory_base(page_perms_local, offsetof(JitState, page_perms_base));
         get(page_local); op(Add);
         op(Load8U); uleb(code, 0); uleb(code, 0);
-        imm(required); op(And); imm(required); op(Ne);
-        begin_if();
-        memory_slow_call(inst, write, bytes, kSlowPerms);
-        op(Else);
-        // Mapping probe: null page-table entry = unallocated page (sparse
-        // backing initializes the table to null and frees null entries).
+        imm(required); op(And); imm(required); op(Eq);
+        op(And);
         memory_base(page_table_local, offsetof(JitState, page_table_base));
         get(page_local); imm(2); op(Shl); op(Add);
         op(Load); uleb(code, 2); uleb(code, 0);
         set(base_local);
-        get(base_local);
-        op(Eqz);
-        begin_if();
-        memory_slow_call(inst, write, bytes, kSlowUnmapped);
-        op(Else);
-        // Page-boundary probe: page offset + size > 4096 crosses, including
-        // an unaligned 16-bit access at offset 0xfff.
-        get(addr_local); imm(0xfff); op(And); imm(4096 - bytes); op(GtU);
-        begin_if();
-        memory_slow_call(inst, write, bytes, kSlowCrossPage);
-        op(Else);
+        get(base_local); op(Eqz); op(Eqz);
+        op(And);
+        get(addr_local); imm(0xfff); op(And); imm(4096 - bytes); op(GtU); op(Eqz);
+        op(And);
         if (write) {
-            // Code-page probe: nonzero refcount = page holds cached JIT code;
-            // the checked helper must own the store so smc_dirty stays exact.
             memory_base(code_pages_local, offsetof(JitState, code_pages_base));
             get(page_local); imm(2); op(Shl); op(Add);
             op(Load); uleb(code, 2); uleb(code, 0);
-            op(Eqz); op(Eqz);
-            begin_if();
-            memory_slow_call(inst, write, bytes, kSlowCodePage);
-            op(Else);
+            op(Eqz);
+            op(And);
+        }
+        op(Eqz);
+        begin_if();
+        memory_slow_reason(inst, write, bytes, emit_fast_guard, addr_local, page_local, base_local);
+        op(Else);
+        if (write) {
             // Direct store: base + (addr & 0xfff).
             get(base_local);
             get(addr_local); imm(0xfff); op(And); op(Add);
@@ -729,7 +751,6 @@ private:
             else { op(Store); uleb(code, 2); uleb(code, 0); }
             get(0); load(offsetof(JitState, mem_fast_writes)); imm(1); op(Add);
             store(offsetof(JitState, mem_fast_writes));
-            end_if();
         } else {
             // Direct load: base + (addr & 0xfff); 8/16-bit zero-extending.
             get(base_local);
@@ -740,6 +761,70 @@ private:
             set(next_local);
             get(0); load(offsetof(JitState, mem_fast_reads)); imm(1); op(Add);
             store(offsetof(JitState, mem_fast_reads));
+        }
+        end_if(); // single probe gate
+        if (emit_fast_guard)
+            end_if(); // fast-path enabled
+    }
+
+    // Cold arm of the single probe gate: re-derive the first-failing
+    // reason in probe order and take the identical slow path. The hot gate
+    // guarantees at least one predicate fails (same values, no calls in
+    // between), so the trailing else is unreachable; it still calls the
+    // helper (correct, conservatively profiled) rather than leaving the
+    // result undefined. base_local was set unconditionally by the hot
+    // gate and is reused for the mapping re-check.
+    void memory_slow_reason(const Inst &inst, bool write, unsigned bytes, bool emit_fast_guard,
+        uint32_t addr_local, uint32_t page_local, uint32_t base_local) {
+        // Production shape: one slow call, reason always Other. The exact
+        // reason only feeds process profiling counters (the helper masks it
+        // off before use), and the nested re-derive below doubles module
+        // size and halves speed, so it lives behind VITA3K_WASMJIT_SLOW_REASONS.
+        if (!slow_reason_detail()) {
+            memory_slow_call(inst, write, bytes, kSlowOther);
+            return;
+        }
+        const uint32_t required = write ? 2 : 1;
+        get(page_local); op(Eqz);
+        begin_if();
+        memory_slow_call(inst, write, bytes, kSlowOther);
+        op(Else);
+        if (emit_fast_guard) {
+            memory_base(page_table_local, offsetof(JitState, page_table_base)); op(Eqz);
+            memory_base(page_perms_local, offsetof(JitState, page_perms_base)); op(Eqz); op(Or);
+            memory_base(code_pages_local, offsetof(JitState, code_pages_base)); op(Eqz); op(Or);
+            begin_if();
+            memory_slow_call(inst, write, bytes, kSlowOther);
+            op(Else);
+        }
+        memory_base(page_perms_local, offsetof(JitState, page_perms_base));
+        get(page_local); op(Add);
+        op(Load8U); uleb(code, 0); uleb(code, 0);
+        imm(required); op(And); imm(required); op(Ne);
+        begin_if();
+        memory_slow_call(inst, write, bytes, kSlowPerms);
+        op(Else);
+        get(base_local);
+        op(Eqz);
+        begin_if();
+        memory_slow_call(inst, write, bytes, kSlowUnmapped);
+        op(Else);
+        get(addr_local); imm(0xfff); op(And); imm(4096 - bytes); op(GtU);
+        begin_if();
+        memory_slow_call(inst, write, bytes, kSlowCrossPage);
+        op(Else);
+        if (write) {
+            memory_base(code_pages_local, offsetof(JitState, code_pages_base));
+            get(page_local); imm(2); op(Shl); op(Add);
+            op(Load); uleb(code, 2); uleb(code, 0);
+            op(Eqz); op(Eqz);
+            begin_if();
+            memory_slow_call(inst, write, bytes, kSlowCodePage);
+            op(Else);
+        }
+        memory_slow_call(inst, write, bytes, kSlowOther); // unreachable; safe fallback
+        if (write) {
+            end_if();
         }
         end_if(); // page boundary
         end_if(); // mapping

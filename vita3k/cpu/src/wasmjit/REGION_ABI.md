@@ -572,14 +572,37 @@ Fast-path shape for a 1/2/4-byte access (probe ORDER matters: permission
 first — it is the only check whose failure the checked path detects BEFORE
 any mapping question, and it costs one byte load):
 ```
-page   = addr >>> 12
-if page == 0 -> fall back (checked path rejects addr < host_page_size)
-if any of page_table_base, page_perms_base, code_pages_base is zero -> fall back (5)
-  (region emission drops this guard under RegionStateOptions::assume_fast_bases,
-  set by the host only when all three bases are provably nonzero for the
-  module's whole lifetime: the arrays allocate once in MemState init and free
-  only at deinit, while regions compile and run strictly inside; single-block
-  emission and the default policy always keep it)
+Branchless single gate (R3f): every probe load is provably in-bounds (the
+page index is 20 bits into fixed 1M-entry/4M-byte arrays with proven or
+guarded-nonzero bases), so all predicates evaluate speculatively with no
+observable effect and exactly one hot branch remains:
+```
+page_ok = page != 0   // checked path rejects addr < host_page_size even
+                      // when sparse backing was force-allocated at page 0
+perm_ok = (i32.load8_u(page_perms_base + page) & required) == required
+base    = i32.load(page_table_base + page*4)   // 0 = unmapped
+in_page = (addr & 0xFFF) <= 4096 - size        // only cross-page path
+code_ok = *not a store* or i32.load(code_pages_base + page*4) == 0
+if !(page_ok & perm_ok & (base != 0) & in_page & code_ok) -> cold arm below
+value   = i32.load8_u/16_u/load(base + (addr & 0xFFF))   // or matching store
+++state.mem_fast_reads (or mem_fast_writes)
+```
+The enabled guard (any base zero -> fall back (5)) stays OUTSIDE the gate
+when kept: region emission drops it under RegionStateOptions::assume_fast_bases
+(set by the host only when all three bases are provably nonzero for the
+module's whole lifetime: the arrays allocate once in MemState init and free
+only at deinit, while regions compile and run strictly inside; single-block
+emission and the default policy always keep it).
+
+Cold arm (never taken in production: slow_* = 0 over tens of millions of
+accesses): ONE slow-helper call with reason 5 (Other). The reason only
+feeds process profiling counters (helpers mask it off before use), and a
+nested exact re-derive costs ~5-6x cold code per access, which keeps hot
+modules out of the optimizing tier and slows baseline execution (measured
+2x on run_js_ms; --liftoff-only confirms bloated modules never tier up).
+Exact reasons live behind VITA3K_WASMJIT_SLOW_REASONS=1 (Module prop first,
+then process.env; native getenv), a strictly diagnostic shape covered by
+running the backend/emitter/exit-42 suites with the flag set.
 perm   = i32.load8_u(page_perms_base + page)
 if (perm & required) != required -> fall back (reason 2)
 base   = i32.load(page_table_base + page*4)
