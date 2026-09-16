@@ -705,6 +705,17 @@ struct WasmJitCPU::Impl {
         while (true) {
             if (stopped || breakpoint)
                 return 1;
+            // ThreadState uses a per-kernel NOP+WFI return sentinel as LR.
+            // Dynarmic translates WFI as a hint only when hooked; the JIT
+            // frontend deliberately leaves hints unhooked, so recognize this
+            // sentinel before region formation and report a clean guest return.
+            if ((state.cpsr & 0x20) != 0) {
+                std::array<uint8_t, 4> halt{};
+                if (mem_fetch(*parent->mem, state.regs[15], halt.data(), halt.size())
+                    && halt[0] == 0x00 && halt[1] == 0xBF
+                    && halt[2] == 0x30 && halt[3] == 0xBF)
+                    return 1;
+            }
             if (remaining_budget == 0)
                 return fail("instruction budget exhausted");
             // M16: the shared region table must exist before any region

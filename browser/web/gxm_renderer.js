@@ -58,7 +58,7 @@ export function createGXMRenderer(device) {
       if (align(width * 4, 256) * height > device.limits.maxBufferSize)
         throw new RangeError('render target readback exceeds maxBufferSize');
       const texture = device.createTexture({ size: [width, height], format: 'rgba8unorm',
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST });
       const id = nextId++;
       targets.set(id, { width, height, texture });
       return id;
@@ -66,7 +66,8 @@ export function createGXMRenderer(device) {
 
     // WGSL must eventually come from real GXP conversion. The smoke test uses
     // explicit test WGSL and deliberately does not claim guest shader execution.
-    async createProgram({ vertexWGSL, fragmentWGSL, stride, attributes, uniformSize = 0 }) {
+    async createProgram({ vertexWGSL, fragmentWGSL, stride, attributes, uniformSize = 0,
+      vertexEntryPoint = 'main', fragmentEntryPoint = 'main', bufferBindings }) {
       available();
       integer(stride, 4, device.limits.maxVertexBufferArrayStride, 'vertex stride');
       if (stride % 4) throw new RangeError('vertex stride must be a multiple of four');
@@ -86,6 +87,23 @@ export function createGXMRenderer(device) {
         locations.add(shaderLocation);
         return { shaderLocation, offset, format };
       });
+      // Explicit binding ABI from the translator/producer. Native Vita3K uses
+      // group 0: render-info UBOs at 0/1, guest uniform data SSBOs at 2/3.
+      // Keep the original single-UBO API for non-GXP consumers.
+      const bindings = bufferBindings ?? (uniformSize ? [{ binding: 0, size: uniformSize,
+        type: 'uniform', visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT }] : []);
+      const seen = new Set();
+      const bindingLayout = bindings.map(({ binding, size, type, visibility }) => {
+        integer(binding, 0, device.limits.maxBindingsPerBindGroup - 1, 'buffer binding');
+        if (seen.has(binding)) throw new Error('duplicate buffer binding');
+        seen.add(binding);
+        if (!['uniform', 'read-only-storage'].includes(type)) throw new Error('unsupported buffer binding type');
+        integer(size, 4, type === 'uniform' ? device.limits.maxUniformBufferBindingSize
+          : device.limits.maxStorageBufferBindingSize, 'binding size');
+        if (size % 4) throw new RangeError('binding size must be a multiple of four');
+        integer(visibility, 1, GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, 'binding visibility');
+        return { binding, size, type, visibility };
+      });
       busy = true;
       device.pushErrorScope('validation');
       let pipeline, failure;
@@ -97,9 +115,12 @@ export function createGXMRenderer(device) {
           const errors = info.messages.filter(message => message.type === 'error');
           if (errors.length) throw new Error(errors.map(message => message.message).join('\n'));
         }
-        pipeline = await device.createRenderPipelineAsync({ layout: 'auto',
-          vertex: { module: vertex, entryPoint: 'main', buffers: [{ arrayStride: stride, attributes: layout }] },
-          fragment: { module: fragment, entryPoint: 'main', targets: [{ format: 'rgba8unorm' }] },
+        const bindGroupLayout = device.createBindGroupLayout({ entries: bindingLayout.map(b => ({
+          binding: b.binding, visibility: b.visibility, buffer: { type: b.type, minBindingSize: b.size },
+        })) });
+        pipeline = await device.createRenderPipelineAsync({ layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+          vertex: { module: vertex, entryPoint: vertexEntryPoint, buffers: [{ arrayStride: stride, attributes: layout }] },
+          fragment: { module: fragment, entryPoint: fragmentEntryPoint, targets: [{ format: 'rgba8unorm' }] },
           primitive: { topology: 'triangle-list', cullMode: 'none' },
         });
       } catch (error) { failure = error; }
@@ -112,7 +133,7 @@ export function createGXMRenderer(device) {
       if (failure) throw failure;
       if (lost) throw new Error(lost);
       const id = nextId++;
-      programs.set(id, { pipeline, stride, uniformSize });
+      programs.set(id, { pipeline, stride, uniformSize, bindingLayout, explicitBindings: bufferBindings !== undefined });
       return id;
     },
 
@@ -120,12 +141,15 @@ export function createGXMRenderer(device) {
     // the first await: Wasm may grow memory or overwrite its buffers afterwards.
     // The producer must await this Promise before signaling GXM sync objects,
     // running a display-queue callback, or releasing/reusing the target.
-    async submit(targetId, draws, { clearColor = [0, 0, 0, 1] } = {}) {
+    async submit(targetId, draws, { clearColor = [0, 0, 0, 1], initialPixels } = {}) {
       available();
       const target = lookup(targets, targetId, 'target');
       if (!Array.isArray(clearColor) || clearColor.length !== 4
           || clearColor.some(value => !Number.isFinite(value) || value < 0 || value > 1))
         throw new RangeError('clear color must contain four normalized components');
+      const initial = initialPixels === undefined ? null : bytes(initialPixels);
+      if (initial && initial.length !== target.width * target.height * 4)
+        throw new RangeError('initial surface size mismatch');
       const snapshots = draws.map(draw => {
         const program = lookup(programs, draw.program, 'program');
         const vertices = bytes(draw.vertices), indices = bytes(draw.indices);
@@ -143,10 +167,18 @@ export function createGXMRenderer(device) {
         }
         const uniforms = draw.uniforms === undefined ? new Uint8Array() : bytes(draw.uniforms);
         if (uniforms.length !== program.uniformSize) throw new RangeError('uniform size mismatch');
-        for (const data of [vertices, indices, uniforms])
+        const supplied = program.explicitBindings ? draw.buffers ?? {} : { 0: uniforms };
+        if (program.explicitBindings && Object.keys(supplied).length !== program.bindingLayout.length)
+          throw new RangeError('buffer binding count mismatch');
+        const boundBuffers = program.bindingLayout.map(binding => {
+          const data = bytes(supplied[binding.binding]);
+          if (data.length !== binding.size) throw new RangeError('buffer binding size mismatch');
+          return { ...binding, data };
+        });
+        for (const data of [vertices, indices, ...boundBuffers.map(b => b.data)])
           if (align(data.length, 4) > device.limits.maxBufferSize)
             throw new RangeError('upload exceeds maxBufferSize');
-        return { program, vertices, indices, uniforms, indexFormat: draw.indexFormat,
+        return { program, vertices, indices, boundBuffers, indexFormat: draw.indexFormat,
           indexCount: indices.length / indexSize };
       });
       busy = true;
@@ -162,18 +194,20 @@ export function createGXMRenderer(device) {
           device.queue.writeBuffer(buffer, 0, padded);
           return buffer;
         };
+        if (initial) device.queue.writeTexture({ texture: target.texture }, initial,
+          { bytesPerRow: target.width * 4 }, [target.width, target.height]);
         const encoder = device.createCommandEncoder();
         const pass = encoder.beginRenderPass({ colorAttachments: [{ view: target.texture.createView(),
-          loadOp: 'clear', storeOp: 'store', clearValue: clearColor }] });
+          loadOp: initial ? 'load' : 'clear', storeOp: 'store', clearValue: clearColor }] });
         for (const draw of snapshots) {
           pass.setPipeline(draw.program.pipeline);
           pass.setVertexBuffer(0, upload(draw.vertices, GPUBufferUsage.VERTEX));
           pass.setIndexBuffer(upload(draw.indices, GPUBufferUsage.INDEX), draw.indexFormat);
-          if (draw.uniforms.length) {
-            const buffer = upload(draw.uniforms, GPUBufferUsage.UNIFORM);
-            pass.setBindGroup(0, device.createBindGroup({ layout: draw.program.pipeline.getBindGroupLayout(0),
-              entries: [{ binding: 0, resource: { buffer } }] }));
-          }
+          // Even an empty explicit group must be set with an explicit layout.
+          pass.setBindGroup(0, device.createBindGroup({ layout: draw.program.pipeline.getBindGroupLayout(0),
+            entries: draw.boundBuffers.map(b => ({ binding: b.binding, resource: {
+              buffer: upload(b.data, b.type === 'uniform' ? GPUBufferUsage.UNIFORM : GPUBufferUsage.STORAGE),
+            } })) }));
           pass.drawIndexed(draw.indexCount);
         }
         pass.end();

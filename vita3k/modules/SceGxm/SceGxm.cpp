@@ -18,6 +18,9 @@
 #include "SceGxm.h"
 
 #include <modules/module_parent.h>
+#ifdef VITA3K_BROWSER_GXM
+#include "gxm_webgpu_bridge.h"
+#endif
 
 #include <span>
 #include <stack>
@@ -2860,6 +2863,10 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
     const uint32_t max_queue_size = std::max(std::min(params->displayQueueMaxPendingCount, 3U) - 1, 1U);
     emuenv.gxm.display_queue.maxPendingCount_ = max_queue_size;
 
+#ifdef VITA3K_BROWSER_GXM
+    // Browser GPU completion is cooperative; never create a native host thread.
+    return browser::gxm_initialize(emuenv);
+#else
     const ThreadStatePtr main_thread = emuenv.kernel.get_thread(thread_id);
     const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", Ptr<void>(0), SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, nullptr);
     if (!display_queue_thread) {
@@ -2873,6 +2880,7 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
     emuenv.gxm.notification_region = Ptr<uint32_t>(alloc(emuenv.mem, MiB(1), "SceGxmNotificationRegion"));
     memset(emuenv.gxm.notification_region.get(emuenv.mem), 0, MiB(1));
     return 0;
+#endif
 }
 
 EXPORT(int, sceGxmIsDebugVersion) {
@@ -4882,6 +4890,9 @@ EXPORT(int, sceGxmSyncObjectDestroy, Ptr<SceGxmSyncObject> syncObject) {
 
 EXPORT(int, sceGxmTerminate) {
     TRACY_FUNC(sceGxmTerminate);
+#ifdef VITA3K_BROWSER_GXM
+    return browser::gxm_terminate(emuenv);
+#else
     // Make sure everything is done in SDL side before killing Vita thread
     emuenv.gxm.display_queue.wait_empty();
     gxm::destroy_all_contexts(emuenv, false);
@@ -4889,6 +4900,7 @@ EXPORT(int, sceGxmTerminate) {
     emuenv.gxm.display_queue.abort();
     emuenv.kernel.get_thread(emuenv.gxm.display_queue_thread)->exit_delete();
     return 0;
+#endif
 }
 
 EXPORT(Ptr<void>, sceGxmTextureGetData, const SceGxmTexture *texture) {

@@ -17,6 +17,7 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <shader/spirv_recompiler.h>
+#include <shader/webgpu_spirv.h>
 #include <shader/uniform_block.h>
 #include <shader/usse_disasm.h>
 #include <shader/usse_program_analyzer.h>
@@ -32,8 +33,11 @@
 #include <util/overloaded.h>
 
 #include <SPIRV/SpvBuilder.h>
+#include <SPIRV/GLSL.std.450.h>
 #include <SPIRV/disassemble.h>
+#ifndef VITA3K_SHADER_SPIRV_ONLY
 #include <spirv_glsl.hpp>
+#endif
 
 #include <algorithm>
 #include <fstream>
@@ -1989,6 +1993,7 @@ static SpirvCode convert_gxp_to_spirv_impl(const SceGxmProgram &program, const s
     return spirv;
 }
 
+#ifndef VITA3K_SHADER_SPIRV_ONLY
 static std::string convert_spirv_to_glsl(const std::string &shader_name, SpirvCode &spirv_binary, const FeatureState &features, TranslationState &translation_state) {
     spirv_cross::CompilerGLSL glsl(std::move(spirv_binary));
 
@@ -2026,6 +2031,8 @@ static std::string convert_spirv_to_glsl(const std::string &shader_name, SpirvCo
     std::string source = glsl.compile();
     return source;
 }
+
+#endif
 
 // ***********************
 // * Functions (utility) *
@@ -2073,11 +2080,15 @@ static spv::ImageFormat translate_color_format(const SceGxmColorBaseFormat forma
 
 GeneratedShader convert_gxp(const SceGxmProgram &program, const std::string &shader_hash, const FeatureState &features, const Target target, const Hints &hints, bool maskupdate,
     bool force_shader_debug, const std::function<bool(const std::string &ext, const std::string &dump)> &dumper) {
+#ifdef VITA3K_SHADER_SPIRV_ONLY
+    if (target == Target::GLSLOpenGL)
+        throw std::runtime_error("GLSL backend excluded from this shader-only build");
+#endif
     TranslationState translation_state;
     translation_state.is_fragment = program.is_fragment();
     translation_state.is_maskupdate = maskupdate;
     translation_state.is_target_glsl = (target == Target::GLSLOpenGL);
-    translation_state.is_vulkan = (target == Target::SpirVVulkan);
+    translation_state.is_vulkan = (target == Target::SpirVVulkan || target == Target::SpirVWebGPU);
     translation_state.hints = &hints;
 
     if (!features.support_unknown_format) {
@@ -2088,6 +2099,10 @@ GeneratedShader convert_gxp(const SceGxmProgram &program, const std::string &sha
     GeneratedShader shader{};
     shader.spirv = convert_gxp_to_spirv_impl(program, shader_hash, features, translation_state, force_shader_debug, dumper);
 
+    if (target == Target::SpirVWebGPU)
+        lower_webgpu_spirv(shader.spirv);
+
+#ifndef VITA3K_SHADER_SPIRV_ONLY
     if (translation_state.is_target_glsl) {
         // also generate the glsl file
         // this destroys shader.spirv
@@ -2106,9 +2121,11 @@ GeneratedShader convert_gxp(const SceGxmProgram &program, const std::string &sha
         }
     }
 
+#endif
     return shader;
 }
 
+#ifndef VITA3K_SHADER_SPIRV_ONLY
 void convert_gxp_to_glsl_from_filepath(const std::string &shader_filepath_utf8) {
     std::vector<char> gxp_program(0);
     fs::path shader_filepath_str = fs_utils::utf8_to_path(shader_filepath_utf8);
@@ -2130,5 +2147,7 @@ void convert_gxp_to_glsl_from_filepath(const std::string &shader_filepath_utf8) 
 
     convert_gxp(*reinterpret_cast<SceGxmProgram *>(gxp_program.data()), shader_filepath_str.filename().string(), features, shader::Target::GLSLOpenGL, hints, false, true);
 }
+
+#endif
 
 } // namespace shader

@@ -19,6 +19,7 @@
 #include <renderer/state.h>
 #include <renderer/types.h>
 
+#ifndef VITA3K_BROWSER_GXM
 #include <dialog/state.h>
 #include <overlay/common_dialog.h>
 #include <overlay/display_manager.h>
@@ -29,12 +30,14 @@
 #include <renderer/gl/state.h>
 #include <renderer/gl/types.h>
 #include <renderer/vulkan/functions.h>
+#endif
 
 #include <gxm/functions.h>
 #include <util/log.h>
 
 namespace renderer {
 
+#ifndef VITA3K_BROWSER_GXM
 void State::update_overlays() {
     if (!overlay_manager)
         return;
@@ -142,6 +145,8 @@ void State::init_overlay_font_dirs() {
         LOG_DEBUG("  system font dir: {}", d);
 }
 
+#endif
+
 void set_depth_bias(State &state, Context *ctx, bool is_front, int factor, int units) {
     renderer::add_state_set_command(ctx, renderer::GXMState::DepthBias, is_front, factor, units);
 }
@@ -231,6 +236,7 @@ void sync_surface_data(State &state, Context *ctx, const SceGxmNotification vert
     renderer::add_command(ctx, renderer::CommandOpcode::SyncSurfaceData, nullptr, vertex_notification, fragment_notification);
 }
 
+#ifndef VITA3K_BROWSER_GXM
 bool create_context(State &state, std::unique_ptr<Context> &context) {
     return renderer::send_single_command(state, nullptr, renderer::CommandOpcode::CreateContext, true, &context) > CommandErrorCodeNone;
 }
@@ -278,6 +284,8 @@ void destroy_render_target_during_shutdown(State &state, std::unique_ptr<RenderT
 
     rt.reset();
 }
+
+#endif
 
 void set_uniform_buffer(State &state, Context *ctx, const bool is_vertex_uniform, const int block_number, const std::uint16_t block_size, const Ptr<const void> buffer) {
     // Calculate the number of bytes

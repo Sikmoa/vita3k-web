@@ -41,6 +41,31 @@ if(EMSCRIPTEN)
         tests/vita_bench_main.cpp
     )
     target_link_libraries(vita3k_web_bench PRIVATE vita3k_web_runtime_hle)
+    # Retail-app launch path (VFS multi-module boot for staged content).
+    # Shared by the browser module, the bench harnesses and the JIT bench
+    # variants below; backend selection stays a compile definition.
+    set(VITA3K_WEB_APP_SOURCES
+        src/vita_app.cpp
+        src/vita_self_decrypt.cpp
+    )
+    add_executable(vita3k_web_app_bench
+        src/vita_runtime.cpp
+        src/vita_display_bridge.cpp
+        ${VITA3K_WEB_APP_SOURCES}
+        tests/vita_app_bench_main.cpp
+    )
+    target_link_libraries(vita3k_web_app_bench PRIVATE vita3k_web_runtime_hle)
+    if(TARGET vita3k_wasm_jit)
+        target_compile_definitions(vita3k_web_app_bench PRIVATE VITA3K_WEB=1 VITA3K_USE_WASM_JIT=1)
+        target_link_libraries(vita3k_web_app_bench PRIVATE vita3k_wasm_jit)
+    else()
+        message(FATAL_ERROR "vita3k_web_app_bench requires VITA3K_WEB_JIT_TESTS=ON")
+    endif()
+    target_link_options(vita3k_web_app_bench PRIVATE
+        ${VITA3K_WEB_GROWTH_LINK_OPTION}
+        "SHELL:-sSTACK_SIZE=1048576"
+        "SHELL:-sNODERAWFS=1"
+    )
     target_link_options(vita3k_web_bench PRIVATE
         ${VITA3K_WEB_GROWTH_LINK_OPTION}
         "SHELL:-sSTACK_SIZE=1048576"
@@ -83,6 +108,7 @@ add_executable(vita3k_web
     src/main.cpp
     src/vita_runtime.cpp
     src/vita_display_bridge.cpp
+    ${VITA3K_WEB_APP_SOURCES}
     src/memory.cpp
     src/interpreter.cpp
     src/guest.cpp
@@ -144,7 +170,7 @@ target_link_options(vita3k_web PRIVATE
     ${VITA3K_WEB_MEMORY_LINK_OPTIONS}
     "SHELL:-sSTACK_SIZE=1048576"
     "SHELL:-sASYNCIFY"
-    "-sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_vita3k_web_run_vita','_vita3k_web_last_run_instructions']"
+    "-sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_vita3k_web_run_vita','_vita3k_web_last_run_instructions','_vita3k_web_set_app_paths','_vita3k_web_set_license_key','_vita3k_web_run_app']"
 )
 
 set_target_properties(vita3k_web PROPERTIES

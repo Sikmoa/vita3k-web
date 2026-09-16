@@ -40,7 +40,9 @@ static constexpr uint32_t GAMMA_CORRECTION_SPECIALIZATION_ID = 0;
 enum struct Target {
     GLSLOpenGL,
     SpirVOpenGL,
-    SpirVVulkan
+    SpirVVulkan,
+    // Vulkan coordinates/buffer ABI, separate texture + sampler descriptors for Naga.
+    SpirVWebGPU
 };
 
 // Hints given while compiling the shader

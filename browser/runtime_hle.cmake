@@ -7,6 +7,15 @@ set(_HLE_ROOT "${CMAKE_CURRENT_LIST_DIR}/../vita3k")
 set(_HLE_EXT "${CMAKE_CURRENT_LIST_DIR}/../external")
 
 set(_hle_exports
+    sceGxmInitialize sceGxmTerminate sceGxmCreateContext sceGxmDestroyContext sceGxmFinish
+    sceGxmTransferFill
+    # Real GXP indexed-draw guest probe (production validation/state handling).
+    sceGxmShaderPatcherCreate sceGxmShaderPatcherRegisterProgram
+    sceGxmProgramFindParameterByName sceGxmProgramParameterGetResourceIndex
+    sceGxmShaderPatcherCreateVertexProgram sceGxmShaderPatcherCreateFragmentProgram
+    sceGxmCreateRenderTarget sceGxmDestroyRenderTarget sceGxmColorSurfaceInit
+    sceGxmBeginScene sceGxmEndScene sceGxmSetVertexProgram sceGxmSetFragmentProgram
+    sceGxmSetVertexStream sceGxmSetVertexDefaultUniformBuffer sceGxmDraw
     sceKernelExitProcess
     sceKernelAllocMemBlock sceKernelFreeMemBlock sceKernelGetMemBlockBase
     sceKernelCreateLwMutex sceKernelDeleteLwMutex sceKernelLockLwMutex
@@ -16,10 +25,19 @@ set(_hle_exports
     sceKernelGetThreadInfo sceKernelGetProcessId
     sceKernelExitThread sceKernelExitDeleteThread
     sceKernelGetProcessTimeLow sceKernelLibcGettimeofday sceKernelGetProcessParam
+    sceKernelGetStdin sceKernelGetStdout sceKernelGetStderr
+    ksceKernelCreateProcessLocalStorage ksceKernelRegisterProcEventHandler
+    ksceKernelGetProcessLocalStorageAddr ksceKernelGetProcessLocalStorageAddrForPid
+    ksceKernelCreateMutex ksceKernelDeleteMutex ksceKernelLockMutex ksceKernelUnlockMutex
     sceClibMemcpy sceClibMemset
     sceIoOpen sceIoClose
     _sceDisplaySetFrameBuf sceDisplaySetFrameBuf sceDisplayWaitVblankStart
     sceDisplayGetVcount sceDisplayGetRefreshRate
+    sceKernelCreateLwCond
+    sceFiosOverlayGetList02
+    sceKernelGetModuleInfoByAddr
+    sceKernelCallAbortHandler
+    sceIoWrite
 )
 
 # Take NID values from the one authoritative database, never a second resolver.
@@ -45,15 +63,20 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${_HLE_ROOT}/nids/include/nids/nids.inc")
 
 set(_hle_module_sources
+    "${_HLE_ROOT}/modules/SceGxm/SceGxm.cpp"
     "${_HLE_ROOT}/modules/SceLibKernel/SceLibKernel.cpp"
     "${_HLE_ROOT}/modules/SceKernelThreadMgr/SceThreadmgr.cpp"
     "${_HLE_ROOT}/modules/SceKernelThreadMgr/SceThreadmgrCoredumpTime.cpp"
+    "${_HLE_ROOT}/modules/SceKernelThreadMgr/SceThreadmgrForDriver.cpp"
     "${_HLE_ROOT}/modules/SceSysmem/SceSysmem.cpp"
     "${_HLE_ROOT}/modules/SceSysmem/SceSysmemForDriver.cpp"
+    "${_HLE_ROOT}/modules/SceSysmem/SceProcEventForDriver.cpp"
     "${_HLE_ROOT}/modules/SceProcessmgr/SceProcessmgr.cpp"
+    "${_HLE_ROOT}/modules/SceProcessmgr/SceProcessmgrForDriver.cpp"
     "${_HLE_ROOT}/modules/SceIofilemgr/SceIofilemgr.cpp"
     "${_HLE_ROOT}/modules/SceDisplay/SceDisplay.cpp"
     "${_HLE_ROOT}/modules/SceDriverUser/SceDisplayUser.cpp"
+    "${_HLE_ROOT}/modules/SceDriverUser/SceFios2User.cpp"
 )
 # Compile the existing implementation files through registration-only adapters.
 # This is necessary because EXPORT's make_bridge initialization roots even
@@ -91,8 +114,21 @@ file(CONFIGURE OUTPUT "${_hle_generated}/startup_bridge_selection.inc" CONTENT "
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_hle_module_sources})
 
 add_library(vita3k_web_runtime_hle STATIC
+    "${_HLE_BROWSER_ROOT}/src/gxm_webgpu_bridge.cpp"
+    "${_HLE_ROOT}/renderer/src/renderer.cpp"
+    "${_HLE_ROOT}/renderer/src/creation.cpp"
+    "${_HLE_ROOT}/gxm/src/textures.cpp"
+    "${_HLE_ROOT}/gxm/src/attributes.cpp"
+    "${_HLE_ROOT}/shader/src/usse_program_analyzer.cpp"
+    "${_HLE_ROOT}/shader/src/gxp_parser.cpp"
+    "${_HLE_ROOT}/gxm/src/gxp.cpp"
+    "${_HLE_ROOT}/gxm/src/color.cpp"
+    "${_HLE_ROOT}/gxm/src/stream.cpp"
+    "${_HLE_BROWSER_ROOT}/src/gxm_hash.cpp"
+    "${_HLE_EXT}/vita-toolchain/src/utils/sha256.c"
     "${_HLE_ROOT}/modules/module_parent.cpp"
     "${_HLE_ROOT}/module/src/write_return_value.cpp"
+    "${_HLE_ROOT}/module/src/load_module.cpp"
     ${_hle_adapters}
     "${_HLE_ROOT}/kernel/src/sync_primitives.cpp"
     "${_HLE_BROWSER_ROOT}/src/hle_io.cpp"
@@ -110,9 +146,10 @@ file(GLOB _hle_includes "${_HLE_ROOT}/*/include")
 target_include_directories(vita3k_web_runtime_hle PUBLIC ${_hle_includes}
     "${_HLE_EXT}/yaml-cpp/include")
 target_include_directories(vita3k_web_runtime_hle PRIVATE
-    "${_hle_generated}" "${_HLE_EXT}/dlmalloc" "${_HLE_EXT}/printf"
-    "${_HLE_EXT}/stb")
+    "${_hle_generated}" "${_HLE_BROWSER_ROOT}/src" "${_HLE_EXT}/dlmalloc" "${_HLE_EXT}/printf"
+    "${_HLE_EXT}/stb" "${_HLE_EXT}/xxHash" "${_HLE_EXT}/vita-toolchain/src")
 target_compile_definitions(vita3k_web_runtime_hle PRIVATE
+    VITA3K_BROWSER_GXM=1
     ONLY_MSPACES=1
     VITA3K_HLE_NID_LIST="startup_nids.inc"
     VITA3K_HLE_LIBRARY_LIST="startup_libraries.inc")

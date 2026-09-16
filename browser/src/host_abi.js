@@ -20,8 +20,8 @@ Module['vita3kHostOffset'] = (pointer, length = 0) => {
     throw new RangeError('invalid host memory range');
   const start = BigInt(pointer);
   const end = start + BigInt(length);
-  if (start < 0n || start >= 0x100000000n || end > 0x100000000n ||
-      end > BigInt(wasmMemory.buffer.byteLength))
+  const limit = BigInt(wasmMemory.buffer.byteLength);
+  if (start < 0n || end > limit || end > BigInt(wasmMemory.buffer.byteLength))
     throw new RangeError('host memory range is outside the runtime area');
   return Number(start);
 };

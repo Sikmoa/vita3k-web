@@ -21,10 +21,12 @@
 #include <renderer/state.h>
 #include <renderer/types.h>
 
+#ifndef VITA3K_BROWSER_GXM
 #include <renderer/gl/functions.h>
 #include <renderer/gl/state.h>
 #include <renderer/vulkan/functions.h>
 #include <renderer/vulkan/state.h>
+#endif
 
 #include <gxm/functions.h>
 #include <renderer/functions.h>
@@ -50,6 +52,7 @@ static void layout_ssbo_offset_from_uniform_buffer_sizes(UniformBufferSizes &siz
     total_hold = static_cast<std::size_t>(last_offset);
 }
 
+#ifndef VITA3K_BROWSER_GXM
 COMMAND(handle_create_context) {
     TRACY_FUNC_COMMANDS(handle_create_context);
     std::unique_ptr<Context> *ctx = helper.pop<std::unique_ptr<Context> *>();
@@ -176,9 +179,22 @@ COMMAND(handle_memory_unmap) {
     complete_command(renderer, helper, 0);
 }
 
+#endif
+
 // Client
 bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProgram &program, const SceGxmBlendInfo *blend, GXPPtrMap &gxp_ptr_map) {
     switch (state.current_backend) {
+#ifdef VITA3K_BROWSER_GXM
+    case Backend::WebGPU:
+        // The initial browser draw path has no blend pipeline state yet.
+        // Reject it here rather than silently drawing with replacement blending.
+        if (blend && (blend->colorMask != SCE_GXM_COLOR_MASK_ALL
+                || blend->colorFunc != SCE_GXM_BLEND_FUNC_NONE
+                || blend->alphaFunc != SCE_GXM_BLEND_FUNC_NONE))
+            return false;
+        fp = std::make_unique<FragmentProgram>();
+        break;
+#else
     case Backend::OpenGL:
         gl::create(fp, dynamic_cast<gl::GLState &>(state), program, blend);
         break;
@@ -186,6 +202,7 @@ bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProg
     case Backend::Vulkan:
         vulkan::create(fp, dynamic_cast<vulkan::VKState &>(state), program, blend);
         break;
+#endif
 
     default:
         REPORT_MISSING(state.current_backend);
@@ -206,6 +223,11 @@ bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProg
 
 bool create(std::unique_ptr<VertexProgram> &vp, State &state, const SceGxmProgram &program, GXPPtrMap &gxp_ptr_map, const std::vector<SceGxmVertexAttribute> &attributes) {
     switch (state.current_backend) {
+#ifdef VITA3K_BROWSER_GXM
+    case Backend::WebGPU:
+        vp = std::make_unique<VertexProgram>();
+        break;
+#else
     case Backend::OpenGL:
         gl::create(vp, dynamic_cast<gl::GLState &>(state), program);
         break;
@@ -213,6 +235,7 @@ bool create(std::unique_ptr<VertexProgram> &vp, State &state, const SceGxmProgra
     case Backend::Vulkan:
         vulkan::create(vp, dynamic_cast<vulkan::VKState &>(state), program);
         break;
+#endif
 
     default:
         REPORT_MISSING(state.current_backend);
@@ -253,6 +276,7 @@ void destroy(SceGxmSyncObject *sync, State &state) {
     // nothing to do right now
 }
 
+#ifndef VITA3K_BROWSER_GXM
 bool init(FrameHost &frame, std::unique_ptr<State> &state, Backend backend, const Config &config, const Root &root_paths) {
     switch (backend) {
     case Backend::OpenGL:
@@ -283,4 +307,5 @@ bool init(FrameHost &frame, std::unique_ptr<State> &state, Backend backend, cons
 
     return true;
 }
+#endif
 } // namespace renderer
