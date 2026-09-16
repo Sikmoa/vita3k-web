@@ -323,6 +323,11 @@ void account_fast_counters(JitState &state) noexcept {
 // Entry layout: {key_lo, key_hi, slot, epoch}; epoch 0 = never written.
 static uint32_t dispatch_map[vita3k::wasmjit::kDispatchMapEntries * 4] = {};
 static uint32_t dispatch_epoch = 1;
+static uint64_t dispatch_global_version = 0;
+// Process-global eviction generation. Every dispatch_bump_epoch() (all region-
+// eviction paths funnel through it) advances this, so each CPU can tell whether
+// any map invalidation happened since its last pump entry without paying a
+// per-entry epoch bump (which would stale its own just-inserted entries).
 static uintptr_t dispatch_map_base() {
     return reinterpret_cast<uintptr_t>(&dispatch_map[0]);
 }
@@ -332,6 +337,8 @@ static uintptr_t dispatch_epoch_addr() {
 // Every region-cache removal path must bump the epoch (stale entries can
 // never match afterwards); table slots are nulled on release as backup.
 static void dispatch_bump_epoch() noexcept {
+    ++dispatch_epoch;
+    ++dispatch_global_version;
     ++dispatch_epoch;
     if (dispatch_epoch == 0) { // Never use the never-written marker.
         std::memset(dispatch_map, 0, sizeof(dispatch_map));
@@ -560,6 +567,7 @@ struct WasmJitCPU::Impl {
         uint64_t last_used = 0;
     };
     uint64_t region_clock = 0;
+    uint64_t last_dispatch_version = 0;
     CPUState *parent;
     std::size_t core;
     State state{};
@@ -664,7 +672,15 @@ struct WasmJitCPU::Impl {
             // The hint map/table are process-global. Discard hints from any
             // other cooperatively scheduled CPU before publishing this CPU's
             // revalidated region set; table slots themselves remain reusable.
-            dispatch_bump_epoch();
+            // Bump ONLY when an eviction happened since this CPU last synced:
+            // an unconditional per-entry bump would stale this CPU's own live
+            // entries, forcing one host miss per pump re-entry (measured 717
+            // vs 71 on the display fixture). All eviction paths funnel through
+            // dispatch_bump_epoch(), which advances the global version.
+            if (dispatch_global_version != last_dispatch_version) {
+                dispatch_bump_epoch();
+                last_dispatch_version = dispatch_global_version;
+            }
             // Host/HLE/loader Ptr writes are intentionally unchecked and can
             // change any cached region, not only the first region entered.
             // Revalidate ALL potential dispatch targets after each host entry
