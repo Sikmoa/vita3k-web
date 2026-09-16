@@ -1163,9 +1163,12 @@ int main() {
     region_budget_continuations(mem);
     // Direct-emitter matrix is independent of the process environment. CPU
     // integration cases above use the process's selected representation;
-    // run this executable in four fresh processes to cover that layer too.
-    for (unsigned mode = 0; mode < 4; ++mode) {
-        const vita3k::wasmjit::RegionStateOptions options{(mode & 1) != 0, (mode & 2) != 0};
+    // run this executable in fresh processes to cover that layer too
+    // (PROMOTE_FLAGS=0/1 x PROMOTE_ACCOUNTING unset/1 covers all four
+    // process defaults; the matrix below additionally crosses the
+    // assume_fast_bases guard shape in every mode).
+    for (unsigned mode = 0; mode < 8; ++mode) {
+        const vita3k::wasmjit::RegionStateOptions options{(mode & 1) != 0, (mode & 2) != 0, (mode & 4) != 0};
         dispatch_bump_epoch(); // released slots from prior cases must not resolve
         region_regressions(mem, options);
         region_store_continuations(mem, options);

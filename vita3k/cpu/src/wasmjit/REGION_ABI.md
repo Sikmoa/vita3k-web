@@ -575,6 +575,11 @@ any mapping question, and it costs one byte load):
 page   = addr >>> 12
 if page == 0 -> fall back (checked path rejects addr < host_page_size)
 if any of page_table_base, page_perms_base, code_pages_base is zero -> fall back (5)
+  (region emission drops this guard under RegionStateOptions::assume_fast_bases,
+  set by the host only when all three bases are provably nonzero for the
+  module's whole lifetime: the arrays allocate once in MemState init and free
+  only at deinit, while regions compile and run strictly inside; single-block
+  emission and the default policy always keep it)
 perm   = i32.load8_u(page_perms_base + page)
 if (perm & required) != required -> fall back (reason 2)
 base   = i32.load(page_table_base + page*4)

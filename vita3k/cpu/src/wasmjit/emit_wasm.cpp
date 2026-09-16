@@ -162,6 +162,10 @@ public:
     uint32_t ssa_base() const {
         return options.promote_flags || options.promote_accounting ? kNextPc + 1 : kRegionSsaBase;
     }
+    // True when the emitter may drop the per-access fast-path-enabled
+    // guard (T3): the host proved all bases nonzero for this module's
+    // lifetime. Single-block emission always keeps the guard.
+    bool skip_fast_guard() const { return options.assume_fast_bases; }
     void load_region_state(Bytes &c) const {
         reload_flags(c);
         if (options.promote_accounting) {
@@ -667,13 +671,18 @@ private:
         op(Else);
         // Fast path enabled? A zero base means the host did not populate the
         // probes; skipping this guard would dereference guest-controlled
-        // linear memory as a host offset.
-        memory_base(page_table_local, offsetof(JitState, page_table_base)); op(Eqz);
-        memory_base(page_perms_local, offsetof(JitState, page_perms_base)); op(Eqz); op(Or);
-        memory_base(code_pages_local, offsetof(JitState, code_pages_base)); op(Eqz); op(Or);
-        begin_if();
-        memory_slow_call(inst, write, bytes, kSlowOther);
-        op(Else);
+        // linear memory as a host offset. Region emission drops it when the
+        // host proved all bases nonzero for the module's lifetime
+        // (RegionStateOptions::assume_fast_bases); single-block keeps it.
+        const bool emit_fast_guard = !(region && state.skip_fast_guard());
+        if (emit_fast_guard) {
+            memory_base(page_table_local, offsetof(JitState, page_table_base)); op(Eqz);
+            memory_base(page_perms_local, offsetof(JitState, page_perms_base)); op(Eqz); op(Or);
+            memory_base(code_pages_local, offsetof(JitState, code_pages_base)); op(Eqz); op(Or);
+            begin_if();
+            memory_slow_call(inst, write, bytes, kSlowOther);
+            op(Else);
+        }
         // Permission probe: (perms[page] & required) != required. The
         // condition ends alone on the stack for begin_if (no staging).
         memory_base(page_perms_local, offsetof(JitState, page_perms_base));
@@ -734,7 +743,8 @@ private:
         end_if(); // page boundary
         end_if(); // mapping
         end_if(); // permissions
-        end_if(); // fast-path enabled
+        if (emit_fast_guard)
+            end_if(); // fast-path enabled
         end_if(); // guest page 0
     }
 

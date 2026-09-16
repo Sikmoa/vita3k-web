@@ -123,7 +123,13 @@ for (const fixture of fixtures) {
             // invocation boundaries. No candidate becomes another's oracle.
             if (variants.length) {
                 const reference = whole.slice();
+                // _F variants (assume_fast_bases) carry the host's proof
+                // obligation: all three fast-path bases nonzero (JitState
+                // words 95/96/100). Inputs violating it are out of contract
+                // (the emitter drops the enabled guard); skip, don't fail.
+                const fastContract = test.in[95] !== 0 && test.in[96] !== 0 && test.in[100] !== 0;
                 for (const variant of variants) {
+                    if (variant.filename.includes('_F') && !fastContract) continue;
                     reset();
                     assert.equal(variant.run(offset, fixture.budget), reason,
                         `${label} ${variant.filename}: differential reason`);

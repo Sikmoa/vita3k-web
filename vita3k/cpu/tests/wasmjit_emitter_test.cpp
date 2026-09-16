@@ -131,17 +131,23 @@ public:
         if (differential) manifest << ",\"differential\":true";
         if (region_budget) {
             manifest << ",\"variants\":[";
+            bool first_variant = true;
             for (unsigned mode = 1; mode <= 3; ++mode) {
-                const vita3k::wasmjit::RegionStateOptions options{(mode & 1) != 0, (mode & 2) != 0};
-                const auto variant = emit(options);
-                CHECK(!variant.empty() && variant == emit(options));
-                const auto filename = name + (mode == 1 ? "_P" : mode == 2 ? "_K" : "_PK") + ".wasm";
-                std::ofstream output(path / filename, std::ios::binary);
-                output.write(reinterpret_cast<const char *>(variant.data()), variant.size());
-                CHECK(output.good());
-                ++candidate_modules;
-                if (mode != 1) manifest << ',';
-                manifest << '"' << filename << '"';
+                for (unsigned fast = 0; fast <= 1; ++fast) {
+                    vita3k::wasmjit::RegionStateOptions options{(mode & 1) != 0, (mode & 2) != 0};
+                    options.assume_fast_bases = fast != 0;
+                    const auto variant = emit(options);
+                    CHECK(!variant.empty() && variant == emit(options));
+                    const auto filename = name + (mode == 1 ? "_P" : mode == 2 ? "_K" : "_PK")
+                        + (fast ? "_F" : "") + ".wasm";
+                    std::ofstream output(path / filename, std::ios::binary);
+                    output.write(reinterpret_cast<const char *>(variant.data()), variant.size());
+                    CHECK(output.good());
+                    ++candidate_modules;
+                    if (!first_variant) manifest << ',';
+                    first_variant = false;
+                    manifest << '"' << filename << '"';
+                }
             }
             manifest << ']';
         }

@@ -575,7 +575,7 @@ struct WasmJitCPU::Impl {
     // Region mode is the production path (M14c); single-block execution
     // remains for step() and the single-block module suite.
     bool region_mode = true;
-    const vita3k::wasmjit::RegionStateOptions region_options = vita3k::wasmjit::region_state_options();
+    vita3k::wasmjit::RegionStateOptions region_options = vita3k::wasmjit::region_state_options();
     std::string error;
     std::map<Key, Block> cache;
     std::map<uint64_t, RegionEntry> region_cache;
@@ -583,6 +583,14 @@ struct WasmJitCPU::Impl {
     Impl(CPUState *parent, std::size_t core) : parent(parent), core(core) {
         static_assert(sizeof(uintptr_t) == sizeof(uint32_t), "JIT memory cookie requires wasm32");
         state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent->mem));
+        // The fast-path base arrays are allocated once in MemState init and
+        // freed only at deinit; region modules compile and run strictly
+        // inside that window, so nonzero bases observed here stay nonzero
+        // for every call into those modules. g_code_pages is process-static
+        // (std::array::data() never null). The per-call publish sites below
+        // refresh the same bases, so this predicate stays exact.
+        region_options.assume_fast_bases = parent->mem->sparse_host_memory
+            && parent->mem->page_table != nullptr && parent->mem->page_permissions != nullptr;
     }
     ~Impl() { clear(); }
     void clear_regions() {

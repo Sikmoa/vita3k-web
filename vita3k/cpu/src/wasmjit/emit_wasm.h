@@ -183,6 +183,14 @@ struct RegionBlockMeta {
 struct RegionStateOptions {
     bool promote_flags = false;
     bool promote_accounting = false;
+    // The host sets this when the three fast-path bases (page table,
+    // permissions, code pages) are provably nonzero for the module's whole
+    // lifetime, letting region emission drop the per-access enabled guard.
+    // The arrays are allocated once in MemState init and freed only at
+    // deinit; regions compile and run strictly inside that window, so the
+    // predicate is run-stable. Never set without that proof: a zero base
+    // would turn a guest address into an unprobed host-memory offset.
+    bool assume_fast_bases = false;
 };
 // Read once per process/module. Native: getenv; Emscripten: Module properties
 // (same names) override process.env. PROMOTE_FLAGS defaults ON (production);
