@@ -1,0 +1,53 @@
+# UNBUILT / UNVALIDATED: see MEMORY64.md for the required toolchain contract.
+# Included before ALL browser/dependency targets, including object libraries.
+include_guard(DIRECTORY)
+if(VITA3K_WEB_MEMORY64)
+    if(NOT EMSCRIPTEN OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+        message(FATAL_ERROR "Memory64 requires a fresh Emscripten -m64 build directory")
+    endif()
+    add_compile_definitions(VITA3K_WEB_MEMORY64=1)
+    # C/C++ ABI flags were set before project(). Link with the same ABI.
+    add_link_options(-m64)
+    # Runtime bytes <4 GiB, fixed guest bytes [4 GiB,8 GiB). Physical memory
+    # behavior is unspecified here. The bounded morecore object is mandatory:
+    # INITIAL_MEMORY alone does NOT keep malloc out of the guest window.
+    set(VITA3K_WEB_MEMORY_LINK_OPTIONS
+        -sINITIAL_MEMORY=8589934592 -sMAXIMUM_MEMORY=8589934592
+        -sALLOW_MEMORY_GROWTH=0 -sMALLOC=dlmalloc -sABORTING_MALLOC=0
+        -sWASM_BIGINT=1)
+    add_library(vita3k_web_memory64_heap OBJECT src/memory64_heap.cpp)
+    target_include_directories(vita3k_web_memory64_heap PRIVATE ../vita3k/mem/include)
+    set(VITA3K_WEB_GROWTH_LINK_OPTION -sALLOW_MEMORY_GROWTH=0)
+    set(VITA3K_WEB_INITIAL_MEMORY_LINK_OPTION -sINITIAL_MEMORY=8589934592)
+else()
+    set(VITA3K_WEB_GROWTH_LINK_OPTION -sALLOW_MEMORY_GROWTH=1)
+    set(VITA3K_WEB_INITIAL_MEMORY_LINK_OPTION -sINITIAL_MEMORY=67108864)
+    set(VITA3K_WEB_MEMORY_LINK_OPTIONS
+        -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=67108864)
+endif()
+
+# Call after constructing the graph. Add the object to final executables only:
+# adding it to every archive could produce duplicate morecore definitions.
+function(vita3k_web_finalize_memory64 directory)
+    if(NOT VITA3K_WEB_MEMORY64)
+        return()
+    endif()
+    get_property(_targets DIRECTORY "${directory}" PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_target IN LISTS _targets)
+        get_target_property(_type "${_target}" TYPE)
+        if(_type STREQUAL "EXECUTABLE")
+            target_sources("${_target}" PRIVATE $<TARGET_OBJECTS:vita3k_web_memory64_heap>)
+            add_dependencies("${_target}" vita3k_web_memory64_heap)
+        endif()
+    endforeach()
+    get_property(_children DIRECTORY "${directory}" PROPERTY SUBDIRECTORIES)
+    foreach(_child IN LISTS _children)
+        vita3k_web_finalize_memory64("${_child}")
+    endforeach()
+endfunction()
+
+# Applied to all final browser targets and inherited by dependency subdirs.
+# Do not add conflicting per-target growth/initial/max-memory settings.
+if(VITA3K_WEB_MEMORY64)
+    add_link_options(${VITA3K_WEB_MEMORY_LINK_OPTIONS})
+endif()

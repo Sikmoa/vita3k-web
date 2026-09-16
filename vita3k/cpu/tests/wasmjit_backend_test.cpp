@@ -24,7 +24,7 @@ void helpers(MemState &mem) {
     state.next_pc = 0x81001234;
     state.dispatches = 37;
     const auto architectural = state;
-    state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mem));
+    state.memory_cookie = reinterpret_cast<uintptr_t>(&mem);
     const std::array<uint32_t, 4> lanes{0x76543210, 0xfedcba98, 0x89abcdef, 0x01234567};
     // Each valid size is deliberately unaligned; wider accesses cross pages.
     for (uint32_t bytes : {1, 2, 4, 8, 16}) {
@@ -466,7 +466,7 @@ void region_regressions(MemState &mem, vita3k::wasmjit::RegionStateOptions optio
             checked_memory_read, checked_memory_write);
         CHECK(slot >= 0);
         const auto reason = vita3k_jit_run(slot,
-            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&state)), budget);
+            reinterpret_cast<uintptr_t>(&state), budget);
         vita3k_jit_release_region(slot);
         return static_cast<Reason>(reason);
     };
@@ -656,11 +656,11 @@ void region_regressions(MemState &mem, vita3k::wasmjit::RegionStateOptions optio
         state.regs[15] = code;
         state.cpsr = 0x10;
         state.executed = 17;
-        state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mem));
+        state.memory_cookie = reinterpret_cast<uintptr_t>(&mem);
         if (probes) {
-            state.page_table_base = reinterpret_cast<uint32_t>(mem.page_table.get());
-            state.page_perms_base = reinterpret_cast<uint32_t>(mem.page_permissions.get());
-            state.code_pages_base = reinterpret_cast<uint32_t>(g_code_pages.data());
+            state.page_table_base = reinterpret_cast<uintptr_t>(mem.page_table.get());
+            state.page_perms_base = reinterpret_cast<uintptr_t>(mem.page_permissions.get());
+            state.code_pages_base = reinterpret_cast<uintptr_t>(g_code_pages.data());
         }
         CHECK(run(fault_module, state, 2) == Reason::Fault);
         CHECK(state.regs[0] == 42 && state.regs[2] == 77);
@@ -706,7 +706,7 @@ void region_regressions(MemState &mem, vita3k::wasmjit::RegionStateOptions optio
     for (unsigned i = 0; i < 256; ++i) mark_code_pages(tracked, +1);
     CHECK(g_code_pages[data / page + 1] == 256);
     state = JitState{};
-    state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mem));
+    state.memory_cookie = reinterpret_cast<uintptr_t>(&mem);
     state.memory_value[0] = 0x12345678;
     CHECK(checked_memory_write(&state, data + page - 2, 4) == 0);
     CHECK(state.smc_dirty == 1);
@@ -801,17 +801,17 @@ void region_store_continuations(MemState &mem, vita3k::wasmjit::RegionStateOptio
         state.cpsr = 0x10;
         state.executed = 17;
         state.dispatches = 29;
-        state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mem));
+        state.memory_cookie = reinterpret_cast<uintptr_t>(&mem);
         if (fast) {
-            state.page_table_base = reinterpret_cast<uint32_t>(mem.page_table.get());
-            state.page_perms_base = reinterpret_cast<uint32_t>(mem.page_permissions.get());
-            state.code_pages_base = reinterpret_cast<uint32_t>(g_code_pages.data());
+            state.page_table_base = reinterpret_cast<uintptr_t>(mem.page_table.get());
+            state.page_perms_base = reinterpret_cast<uintptr_t>(mem.page_permissions.get());
+            state.code_pages_base = reinterpret_cast<uintptr_t>(g_code_pages.data());
         }
         return state;
     };
     const auto run = [&](int slot, JitState &state, uint32_t budget) {
         return static_cast<Reason>(vita3k_jit_run(slot,
-            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&state)), budget));
+            reinterpret_cast<uintptr_t>(&state), budget));
     };
 
     // STR r0,[r1],#4; STR r2,[r1],#4; ADD r3,r0,r2; SVC.
@@ -1028,15 +1028,15 @@ void dispatch_pump(MemState &mem, vita3k::wasmjit::RegionStateOptions options) {
         JitState state{};
         state.regs[15] = entry;
         state.cpsr = cpsr;
-        state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mem));
-        state.page_table_base = reinterpret_cast<uint32_t>(mem.page_table.get());
-        state.page_perms_base = reinterpret_cast<uint32_t>(mem.page_permissions.get());
-        state.code_pages_base = reinterpret_cast<uint32_t>(g_code_pages.data());
+        state.memory_cookie = reinterpret_cast<uintptr_t>(&mem);
+        state.page_table_base = reinterpret_cast<uintptr_t>(mem.page_table.get());
+        state.page_perms_base = reinterpret_cast<uintptr_t>(mem.page_permissions.get());
+        state.code_pages_base = reinterpret_cast<uintptr_t>(g_code_pages.data());
         return state;
     };
     const auto drun = [&](JitState &state, uint32_t remaining) {
         return static_cast<Reason>(vita3k_jit_run_dispatch(
-            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&state)),
+            reinterpret_cast<uintptr_t>(&state),
             remaining, dispatch_map_base(), dispatch_epoch_addr()));
     };
     // A: LDR r1,[pc,#4]; BX r1; NOP; .word codeB (literal at code+12).

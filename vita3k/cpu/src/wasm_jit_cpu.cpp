@@ -323,11 +323,11 @@ void account_fast_counters(JitState &state) noexcept {
 // Entry layout: {key_lo, key_hi, slot, epoch}; epoch 0 = never written.
 static uint32_t dispatch_map[vita3k::wasmjit::kDispatchMapEntries * 4] = {};
 static uint32_t dispatch_epoch = 1;
-static uint32_t dispatch_map_base() {
-    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&dispatch_map[0]));
+static uintptr_t dispatch_map_base() {
+    return reinterpret_cast<uintptr_t>(&dispatch_map[0]);
 }
-static uint32_t dispatch_epoch_addr() {
-    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&dispatch_epoch));
+static uintptr_t dispatch_epoch_addr() {
+    return reinterpret_cast<uintptr_t>(&dispatch_epoch);
 }
 // Every region-cache removal path must bump the epoch (stale entries can
 // never match afterwards); table slots are nulled on release as backup.
@@ -429,15 +429,18 @@ EM_JS(int, vita3k_jit_install, (const uint8_t *bytes, unsigned length,
     let slot = -1;
     const freeSlots = Module['vita3kJitFreeSlots'] || (Module['vita3kJitFreeSlots'] = []);
     try {
-        const raw = HEAPU8.slice(bytes, bytes + length);
+        const raw = Module['vita3kHostBytes'](bytes, length).slice();
         if (typeof process !== 'undefined' && process.env?.VITA3K_DUMP_JIT) require('fs').writeFileSync('/tmp/jit-module.wasm', raw);
         const module = new WebAssembly.Module(raw);
         const instance = new WebAssembly.Instance(module, {env: {
             memory: wasmMemory,
-            mem_read: wasmTable.get(read_memory),
-            mem_write: wasmTable.get(write_memory)
+            mem_read: Module['vita3kNativeFunction'](read_memory),
+            mem_write: Module['vita3kNativeFunction'](write_memory)
         }});
-        slot = freeSlots.length ? freeSlots.pop() : wasmTable.grow(1);
+        // This is Emscripten's native function table, whose indexing ABI is
+        // toolchain-owned. The independent M16 region table remains i32.
+        slot = freeSlots.length ? freeSlots.pop()
+            : Number(wasmTable.grow(Module['vita3kMemory64'] ? 1n : 1));
         setWasmTableEntry(slot, instance.exports.block);
         return slot;
     } catch (error) {
@@ -446,9 +449,9 @@ EM_JS(int, vita3k_jit_install, (const uint8_t *bytes, unsigned length,
         return -1;
     }
 });
-EM_JS(uint32_t, vita3k_jit_call, (int slot, uint32_t state), {
-    const fn = wasmTable.get(slot);
-    return fn(state);
+EM_JS(uint32_t, vita3k_jit_call, (int slot, uintptr_t state), {
+    const fn = Module['vita3kNativeFunction'](slot);
+    return fn(Module['vita3kHostPointer'](state));
 });
 EM_JS(void, vita3k_jit_release, (int slot), {
     setWasmTableEntry(slot, null);
@@ -471,13 +474,13 @@ EM_JS(int, vita3k_jit_install_region, (const uint8_t *bytes, unsigned length,
     let slot = -1;
     const freeSlots = Module['vita3kJitFreeRegionSlots'] || (Module['vita3kJitFreeRegionSlots'] = []);
     try {
-        const raw = HEAPU8.slice(bytes, bytes + length);
+        const raw = Module['vita3kHostBytes'](bytes, length).slice();
         if (typeof process !== 'undefined' && process.env?.VITA3K_DUMP_JIT) require('fs').writeFileSync('/tmp/jit-region-' + arguments[2] + '-' + Date.now() + '.wasm', raw);
         const module = new WebAssembly.Module(raw);
         const instance = new WebAssembly.Instance(module, {env: {
             memory: wasmMemory,
-            mem_read: wasmTable.get(read_memory),
-            mem_write: wasmTable.get(write_memory)
+            mem_read: Module['vita3kNativeFunction'](read_memory),
+            mem_write: Module['vita3kNativeFunction'](write_memory)
         }});
         const run = instance.exports.run;
         if (typeof run !== 'function') throw new Error('region module does not export run');
@@ -502,7 +505,7 @@ EM_JS(int, vita3k_jit_install_region, (const uint8_t *bytes, unsigned length,
 // the shared region table and the same linear memory as the regions.
 EM_JS(int, vita3k_jit_install_dispatch, (const uint8_t *bytes, unsigned length), {
     try {
-        const raw = HEAPU8.slice(bytes, bytes + length);
+        const raw = Module['vita3kHostBytes'](bytes, length).slice();
         if (typeof process !== 'undefined' && process.env?.VITA3K_DUMP_JIT) require('fs').writeFileSync('/tmp/jit-dispatch.wasm', raw);
         if (!Module['vita3kJitTable'])
             Module['vita3kJitTable'] = new WebAssembly.Table({initial: 512, element: 'anyfunc'});
@@ -520,13 +523,14 @@ EM_JS(int, vita3k_jit_install_dispatch, (const uint8_t *bytes, unsigned length),
         return -1;
     }
 });
-EM_JS(uint32_t, vita3k_jit_run_dispatch, (uint32_t state, uint32_t remaining, uint32_t map_base, uint32_t epoch_addr), {
+EM_JS(uint32_t, vita3k_jit_run_dispatch, (uintptr_t state, uint32_t remaining, uintptr_t map_base, uintptr_t epoch_addr), {
     const fn = Module['vita3kJitDispatch'];
-    return fn(state, remaining, map_base, epoch_addr);
+    return fn(Module['vita3kHostPointer'](state), remaining,
+        Module['vita3kHostPointer'](map_base), Module['vita3kHostPointer'](epoch_addr));
 });
-EM_JS(uint32_t, vita3k_jit_run, (int slot, uint32_t state, uint32_t budget), {
+EM_JS(uint32_t, vita3k_jit_run, (int slot, uintptr_t state, uint32_t budget), {
     const fn = Module['vita3kJitRegions'].get(slot);
-    return fn(state, budget);
+    return fn(Module['vita3kHostPointer'](state), budget);
 });
 EM_JS(void, vita3k_jit_release_region, (int slot), {
     Module['vita3kJitRegions'].delete(slot);
@@ -581,16 +585,17 @@ struct WasmJitCPU::Impl {
     std::map<uint64_t, RegionEntry> region_cache;
 
     Impl(CPUState *parent, std::size_t core) : parent(parent), core(core) {
-        static_assert(sizeof(uintptr_t) == sizeof(uint32_t), "JIT memory cookie requires wasm32");
-        state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent->mem));
+        static_assert(sizeof(vita3k::wasmjit::HostAddress) == sizeof(uintptr_t), "JIT host ABI must match the runtime");
+        state.memory_cookie = reinterpret_cast<uintptr_t>(parent->mem);
         // The fast-path base arrays are allocated once in MemState init and
         // freed only at deinit; region modules compile and run strictly
         // inside that window, so nonzero bases observed here stay nonzero
         // for every call into those modules. g_code_pages is process-static
         // (std::array::data() never null). The per-call publish sites below
         // refresh the same bases, so this predicate stays exact.
-        region_options.assume_fast_bases = parent->mem->sparse_host_memory
-            && parent->mem->page_table != nullptr && parent->mem->page_permissions != nullptr;
+        region_options.assume_fast_bases = parent->mem->page_permissions != nullptr
+            && (parent->mem->direct_host_memory
+                || (parent->mem->sparse_host_memory && parent->mem->page_table != nullptr));
     }
     ~Impl() { clear(); }
     void clear_regions() {
@@ -655,6 +660,30 @@ struct WasmJitCPU::Impl {
     // generated module's in-Wasm dispatch loop run many guest blocks per
     // host entry. Handles all ExitReason values from REGION_ABI.md.
     int execute_regions(uint64_t remaining_budget) {
+        if (parent->mem->direct_host_memory) {
+            // The hint map/table are process-global. Discard hints from any
+            // other cooperatively scheduled CPU before publishing this CPU's
+            // revalidated region set; table slots themselves remain reusable.
+            dispatch_bump_epoch();
+            // Host/HLE/loader Ptr writes are intentionally unchecked and can
+            // change any cached region, not only the first region entered.
+            // Revalidate ALL potential dispatch targets after each host entry
+            // (including a suspended HLE return). No host mutator runs inside
+            // this cooperative pump; generated code-page writes use smc_dirty.
+            // Thus M16 cannot chain to stale bytes or a freed/non-executable
+            // region after a direct host write. No per-access host logging/hook.
+            for (auto it = region_cache.begin(); it != region_cache.end();) {
+                if (region_unchanged(*it->second.region, *parent->mem)) {
+                    ++it;
+                    continue;
+                }
+                vita3k_jit_release_region(it->second.table_index);
+                mark_code_pages(*it->second.region, -1);
+                it = region_cache.erase(it);
+                ++invalidated;
+                dispatch_bump_epoch();
+            }
+        }
         uint64_t budget_progress_mark = state.executed;
         using vita3k::wasmjit::ExitReason;
         while (true) {
@@ -744,21 +773,22 @@ struct WasmJitCPU::Impl {
                 std::fprintf(stderr, "JIT region PC=%08x blocks=%zu\n",
                     pc, found->second.region->blocks.size());
             // Refresh per-run state fields (bases are stable but cheap).
-            state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent->mem));
+            state.memory_cookie = reinterpret_cast<uintptr_t>(parent->mem);
             // M15 inline memory fast path (REGION_ABI.md): expose MemState's
             // page table, permission bytes and the code-page refcounts as
             // linear-memory offsets. The two arrays never reallocate after
             // init and g_code_pages is process-static, so the bases outlive
-            // every compiled region. A zero page_table_base disables the
-            // fast path (emitted code probes it first). The table entries
+            // every compiled region. For wasm32 a zero page_table_base disables
+            // the fast path. Memory64 ignores that field entirely and uses
+            // permission/code metadata plus the fixed guest window. Sparse entries
             // must be SPARSE page pointers (host offset of the page start);
             // native non-sparse tables hold address biases instead, so they
             // must not enable the fast path.
             const auto *mem_state = parent->mem;
             state.page_table_base = mem_state->sparse_host_memory
-                ? reinterpret_cast<uint32_t>(mem_state->page_table.get()) : 0;
-            state.page_perms_base = reinterpret_cast<uint32_t>(mem_state->page_permissions.get());
-            state.code_pages_base = reinterpret_cast<uint32_t>(g_code_pages.data());
+                ? reinterpret_cast<uintptr_t>(mem_state->page_table.get()) : 0;
+            state.page_perms_base = reinterpret_cast<uintptr_t>(mem_state->page_permissions.get());
+            state.code_pages_base = reinterpret_cast<uintptr_t>(g_code_pages.data());
             state.smc_dirty = 0;
             state.smc_page = 0;
             // stop() owns an atomic request. Mirror it at entry and return
@@ -777,7 +807,7 @@ struct WasmJitCPU::Impl {
                 return fail("region slot outside dispatch table");
             if (!dispatch_map_insert(key, static_cast<uint32_t>(found->second.table_index)))
                 return fail("region map full");
-            const uint32_t state_offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&state));
+            const uintptr_t state_offset = reinterpret_cast<uintptr_t>(&state);
             const uint32_t granted = static_cast<uint32_t>(std::min<uint64_t>(remaining_budget, UINT32_MAX));
             const uint32_t executed_before = state.executed;
             const uint32_t dispatches_before = state.dispatches;
@@ -945,13 +975,13 @@ struct WasmJitCPU::Impl {
             state.svc = 0;
             state.fault_address = 0;
             state.fault_write = 0;
-            state.memory_cookie = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent->mem));
+            state.memory_cookie = reinterpret_cast<uintptr_t>(parent->mem);
             // M15 fast-path bases, exactly as in region mode above.
             const auto *mem_state = parent->mem;
             state.page_table_base = mem_state->sparse_host_memory
-                ? reinterpret_cast<uint32_t>(mem_state->page_table.get()) : 0;
-            state.page_perms_base = reinterpret_cast<uint32_t>(mem_state->page_permissions.get());
-            state.code_pages_base = reinterpret_cast<uint32_t>(g_code_pages.data());
+                ? reinterpret_cast<uintptr_t>(mem_state->page_table.get()) : 0;
+            state.page_perms_base = reinterpret_cast<uintptr_t>(mem_state->page_permissions.get());
+            state.code_pages_base = reinterpret_cast<uintptr_t>(g_code_pages.data());
             // Fast-path tallies are per-call scratch (REGION_ABI.md): zero
             // them before the snapshot so the fault rollback below cannot
             // resurrect stale counts.
@@ -960,7 +990,7 @@ struct WasmJitCPU::Impl {
             const State before = state;
             // Host entry currently uses the EM_JS trampoline below.
             // Guest faults use return reasons; checked helpers are Wasm imports.
-            const uint32_t state_offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&state));
+            const uintptr_t state_offset = reinterpret_cast<uintptr_t>(&state);
             const double t2 = emscripten_get_now();
             const uint32_t reason = vita3k_jit_call(found->second.table_index, state_offset);
             run_js_ms += emscripten_get_now() - t2;
@@ -1076,6 +1106,7 @@ void WasmJitCPU::invalidate_jit_cache(Address start, size_t length) {
             ++impl->invalidated;
         } else ++it;
     }
+    bool erased_region = false;
     for (auto it = impl->region_cache.begin(); it != impl->region_cache.end();) {
         const Region &r = *it->second.region;
         if (first_page < r.page_end && r.page_begin < end_page) {
@@ -1083,8 +1114,13 @@ void WasmJitCPU::invalidate_jit_cache(Address start, size_t length) {
             mark_code_pages(r, -1);
             it = impl->region_cache.erase(it);
             ++impl->invalidated;
+            erased_region = true;
         } else ++it;
     }
+    // Nulling a slot alone does not retire its map entries; slot reuse can
+    // otherwise make an old key dispatch unrelated code after host invalidation.
+    if (erased_region)
+        dispatch_bump_epoch();
 }
 bool WasmJitCPU::is_thumb_mode() { return impl->state.cpsr & 0x20; }
 bool WasmJitCPU::hit_breakpoint() { return impl->breakpoint; }

@@ -19,6 +19,7 @@
 
 #include <mem/allocator.h>
 #include <mem/functions.h>
+#include <mem/memory_model.h>
 #include <mem/util.h>
 
 #include <map>
@@ -75,8 +76,10 @@ struct MemState {
     std::mutex protect_mutex;
 
     uint32_t host_page_size = 0;
-    // Wasm uses sparse page-table backing; native targets retain the contiguous mapping.
+    // Browser wasm32 uses sparse backing; Memory64 owns a fixed guest window.
+    // Native targets retain their existing OS mapping and optional page table.
     bool sparse_host_memory = false;
+    bool direct_host_memory = false;
     Memory memory;
     AllocPageTable alloc_table;
     BitmapAllocator allocator;

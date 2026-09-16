@@ -19,6 +19,7 @@
 #include <kernel/state.h>
 
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <vector>
 
@@ -83,7 +84,18 @@ void vita3k_web_present_frame(EmuEnvState &emuenv) {
     const uint32_t width = static_cast<uint32_t>(info.image_size.x);
     const uint32_t height = static_cast<uint32_t>(info.image_size.y);
     const uint32_t pitch = info.pitch != 0 ? info.pitch : width; // pitch is in pixels
-    const size_t frame_bytes = size_t(width) * height * 4;
+    const uint64_t row_bytes = uint64_t(width) * 4;
+    const uint64_t stride = uint64_t(pitch) * 4;
+    // Validate before converting any row offset back into a Vita address.
+    if (pitch < width || stride > vita3k::memory::guest_address_space_size
+        || uint64_t(height - 1) > (vita3k::memory::guest_address_space_size - info.base.address()) / stride)
+        return;
+    const uint64_t span = uint64_t(height - 1) * stride + row_bytes;
+    const uint64_t frame_size = row_bytes * height;
+    if (!vita3k::memory::guest_range_fits(info.base.address(), span)
+        || frame_size > std::numeric_limits<size_t>::max())
+        return;
+    const size_t frame_bytes = static_cast<size_t>(frame_size);
     if (bridge.rgba.size() != frame_bytes)
         bridge.rgba.assign(frame_bytes, 0);
 
@@ -91,7 +103,7 @@ void vita3k_web_present_frame(EmuEnvState &emuenv) {
     // byte-identical to canvas RGBA8 — so no channel swizzle is needed. The
     // only per-row work is pitch tightening (guest pitch may exceed width).
     for (uint32_t y = 0; y < height; ++y) {
-        const Address row_addr = info.base.address() + Address(size_t(y) * pitch * 4);
+        const Address row_addr = static_cast<Address>(uint64_t(info.base.address()) + uint64_t(y) * stride);
         if (!mem_read(emuenv.mem, row_addr, bridge.rgba.data() + size_t(y) * width * 4, size_t(width) * 4))
             return; // unmapped/invalid framebuffer: skip this frame entirely
     }
@@ -104,7 +116,7 @@ void vita3k_web_present_frame(EmuEnvState &emuenv) {
     ++bridge.posted_generation;
     vita3k_web_post_frame_hook(static_cast<int>(bridge.posted_generation),
         static_cast<int>(width), static_cast<int>(height),
-        reinterpret_cast<int>(bridge.rgba.data()));
+        bridge.rgba.data());
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE

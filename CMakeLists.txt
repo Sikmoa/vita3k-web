@@ -7,7 +7,20 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Android")
 	include("cmake/vcpkg_android.cmake")
 endif()
 
+# Set the ABI before project() determines pointer sizes, including dependency
+# configure probes. Use a fresh build directory when changing this option.
+option(VITA3K_WEB_MEMORY64 "Use the opt-in wasm64 direct guest memory backend" OFF)
+if(VITA3K_WEB_MEMORY64 AND (CMAKE_SYSTEM_NAME STREQUAL "Emscripten"
+        OR CMAKE_TOOLCHAIN_FILE MATCHES "[Ee]mscripten"))
+	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -m64")
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -m64")
+endif()
+
 project(Vita3K)
+
+if(VITA3K_WEB_MEMORY64 AND NOT EMSCRIPTEN)
+	message(FATAL_ERROR "VITA3K_WEB_MEMORY64 requires the Emscripten toolchain")
+endif()
 
 # The browser build is intentionally a separate, minimal target during M1.
 # It must not pull in Qt, SDL, Vulkan, Dynarmic, or desktop-only dependencies.

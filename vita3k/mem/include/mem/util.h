@@ -21,6 +21,7 @@
 #include <functional>
 
 typedef uint32_t Address;
+static_assert(sizeof(Address) == 4, "Vita addresses must remain 32 bits");
 typedef std::function<bool(Address, bool)> ProtectCallback;
 
 // Powers of 10

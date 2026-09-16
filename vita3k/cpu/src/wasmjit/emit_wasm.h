@@ -3,6 +3,7 @@
 #pragma once
 
 #include "block_metadata.h"
+#include <mem/memory_model.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,13 @@ class Block;
 }
 
 namespace vita3k::wasmjit {
+
+enum class MemoryAddressType { I32, I64 };
+inline constexpr MemoryAddressType memory_address_type = vita3k::memory::direct_memory64
+    ? MemoryAddressType::I64 : MemoryAddressType::I32;
+// Serialized emitter ABI: native source-only emitter consumers still default
+// to the wasm32 layout. Only a true Memory64 browser build selects u64 here.
+using HostAddress = std::conditional_t<vita3k::memory::direct_memory64, uint64_t, uint32_t>;
 
 enum class ExitReason : uint32_t {
     Continue = 0,
@@ -36,23 +44,24 @@ struct JitState {
     uint32_t svc;
     uint32_t exit_reason;
     uint32_t executed;
-    uint32_t memory_cookie;
+    HostAddress memory_cookie;
     uint32_t fault_address;
     uint32_t fault_write;
     uint32_t memory_value[4];
     uint32_t fpu[64]; // S0..S31 alias D0..D15; D16..D31 follow (little-endian words)
     uint32_t tpidruro;
-    // M14c region ABI appends (REGION_ABI.md; offsets are contractual).
+    // Comments below give wasm32 offsets only. Generated code uses offsetof
+    // under both ABIs; Memory64 padding and host-field widths differ.
     uint32_t next_pc;         // +372 resume PC for Miss/Budget/Smc/Stop
     uint32_t fault_pc;        // +376 guest PC of the faulting instruction
-    uint32_t page_table_base; // +380 host offset of page_table entries, 0=off
-    uint32_t page_perms_base; // +384 host offset of page permission bytes, 0=off
+    HostAddress page_table_base; // +380 sparse page table; unused/zero in Memory64
+    HostAddress page_perms_base; // +384 host pointer to guest permission bytes
     uint32_t smc_dirty;       // +388 set by checked writes into code pages
     uint32_t stop_flag;       // +392 host sets 1 to request a return
     uint32_t dispatches;      // +396 region dispatch-loop iterations (profiling)
     // M15 memory fast-path appends (REGION_ABI.md; offsets are contractual).
     // Host offsets into linear memory; 0 disables the fast path entirely.
-    uint32_t code_pages_base; // +400 host offset of code-page refcounts, 0=off
+    HostAddress code_pages_base; // +400 host pointer to code-page refcounts
     // Per-call fast-path tallies (generated Wasm increments; host accumulates
     // into process counters and zeroes before each call). Fallback reasons are
     // NOT state fields: the emitter encodes the reason in the high byte of the
@@ -66,6 +75,9 @@ struct JitState {
     uint32_t tx_wasm;         // +416 in-Wasm cached-region transfers
 };
 static_assert(std::is_standard_layout_v<JitState>);
+static_assert(sizeof(JitState::regs) == 16 * sizeof(uint32_t));
+static_assert(offsetof(JitState, cpsr) == 64);
+#ifndef VITA3K_WEB_MEMORY64
 static_assert(offsetof(JitState, memory_cookie) == 84);
 static_assert(offsetof(JitState, memory_value) == 96);
 static_assert(offsetof(JitState, fpu) == 112);
@@ -83,15 +95,26 @@ static_assert(offsetof(JitState, mem_fast_writes) == 408);
 static_assert(offsetof(JitState, smc_page) == 412);
 static_assert(offsetof(JitState, tx_wasm) == 416);
 static_assert(sizeof(JitState) == 420);
+#else
+static_assert(sizeof(HostAddress) == sizeof(void *));
+static_assert(offsetof(JitState, memory_cookie) % alignof(HostAddress) == 0);
+static_assert(offsetof(JitState, page_perms_base) % alignof(HostAddress) == 0);
+#endif
 
-// Emits an MVP Wasm module importing env.memory (unshared, min 1 page)
-// and env.mem_read/env.mem_write: (stateOffset i32, address i32, bytes i32)->i32.
+// Memory64 overrides all wasm32-specific signatures below: state/metadata
+// pointers are i64, guest operands and results remain i32, and env.memory is
+// the runtime's unshared Memory64 memory. REGION_ABI.md defines both modes.
+
+// Emits a Wasm module importing env.memory (unshared, min 1 page in wasm32;
+// fixed Memory64 limits in the opt-in wasm64 mode) and env.mem_read/
+// env.mem_write: (host state pointer, guest address i32, bytes i32)->i32.
 // Helpers are noexcept native Wasm functions: 0=success, 2=fault. Read fills
 // memory_value in little-endian order; write consumes it. Only the low `bytes`
 // bytes are significant. On failure helpers set fault_address/fault_write.
-// The module exports block: (i32 stateOffset) -> i32 reason; it can be put
-// directly in an Emscripten function table (signature "ii"). stateOffset must
-// address a live JitState in that memory; out-of-bounds accesses trap.
+// The module exports block: (host pointer) -> i32 reason. Its pointer parameter
+// is i32 in the existing wasm32 ABI and i64 in Memory64; it is passed through
+// Emscripten's native function-table ABI. The pointer must address a live
+// JitState in that memory; out-of-bounds accesses trap.
 //
 // EMPTY vector means unsupported IR/terminal/location or exceeded limits; no
 // partial module is returned. No guest instructions execute during emission.
@@ -104,11 +127,13 @@ static_assert(sizeof(JitState) == 420);
 // Parent MUST snapshot/restore architectural regs/CPSR/FPU on Fault (not the
 // fault fields). Earlier stores of a multi-access instruction may have completed.
 //
-// M15 inline memory fast path: when page_table_base, page_perms_base and
-// code_pages_base are all populated (any 0=off), 1/2/4-byte A32 memory IR lowers
-// INLINE instead of calling the checked helpers: page-table lookup +
-// permission/refcount probe + direct Wasm load/store against the sparse page
-// backing. The fast path is taken only
+// M15 inline memory fast path: when the metadata bases are populated (any 0=off),
+// 1/2/4-byte A32 memory IR lowers INLINE instead of calling the checked helpers.
+// wasm32 performs the existing page-table lookup + permission/refcount probe +
+// direct load/store against sparse backing. Memory64 keeps the permission and
+// refcount probe but widens the guest i32 only at the final fixed-window address
+// construction; it does not load a physical page-table entry. The fast path is
+// taken only
 // when it is provably equivalent to the checked path: fast-path disabled,
 // guest page 0 (the checked path rejects addr < host_page_size even when a
 // sparse backing was force-allocated there), page-crossing access, unmapped

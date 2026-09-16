@@ -1,6 +1,11 @@
 # Authoritative Vita3K runtime sources, built independently of desktop frontend.
 set(VITA_ROOT "${CMAKE_CURRENT_LIST_DIR}/../vita3k")
 set(EXT_ROOT "${CMAKE_CURRENT_LIST_DIR}/../external")
+add_library(vita3k_web_host_abi INTERFACE)
+target_link_options(vita3k_web_host_abi INTERFACE
+    --pre-js "${CMAKE_CURRENT_LIST_DIR}/src/host_abi.js")
+set_property(TARGET vita3k_web_host_abi PROPERTY INTERFACE_LINK_DEPENDS
+    "${CMAKE_CURRENT_LIST_DIR}/src/host_abi.js")
 set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(CAPSTONE_BUILD_CSTOOL OFF CACHE BOOL "" FORCE)
 set(CAPSTONE_ARCHITECTURE_DEFAULT OFF CACHE BOOL "" FORCE)
@@ -36,12 +41,12 @@ target_include_directories(vita3k_web_runtime_core PUBLIC
 target_compile_definitions(vita3k_web_runtime_core PUBLIC VITA3K_INTERPRETER_CPU=1 SPDLOG_FMT_EXTERNAL)
 target_compile_options(vita3k_web_runtime_core PUBLIC -fexceptions)
 target_link_options(vita3k_web_runtime_core INTERFACE -fexceptions)
-target_link_libraries(vita3k_web_runtime_core PUBLIC fmt::fmt spdlog::spdlog capstone vita3k_web_boost_filesystem)
+target_link_libraries(vita3k_web_runtime_core PUBLIC fmt::fmt spdlog::spdlog capstone vita3k_web_boost_filesystem vita3k_web_host_abi)
 add_executable(vita3k_web_runtime_tests "${VITA_ROOT}/cpu/tests/interpreter_runtime_tests.cpp")
 target_link_libraries(vita3k_web_runtime_tests PRIVATE vita3k_web_runtime_core)
-target_link_options(vita3k_web_runtime_tests PRIVATE -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=1048576)
+target_link_options(vita3k_web_runtime_tests PRIVATE ${VITA3K_WEB_GROWTH_LINK_OPTION} -sSTACK_SIZE=1048576)
 add_executable(vita3k_web_loader_tests "${CMAKE_CURRENT_LIST_DIR}/tests/vita_loader_runtime_tests.cpp")
 target_link_libraries(vita3k_web_loader_tests PRIVATE vita3k_web_runtime_core)
 # This executable is a Node-only file-input test; browser entrypoints do not use
 # NODERAWFS and receive uploaded bytes instead.
-target_link_options(vita3k_web_loader_tests PRIVATE -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=1048576 -sNODERAWFS=1)
+target_link_options(vita3k_web_loader_tests PRIVATE ${VITA3K_WEB_GROWTH_LINK_OPTION} -sSTACK_SIZE=1048576 -sNODERAWFS=1)

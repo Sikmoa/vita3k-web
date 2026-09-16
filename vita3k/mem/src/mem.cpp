@@ -22,6 +22,7 @@
 #include <util/log.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstring>
 #include <limits>
@@ -40,7 +41,7 @@
 
 constexpr uint32_t STANDARD_PAGE_SIZE = KiB(4);
 // The guest address space does not fit in Wasm32 size_t.
-constexpr uint64_t TOTAL_MEM_SIZE = uint64_t { 1 } << 32;
+constexpr uint64_t TOTAL_MEM_SIZE = vita3k::memory::guest_address_space_size;
 constexpr uint32_t PAGE_COUNT = TOTAL_MEM_SIZE / STANDARD_PAGE_SIZE;
 constexpr bool LOG_PROTECT = false;
 #ifdef NDEBUG
@@ -58,6 +59,13 @@ static void delete_memory(uint8_t *memory);
 
 static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_count, const char *name, const bool force);
 
+#ifdef VITA3K_WEB_MEMORY64
+// A fixed window belongs to one live guest machine in this Wasm instance.
+// A second MemState must fail rather than alias another machine's bytes.
+static std::atomic<MemState *> direct_window_owner{nullptr};
+extern "C" bool vita3k_web_memory64_ready();
+#endif
+
 #ifndef __EMSCRIPTEN__
 #ifdef _WIN32
 static std::string get_error_msg() {
@@ -74,7 +82,16 @@ bool init(MemState &state, const bool use_page_table) {
     deinit_mem(state);
 #ifdef __EMSCRIPTEN__
     state.host_page_size = STANDARD_PAGE_SIZE;
-    state.sparse_host_memory = true;
+    state.direct_host_memory = vita3k::memory::direct_memory64;
+    state.sparse_host_memory = !state.direct_host_memory;
+#ifdef VITA3K_WEB_MEMORY64
+    MemState *expected = nullptr;
+    if (!vita3k_web_memory64_ready()
+        || !direct_window_owner.compare_exchange_strong(expected, &state)) {
+        deinit_mem(state);
+        return false;
+    }
+#endif
 #elif defined(_WIN32)
     SYSTEM_INFO system_info = {};
     GetSystemInfo(&system_info);
@@ -119,7 +136,7 @@ bool init(MemState &state, const bool use_page_table) {
         state.alloc_table = AllocPageTable(new AllocMemPage[PAGE_COUNT]{});
         state.page_permissions = std::make_unique<MemPerm[]>(PAGE_COUNT);
         state.allocator.set_maximum(PAGE_COUNT);
-        state.use_page_table = state.sparse_host_memory || use_page_table;
+        state.use_page_table = !state.direct_host_memory && (state.sparse_host_memory || use_page_table);
         if (state.use_page_table) {
             state.page_table = PageTable(new PagePtr[PAGE_COUNT]);
             std::fill_n(state.page_table.get(), PAGE_COUNT, state.memory.get());
@@ -138,8 +155,10 @@ bool init(MemState &state, const bool use_page_table) {
 
     // Reserve the null host page in the same allocator; Wasm needs no backing.
     const uint32_t null_pages = state.host_page_size / STANDARD_PAGE_SIZE;
-    if (state.allocator.allocate_at(0, null_pages) < 0)
+    if (state.allocator.allocate_at(0, null_pages) < 0) {
+        deinit_mem(state);
         return false;
+    }
     state.alloc_table[0].allocated = 1;
     state.alloc_table[0].size = null_pages;
     return true;
@@ -163,8 +182,8 @@ bool is_valid_addr(const MemState &state, Address addr) {
     return addr >= state.host_page_size && state.alloc_table && state.allocator.free_slot_count(page_num, page_num + 1) == 0;
 }
 
-bool is_valid_addr_range(const MemState &state, Address start, Address end) {
-    if (start >= end || start < state.host_page_size || !state.alloc_table)
+bool is_valid_addr_range(const MemState &state, Address start, uint64_t end) {
+    if (start >= end || end > TOTAL_MEM_SIZE || start < state.host_page_size || !state.alloc_table)
         return false;
     const uint32_t start_page = start / STANDARD_PAGE_SIZE;
     const uint32_t end_page = (uint64_t(end) + STANDARD_PAGE_SIZE - 1) / STANDARD_PAGE_SIZE;
@@ -187,7 +206,11 @@ static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_c
 
     const uint64_t size = uint64_t(page_count) * STANDARD_PAGE_SIZE;
     const Address addr = uint32_t(page_num) * STANDARD_PAGE_SIZE;
-    if (state.sparse_host_memory) {
+    if (state.direct_host_memory) {
+        // No physical backing allocation and no page translation table. Reuse
+        // always starts zeroed, even though free does not shrink Wasm memory.
+        std::memset(vita3k::memory::direct_pointer(addr), 0, static_cast<size_t>(size));
+    } else if (state.sparse_host_memory) {
         // Every page in an allocation points into ONE buffer. ELF segment copies,
         // stacks and HLE Ptr+length users rely on this contiguity.
         if (size > std::numeric_limits<size_t>::max()) {
@@ -289,7 +312,9 @@ Address alloc_aligned(MemState &state, uint32_t size, const char *name, unsigned
 
 // Unchecked translation for trusted HLE access. A sparse entry is a page base;
 // a native entry remains the original direct-path absolute-address bias.
-static uint8_t *page_pointer(const MemState &state, Address addr) {
+uint8_t *mem_guest_to_host(const MemState &state, Address addr) {
+    if (state.direct_host_memory)
+        return is_valid_addr(state, addr) ? vita3k::memory::direct_pointer(addr) : nullptr;
     if (state.use_page_table) {
         auto *base = state.page_table[addr / STANDARD_PAGE_SIZE];
         if (!base)
@@ -297,6 +322,10 @@ static uint8_t *page_pointer(const MemState &state, Address addr) {
         return base + (state.sparse_host_memory ? addr % STANDARD_PAGE_SIZE : addr);
     }
     return state.memory ? state.memory.get() + addr : nullptr;
+}
+
+static uint8_t *page_pointer(const MemState &state, Address addr) {
+    return mem_guest_to_host(state, addr);
 }
 
 static bool check_range(const MemState &state, Address addr, size_t size, MemPerm required) {
@@ -311,7 +340,7 @@ static bool check_range(const MemState &state, Address addr, size_t size, MemPer
     for (uint32_t page = first; page < end; ++page) {
         if ((static_cast<uint8_t>(state.page_permissions[page]) & static_cast<uint8_t>(required)) != static_cast<uint8_t>(required))
             return false;
-        if (!page_pointer(state, page * STANDARD_PAGE_SIZE))
+        if (!state.direct_host_memory && !page_pointer(state, page * STANDARD_PAGE_SIZE))
             return false;
     }
     return true;
@@ -320,6 +349,11 @@ static bool check_range(const MemState &state, Address addr, size_t size, MemPer
 static bool copy_from_guest(const MemState &state, Address addr, void *destination, size_t size, MemPerm required) {
     if ((!destination && size) || !check_range(state, addr, size, required))
         return false;
+    if (state.direct_host_memory) {
+        if (size)
+            std::memcpy(destination, vita3k::memory::direct_pointer(addr), size);
+        return true;
+    }
     auto *output = static_cast<uint8_t *>(destination);
     while (size) {
         const size_t count = std::min(size, size_t(STANDARD_PAGE_SIZE - addr % STANDARD_PAGE_SIZE));
@@ -342,6 +376,11 @@ bool mem_fetch(const MemState &state, Address addr, void *destination, size_t si
 bool mem_write(MemState &state, Address addr, const void *source, size_t size) {
     if ((!source && size) || !check_range(state, addr, size, MemPerm::WriteOnly))
         return false;
+    if (state.direct_host_memory) {
+        if (size)
+            std::memcpy(vita3k::memory::direct_pointer(addr), source, size);
+        return true;
+    }
     auto *input = static_cast<const uint8_t *>(source);
     while (size) {
         const size_t count = std::min(size, size_t(STANDARD_PAGE_SIZE - addr % STANDARD_PAGE_SIZE));
@@ -367,10 +406,22 @@ bool mem_host_to_guest(const MemState &state, const void *pointer, Address &addr
     if (!pointer || !state.alloc_table)
         return false;
     const uintptr_t value = reinterpret_cast<uintptr_t>(pointer);
+    if (state.direct_host_memory) {
+        if (value < vita3k::memory::guest_window_base || value >= vita3k::memory::guest_window_end)
+            return false;
+        const uint64_t candidate = uint64_t(value) - vita3k::memory::guest_window_base;
+        if (candidate > UINT32_MAX || !is_valid_addr(state, static_cast<Address>(candidate)))
+            return false;
+        addr = static_cast<Address>(candidate);
+        return true;
+    }
     const auto accept = [&](uintptr_t base, uint64_t size, Address guest) {
         if (value < base || uint64_t(value - base) >= size)
             return false;
-        const Address candidate = guest + static_cast<Address>(value - base);
+        const uint64_t candidate64 = uint64_t(guest) + uint64_t(value - base);
+        if (candidate64 >= TOTAL_MEM_SIZE)
+            return false;
+        const Address candidate = static_cast<Address>(candidate64);
         if (!is_valid_addr(state, candidate) || reinterpret_cast<uintptr_t>(page_pointer(state, candidate)) != value)
             return false;
         addr = candidate;
@@ -516,6 +567,12 @@ static uint8_t *original_page_pointer(const MemState &mem, uint32_t page) {
 }
 
 void add_external_mapping(MemState &mem, Address addr, uint32_t size, uint8_t *addr_ptr) {
+    // Direct mode cannot alias a separately allocated host buffer. The browser
+    // runtime does not use renderer external mappings; fail closed if introduced.
+    if (mem.direct_host_memory) {
+        LOG_ERROR("External host aliases are unavailable with the fixed Memory64 guest window");
+        return;
+    }
     if (!mem.use_page_table || !addr_ptr || !size || (addr % STANDARD_PAGE_SIZE) || (size % STANDARD_PAGE_SIZE)
         || !check_range(mem, addr, size, MemPerm::None))
         return;
@@ -733,6 +790,11 @@ void deinit_mem(MemState &state) {
     state.sparse_allocations.clear();
     state.page_permissions.reset();
     state.sparse_host_memory = false;
+    state.direct_host_memory = false;
+#ifdef VITA3K_WEB_MEMORY64
+    MemState *expected = &state;
+    direct_window_owner.compare_exchange_strong(expected, nullptr);
+#endif
     state.memory.reset();
     state.alloc_table.reset();
     state.allocator.reset();

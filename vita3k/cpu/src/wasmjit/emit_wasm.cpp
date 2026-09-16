@@ -89,18 +89,23 @@ using Cond = Dynarmic::IR::Cond;
 using Location = Dynarmic::A32::LocationDescriptor;
 namespace Term = Dynarmic::IR::Term;
 
-// Only MVP opcodes. In particular, no sign-extension proposal or multivalue.
+// MVP operations plus the opt-in Memory64 address/import types. No Table64
+// region table, sign-extension proposal, multivalue or additional memory.
 enum Wasm : uint8_t {
     Block = 0x02, Loop = 0x03, If = 0x04, Else = 0x05, End = 0x0b,
     Br = 0x0c, BrIf = 0x0d, BrTable = 0x0e, Return = 0x0f, Call = 0x10,
     CallIndirect = 0x11, Select = 0x1b,
-    Get = 0x20, Set = 0x21, Load = 0x28, Load8U = 0x2d, Load16U = 0x2f,
+    Get = 0x20, Set = 0x21, Load = 0x28, Load64 = 0x29, Load8U = 0x2d, Load16U = 0x2f,
     Store = 0x36, Store8 = 0x3a, Store16 = 0x3b, Const = 0x41,
-    Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtU = 0x49, GtU = 0x4b, LeU = 0x4d, GeU = 0x4e,
+    Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtU = 0x49, GtU = 0x4b, LeU = 0x4d, GeU = 0x4e, Eqz64 = 0x50,
     Clz = 0x67, Add = 0x6a, Sub = 0x6b, Mul = 0x6c, And = 0x71, Or = 0x72, Xor = 0x73,
     Shl = 0x74, ShrS = 0x75, ShrU = 0x76, RotR = 0x78,
     Add64 = 0x7c, Mul64 = 0x7e, Or64 = 0x84, Shl64 = 0x86, ShrU64 = 0x88, ShrS64 = 0x87, Wrap = 0xa7, ExtendU = 0xad,
 };
+
+constexpr bool memory64 = memory_address_type == MemoryAddressType::I64;
+constexpr uint8_t host_type = memory64 ? 0x7e : 0x7f;
+constexpr uint8_t host_eqz = memory64 ? Eqz64 : Eqz;
 
 void uleb(Bytes &out, uint32_t n) {
     do {
@@ -108,6 +113,57 @@ void uleb(Bytes &out, uint32_t n) {
         n >>= 7;
         out.push_back(byte | (n ? 0x80 : 0));
     } while (n);
+}
+
+void uleb64(Bytes &out, uint64_t n) {
+    do {
+        const uint8_t byte = n & 0x7f;
+        n >>= 7;
+        out.push_back(byte | (n ? 0x80 : 0));
+    } while (n);
+}
+
+void constant64(Bytes &out, int64_t n) {
+    out.push_back(0x42); // i64.const, signed LEB128
+    for (;;) {
+        const uint8_t byte = static_cast<uint8_t>(n) & 0x7f;
+        n = (n - byte) / 128;
+        const bool done = (n == 0 && !(byte & 0x40)) || (n == -1 && (byte & 0x40));
+        out.push_back(byte | (done ? 0 : 0x80));
+        if (done) break;
+    }
+}
+
+void memory_type(Bytes &out) {
+    if (memory64) {
+        // Unshared, maximum present, i64 address type. Import the ONE main
+        // runtime memory, whose fixed extent is 8 GiB = 131072 Wasm pages.
+        out.push_back(0x05);
+        uleb64(out, vita3k::memory::guest_window_end / vita3k::memory::wasm_page_size);
+        uleb64(out, vita3k::memory::guest_window_end / vita3k::memory::wasm_page_size);
+    } else {
+        out.insert(out.end(), {0, 1}); // original unshared min=1, no maximum
+    }
+}
+
+Bytes memory_imports(uint32_t count) {
+    Bytes out;
+    uleb(out, count);
+    out.insert(out.end(), {3, 'e', 'n', 'v', 6, 'm', 'e', 'm', 'o', 'r', 'y', 2});
+    memory_type(out);
+    return out;
+}
+
+void memarg(Bytes &out, uint32_t alignment, uint64_t offset) {
+    uleb(out, alignment);
+    uleb64(out, offset);
+}
+
+// Stack: host address, unsigned i32 byte offset -> host address. Guest
+// arithmetic is still i32; widen only at this memory-address boundary.
+void address_add_i32(Bytes &out) {
+    if (memory64) out.push_back(ExtendU);
+    out.push_back(memory64 ? Add64 : Add);
 }
 
 void constant(Bytes &out, uint32_t n) {
@@ -136,8 +192,11 @@ void b_op(Bytes &c, uint8_t byte) { c.push_back(byte); }
 void b_imm(Bytes &c, uint32_t n) { constant(c, n); }
 void b_get(Bytes &c, uint32_t index) { b_op(c, Get); uleb(c, index); }
 void b_set(Bytes &c, uint32_t index) { b_op(c, Set); uleb(c, index); }
-void b_load(Bytes &c, uint32_t offset) { b_get(c, 0); b_op(c, Load); uleb(c, 2); uleb(c, offset); }
-void b_store(Bytes &c, uint32_t offset) { b_op(c, Store); uleb(c, 2); uleb(c, offset); }
+void b_load(Bytes &c, uint32_t offset) { b_get(c, 0); b_op(c, Load); memarg(c, 2, offset); }
+void b_store(Bytes &c, uint32_t offset) { b_op(c, Store); memarg(c, 2, offset); }
+void b_load_host(Bytes &c, uint32_t offset) {
+    b_get(c, 0); b_op(c, memory64 ? Load64 : Load); memarg(c, memory64 ? 3 : 2, offset);
+}
 
 bool scalar(Type type) {
     return type == Type::U1 || type == Type::U8 || type == Type::U16 || type == Type::U32 || type == Type::U64 || type == Type::NZCVFlags;
@@ -511,12 +570,13 @@ public:
         functions.insert(functions.end(), body.begin(), body.end());
 
         Bytes module{0, 'a', 's', 'm', 1, 0, 0, 0};
-        section(module, 1, {2, 0x60, 1, 0x7f, 1, 0x7f,
-            0x60, 3, 0x7f, 0x7f, 0x7f, 1, 0x7f}); // block and checked helpers
-        section(module, 2, {3,
-            3, 'e', 'n', 'v', 6, 'm', 'e', 'm', 'o', 'r', 'y', 2, 0, 1,
+        section(module, 1, {2, 0x60, 1, host_type, 1, 0x7f,
+            0x60, 3, host_type, 0x7f, 0x7f, 1, 0x7f}); // block and checked helpers
+        auto imports = memory_imports(3);
+        imports.insert(imports.end(), {
             3, 'e', 'n', 'v', 8, 'm', 'e', 'm', '_', 'r', 'e', 'a', 'd', 0, 1,
             3, 'e', 'n', 'v', 9, 'm', 'e', 'm', '_', 'w', 'r', 'i', 't', 'e', 0, 1});
+        section(module, 2, imports);
         section(module, 3, {1, 0}); // one function, type 0
         section(module, 7, {1, 5, 'b', 'l', 'o', 'c', 'k', 0, 2});
         section(module, 10, functions);
@@ -561,8 +621,8 @@ private:
     void set(uint32_t index) { op(Set); uleb(code, index); }
     void begin_if(bool result = false) { op(If); op(result ? 0x7f : 0x40); ++extra_labels; }
     void end_if() { op(End); --extra_labels; }
-    void load(uint32_t offset) { get(0); op(Load); uleb(code, 2); uleb(code, offset); }
-    void store(uint32_t offset) { op(Store); uleb(code, 2); uleb(code, offset); }
+    void load(uint32_t offset) { b_load(code, offset); }
+    void store(uint32_t offset) { b_store(code, offset); }
     void store_constant(uint32_t offset, uint32_t n) { get(0); imm(n); store(offset); }
     void mask(uint32_t bits) { imm(bits); op(And); }
     void analyze_register_cache() {
@@ -695,7 +755,23 @@ private:
         if (region)
             get(local);
         else
-            load(offset);
+            b_load_host(code, offset);
+    }
+    void memory_disabled() {
+        if (!memory64) {
+            memory_base(page_table_local, offsetof(JitState, page_table_base)); op(host_eqz);
+        }
+        memory_base(page_perms_local, offsetof(JitState, page_perms_base)); op(host_eqz);
+        if (!memory64) op(Or);
+        memory_base(code_pages_local, offsetof(JitState, code_pages_base)); op(host_eqz); op(Or);
+    }
+    void guest_effective_address(uint32_t address, uint32_t backing) {
+        if (memory64) {
+            get(address); op(ExtendU);
+            constant64(code, vita3k::memory::guest_window_base); op(Add64);
+        } else {
+            get(backing); get(address); imm(0xfff); op(And); op(Add);
+        }
     }
     // Probe chain: page 0 -> fast-path enabled -> permissions -> mapped ->
     // page boundary -> (stores) code-page refcount. All ifs are void; every
@@ -733,9 +809,7 @@ private:
         // smc_dirty via the helper).
         const bool emit_fast_guard = !(region && state.skip_fast_guard());
         if (emit_fast_guard) {
-            memory_base(page_table_local, offsetof(JitState, page_table_base)); op(Eqz);
-            memory_base(page_perms_local, offsetof(JitState, page_perms_base)); op(Eqz); op(Or);
-            memory_base(code_pages_local, offsetof(JitState, code_pages_base)); op(Eqz); op(Or);
+            memory_disabled();
             begin_if();
             memory_slow_call(inst, write, bytes, kSlowOther);
             op(Else);
@@ -743,21 +817,26 @@ private:
         // ok = page_nonzero & perm_ok & mapped & in_page [& code_ok].
         get(page_local); op(Eqz); op(Eqz);
         memory_base(page_perms_local, offsetof(JitState, page_perms_base));
-        get(page_local); op(Add);
+        get(page_local); address_add_i32(code);
         op(Load8U); uleb(code, 0); uleb(code, 0);
         imm(required); op(And); imm(required); op(Eq);
         op(And);
-        memory_base(page_table_local, offsetof(JitState, page_table_base));
-        get(page_local); imm(2); op(Shl); op(Add);
-        op(Load); uleb(code, 2); uleb(code, 0);
-        set(base_local);
-        get(base_local); op(Eqz); op(Eqz);
-        op(And);
+        if (!memory64) {
+            memory_base(page_table_local, offsetof(JitState, page_table_base));
+            get(page_local); imm(2); op(Shl); op(Add);
+            op(Load); uleb(code, 2); uleb(code, 0);
+            set(base_local);
+            get(base_local); op(Eqz); op(Eqz);
+            op(And);
+        }
+        // Direct mode: permission Read/Write implies a live allocation. Init,
+        // free and aligned trimming clear permission bytes to None. No PTE,
+        // physical-page pointer, or translated backing base is loaded here.
         get(addr_local); imm(0xfff); op(And); imm(4096 - bytes); op(GtU); op(Eqz);
         op(And);
         if (write) {
             memory_base(code_pages_local, offsetof(JitState, code_pages_base));
-            get(page_local); imm(2); op(Shl); op(Add);
+            get(page_local); imm(2); op(Shl); address_add_i32(code);
             op(Load); uleb(code, 2); uleb(code, 0);
             op(Eqz);
             op(And);
@@ -768,8 +847,7 @@ private:
         op(Else);
         if (write) {
             // Direct store: base + (addr & 0xfff).
-            get(base_local);
-            get(addr_local); imm(0xfff); op(And); op(Add);
+            guest_effective_address(addr_local, base_local);
             value_word(inst.GetArg(2), 0);
             if (bytes == 1) { op(Store8); uleb(code, 0); uleb(code, 0); }
             else if (bytes == 2) { op(Store16); uleb(code, 1); uleb(code, 0); }
@@ -778,8 +856,7 @@ private:
             store(offsetof(JitState, mem_fast_writes));
         } else {
             // Direct load: base + (addr & 0xfff); 8/16-bit zero-extending.
-            get(base_local);
-            get(addr_local); imm(0xfff); op(And); op(Add);
+            guest_effective_address(addr_local, base_local);
             if (bytes == 1) { op(Load8U); uleb(code, 0); uleb(code, 0); }
             else if (bytes == 2) { op(Load16U); uleb(code, 1); uleb(code, 0); }
             else { op(Load); uleb(code, 2); uleb(code, 0); }
@@ -815,32 +892,32 @@ private:
         memory_slow_call(inst, write, bytes, kSlowOther);
         op(Else);
         if (emit_fast_guard) {
-            memory_base(page_table_local, offsetof(JitState, page_table_base)); op(Eqz);
-            memory_base(page_perms_local, offsetof(JitState, page_perms_base)); op(Eqz); op(Or);
-            memory_base(code_pages_local, offsetof(JitState, code_pages_base)); op(Eqz); op(Or);
+            memory_disabled();
             begin_if();
             memory_slow_call(inst, write, bytes, kSlowOther);
             op(Else);
         }
         memory_base(page_perms_local, offsetof(JitState, page_perms_base));
-        get(page_local); op(Add);
+        get(page_local); address_add_i32(code);
         op(Load8U); uleb(code, 0); uleb(code, 0);
         imm(required); op(And); imm(required); op(Ne);
         begin_if();
         memory_slow_call(inst, write, bytes, kSlowPerms);
         op(Else);
-        get(base_local);
-        op(Eqz);
-        begin_if();
-        memory_slow_call(inst, write, bytes, kSlowUnmapped);
-        op(Else);
+        if (!memory64) {
+            get(base_local);
+            op(Eqz);
+            begin_if();
+            memory_slow_call(inst, write, bytes, kSlowUnmapped);
+            op(Else);
+        }
         get(addr_local); imm(0xfff); op(And); imm(4096 - bytes); op(GtU);
         begin_if();
         memory_slow_call(inst, write, bytes, kSlowCrossPage);
         op(Else);
         if (write) {
             memory_base(code_pages_local, offsetof(JitState, code_pages_base));
-            get(page_local); imm(2); op(Shl); op(Add);
+            get(page_local); imm(2); op(Shl); address_add_i32(code);
             op(Load); uleb(code, 2); uleb(code, 0);
             op(Eqz); op(Eqz);
             begin_if();
@@ -852,7 +929,7 @@ private:
             end_if();
         }
         end_if(); // page boundary
-        end_if(); // mapping
+        if (!memory64) end_if(); // sparse mapping
         end_if(); // permissions
         if (emit_fast_guard)
             end_if(); // fast-path enabled
@@ -2042,9 +2119,9 @@ std::vector<uint8_t> emit_region(
     // (a stale 0 would wrongly route the first dispatch to block 0).
     b_imm(code, kLightDispatchSentinel); b_set(code, 6);
     b_imm(code, 0); b_set(code, 7);
-    b_load(code, offsetof(JitState, page_table_base)); b_set(code, 8);
-    b_load(code, offsetof(JitState, page_perms_base)); b_set(code, 9);
-    b_load(code, offsetof(JitState, code_pages_base)); b_set(code, 10);
+    if (!memory64) { b_load_host(code, offsetof(JitState, page_table_base)); b_set(code, 8); }
+    b_load_host(code, offsetof(JitState, page_perms_base)); b_set(code, 9);
+    b_load_host(code, offsetof(JitState, code_pages_base)); b_set(code, 10);
     for (uint32_t i = 0; i < used_regs.size(); ++i) {
         if (used_regs[i]) {
             b_load(code, offsetof(JitState, regs) + i * sizeof(uint32_t));
@@ -2081,10 +2158,16 @@ std::vector<uint8_t> emit_region(
     b_op(code, End); // end function body
 
     Bytes body;
-    uleb(body, 3); // three local runs
+    uleb(body, memory64 ? 5 : 3);
     uleb(body, 3); body.push_back(0x7f); // locals 2,3,4: executed_call, pc, CheckBit
     uleb(body, 1); body.push_back(0x7e); // local 5: i64 scratch
-    uleb(body, state.ssa_base() - 6 + max_ssa); body.push_back(0x7f); // fixed region locals, optional state locals, then SSA
+    if (memory64) {
+        uleb(body, 2); body.push_back(0x7f); // 6,7: dispatch index and counter
+        uleb(body, 3); body.push_back(host_type); // 8..10: host metadata pointers (8 unused)
+        uleb(body, state.ssa_base() - 11 + max_ssa); body.push_back(0x7f);
+    } else {
+        uleb(body, state.ssa_base() - 6 + max_ssa); body.push_back(0x7f);
+    }
     body.insert(body.end(), code.begin(), code.end());
     // Outlined region fault path (R3j): one cold function per module shared
     // by every fault arm. Promoted mode round-trips other_psr through a
@@ -2114,18 +2197,19 @@ std::vector<uint8_t> emit_region(
 
     Bytes module{0, 'a', 's', 'm', 1, 0, 0, 0};
     Bytes types{3,
-        0x60, 2, 0x7f, 0x7f, 1, 0x7f, // type 0: (i32,i32)->i32 for run
-        0x60, 3, 0x7f, 0x7f, 0x7f, 1, 0x7f}; // type 1: checked helpers
+        0x60, 2, host_type, 0x7f, 1, 0x7f, // type 0: (host,i32)->i32 for run
+        0x60, 3, host_type, 0x7f, 0x7f, 1, 0x7f}; // type 1: checked helpers
     if (state.uses_flag_locals()) {
-        types.insert(types.end(), {0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f}); // type 2: fault (P)
+        types.insert(types.end(), {0x60, 4, host_type, 0x7f, 0x7f, 0x7f, 1, 0x7f}); // type 2: fault (P)
     } else {
-        types.insert(types.end(), {0x60, 3, 0x7f, 0x7f, 0x7f, 0}); // type 2: fault (A)
+        types.insert(types.end(), {0x60, 3, host_type, 0x7f, 0x7f, 0}); // type 2: fault (A)
     }
     section(module, 1, types);
-    section(module, 2, {3,
-        3, 'e', 'n', 'v', 6, 'm', 'e', 'm', 'o', 'r', 'y', 2, 0, 1,
+    auto imports = memory_imports(3);
+    imports.insert(imports.end(), {
         3, 'e', 'n', 'v', 8, 'm', 'e', 'm', '_', 'r', 'e', 'a', 'd', 0, 1,
         3, 'e', 'n', 'v', 9, 'm', 'e', 'm', '_', 'w', 'r', 'i', 't', 'e', 0, 1});
+    section(module, 2, imports);
     section(module, 3, {2, 0, 2}); // run (type 0), fault (type 2)
     // Function index space counts IMPORTED functions first: mem_read=0,
     // mem_write=1, our run=2, fault=3. (Same layout as the single-block module.)
@@ -2195,27 +2279,27 @@ std::vector<uint8_t> emit_dispatch() {
         b_get(c, 10); b_imm(c, kDispatchMaxProbe); b_op(c, LtU); b_op(c, Eqz);
         if_void(miss);
         // epoch = *(map_base + idx*16 + 12); if 0: miss (never written).
-        b_get(c, 2); b_get(c, 9); b_imm(c, 4); b_op(c, Shl); b_op(c, Add);
-        b_imm(c, 12); b_op(c, Add);
+        b_get(c, 2); b_get(c, 9); b_imm(c, 4); b_op(c, Shl); address_add_i32(c);
+        b_imm(c, 12); address_add_i32(c);
         b_op(c, Load); uleb(c, 2); uleb(c, 0);
         b_op(c, Eqz);
         if_void(miss);
         // match = (epoch == *epoch_addr) & (lo==key_lo) & (hi==key_hi).
-        b_get(c, 2); b_get(c, 9); b_imm(c, 4); b_op(c, Shl); b_op(c, Add);
-        b_imm(c, 12); b_op(c, Add);
+        b_get(c, 2); b_get(c, 9); b_imm(c, 4); b_op(c, Shl); address_add_i32(c);
+        b_imm(c, 12); address_add_i32(c);
         b_op(c, Load); uleb(c, 2); uleb(c, 0);
         b_get(c, 3); b_op(c, Load); uleb(c, 2); uleb(c, 0);
         b_op(c, Eq);
-        b_get(c, 2); b_get(c, 9); b_imm(c, 4); b_op(c, Shl); b_op(c, Add);
+        b_get(c, 2); b_get(c, 9); b_imm(c, 4); b_op(c, Shl); address_add_i32(c);
         b_op(c, Load); uleb(c, 2); uleb(c, 0);
         b_get(c, 7); b_op(c, Eq); b_op(c, And);
-        b_get(c, 2); b_get(c, 9); b_imm(c, 4); b_op(c, Shl); b_op(c, Add);
-        b_imm(c, 4); b_op(c, Add);
+        b_get(c, 2); b_get(c, 9); b_imm(c, 4); b_op(c, Shl); address_add_i32(c);
+        b_imm(c, 4); address_add_i32(c);
         b_op(c, Load); uleb(c, 2); uleb(c, 0);
         b_get(c, 8); b_op(c, Eq); b_op(c, And);
         if_void([&] {
-            b_get(c, 2); b_get(c, 9); b_imm(c, 4); b_op(c, Shl); b_op(c, Add);
-            b_imm(c, 8); b_op(c, Add);
+            b_get(c, 2); b_get(c, 9); b_imm(c, 4); b_op(c, Shl); address_add_i32(c);
+            b_imm(c, 8); address_add_i32(c);
             b_op(c, Load); uleb(c, 2); uleb(c, 0);
             b_set(c, 6);
             // Inside if_void at probe level: if=0,$p=1,$r=2 -> br 2 breaks $r.
@@ -2330,12 +2414,13 @@ std::vector<uint8_t> emit_dispatch() {
     funcs.insert(funcs.end(), c.begin(), c.end());
     Bytes module{0, 'a', 's', 'm', 1, 0, 0, 0};
     section(module, 1, {2,
-        0x60, 2, 0x7f, 0x7f, 1, 0x7f, // type 0: region run(state,budget)->reason
-        0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f}); // type 1: dispatch
-    section(module, 2, {2,
-        3, 'e', 'n', 'v', 6, 'm', 'e', 'm', 'o', 'r', 'y', 2, 0, 1,
+        0x60, 2, host_type, 0x7f, 1, 0x7f, // type 0: region run(state,budget)->reason
+        0x60, 4, host_type, 0x7f, host_type, host_type, 1, 0x7f}); // type 1: dispatch
+    auto imports = memory_imports(2);
+    imports.insert(imports.end(), {
         3, 'e', 'n', 'v', 12, 'r', 'e', 'g', 'i', 'o', 'n', '_', 't', 'a', 'b', 'l', 'e',
-        1, 0x70, 0, 1});
+        1, 0x70, 0, 1}); // ordinary i32-indexed funcref table in BOTH memory modes
+    section(module, 2, imports);
     section(module, 3, {1, 1}); // one function, type 1
     section(module, 7, {1, 8, 'd', 'i', 's', 'p', 'a', 't', 'c', 'h', 0, 0});
     section(module, 10, funcs);

@@ -779,7 +779,7 @@ static SceUID load_self_impl(KernelState &kernel, MemState &mem, const void *sel
                     || i >= MODULE_INFO_NUM_SEGMENTS
                     || (seg.p_vaddr & 3)
                     || seg.p_memsz > UINT32_MAX - 0xfff
-                    || static_cast<uint64_t>(seg.p_vaddr) + seg.p_memsz > UINT32_MAX))
+                    || !vita3k::memory::guest_range_fits(seg.p_vaddr, seg.p_memsz)))
                 return SCE_KERNEL_ERROR_ILLEGAL_ELF_HEADER;
         }
         const auto index = elf.e_entry >> 30;
@@ -958,7 +958,7 @@ static SceUID load_self_impl(KernelState &kernel, MemState &mem, const void *sel
             const auto first = segment_reloc_info.begin()->first;
             const auto last = segment_reloc_info.rbegin()->first;
             const auto start = dump_segments[first].p_vaddr;
-            const auto end = dump_segments[last].p_vaddr + dump_segments[last].p_filesz;
+            const auto end = uint64_t(dump_segments[last].p_vaddr) + dump_segments[last].p_filesz;
             const auto elf_name = fs::path(self_path).filename().stem().string();
             const auto filename = dump_path / fmt::format("{}-{}_{}.elf", log_hex_full(start), log_hex_full(end), elf_name);
             fs_utils::dump_data(filename, dump_elf.data(), dump_elf.size());
@@ -980,7 +980,7 @@ static SceUID load_self_impl(KernelState &kernel, MemState &mem, const void *sel
     }
 
     for (const auto &[seg, infos] : segment_reloc_info) {
-        LOG_INFO("Loaded module segment {} @ [0x{:08X} - 0x{:08X} / 0x{:08X}] (size: 0x{:08X}) of module {}", seg, infos.addr, infos.addr + infos.size, infos.p_vaddr, infos.size, self_path);
+        LOG_INFO("Loaded module segment {} @ [0x{:08X} - 0x{:08X} / 0x{:08X}] (size: 0x{:08X}) of module {}", seg, infos.addr, uint64_t(infos.addr) + infos.size, infos.p_vaddr, infos.size, self_path);
     }
 
     const SceKernelModulePtr kernelModuleInfo = std::make_shared<KernelModule>();

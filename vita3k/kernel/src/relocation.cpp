@@ -245,7 +245,7 @@ static void write_thumb_mov_abs(void *data, uint16_t symbol) {
 }
 
 static bool relocate_entry(void *data, uint32_t code, uint32_t symval, uint32_t addend, uint32_t addr) {
-    LOG_DEBUG_IF(LOG_RELOCATIONS, "code: {}, *data: {}, data: {}, addr: {}, symval: {}, addend: {}", code, log_hex(*static_cast<uint32_t *>(data)), data, log_hex(addr), log_hex(symval), log_hex(addend));
+    LOG_DEBUG_IF(LOG_RELOCATIONS, "code: {}, data: {}, addr: {}, symval: {}, addend: {}", code, data, log_hex(addr), log_hex(symval), log_hex(addend));
     switch (code) {
     case None:
     case V4BX: // Untested.
@@ -306,6 +306,29 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
 
     const auto segment_count = segments.size();
 
+    // Range arithmetic is wider than a Vita address. Narrow only AFTER proving
+    // the entire destination fits one mapped segment; symbol/addend/relocation
+    // values themselves retain ARM's 32-bit arithmetic. Loader writes remain
+    // intentionally unchecked with respect to guest permissions.
+    const auto target_pointer = [&](uint64_t address, uint32_t bytes) -> uint8_t * {
+        if (address >= vita3k::memory::guest_address_space_size
+            || !vita3k::memory::guest_range_fits(static_cast<Address>(address), bytes)
+            || !is_valid_addr_range(mem, static_cast<Address>(address), address + bytes))
+            return nullptr;
+        for (const auto &[_, segment] : segments) {
+            if (address >= segment.addr && address - segment.addr <= segment.size
+                && bytes <= segment.size - (address - segment.addr))
+                return mem_guest_to_host(mem, static_cast<Address>(address));
+        }
+        return nullptr;
+    };
+    const auto relocate_guest = [&](uint64_t address, uint32_t code, uint32_t symbol, uint32_t addend) {
+        if (code == None || code == V4BX || code == RBase)
+            return true;
+        auto *data = target_pointer(address, code == Abs8 ? 1 : 4);
+        return data && relocate_entry(data, code, symbol, addend, static_cast<Address>(address));
+    };
+
     if (LOG_RELOCATIONS) {
         LOG_DEBUG("Relocating patch of size: {}, # of segments: {}", log_hex(size), segment_count);
         for (const auto &seg : segments)
@@ -313,9 +336,8 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
     }
 
     // initialized in format 1 and 2
-    Address g_addr = 0,
-            g_offset = 0,
-            g_patchseg = 0;
+    Address g_addr = 0, g_patchseg = 0;
+    uint64_t g_offset = 0; // range accumulator, not a serialized Vita offset
 
     // initialized in format 0, 1, 2, and 3
     Address g_saddr = 0,
@@ -340,23 +362,23 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
             const auto patch_seg_start = segments.find(patch_seg)->second.addr;
 
             const Address s = (format0_entry->symbol_segment == 0xf) ? 0 : symbol_seg_start;
-            const Address p = patch_seg_start + format0_entry->offset;
+            const uint64_t p = uint64_t(patch_seg_start) + format0_entry->offset;
             const Address a = format0_entry->addend;
 
             LOG_DEBUG_IF(LOG_RELOCATIONS, "[FORMAT0]: offset: {}, code: {}, sym_seg: {}, sym_start: {}, patch_seg: {}, patch_start: {}, s: {}, p: {}, a: {}. {}",
-                format0_entry->offset, format0_entry->code, symbol_seg, log_hex(symbol_seg_start), patch_seg, log_hex(patch_seg_start), log_hex(s), log_hex(p), log_hex(a), log_hex((uint64_t)Ptr<uint32_t>(p).get(mem)));
+                format0_entry->offset, format0_entry->code, symbol_seg, log_hex(symbol_seg_start), patch_seg, log_hex(patch_seg_start), log_hex(s), log_hex(p), log_hex(a), log_hex(reinterpret_cast<uintptr_t>(target_pointer(p, 1))));
 
-            if (!relocate_entry(Ptr<uint32_t>(p).get(mem), format0_entry->code, s, a, p)) {
+            if (!relocate_guest(p, format0_entry->code, s, a)) {
                 return false;
             }
 
-            const Address addr2 = p + format0_entry->dist2 * 2;
+            const uint64_t addr2 = p + format0_entry->dist2 * 2;
 
             if (format0_entry->code2 != 0) {
                 LOG_DEBUG_IF(LOG_RELOCATIONS, "[FORMAT0/2]: code: {}, sym_seg: {}, sym_start: {}, s: {}, patch_seg: {}, p: {}, a: {}. {}",
-                    format0_entry->code2, format0_entry->symbol_segment, symbol_seg_start, format0_entry->patch_segment, log_hex(patch_seg_start), log_hex(s), log_hex(addr2), log_hex(a), log_hex((uint64_t)Ptr<uint32_t>(addr2).get(mem)));
+                    format0_entry->code2, format0_entry->symbol_segment, symbol_seg_start, format0_entry->patch_segment, log_hex(patch_seg_start), log_hex(s), log_hex(addr2), log_hex(a), log_hex(reinterpret_cast<uintptr_t>(target_pointer(addr2, 1))));
 
-                if (!relocate_entry(Ptr<uint32_t>(addr2).get(mem), format0_entry->code2, s, a, addr2)) {
+                if (!relocate_guest(addr2, format0_entry->code2, s, a)) {
                     return false;
                 }
             }
@@ -382,13 +404,13 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
                 const Address s = (format1_entry->symbol_segment == 0xf) ? 0 : symbol_seg_start;
 
                 const Address offset = format1_entry->offset_lo | (format1_entry->offset_hi << 12);
-                const Address p = patch_seg_start + offset;
+                const uint64_t p = uint64_t(patch_seg_start) + offset;
                 const Address a = format1_entry->addend;
 
                 LOG_DEBUG_IF(LOG_RELOCATIONS, "[FORMAT1]: code: {}, sym_seg: {}, sym_start: {}, patch_seg: {}, data_start: {}, s: {}, offset: {}, p: {}, a: {}",
                     format1_entry->code, symbol_seg, log_hex(symbol_seg_start), patch_seg, log_hex(patch_seg_start), log_hex(s), format1_entry->patch_segment, patch_seg_start, log_hex(offset), log_hex(p), log_hex(a));
 
-                if (!relocate_entry(Ptr<uint32_t>(p).get(mem), format1_entry->code, s, a, p)) {
+                if (!relocate_guest(p, format1_entry->code, s, a)) {
                     return false;
                 }
 
@@ -416,13 +438,13 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
                 }
 
                 const Address offset = format1_entry->offset;
-                const Address p = patch_seg_start + offset;
+                const uint64_t p = uint64_t(patch_seg_start) + offset;
                 const Address a = format1_entry->addend;
 
                 LOG_DEBUG_IF(LOG_RELOCATIONS, "[FORMAT1_VAR_IMPORT]: code: {}, patch_seg: {}, data_start: {}, s: {}, offset: {}, p: {}, a: {}",
                     format1_entry->code, patch_seg, log_hex(patch_seg_start), log_hex(s), format1_entry->patch_segment, patch_seg_start, log_hex(offset), log_hex(p), log_hex(a));
 
-                if (!relocate_entry(Ptr<uint32_t>(p).get(mem), format1_entry->code, s, a, p)) {
+                if (!relocate_guest(p, format1_entry->code, s, a)) {
                     return false;
                 }
 
@@ -456,7 +478,7 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
                 LOG_DEBUG_IF(LOG_RELOCATIONS, "[FORMAT2]: code: {}, sym_seg: {}, sym_start: {}, offset: {}, s: {}, p: {}, a: {}",
                     format2_entry->code, symbol_seg, log_hex(symbol_seg_start), log_hex(format2_entry->offset), log_hex(s), log_hex(p), log_hex(a));
 
-                if (!relocate_entry(Ptr<uint32_t>(p).get(mem), g_type, s, a, p)) {
+                if (!relocate_guest(p, g_type, s, a)) {
                     return false;
                 }
 
@@ -477,13 +499,13 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
                 }
 
                 const Address offset = format1_entry->offset;
-                const Address p = patch_seg_start + offset;
+                const uint64_t p = uint64_t(patch_seg_start) + offset;
                 const Address a = format1_entry->addend;
 
                 LOG_DEBUG_IF(LOG_RELOCATIONS, "[FORMAT2_VAR_IMPORT]: code: {}, patch_seg: {}, data_start: {}, s: {}, offset: {}, p: {}, a: {}",
                     format1_entry->code, patch_seg, log_hex(patch_seg_start), log_hex(s), format1_entry->patch_segment, patch_seg_start, log_hex(offset), log_hex(p), log_hex(a));
 
-                if (!relocate_entry(Ptr<uint32_t>(p).get(mem), format1_entry->code, s, a, p)) {
+                if (!relocate_guest(p, format1_entry->code, s, a)) {
                     return false;
                 }
 
@@ -527,11 +549,11 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
             const auto a = g_addend;
             const auto p = g_addr + g_offset;
 
-            if (!relocate_entry(Ptr<uint32_t>(p).get(mem), g_type, s, a, p)) {
+            if (!relocate_guest(p, g_type, s, a)) {
                 return false;
             }
 
-            if (!relocate_entry(Ptr<uint32_t>(p + dist2).get(mem), g_type2, s, a, p + dist2)) {
+            if (!relocate_guest(p + dist2, g_type2, s, a)) {
                 return false;
             }
 
@@ -550,11 +572,11 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
             const auto a = g_addend;
             const auto p = g_addr + g_offset;
 
-            if (!relocate_entry(Ptr<uint32_t>(p).get(mem), g_type, s, a, p)) {
+            if (!relocate_guest(p, g_type, s, a)) {
                 return false;
             }
 
-            if (!relocate_entry(Ptr<uint32_t>(p + dist2).get(mem), g_type2, s, a, p + dist2)) {
+            if (!relocate_guest(p + dist2, g_type2, s, a)) {
                 return false;
             }
 
@@ -569,22 +591,22 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
             const auto a = g_addend;
             const auto p = g_addr + g_offset;
 
-            if (!relocate_entry(Ptr<uint32_t>(p).get(mem), g_type, s, a, p)) {
+            if (!relocate_guest(p, g_type, s, a)) {
                 return false;
             }
 
-            if (!relocate_entry(Ptr<uint32_t>(p + format5_entry->dist2).get(mem), g_type2, s, a, p + format5_entry->dist2)) {
+            if (!relocate_guest(p + format5_entry->dist2, g_type2, s, a)) {
                 return false;
             }
 
             g_offset += format5_entry->dist3;
             const auto p2 = g_addr + g_offset;
 
-            if (!relocate_entry(Ptr<uint32_t>(p2).get(mem), g_type, s, a, p2)) {
+            if (!relocate_guest(p2, g_type, s, a)) {
                 return false;
             }
 
-            if (!relocate_entry(Ptr<uint32_t>(p2 + format5_entry->dist4).get(mem), g_type2, s, a, p2 + format5_entry->dist4)) {
+            if (!relocate_guest(p2 + format5_entry->dist4, g_type2, s, a)) {
                 return false;
             }
 
@@ -597,12 +619,15 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
 
             const auto patch_seg_start = segments.find(g_patchseg)->second.addr;
 
-            const uint32_t orgval = *Ptr<uint32_t>(patch_seg_start + g_offset).get(mem);
+            const auto *original = target_pointer(uint64_t(patch_seg_start) + g_offset, 4);
+            if (!original) return false;
+            uint32_t orgval;
+            std::memcpy(&orgval, original, sizeof(orgval));
 
             uint32_t segbase = 0;
             for (const auto &seg_ : segments) {
                 const auto seg = seg_.second;
-                if (orgval >= seg.p_vaddr && orgval < seg.p_vaddr + seg.size) {
+                if (orgval >= seg.p_vaddr && uint64_t(orgval) < uint64_t(seg.p_vaddr) + seg.size) {
                     segbase = seg.p_vaddr;
                     g_saddr = seg.addr;
                 }
@@ -618,7 +643,7 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
             const auto a = addend;
             const auto p = g_addr + g_offset;
 
-            if (!relocate_entry(Ptr<uint32_t>(p).get(mem), g_type, s, a, p)) {
+            if (!relocate_guest(p, g_type, s, a)) {
                 return false;
             }
 
@@ -649,12 +674,15 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
 
                 const auto patch_seg_start = segments.find(g_patchseg)->second.addr;
 
-                const uint32_t orgval = *Ptr<uint32_t>(patch_seg_start + g_offset).get(mem);
+                const auto *original = target_pointer(uint64_t(patch_seg_start) + g_offset, 4);
+                if (!original) return false;
+                uint32_t orgval;
+                std::memcpy(&orgval, original, sizeof(orgval));
 
                 uint32_t segbase = 0;
                 for (const auto &seg_ : segments) {
                     const auto seg = seg_.second;
-                    if (orgval >= seg.p_vaddr && orgval < seg.p_vaddr + seg.size) {
+                    if (orgval >= seg.p_vaddr && uint64_t(orgval) < uint64_t(seg.p_vaddr) + seg.size) {
                         segbase = seg.p_vaddr;
                         g_saddr = seg.addr;
                     }
@@ -670,7 +698,7 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
                 const auto a = addend;
                 const auto p = g_addr + g_offset;
 
-                if (!relocate_entry(Ptr<uint32_t>(p).get(mem), g_type, s, a, p)) {
+                if (!relocate_guest(p, g_type, s, a)) {
                     return false;
                 }
             } while (offsets >>= bitsize);

@@ -61,9 +61,9 @@ selection, while direct emitter/backend cases explicitly exercise the matrix.
 Run genuine exit-42 and display fixtures in each mode before benchmarking;
 repeat the hot-region WAT census on exactly that build. Record profile option
 fields so results cannot be mistaken for another policy. The public external
-cache-invalidation epoch discrepancy noted in REGION_ABI.md is pre-existing
-and requires separate investigation; a stale-epoch unit case is not a proof
-that every host eviction path bumps the epoch.
+cache-invalidation epoch discrepancy noted in REGION_ABI.md has a source fix
+in the Memory64 patch; that fix remains unbuilt and unvalidated. A stale-epoch
+unit case is not a proof that every host eviction path bumps the epoch.
 
 ## Run from repository root
 
@@ -78,6 +78,7 @@ c++ -std=c++20 -O1 -Wall -Wextra -Werror \
   -Iexternal/dynarmic/src \
   -Iexternal/dynarmic/externals/mcl/include \
   -Iexternal/fmt/include -Iexternal/boost \
+  -Ivita3k/mem/include \
   vita3k/cpu/src/wasmjit/emit_wasm.cpp \
   vita3k/cpu/tests/wasmjit_emitter_test.cpp \
   build/native/external/dynarmic/src/dynarmic/libdynarmic.a \

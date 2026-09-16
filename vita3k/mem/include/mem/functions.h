@@ -60,6 +60,9 @@ bool mem_set_permissions(MemState &state, Address addr, size_t size, MemPerm per
 // Safe reverse translation. Unrelated, freed, null and shadowed backing pointers
 // fail and set addr to zero. Never subtracts unrelated C++ pointers.
 bool mem_host_to_guest(const MemState &state, const void *pointer, Address &addr);
+// Unchecked HLE translation: no permission check. A direct window still rejects
+// unallocated/null guest pages. Bulk guest-controlled ranges use checked helpers.
+uint8_t *mem_guest_to_host(const MemState &state, Address addr);
 
 bool init(MemState &state, const bool use_page_table);
 void deinit_mem(MemState &state);
@@ -74,7 +77,7 @@ void add_external_mapping(MemState &mem, Address addr, uint32_t size, uint8_t *a
 void remove_external_mapping(MemState &mem, uint8_t *addr_ptr, uint32_t size);
 bool is_protecting(MemState &state, Address addr, MemPerm *perm = nullptr);
 bool is_valid_addr(const MemState &state, Address addr);
-bool is_valid_addr_range(const MemState &state, Address start, Address end);
+bool is_valid_addr_range(const MemState &state, Address start, uint64_t end);
 bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcept;
 Block alloc_block(MemState &mem, uint32_t size, const char *name, Address start_addr = user_main_memory_start);
 Address alloc_at(MemState &state, Address address, uint32_t size, const char *name);

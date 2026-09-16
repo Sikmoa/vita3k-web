@@ -47,8 +47,8 @@ set(VITA3K_DISPLAY_BENCH_LINK_OPTIONS
     -sENVIRONMENT=node
     -sASYNCIFY=1
     -sNODERAWFS=1
-    -sALLOW_MEMORY_GROWTH=1
-    -sINITIAL_MEMORY=67108864
+    ${VITA3K_WEB_GROWTH_LINK_OPTION}
+    ${VITA3K_WEB_INITIAL_MEMORY_LINK_OPTION}
     -sSTACK_SIZE=1048576
     "-sEXPORTED_FUNCTIONS=['_malloc','_free','_fflush','_vita3k_web_run_vita','_vita3k_web_last_run_instructions','_vita3k_web_last_frame_instructions','_vita3k_web_set_fast_vblank']")
 

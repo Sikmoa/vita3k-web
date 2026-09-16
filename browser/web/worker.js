@@ -37,7 +37,8 @@ try {
     printErr: (message) => post({ type: 'log', message }),
   });
   transition('ready');
-  post({ type: 'ready', diagnostics: { module: moduleName, backend: jit ? 'jit' : 'interpreter', wasm: true, worker: true } });
+  post({ type: 'ready', diagnostics: { module: moduleName, backend: jit ? 'jit' : 'interpreter',
+    memoryModel: module['vita3kMemoryModel'], hostPointerBits: module['vita3kHostPointerBits'], wasm: true, worker: true } });
 } catch (error) {
   lifecycle = 'error';
   post({ type: 'error', state: lifecycle, message: String(error) });
@@ -71,10 +72,12 @@ self.onmessage = async ({ data }) => {
       } else {
         input = await storage.read(path);
       }
-      const allocation = module._malloc(input.byteLength);
+      if (input.byteLength === 0 || input.byteLength > 0xffffffff)
+        throw new RangeError('ELF input size is outside the 32-bit file transport');
+      const allocation = module['vita3kHostPointer'](module._vita3k_web_alloc_input(input.byteLength));
       if (!allocation) throw new Error('unable to allocate ELF input buffer');
       try {
-        module.HEAPU8.set(input, allocation);
+        module['vita3kHostBytes'](allocation, input.byteLength).set(input);
         if (vita) {
           // Completion is always reported via the vita3kWebOnExit hook (the
           // call may suspend across ASYNCIFY yields, losing its return value).
@@ -93,10 +96,10 @@ self.onmessage = async ({ data }) => {
         } else {
           const exitCode = module._vita3k_web_run_elf_probe(allocation, input.byteLength);
           post({ type: resultType, path, size: input.byteLength, exitCode, ok: exitCode >= 0 });
-          module._free(allocation);
+          module._vita3k_web_free_input(allocation);
         }
       } catch (error) {
-        module._free(allocation);
+        module._vita3k_web_free_input(allocation);
         throw error;
       }
     } catch (error) {

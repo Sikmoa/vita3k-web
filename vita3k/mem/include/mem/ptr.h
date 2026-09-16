@@ -40,9 +40,10 @@ public:
 
     Ptr(T *pointer, const MemState &mem) {
         if constexpr (std::is_function_v<T>) {
-            // Host function pointers never live in guest memory; trace-only
-            // users (to_debug_str) just need a stable printable value.
-            addr = pointer ? static_cast<Address>(reinterpret_cast<uintptr_t>(pointer)) : 0;
+            // A function-typed pointer returned by Ptr::get is a guest byte
+            // location, not a callable host function/table slot. Reverse-map
+            // it just like a data pointer; real host functions are rejected.
+            mem_host_to_guest(mem, reinterpret_cast<const void *>(pointer), addr);
         } else {
             mem_host_to_guest(mem, pointer, addr);
         }
@@ -58,20 +59,10 @@ public:
     }
 
     // Unchecked HLE/native fast path, NOT an interpreter access check. In Wasm,
-    // a bulk host span is contiguous only within one allocation (or one external
-    // mapping). Use mem_read/write/fetch for guest-controlled ranges/permissions.
+    // wasm32 bulk spans are contiguous only within one allocation/mapping.
+    // Memory64 bytes are direct, but validity/permissions remain guest metadata.
     T *get(const MemState &mem) const {
-        if (addr == 0) {
-            return nullptr;
-        } else if (mem.use_page_table) {
-            const auto page = addr / KiB(4);
-            if (!mem.page_table[page])
-                return nullptr;
-            const auto offset = mem.sparse_host_memory ? addr % KiB(4) : addr;
-            return reinterpret_cast<T *>(mem.page_table[page] + offset);
-        } else {
-            return mem.memory ? reinterpret_cast<T *>(&mem.memory[addr]) : nullptr;
-        }
+        return addr ? reinterpret_cast<T *>(mem_guest_to_host(mem, addr)) : nullptr;
     }
 
     template <class U>
@@ -111,10 +102,12 @@ private:
 };
 
 static_assert(sizeof(Ptr<const void>) == 4, "Size of Ptr isn't 4 bytes.");
+static_assert(sizeof(Ptr<void()>) == 4, "Vita function pointers must remain 32 bits.");
 
 template <class T>
 Ptr<T> operator+(const Ptr<T> &base, int32_t offset) {
-    return Ptr<T>(base.address() + (offset * sizeof(T)));
+    // ARM pointer arithmetic wraps in 32 bits regardless of host size_t width.
+    return Ptr<T>(base.address() + static_cast<uint32_t>(offset) * static_cast<uint32_t>(sizeof(T)));
 }
 
 template <class T, class U>

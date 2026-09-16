@@ -20,8 +20,12 @@
 #include <bit>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <optional>
+
+static_assert(sizeof(SceSize) == 4 && sizeof(SceUIntPtr) == 4 && sizeof(SceIntPtr) == 4,
+    "The Vita HLE ABI must not inherit the host pointer/size width");
 
 // Completion callback. With ASYNCIFY, a suspended call's return value is not
 // delivered to the original JS call site, so the runtime reports its final
@@ -37,10 +41,21 @@ EM_JS(void, vita3k_web_notify_exit, (int code), {
 // The receiving host must copy the view synchronously; the scratch buffer is
 // reused by the next frame. Pixel format is fixed RGBA8; A8B8G8R8 guest
 // framebuffers are converted/tightened in Wasm before this call.
-EM_JS(void, vita3k_web_post_frame_hook, (int generation, int width, int height, int ptr), {
+EM_JS(void, vita3k_web_post_frame_hook, (int generation, int width, int height, const uint8_t *ptr), {
     if (typeof vita3kWebOnFrame === 'function')
-        vita3kWebOnFrame(generation, width, height, HEAPU8.subarray(ptr, ptr + width * height * 4));
+        vita3kWebOnFrame(generation, width, height, Module['vita3kHostBytes'](ptr, width * height * 4));
 });
+
+// Fixed-width input length, native host pointer. Dedicated exports avoid the
+// special Number wrappers Emscripten may apply to its built-in malloc/free.
+extern "C" EMSCRIPTEN_KEEPALIVE
+uint8_t *vita3k_web_alloc_input(uint32_t size) {
+    return static_cast<uint8_t *>(std::malloc(size));
+}
+extern "C" EMSCRIPTEN_KEEPALIVE
+void vita3k_web_free_input(uint8_t *pointer) {
+    std::free(pointer);
+}
 
 // Total guest instructions of the most recent run (benchmarking).
 static uint64_t vita3k_web_bench_instructions = 0;
@@ -77,6 +92,12 @@ static int run_vita(const uint8_t *bytes, uint32_t size) {
     if (!bytes || !size) return -1;
     auto env = std::make_unique<EmuEnvState>();
     if (!init(env->mem, true)) return -2;
+    std::printf("[vita3k-web] memory model: %s; host pointer bits=%zu\n",
+        env->mem.direct_host_memory ? "wasm64-direct" : "wasm32-sparse", sizeof(void *) * 8);
+    if (env->mem.direct_host_memory)
+        std::printf("[vita3k-web] guest window: [0x%llx,0x%llx); runtime allocation below 4 GiB\n",
+            static_cast<unsigned long long>(vita3k::memory::guest_window_base),
+            static_cast<unsigned long long>(vita3k::memory::guest_window_end));
     env->display.fast_vblank = vita3k_web_fast_vblank;
     ThreadStatePtr thread;
     bool exited = false;

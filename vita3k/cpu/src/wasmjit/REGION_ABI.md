@@ -1,5 +1,33 @@
 # M14c region JIT ABI (parent-owned spec, v1.2)
 
+## Memory64 addendum (source implementation, unvalidated)
+
+The historical sections below describe the wasm32 reference ABI and its
+measurements.  When `VITA3K_WEB_MEMORY64` is enabled, the same region protocol
+is emitted with these deliberate substitutions:
+
+* The imported `env.memory` is the runtime's single unshared Memory64 memory,
+  with 64-bit limits.  The direct guest window is `[0x1_0000_0000,
+  0x2_0000_0000)`.
+* `JitState*`, metadata bases, dispatch-map bases and epoch pointers are host
+  pointers and use the wasm64 parameter/local representation.  Guest PCs,
+  guest addresses, GPRs, flags, region IDs, table slots and budgets remain i32.
+* A guest memory operation checks its guest page and permission byte exactly as
+  before, then emits `i64.extend_i32_u`, adds the fixed guest-window base and
+  performs the ordinary i32 load/store.  The sparse page-table/physical-base
+  lookup is omitted.  Cross-page, null-page, fault and executable-page/SMC
+  behavior remains routed through the existing checked helpers.
+* The region table imported by the dispatcher remains an ordinary i32-indexed
+  `funcref` table.  It is independent of the compiler-owned Emscripten native
+  function table, whose wasm64 indexing is handled by Emscripten's JS helpers.
+* `JitState` offsets are derived with `offsetof`; the old numeric offsets and
+  420-byte assertion are guarded to the wasm32 representation.  The guest
+  fields stay compact even though true host-pointer fields widen.
+
+This addendum is a source contract, not a claim that a generated module has
+validated or instantiated.  Memory64/shared-memory combinations, browser
+support and the whole-program pointer-size cost require later validation.
+
 Goal: one WebAssembly module per REGION (many guest basic blocks) with an
 in-module dispatch loop. No JS crossing and no C++ cache work per guest block.
 Only region-level exits return to the host.
@@ -182,14 +210,10 @@ smc_dirty before chaining a Miss/Budget and the host normalizes pending SMC on
 other reasons, including Budget-before-loop-poll paths. Epoch lookup occurs
 between fully materialized calls. Local promotion cannot hide stop/SMC flags.
 
-Static review also noted a **pre-existing** discrepancy: the public
-`WasmJitCPU::invalidate_jit_cache` region-erasure loop does not bump
-`dispatch_epoch`, unlike `clear_regions`, `clear_regions_for_page`, LRU and
-byte-validation eviction. This candidate leaves that reference behavior
-unchanged; explicitly validate external invalidation and shared-table slot
-reuse before drawing correctness conclusions. The new matrix tests include
-stale-epoch lookup and mixed-policy transfers, but do not establish this
-pre-existing external invalidation path correct.
+The public `WasmJitCPU::invalidate_jit_cache` path now bumps `dispatch_epoch`
+when it erases regions, matching the other eviction paths.  This source change
+closes the stale-map/slot-reuse window; external invalidation and shared-table
+behavior still require generated-Wasm validation.
 
 ### Expected structural effect (not a WAT measurement)
 

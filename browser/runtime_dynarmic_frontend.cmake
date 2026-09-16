@@ -93,7 +93,7 @@ if(VITA3K_WEB_JIT_IR_PROBE)
         vita3k_dynarmic_frontend vita3k_web_runtime_core)
     if(EMSCRIPTEN)
         target_link_options(vita3k_web_jit_ir_probe PRIVATE
-            -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=1048576
+            ${VITA3K_WEB_GROWTH_LINK_OPTION} -sSTACK_SIZE=1048576
             -sENVIRONMENT=node -sWASM_ASYNC_COMPILATION=0)
     endif()
 endif()

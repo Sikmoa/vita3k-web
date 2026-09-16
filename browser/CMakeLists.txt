@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/runtime_memory.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/runtime_core.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/runtime_hle.cmake)
 
@@ -41,7 +42,7 @@ if(EMSCRIPTEN)
     )
     target_link_libraries(vita3k_web_bench PRIVATE vita3k_web_runtime_hle)
     target_link_options(vita3k_web_bench PRIVATE
-        "SHELL:-sALLOW_MEMORY_GROWTH=1"
+        ${VITA3K_WEB_GROWTH_LINK_OPTION}
         "SHELL:-sSTACK_SIZE=1048576"
         "SHELL:-sNODERAWFS=1"
     )
@@ -140,8 +141,7 @@ target_link_options(vita3k_web PRIVATE
     "SHELL:-sENVIRONMENT=web,worker"
     "SHELL:-sEXIT_RUNTIME=0"
     "SHELL:-sNO_EXIT_RUNTIME=1"
-    "SHELL:-sALLOW_MEMORY_GROWTH=1"
-    "SHELL:-sINITIAL_MEMORY=67108864"
+    ${VITA3K_WEB_MEMORY_LINK_OPTIONS}
     "SHELL:-sSTACK_SIZE=1048576"
     "SHELL:-sASYNCIFY"
     "-sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_vita3k_web_run_vita','_vita3k_web_last_run_instructions']"
@@ -209,3 +209,5 @@ add_custom_target(vita3k_web_fixture_stage
 )
 add_dependencies(vita3k_web_dist_stage vita3k_web_fixture_stage)
 add_dependencies(vita3k_web vita3k_web_dist_stage)
+
+vita3k_web_finalize_memory64("${CMAKE_CURRENT_SOURCE_DIR}")
