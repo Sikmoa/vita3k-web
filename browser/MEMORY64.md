@@ -99,15 +99,42 @@ forces the Emscripten table-index conversion shim to BigInt for the validated
 3.1.69/new-Node combination.  Guest addresses are never represented as BigInts
 merely because the host build is wasm64.
 
-## Later validation
+## Preferred configuration and browser fallback
 
-No build, link, generated-Wasm validation, test, browser execution, memory
-reservation measurement or benchmark was run for this source-only change.  A
-real validation pass should build the existing wasm32 target and its regressions,
-build wasm64 in a fresh directory, validate the generated JIT imports and
-function signatures, exercise allocation/free/read/write/fetch and loader
-relocations at the 4 GiB endpoint, run the genuine exit and display fixtures,
-run the existing Node and Worker smoke paths, compare Chromium and Firefox
-startup/RSS/growth/failure behavior, and compare JIT-only, compute-equivalent
-and end-to-end throughput.  It should also repeat the generated-Wasm operation
-census.  None of those results are implied by this source patch.
+Memory64 (`wasm64-direct`) is the preferred browser configuration; the
+sparse wasm32 backend remains as the automatic fallback. Selection happens at
+runtime in `browser/web/worker.js` (no CMake default was changed, so existing
+wasm32 consumers are unaffected):
+
+- `display.html?memory=w64` forces the Memory64 build (fails loudly when the
+  browser cannot run it); `?memory=w32` forces the wasm32 reference.
+- Default (`auto`) probes `WebAssembly.validate` on a minimal Memory64
+  module (`capabilities.js detectMemory64Support`), attempts the preferred
+  module first, and falls back to wasm32 on any load/instantiation error.
+  The fallback also covers a failed 8 GiB reservation on constrained devices
+  (support probe and capacity are different things).
+- The `ready` diagnostics report `memoryRequested`, `memoryFallback`, and the
+  effective `memoryModel`, so any run is attributable after the fact.
+
+Serving layout: the wasm64 module files (`vita3k_web.js`/`.wasm`,
+`vita3k_web_jit.js`/`.wasm` from the `VITA3K_WEB_MEMORY64=ON` build) are
+served from a `wasm64/` subdirectory next to `worker.js`; `locateFile` is
+based per attempt so each module resolves its own `.wasm`. Browser
+requirement: Chrome 128+ (Memory64 unflagged). Firefox/Safari behavior is
+deployment-tested via the fallback path, not assumed.
+
+## Validation status (updated: validated September 2026)
+
+The source-only caveat below is SUPERSEDED. Validated on Emscripten 3.1.69
+with `-sMEMORY64=1` (note: `-m64` does not link on this toolchain), a local
+unfrozen sysroot cache, and Node 24 for wasm64 execution:
+
+- wasm64 backend suite 9157/9157; exit-42 fixture exit 42; display fixture
+  156,399,069 instructions, exit 77, counter-identical to wasm32.
+- Dispatch-map anomaly found and fixed in-tree (per-entry epoch bump made
+  every pump re-entry miss: 717 vs 71); post-fix `host_miss` 71,
+  `js_calls` 217, `tx_wasm` bit-identical to wasm32 on both modes.
+- Container A/B (4 interleaved pairs): generated-Wasm time median -10%
+  (4/4 pair wins); laptop Firefox uncapped: 77 -> 89.3 FPS (+16%).
+- Remaining: Safari/Firefox deployment matrix, RSS/reservation telemetry,
+  and the lazy-flags structural project. None of those are implied here.

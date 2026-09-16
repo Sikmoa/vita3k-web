@@ -1,4 +1,6 @@
+__limbo_game
 .pi
+
 /api.trace
 .vs/
 /external/boost-build

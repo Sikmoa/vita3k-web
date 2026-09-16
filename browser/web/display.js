@@ -62,11 +62,20 @@ window.addEventListener('DOMContentLoaded', () => {
     : promoteRaw === 'p' || promoteRaw === 'flags' ? 'p' : '';
   const workerUrl = (backend === 'jit' ? './worker.js?backend=jit' : './worker.js')
     + (fastVblank ? (backend === 'jit' ? '&' : '?') + 'fastvblank=1' : '');
+  // Memory-model override: ?memory=w64 forces the preferred Memory64 build
+  // (fails loudly when unsupported); ?memory=w32 forces the wasm32 fallback.
+  // Default is auto: prefer Memory64, fall back to wasm32. Forwarded to the
+  // worker, which owns module selection (see worker.js).
+  const memoryRaw = (params.get('memory') || '').toLowerCase();
+  const memory = memoryRaw === 'w64' || memoryRaw === 'wasm64' || memoryRaw === 'memory64' ? 'w64'
+    : memoryRaw === 'w32' || memoryRaw === 'wasm32' ? 'w32' : '';
+  const workerUrlWithMemory = workerUrl + (memory ? (workerUrl.includes('?') ? '&' : '?') + 'memory=' + memory : '');
   const backendLabel = document.querySelector('#backend-label');
   if (backendLabel) backendLabel.textContent = (backend === 'jit' ? '(WasmJitCPU)' : '(InterpreterCPU)')
     + (fastVblank ? ' [fast vblank: uncapped]' : '')
-    + (promote ? ` [promote:${promote}]` : '');
-  const worker = new Worker(workerUrl, { type: 'module' });
+    + (promote ? ` [promote:${promote}]` : '')
+    + (memory ? ` [memory:${memory}]` : '');
+  const worker = new Worker(workerUrlWithMemory, { type: 'module' });
   worker.onmessage = ({ data }) => {
     if (data.type === 'lifecycle') console.log('[vita3k-web] lifecycle:', data.state);
     if (data.type === 'ready') {

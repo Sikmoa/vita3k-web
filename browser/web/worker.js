@@ -26,18 +26,52 @@ const transition = (state) => {
 
 try {
   transition('loading');
-  const jit = new URL(self.location.href).searchParams.get('backend') === 'jit';
+  const workerParams = new URL(self.location.href).searchParams;
+  const jit = workerParams.get('backend') === 'jit';
   const moduleName = jit ? 'vita3k_web_jit' : 'vita3k_web';
-  const moduleUrl = new URL(`./${moduleName}.js`, self.location.href).href;
-  const { default: createModule } = await import(moduleUrl);
-  if (typeof createModule !== 'function') throw new TypeError('Emscripten module factory is not callable');
-  module = await createModule({
-    locateFile: (file) => new URL(`./${file}`, self.location.href).href,
-    print: (message) => post({ type: 'log', message }),
-    printErr: (message) => post({ type: 'log', message }),
-  });
+  // Memory-model selection: Memory64 is the preferred configuration, wasm32
+  // the fallback. ?memory=w64 forces the direct build (fails loudly when
+  // unsupported); ?memory=w32 forces the sparse reference; default (auto)
+  // probes for Memory64 support, attempts the preferred module first, and
+  // falls back to wasm32 on any load/instantiation error (which also covers
+  // a failed 8 GiB reservation on constrained devices). The wasm64 module
+  // files are served from ./wasm64/ next to this worker; see MEMORY64.md.
+  const memoryParam = (workerParams.get('memory') || 'auto').toLowerCase();
+  const forceW64 = memoryParam === 'w64' || memoryParam === 'wasm64' || memoryParam === 'memory64';
+  const forceW32 = memoryParam === 'w32' || memoryParam === 'wasm32';
+  const probeMemory64 = () => {
+    if (typeof WebAssembly === 'undefined' || typeof WebAssembly.validate !== 'function') return false;
+    try {
+      return WebAssembly.validate(new Uint8Array([
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x05, 0x03, 0x01, 0x04, 0x00,
+      ]));
+    } catch {
+      return false;
+    }
+  };
+  const attempts = forceW64 ? ['w64'] : forceW32 ? ['w32'] : (probeMemory64() ? ['w64', 'w32'] : ['w32']);
+  let memoryFallback = false;
+  for (const attempt of attempts) {
+    const base = attempt === 'w64' ? './wasm64/' : './';
+    const moduleUrl = new URL(`${base}${moduleName}.js`, self.location.href).href;
+    try {
+      const { default: createModule } = await import(moduleUrl);
+      if (typeof createModule !== 'function') throw new TypeError('Emscripten module factory is not callable');
+      module = await createModule({
+        locateFile: (file) => new URL(`${base}${file}`, self.location.href).href,
+        print: (message) => post({ type: 'log', message }),
+        printErr: (message) => post({ type: 'log', message }),
+      });
+      break;
+    } catch (error) {
+      if (attempt === attempts[attempts.length - 1]) throw error;
+      memoryFallback = true;
+      post({ type: 'log', message: `memory model ${attempt} unavailable (${error?.message || error}), falling back` });
+    }
+  }
   transition('ready');
   post({ type: 'ready', diagnostics: { module: moduleName, backend: jit ? 'jit' : 'interpreter',
+    memoryRequested: memoryParam, memoryFallback,
     memoryModel: module['vita3kMemoryModel'], hostPointerBits: module['vita3kHostPointerBits'], wasm: true, worker: true } });
 } catch (error) {
   lifecycle = 'error';
