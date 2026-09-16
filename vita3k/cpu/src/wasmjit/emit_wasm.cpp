@@ -2246,7 +2246,10 @@ std::vector<uint8_t> emit_dispatch() {
     // Matches Dynarmic A32 LocationDescriptor::UniqueHash (T=bit5, E=bit9,
     // ITSTATE=(bit26:25,bit15:10)); single_stepping is always false here.
     const auto compute_key_hi = [&] {
+        // Mask to FPSCR mode bits exactly like LocationDescriptor::UniqueHash:
+        // raw status bits (NZCV/QC/cumulative) are not part of the host key.
         b_load(c, offsetof(JitState, fpscr));
+        b_imm(c, Location::FPSCR_MODE_MASK); b_op(c, And);
         b_load(c, offsetof(JitState, cpsr)); b_imm(c, 5); b_op(c, ShrU);
         b_imm(c, 1); b_op(c, And); b_op(c, Or);
         b_load(c, offsetof(JitState, cpsr)); b_imm(c, 9); b_op(c, ShrU);
