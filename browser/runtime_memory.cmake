@@ -3,11 +3,13 @@
 include_guard(DIRECTORY)
 if(VITA3K_WEB_MEMORY64)
     if(NOT EMSCRIPTEN OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-        message(FATAL_ERROR "Memory64 requires a fresh Emscripten -m64 build directory")
+        message(FATAL_ERROR "Memory64 requires a fresh Emscripten wasm64 build directory")
     endif()
     add_compile_definitions(VITA3K_WEB_MEMORY64=1)
-    # C/C++ ABI flags were set before project(). Link with the same ABI.
-    add_link_options(-m64)
+    # Emscripten 3.1.69's supported wasm64 switch. Newer toolchains may move
+    # back to -m64 once their final-link support is available; this setting is
+    # intentionally localized here rather than applied to native targets.
+    add_link_options(-sMEMORY64=1)
     # Runtime bytes <4 GiB, fixed guest bytes [4 GiB,8 GiB). Physical memory
     # behavior is unspecified here. The bounded morecore object is mandatory:
     # INITIAL_MEMORY alone does NOT keep malloc out of the guest window.

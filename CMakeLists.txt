@@ -7,13 +7,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Android")
 	include("cmake/vcpkg_android.cmake")
 endif()
 
-# Set the ABI before project() determines pointer sizes, including dependency
-# configure probes. Use a fresh build directory when changing this option.
+# The validated Emscripten 3.1.69 toolchain accepts Memory64 through the
+# MEMORY64 setting and rejects -m64 during its final link. Set it before
+# project() so compiler/dependency ABI probes see wasm64 too; use a fresh build
+# directory when changing this option.
 option(VITA3K_WEB_MEMORY64 "Use the opt-in wasm64 direct guest memory backend" OFF)
 if(VITA3K_WEB_MEMORY64 AND (CMAKE_SYSTEM_NAME STREQUAL "Emscripten"
         OR CMAKE_TOOLCHAIN_FILE MATCHES "[Ee]mscripten"))
-	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -m64")
-	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -m64")
+	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -sMEMORY64=1")
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -sMEMORY64=1")
 endif()
 
 project(Vita3K)

@@ -18,8 +18,9 @@
 //                                    frames (default 10)
 //
 // The guest is driven exactly like the browser Worker drives it: bytes are
-// copied into the module heap and module._vita3k_web_run_vita(allocation,
-// size) is called; with ASYNCIFY the call suspends inside emscripten_sleep
+// copied into the module heap through the runtime's pointer-width helpers and
+// module._vita3k_web_run_vita(allocation, size) is called; with ASYNCIFY the
+// call suspends inside emscripten_sleep
 // and the final exit code arrives through the runtime's vita3kWebOnExit host
 // hook. The frame sink is the runtime's own vita3kWebOnFrame host hook - no
 // test-only code runs inside the guest, and the display bridge's pixel path
@@ -147,9 +148,10 @@ if (process.env.VITA3K_FAST_VBLANK === '1') {
   module._vita3k_web_set_fast_vblank(1);
 }
 
-const allocation = module._malloc(ebootBytes.length);
+const rawAllocation = module._vita3k_web_alloc_input(ebootBytes.length);
+const allocation = module.vita3kHostPointer(rawAllocation);
 assert.ok(allocation, 'unable to allocate the eboot input buffer');
-module.HEAPU8.set(ebootBytes, allocation);
+module.vita3kHostBytes(allocation, ebootBytes.length).set(ebootBytes);
 // The allocation is intentionally not freed afterwards, exactly like the
 // browser Worker: freeing while the run is suspended across an ASYNCIFY
 // yield would mutate the heap under a suspended stack.

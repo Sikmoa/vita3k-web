@@ -22,9 +22,12 @@ not.
 
 ## Build contract (UNBUILT / UNVALIDATED)
 
-The root option adds `-m64` before CMake's compiler and dependency probes and
-the browser graph propagates the same ABI to its targets.  The browser memory
-configuration sets a fixed 8 GiB WebAssembly memory (`INITIAL_MEMORY` and
+The root option adds Emscripten's `-sMEMORY64=1` setting before CMake's compiler
+and dependency probes.  Emscripten 3.1.69 accepts this setting but rejects
+`-m64` during final link; a newer toolchain can replace it with `-m64` once
+that link path is supported.  The browser graph propagates the same ABI to its
+targets.  The browser memory configuration sets a fixed 8 GiB WebAssembly
+memory (`INITIAL_MEMORY` and
 `MAXIMUM_MEMORY`), disables growth, enables `WASM_BIGINT`, and keeps the current
 unshared memory model.  A fresh build directory is required when switching the
 option.  The hand-written JIT modules import the one runtime memory with a
@@ -91,8 +94,10 @@ conversion.  Typed-array views use a checked Number offset in the runtime area;
 raw wasm64 pointer arguments are passed as BigInts.  Uploaded files use custom
 raw-pointer allocation exports, and the framebuffer hook receives the original
 32-bit guest address after C++ has copied it into a runtime scratch buffer.
-JIT module bytes are copied through the checked host view.  Guest addresses are
-never represented as BigInts merely because the host build is wasm64.
+JIT module bytes are copied through the checked host view.  `memory64_post.js`
+forces the Emscripten table-index conversion shim to BigInt for the validated
+3.1.69/new-Node combination.  Guest addresses are never represented as BigInts
+merely because the host build is wasm64.
 
 ## Later validation
 

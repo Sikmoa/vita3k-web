@@ -3,9 +3,11 @@ set(VITA_ROOT "${CMAKE_CURRENT_LIST_DIR}/../vita3k")
 set(EXT_ROOT "${CMAKE_CURRENT_LIST_DIR}/../external")
 add_library(vita3k_web_host_abi INTERFACE)
 target_link_options(vita3k_web_host_abi INTERFACE
-    --pre-js "${CMAKE_CURRENT_LIST_DIR}/src/host_abi.js")
+    --pre-js "${CMAKE_CURRENT_LIST_DIR}/src/host_abi.js"
+    --post-js "${CMAKE_CURRENT_LIST_DIR}/src/memory64_post.js")
 set_property(TARGET vita3k_web_host_abi PROPERTY INTERFACE_LINK_DEPENDS
-    "${CMAKE_CURRENT_LIST_DIR}/src/host_abi.js")
+    "${CMAKE_CURRENT_LIST_DIR}/src/host_abi.js"
+    "${CMAKE_CURRENT_LIST_DIR}/src/memory64_post.js")
 set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(CAPSTONE_BUILD_CSTOOL OFF CACHE BOOL "" FORCE)
 set(CAPSTONE_ARCHITECTURE_DEFAULT OFF CACHE BOOL "" FORCE)

@@ -1,6 +1,7 @@
 #preprocess
-// Emscripten preprocesses this file when linking (--pre-js). -m64 determines
-// MEMORY64; this is not a separate runtime toggle or a second Wasm memory.
+// Emscripten preprocesses this file when linking (--pre-js). The build's
+// MEMORY64 setting determines the mode; this is not a runtime toggle or a
+// second Wasm memory.
 Module['vita3kMemory64'] = {{{ MEMORY64 ? 'true' : 'false' }}};
 Module['vita3kMemoryModel'] = Module['vita3kMemory64'] ? 'wasm64-direct' : 'wasm32-sparse';
 Module['vita3kHostPointerBits'] = {{{ POINTER_BITS }}};
