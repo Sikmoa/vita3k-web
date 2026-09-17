@@ -24,7 +24,14 @@ set(_hle_exports
     sceKernelGetTLSAddr sceKernelGetThreadTLSAddr sceKernelGetThreadId
     sceKernelGetThreadInfo sceKernelGetProcessId
     sceKernelExitThread sceKernelExitDeleteThread
-    sceKernelGetProcessTimeLow sceKernelLibcGettimeofday sceKernelGetProcessParam
+    # Nonblocking clocks: use the production implementations and AAPCS bridges
+    # (the process-time wrappers live in SceLibKernel, not SceProcessmgr).
+    sceKernelGetProcessTime sceKernelGetProcessTimeLow sceKernelGetProcessTimeWide
+    sceKernelGetSystemTimeWide sceKernelLibcClock sceKernelLibcTime
+    sceKernelLibcGettimeofday sceKernelGetProcessParam
+    sceKernelGetThreadCurrentPriority sceKernelGetThreadExitStatus
+    sceKernelGetThreadCpuAffinityMask sceKernelGetThreadCpuAffinityMask2
+    sceKernelGetSemaInfo sceKernelTryLockMutex
     sceKernelGetStdin sceKernelGetStdout sceKernelGetStderr
     ksceKernelCreateProcessLocalStorage ksceKernelRegisterProcEventHandler
     ksceKernelGetProcessLocalStorageAddr ksceKernelGetProcessLocalStorageAddrForPid
@@ -42,6 +49,11 @@ set(_hle_exports
     # Nonblocking semaphore operations use the production kernel objects.
     # Blocking waits need cooperative scheduling before they can be selected.
     sceKernelCreateSema sceKernelDeleteSema sceKernelPollSema sceKernelSignalSema
+    # Keep sceKernelWaitSema/CB, DelayThread/CB/200, WaitThreadEnd/CB,
+    # WaitEventFlag/CB and WaitLwCond/CB unselected: their production paths
+    # wait on host condition variables (or sleep) and cannot yield guest threads.
+    # GetSystemTime and GetThreadRunStatus are UNIMPLEMENTED upstream. There
+    # is no user sceKernelGetSystemTimeLow in nids.inc; do not invent one.
 )
 
 # Take NID values from the one authoritative database, never a second resolver.
@@ -62,6 +74,10 @@ foreach(_export IN LISTS _hle_exports)
     endif()
 endforeach()
 file(CONFIGURE OUTPUT "${_hle_generated}/startup_nids.inc" CONTENT "${_hle_nids}" @ONLY)
+# This is an initializer list, NOT an import-library allowlist. NID resolution
+# in module_parent.cpp uses startup_nids.inc alone. Only SceSysmem among these
+# source files defines LIBRARY_INIT; adding e.g. LIBRARY(SceLibKernel) would
+# reference a nonexistent import_library_init_SceLibKernel symbol.
 file(CONFIGURE OUTPUT "${_hle_generated}/startup_libraries.inc" CONTENT "LIBRARY(SceSysmem)\n" @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${_HLE_ROOT}/nids/include/nids/nids.inc")
