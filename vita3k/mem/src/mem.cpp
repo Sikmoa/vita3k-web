@@ -213,18 +213,22 @@ static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_c
     } else if (state.sparse_host_memory) {
         // Every page in an allocation points into ONE buffer. ELF segment copies,
         // stacks and HLE Ptr+length users rely on this contiguity.
-        if (size > std::numeric_limits<size_t>::max()) {
+        if (size > std::numeric_limits<size_t>::max() - (STANDARD_PAGE_SIZE - 1)) {
             state.allocator.free(page_num, page_count);
             return 0;
         }
-        auto backing = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[static_cast<size_t>(size)]{});
+        // Guest pages are page-aligned. Preserve the same low address bits in
+        // sparse host backing so HLE allocators' sub-page alignment survives
+        // Ptr(host, mem) translation. Keep the original owner for delete[].
+        auto backing = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[static_cast<size_t>(size) + STANDARD_PAGE_SIZE - 1]{});
         if (!backing) {
             state.allocator.free(page_num, page_count);
             return 0;
         }
-        auto *base = backing.get();
+        const size_t offset = (STANDARD_PAGE_SIZE - (reinterpret_cast<uintptr_t>(backing.get()) % STANDARD_PAGE_SIZE)) % STANDARD_PAGE_SIZE;
+        auto *base = backing.get() + offset;
         try {
-            state.sparse_allocations.emplace(page_num, SparseAllocation { std::move(backing), 0 });
+            state.sparse_allocations.emplace(page_num, SparseAllocation { std::move(backing), offset });
         } catch (const std::bad_alloc &) {
             state.allocator.free(page_num, page_count);
             return 0;

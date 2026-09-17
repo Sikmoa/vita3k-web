@@ -34,6 +34,7 @@ set(_hle_exports
     sceKernelGetProcessTime sceKernelGetProcessTimeLow sceKernelGetProcessTimeWide
     sceKernelGetSystemTimeWide sceKernelLibcClock sceKernelLibcTime
     sceKernelLibcGettimeofday sceKernelGetProcessParam
+    sceKernelGetMainModuleSdkVersion
     sceKernelGetThreadCurrentPriority sceKernelGetThreadExitStatus
     sceKernelGetThreadCpuAffinityMask sceKernelGetThreadCpuAffinityMask2
     sceKernelGetSemaInfo sceKernelTryLockMutex
@@ -42,6 +43,9 @@ set(_hle_exports
     ksceKernelGetProcessLocalStorageAddr ksceKernelGetProcessLocalStorageAddrForPid
     ksceKernelCreateMutex ksceKernelDeleteMutex ksceKernelLockMutex ksceKernelUnlockMutex
     sceClibMemcpy sceClibMemset
+    # Production guest-backed heaps. Statistics/stub exports remain unselected.
+    sceClibMspaceCreate sceClibMspaceDestroy sceClibMspaceMalloc
+    sceClibMspaceCalloc sceClibMspaceRealloc sceClibMspaceMemalign sceClibMspaceFree
     # Production kernel memset/memcpy, required by observed firmware imports.
     kmemset kmemcpy
     sceIoOpen sceIoClose
@@ -93,6 +97,8 @@ set(_hle_exports
     # Network init/term: production bodies are net-state writes only
     # (SceNet.cpp:471/698); net_utils gets a loopback Emscripten branch.
     sceNetInit sceNetTerm
+    # Offline control initialization only; upstream stub parity, no connection.
+    sceNetCtlInit sceNetCtlTerm
     # Keep sceKernelWaitSema/CB, DelayThread/CB/200, WaitThreadEnd/CB,
     # WaitEventFlag/CB and WaitLwCond/CB unselected: their production paths
     # wait on host condition variables (or sleep) and cannot yield guest threads.
@@ -204,6 +210,7 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceDriverUser/SceDisplayUser.cpp"
     "${_HLE_ROOT}/modules/SceDriverUser/SceFios2User.cpp"
     "${_HLE_ROOT}/modules/SceNet/SceNet.cpp"
+    "${_HLE_ROOT}/modules/SceNetCtl/SceNetCtl.cpp"
     "${_HLE_ROOT}/modules/SceAppUtil/SceAppUtil.cpp"
     "${_HLE_ROOT}/modules/SceCommonDialog/SceCommonDialog.cpp"
     # No LIBRARY_INIT; startup_libraries.inc stays LIBRARY(SceSysmem).
@@ -305,9 +312,14 @@ if(NOT TARGET SDL3::SDL3-static)
     endforeach()
     add_subdirectory("${_HLE_EXT}/sdl" "${CMAKE_CURRENT_BINARY_DIR}/runtime-deps/sdl" EXCLUDE_FROM_ALL)
 endif()
+# Separate from Emscripten's process allocator: emit only mspace symbols.
+# The bundled header disables mmap/morecore, so heaps stay in guest backing.
+add_library(vita3k_web_mspace STATIC "${_HLE_EXT}/dlmalloc/dlmalloc.cc")
+target_include_directories(vita3k_web_mspace PUBLIC "${_HLE_EXT}/dlmalloc")
+target_compile_definitions(vita3k_web_mspace PRIVATE ONLY_MSPACES=1)
 target_link_libraries(vita3k_web_runtime_hle
     PUBLIC vita3k_web_runtime_core
-    PRIVATE SDL3::SDL3-static)
+    PRIVATE SDL3::SDL3-static vita3k_web_mspace)
 
 if(EMSCRIPTEN)
     target_compile_options(vita3k_web_runtime_hle PRIVATE
