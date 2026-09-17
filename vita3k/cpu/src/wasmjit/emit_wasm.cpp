@@ -606,7 +606,14 @@ private:
 public:
     std::string rejection;
 private:
-    void reject(const char *why) { ok = false; if (rejection.empty()) rejection = why; }
+    void reject(const char *why) {
+        ok = false;
+        if (rejection.empty()) rejection = why;
+        // Env-gated diagnostic: a rejected route is otherwise only visible as an
+        // empty module, which makes it hard to tell which case is missing.
+        if (std::getenv("VITA3K_WASMJIT_REJECT_TRACE"))
+            std::fprintf(stderr, "WasmJit emit reject: %s\n", why);
+    }
     bool svc = false;
     bool pc_written = false;
     bool has_bx = false;
@@ -1017,6 +1024,46 @@ private:
     void value64(const Value &v) {
         value_word(v, 0); op(ExtendU);
         value_word(v, 1); op(ExtendU); op(0x42); uleb(code, 32); op(Shl64); op(Or64);
+    }
+    // Scalar binary64 helpers. Wasm exposes exactly one i64 scratch local, so
+    // double results are staged as two i32 SSA words and reinterpreted on
+    // demand; declaring more locals would renumber the SSA range that region
+    // metadata and dispatch depend on.
+    void store_i64_words(uint32_t slot) {
+        set(scratch_local);
+        get(scratch_local); op(Wrap); set(slot);
+        get(scratch_local); constant64(code, 32); op(ShrU64); op(Wrap); set(slot + 1);
+    }
+    void store_f64_words(uint32_t slot) {
+        op(0xbd); // i64.reinterpret_f64
+        store_i64_words(slot);
+    }
+    void push_i64_words(uint32_t slot) {
+        get(slot); op(ExtendU);
+        get(slot + 1); op(ExtendU); constant64(code, 32); op(Shl64); op(Or64);
+    }
+    void push_f64_words(uint32_t slot) {
+        push_i64_words(slot);
+        op(0xbf); // f64.reinterpret_i64
+    }
+    void push_f64_imm(int64_t bits) {
+        constant64(code, bits);
+        op(0xbf);
+    }
+    // |x| test on two words: result is 1 when the magnitude is a NaN.
+    void f64_words_are_nan(uint32_t slot, uint32_t dest) {
+        get(slot + 1); mask(0x7fffffff); set(dest);
+        get(dest); imm(0x7ff00000); op(GtU);
+        get(dest); imm(0x7ff00000); op(Eq);
+        get(slot); op(Eqz); op(Eqz); op(And);
+        op(Or); set(dest);
+    }
+    // 1 when |x| is nonzero and below the smallest normal binary64 value.
+    void f64_words_are_subnormal(uint32_t slot, uint32_t dest) {
+        get(slot + 1); mask(0x7fffffff); set(dest);
+        get(dest); imm(0x00100000); op(LtU);
+        get(dest); get(slot); op(Or); op(Eqz); op(Eqz); op(And);
+        set(dest);
     }
 
     // Vectors use four consecutive i32 SSA words, not host SIMD locals. All
@@ -2173,6 +2220,194 @@ private:
         }
         case Op::FPNeg32: arg(0); imm(0x80000000); op(Xor); break;
         case Op::FPAbs32: arg(0); mask(0x7fffffff); break;
+        case Op::FPNeg64:
+        case Op::FPAbs64:
+            // Sign-bit operations on the two binary64 words; NaN payloads and
+            // signed zeros are preserved exactly like FPNeg32/FPAbs32.
+            value_word(inst.GetArg(0), 0); set(next_local);
+            value_word(inst.GetArg(0), 1);
+            if (kind == Op::FPNeg64) { imm(0x80000000u); op(Xor); }
+            else mask(0x7fffffffu);
+            set(next_local + 1);
+            return ok;
+        case Op::FPFixedU32ToDouble:
+        case Op::FPFixedS32ToDouble:
+            // fbits == 0 converts an exact integer, and binary64 represents
+            // every 32-bit integer exactly, so no exception flag can be raised
+            // and the rounding mode cannot change the result. Scaled
+            // fixed-point forms stay unimplemented rather than silently
+            // returning an unscaled value.
+            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0) return false;
+            arg(0);
+            op(kind == Op::FPFixedU32ToDouble ? 0xb8 : 0xb7); // f64.convert_i32_u/s
+            store_f64_words(next_local);
+            return ok;
+        case Op::FPSingleToDouble: {
+            // Widening binary32 to binary64 is exact for every finite input,
+            // so the rounding mode cannot change the result. FZ flushes a
+            // denormal input to a signed zero and raises IDC; a signaling NaN
+            // raises IOC and is quieted with its payload widened explicitly
+            // instead of relying on the host's NaN propagation.
+            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0) return false;
+            load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+            begin_if(); ret(ExitReason::Unsupported); end_if();
+            const auto a = next_local + 2, flags = next_local + 3;
+            value_word(inst.GetArg(0)); set(a); // binary32 bits
+            imm(0); set(flags);
+            if (start.FPSCR().FTZ()) {
+                get(a); mask(0x7fffffff); imm(0x00800000); op(LtU);
+                get(a); mask(0x7fffffff); op(Eqz); op(Eqz); op(And);
+                begin_if();
+                get(flags); imm(0x80); op(Or); set(flags);
+                get(a); mask(0x80000000); set(a);
+                end_if();
+            }
+            get(a); mask(0x7fffffff); imm(0x7f800000); op(GtU);
+            begin_if(); // NaN input
+            get(a); mask(0x00400000); op(Eqz);
+            begin_if(); get(flags); imm(1); op(Or); set(flags); end_if();
+            if (start.FPSCR().DN()) {
+                constant64(code, 0x7ff8000000000000LL);
+            } else {
+                // sign | quieted payload widened from binary32
+                get(a); op(ExtendU);
+                constant64(code, 31); op(ShrU64); // sign bit 0/1
+                constant64(code, 63); op(Shl64);
+                constant64(code, 0x7ff8000000000000LL); op(Or64);
+                get(a); op(ExtendU); constant64(code, 0x007fffff); op(0x83); // i64.and
+                constant64(code, 29); op(Shl64); op(Or64);
+            }
+            store_i64_words(next_local);
+            op(Else);
+            get(a); op(0xbe); // f32.reinterpret_i32
+            op(0xbb); // f64.promote_f32
+            store_f64_words(next_local);
+            end_if();
+            get(0); load(offsetof(JitState, fpscr)); get(flags); op(Or); store(offsetof(JitState, fpscr));
+            return ok;
+        }
+        case Op::FPDoubleToSingle: {
+            // Narrowing conversion. Only round-to-nearest is emitted (wasm's
+            // f32.demote_f64); every flag below is derived from the exact
+            // binary64 operand rather than approximated.
+            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0) return false;
+            load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+            begin_if(); ret(ExitReason::Unsupported); end_if();
+            const auto a = next_local + 2, flags = next_local + 4;
+            const auto result32 = next_local + 5, inexact = next_local + 6;
+            const auto overflow = next_local + 7, underflow = next_local + 8, flushed = next_local + 9;
+            value_word(inst.GetArg(0), 0); set(a);
+            value_word(inst.GetArg(0), 1); set(a + 1);
+            imm(0); set(flags);
+            if (start.FPSCR().FTZ()) {
+                f64_words_are_subnormal(a, result32);
+                get(result32); begin_if();
+                get(flags); imm(0x80); op(Or); set(flags);
+                get(a + 1); mask(0x80000000); set(a + 1);
+                imm(0); set(a);
+                end_if();
+            }
+            f64_words_are_nan(a, result32);
+            get(result32); begin_if();
+            // A signaling NaN raises IOC; the result is a quiet NaN.
+            get(a + 1); mask(0x00080000); op(Eqz);
+            begin_if(); get(flags); imm(1); op(Or); set(flags); end_if();
+            if (start.FPSCR().DN()) {
+                imm(0x7fc00000);
+            } else {
+                push_i64_words(a); constant64(code, 29); op(ShrU64); op(Wrap); mask(0x003fffff);
+                get(a + 1); mask(0x80000000); op(Or); imm(0x7fc00000); op(Or);
+            }
+            set(next_local);
+            op(Else);
+            push_f64_words(a); op(0xb6); op(0xbc); set(result32); // f32.demote_f64
+            get(result32); op(0xbe); op(0xbb); // widen the rounded result
+            push_f64_words(a); op(0x62); set(inexact); // f64.ne
+            get(result32); mask(0x7fffffff); imm(0x7f800000); op(Eq);
+            get(a + 1); mask(0x7fffffff); imm(0x7ff00000); op(Eq);
+            get(a); op(Eqz); op(And); op(Eqz);
+            op(And); set(overflow);
+            // Tininess is decided against the exact operand (binary64 holds
+            // it losslessly), so no pre-rounding value has to be estimated.
+            push_f64_words(a); op(0x99); // f64.abs
+            push_f64_imm(0x3810000000000000LL); // 2^-126
+            op(0x63); // f64.lt
+            set(underflow);
+            imm(0); set(flushed);
+            if (start.FPSCR().FTZ()) {
+                get(underflow);
+                get(a); get(a + 1); mask(0x7fffffff); op(Or); op(Eqz); op(Eqz); op(And);
+                begin_if();
+                get(result32); mask(0x80000000); set(result32);
+                imm(1); set(flushed);
+                end_if();
+            }
+            get(flags);
+            get(inexact); get(flushed); op(Eqz); op(And); imm(0x10); op(Mul); op(Or); set(flags);
+            // Underflow needs tininess plus either inexactness or an FZ flush;
+            // a flushed result is not additionally reported as inexact.
+            get(flags);
+            get(underflow); get(inexact); get(flushed); op(Or); op(And); imm(8); op(Mul); op(Or); set(flags);
+            get(flags); get(overflow); imm(4); op(Mul); op(Or); set(flags);
+            get(result32); set(next_local);
+            end_if();
+            get(0); load(offsetof(JitState, fpscr)); get(flags); op(Or); store(offsetof(JitState, fpscr));
+            return ok;
+        }
+        case Op::FPCompare64: {
+            // Same bit-pattern comparison as FPCompare32, on two binary64
+            // words: no host FP, so signaling NaNs, signed zeros and FZ
+            // flushing stay exact. Exception enables are not in the location
+            // key, so the live FPSCR is checked instead.
+            if (!inst.GetArg(2).IsImmediate()) return false;
+            load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+            begin_if(); ret(ExitReason::Unsupported); end_if();
+            const bool signal = inst.GetArg(2).GetU1();
+            imm(0); set(next_local + 5); // any NaN
+            imm(0); set(next_local + 6); // invalid-operation cumulative bit
+            for (unsigned i = 0; i < 2; ++i) {
+                const auto slot = next_local + 1 + i * 2;
+                value64(inst.GetArg(i));
+                store_i64_words(slot);
+                f64_words_are_nan(slot, next_local + 7);
+                get(next_local + 7); begin_if();
+                imm(1); set(next_local + 5);
+                get(next_local + 6);
+                if (signal) imm(1);
+                else { get(slot + 1); mask(0x00080000); op(Eqz); }
+                op(Or); set(next_local + 6);
+                end_if();
+                if (start.FPSCR().FTZ()) {
+                    f64_words_are_subnormal(slot, next_local + 8);
+                    get(next_local + 8); begin_if();
+                    get(0); load(offsetof(JitState, fpscr)); imm(0x80); op(Or); store(offsetof(JitState, fpscr));
+                    get(slot + 1); mask(0x80000000); set(slot + 1);
+                    imm(0); set(slot);
+                    end_if();
+                }
+                // Canonicalize both zeros, then build the unsigned sortable
+                // key: negatives are complemented, non-negatives get the sign
+                // bit set.
+                get(slot + 1); mask(0x7fffffff); op(Eqz);
+                get(slot); op(Eqz); op(And);
+                begin_if(); imm(0); set(slot); imm(0); set(slot + 1); end_if();
+                constant64(code, -1);
+                constant64(code, INT64_MIN);
+                push_i64_words(slot); constant64(code, 63); op(ShrU64); op(Wrap);
+                op(Select);
+                push_i64_words(slot); op(0x85); // i64.xor
+                store_i64_words(slot);
+            }
+            get(0); load(offsetof(JitState, fpscr)); get(next_local + 6); op(Or); store(offsetof(JitState, fpscr));
+            imm(0x30000000); // unordered: C,V
+            imm(0x60000000); // equal: Z,C
+            imm(0x80000000); // less: N
+            imm(0x20000000); // greater: C
+            push_i64_words(next_local + 1); push_i64_words(next_local + 3); op(0x54); op(Select); // i64.lt_u
+            push_i64_words(next_local + 1); push_i64_words(next_local + 3); op(0x51); op(Select); // i64.eq
+            get(next_local + 5); op(Select);
+            break;
+        }
         case Op::A32GetFpscrNZCV:
             load(offsetof(JitState, fpscr)); mask(0xf0000000); break;
         case Op::A32SetFpscrNZCV:
@@ -2519,7 +2754,11 @@ private:
 } // namespace
 
 std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block) {
-    return Emitter(block).run();
+    Emitter emitter(block);
+    auto bytes = emitter.run();
+    if (bytes.empty() && std::getenv("VITA3K_WASMJIT_REJECT_TRACE"))
+        std::fprintf(stderr, "WasmJit emit_block rejected: %s\n", emitter.rejection.c_str());
+    return bytes;
 }
 
 bool validate_region_block(const Dynarmic::IR::Block &block,
@@ -2586,6 +2825,8 @@ std::vector<uint8_t> emit_region(
         Emitter emitter(*blocks[i], unsigned(i), blocks, meta, options);
         bodies[i] = emitter.region_body();
         if (bodies[i].empty()) {
+            if (std::getenv("VITA3K_WASMJIT_REJECT_TRACE"))
+                std::fprintf(stderr, "WasmJit emit_region rejected block %zu: %s\n", i, emitter.rejection.c_str());
             return {};
         }
         max_ssa = std::max(max_ssa, emitter.ssa_words());
