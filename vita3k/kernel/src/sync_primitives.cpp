@@ -81,6 +81,16 @@ inline static int handle_timeout(KernelState &kernel, const ThreadStatePtr &thre
     std::unique_lock<std::mutex> &primitive_lock, WaitingThreadQueuePtr &queue,
     const ThreadDataQueueInterator<WaitingThreadData> &data_it, const char *export_name,
     SceUInt *const timeout) {
+    // Only semaphore waits have a cooperative continuation contract for now.
+    // Roll back the queue/status before returning an explicit unsupported-context
+    // error; never fall through to a host condition-variable wait in the browser.
+    if (kernel.execution_host) {
+        queue->erase(data_it);
+        thread_lock.lock();
+        thread->update_status(ThreadStatus::run);
+        thread_lock.unlock();
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
+    }
     if (timeout) {
         bool status = false;
         auto start = std::chrono::steady_clock::now();
@@ -450,6 +460,8 @@ SceInt32 timer_waitorpoll(KernelState &kernel, const char *export_name, SceUID t
 
         return SCE_KERNEL_OK;
     } else if (is_wait) {
+        if (kernel.execution_host)
+            return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
         thread->update_status(ThreadStatus::wait, ThreadStatus::run);
 
         WaitingThreadData data;
@@ -1065,7 +1077,50 @@ SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thr
         const auto data_it = semaphore->waiting_threads->push(data);
         thread_lock.unlock();
 
-        auto res = handle_timeout(kernel, thread, thread_lock, semaphore_lock, semaphore->waiting_threads, data_it, export_name, pTimeout);
+        int res;
+        if (kernel.execution_host) {
+            const auto start = std::chrono::steady_clock::now();
+            const auto duration = pTimeout ? std::optional<uint32_t>(*pTimeout) : std::nullopt;
+            // The stack-local cancellation flag remains alive on the fiber.
+            // Neither the primitive nor the thread mutex may cross a swap.
+            semaphore_lock.unlock();
+            KernelExecutionHost::WaitResult result;
+            try {
+                result = kernel.execution_host->wait_semaphore(*thread, duration);
+            } catch (...) {
+                // A failed host callback must not leave was_canceled pointing
+                // into a destroyed fiber frame in the production queue.
+                semaphore_lock.lock();
+                const auto pending = semaphore->waiting_threads->find(thread);
+                if (pending != semaphore->waiting_threads->end())
+                    semaphore->waiting_threads->erase(pending);
+                thread_lock.lock();
+                thread->update_status(ThreadStatus::run);
+                thread_lock.unlock();
+                throw;
+            }
+            semaphore_lock.lock();
+            // Signal/cancel may already have erased data_it. Never reuse it.
+            const auto pending = semaphore->waiting_threads->find(thread);
+            const bool still_queued = pending != semaphore->waiting_threads->end();
+            if (still_queued)
+                semaphore->waiting_threads->erase(pending);
+            thread_lock.lock();
+            thread->update_status(ThreadStatus::run);
+            thread_lock.unlock();
+            res = SCE_KERNEL_OK;
+            if (still_queued) {
+                res = result == KernelExecutionHost::WaitResult::timeout
+                    ? SCE_KERNEL_ERROR_WAIT_TIMEOUT : SCE_KERNEL_ERROR_WAIT_CANCEL;
+            }
+            if (pTimeout) {
+                const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+                *pTimeout = elapsed >= *duration ? 0 : *duration - static_cast<uint32_t>(elapsed);
+            }
+        } else {
+            res = handle_timeout(kernel, thread, thread_lock, semaphore_lock, semaphore->waiting_threads, data_it, export_name, pTimeout);
+        }
         if (was_canceled)
             res = SCE_KERNEL_ERROR_WAIT_CANCEL;
         return res;
@@ -1103,6 +1158,14 @@ int semaphore_signal(KernelState &kernel, const char *export_name, SceUID thread
         const auto waiting_thread = waiting_thread_data.thread;
         const auto waiting_signal_count = waiting_thread_data.signal;
 
+        // A deletion can wake a browser waiter before its continuation gets a
+        // dispatch to unlink itself. Do not consume a permit or assert wait.
+        if (kernel.execution_host && waiting_thread->status != ThreadStatus::wait) {
+            if (waiting_thread_data.was_canceled)
+                *waiting_thread_data.was_canceled = true;
+            semaphore->waiting_threads->pop();
+            continue;
+        }
         if (semaphore->val < waiting_signal_count)
             break;
 
@@ -1132,6 +1195,10 @@ int semaphore_delete(KernelState &kernel, const char *export_name, SceUID thread
             semaphore->waiting_threads->size());
     }
 
+    // Deletion with live waiters is not implemented by the production queue.
+    // Do not report fake success on the cooperative path.
+    if (kernel.execution_host && !semaphore->waiting_threads->empty())
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
     if (semaphore->waiting_threads->empty()) {
         const std::lock_guard<std::mutex> kernel_lock(kernel.mutex);
         kernel.semaphores.erase(semaid);
@@ -1160,6 +1227,8 @@ int semaphore_cancel(KernelState &kernel, const char *export_name, SceUID thread
 
     SceUInt32 nb_threads = 0;
     const std::lock_guard<std::mutex> semaphore_lock(semaphore->mutex);
+    if (kernel.execution_host && setCount > semaphore->max)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_COUNT);
     while (!semaphore->waiting_threads->empty()) {
         const auto &waiting_thread_data = *semaphore->waiting_threads->begin();
         const auto waiting_thread = waiting_thread_data.thread;
@@ -1170,13 +1239,16 @@ int semaphore_cancel(KernelState &kernel, const char *export_name, SceUID thread
             *waiting_thread_data.was_canceled = true;
         }
 
-        waiting_thread->update_status(ThreadStatus::run, ThreadStatus::wait);
+        if (kernel.execution_host)
+            waiting_thread->update_status(ThreadStatus::run);
+        else
+            waiting_thread->update_status(ThreadStatus::run, ThreadStatus::wait);
 
         semaphore->waiting_threads->erase(semaphore->waiting_threads->begin());
         nb_threads++;
     }
 
-    if (semaphore->val < setCount) {
+    if (!kernel.execution_host && semaphore->val < setCount) {
         return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
     }
     if (setCount < 0) {
@@ -1245,6 +1317,9 @@ int condvar_wait(KernelState &kernel, MemState &mem, const char *export_name, Sc
     const ThreadStatePtr thread = kernel.get_thread(thread_id);
 
     std::unique_lock<std::mutex> condition_variable_lock(condvar->mutex);
+
+    if (kernel.execution_host)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
 
     if (auto error = mutex_unlock_impl(kernel, export_name, thread_id, 1, condvar->associated_mutex))
         return error;
@@ -1729,6 +1804,8 @@ SceSize msgpipe_recv(KernelState &kernel, const char *export_name, SceUID thread
     } else if (waitMode & SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT) {
         return 0;
     } else { // sleep until we can insert
+        if (kernel.execution_host)
+            return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
         WaitingThreadData wait_data;
         wait_data.thread = thread;
         wait_data.priority = thread->priority;
@@ -1836,6 +1913,8 @@ SceSize msgpipe_send(KernelState &kernel, const char *export_name, SceUID thread
     } else if (waitMode & SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT) {
         return 0;
     } else { // Go to sleep until there's more space
+        if (kernel.execution_host)
+            return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
         WaitingThreadData wait_data;
         wait_data.thread = thread;
         wait_data.priority = thread->priority;

@@ -54,7 +54,7 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
     this->name = name;
     this->entry_point = entry_point.address();
 
-    int core_num = kernel.corenum_allocator.new_corenum();
+    int core_num = kernel.execution_host ? 0 : kernel.corenum_allocator.new_corenum();
     if (core_num < 0) {
         LOG_ERROR("Out of core number to allocate, use 0");
         core_num = 0;
@@ -71,7 +71,8 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
     start_tick = rtc_get_ticks(kernel.base_tick.tick);
     last_vblank_waited = 0;
 
-    cpu = init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem);
+    cpu = kernel.execution_host ? kernel.execution_host->make_cpu(id, mem)
+                                : init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem);
     if (!cpu) {
         return SCE_KERNEL_ERROR_ERROR;
     }
@@ -156,6 +157,8 @@ int ThreadState::start(SceSize arglen, const Ptr<void> argp, bool run_entry_call
         status = ThreadStatus::run;
     }
     status_cond.notify_one();
+    if (kernel.execution_host)
+        kernel.execution_host->notify(*this);
 
     return SCE_KERNEL_OK;
 }
@@ -183,6 +186,10 @@ void ThreadState::exit_delete(bool exit) {
         status_cond.notify_all();
     }
 
+    // Enqueue only: this hook is called while the thread mutex is held.
+    if (kernel.execution_host)
+        kernel.execution_host->notify(*this, true);
+
     // Wake if thread waiting on sceKernelWaitSignal
     signal.send();
 }
@@ -193,13 +200,18 @@ void ThreadState::run_loop(bool cooperative) {
     // Set thread-local CPU state so signal handlers can access it.
     // The guard clears it on any exit so a recycled host thread never sees
     // a stale CPUState pointer.
-    set_current_cpu_state(cpu.get());
     struct CpuStateGuard {
-        ~CpuStateGuard() { set_current_cpu_state(nullptr); }
-    } cpu_state_guard;
+        CPUState *previous;
+        ~CpuStateGuard() { set_current_cpu_state(previous); }
+    } cpu_state_guard{get_current_cpu_state()};
+    set_current_cpu_state(cpu.get());
 
     std::unique_lock<std::mutex> lock(mutex);
     ++call_level;
+    struct CallLevelGuard {
+        int &level;
+        ~CallLevelGuard() { --level; }
+    } call_level_guard{call_level};
     const bool top_level = call_level == 1;
 
     auto run_thread_end_callback = [&]() {
@@ -207,12 +219,20 @@ void ThreadState::run_loop(bool cooperative) {
             return;
         run_end_callback = false;
 
-        if (!kernel.thread_event_end)
+        if (!kernel.thread_event_end || (kernel.execution_host && kernel.execution_host->stopping()))
             return;
 
         const ThreadStatus old_status = status;
         const uint32_t old_returned_value = returned_value;
         status = ThreadStatus::run;
+        // An exit request must not suppress the end handler's nested run_loop.
+        // Browser deletion notifications stay latched in the execution host.
+        const bool saved_exit = exit_requested;
+        const bool saved_delete = delete_requested;
+        if (kernel.execution_host) {
+            exit_requested = false;
+            delete_requested = false;
+        }
 
         lock.unlock();
         const int ret = run_callback(kernel.thread_event_end.address(), { SCE_KERNEL_THREAD_EVENT_TYPE_END, static_cast<uint32_t>(id), 0, kernel.thread_event_end_arg });
@@ -220,6 +240,10 @@ void ThreadState::run_loop(bool cooperative) {
             LOG_WARN("Thread end event handler returned {}", log_hex(ret));
         lock.lock();
 
+        if (kernel.execution_host) {
+            exit_requested = exit_requested || saved_exit;
+            delete_requested = delete_requested || saved_delete;
+        }
         status = old_status;
         returned_value = old_returned_value;
     };
@@ -246,6 +270,12 @@ void ThreadState::run_loop(bool cooperative) {
 
         // Park until we have something to do.
         if (status != ThreadStatus::run) {
+            if (kernel.execution_host) {
+                lock.unlock();
+                kernel.execution_host->park(*this);
+                lock.lock();
+                continue;
+            }
             if (cooperative)
                 break;
             status_cond.wait(lock, [&] {
@@ -275,7 +305,8 @@ void ThreadState::run_loop(bool cooperative) {
             lock.unlock();
 
             // Single step or run
-            const int res = do_step ? step(*cpu) : run(*cpu);
+            const int res = kernel.execution_host ? kernel.execution_host->run_cpu(*this, do_step)
+                                                  : (do_step ? step(*cpu) : run(*cpu));
 
             // handle svc call if this was what stopped the cpu
             if (cpu->svc_called) {
@@ -306,10 +337,13 @@ void ThreadState::run_loop(bool cooperative) {
                 }
                 guest_returned = true;
             }
+            if (kernel.execution_host && !guest_returned && !exit_requested && !delete_requested) {
+                lock.unlock();
+                kernel.execution_host->checkpoint(*this);
+                lock.lock();
+            }
         }
     }
-
-    --call_level;
 }
 
 void ThreadState::push_arguments(const std::vector<uint32_t> &args) {
@@ -327,6 +361,10 @@ void ThreadState::push_arguments(const std::vector<uint32_t> &args) {
 }
 
 uint32_t ThreadState::run_callback(Address callback_address, const std::vector<uint32_t> &args) {
+    // Callback::execute holds its notification mutex across this call. Those
+    // callbacks cannot enter a switching host yet; thread event handlers can.
+    if (kernel.execution_host && is_processing_callbacks)
+        return static_cast<uint32_t>(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
     std::unique_lock<std::mutex> thread_lock(mutex);
     if (call_level == 0) {
         LOG_ERROR("run_callback should not be called as the first thread entry");
@@ -392,6 +430,8 @@ void ThreadState::dispatch_abort(CPUState &cpu) {
 }
 
 uint32_t ThreadState::run_guest_function(Address callback_address, SceSize args, const Ptr<void> argp) {
+    if (kernel.execution_host)
+        return kernel.execution_host->run_guest_function(*this, callback_address, args, argp);
     // save the previous entry point, just in case
     const auto old_entry_point = entry_point;
     entry_point = callback_address;
@@ -422,6 +462,8 @@ void ThreadState::update_status(ThreadStatus status, std::optional<ThreadStatus>
 
     this->status = status;
     status_cond.notify_all();
+    if (kernel.execution_host)
+        kernel.execution_host->notify(*this);
 
     if (status == ThreadStatus::dormant) {
         raise_waiting_threads();

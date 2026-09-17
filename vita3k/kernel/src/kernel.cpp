@@ -156,6 +156,15 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
         threads.emplace(thread->id, thread);
     }
 
+    if (execution_host) {
+        if (!execution_host->created(thread)) {
+            const std::lock_guard<std::mutex> lock(mutex);
+            threads.erase(thread->id);
+            return nullptr;
+        }
+        return thread;
+    }
+
     ThreadParams params;
     params.kernel = this;
     params.thid = thread->id;
@@ -187,6 +196,10 @@ void KernelState::request_process_exit(int res, std::optional<AppLaunchRequest> 
 }
 
 void KernelState::process_exit() {
+    if (execution_host) {
+        execution_host->process_exit();
+        return;
+    }
     {
         std::lock_guard<std::mutex> lock(mutex);
         for (auto &[_, timer] : timers)

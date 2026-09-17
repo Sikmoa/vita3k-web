@@ -12,6 +12,16 @@ target_link_options(vita3k_wasm_jit INTERFACE
     -sSTACK_SIZE=1048576 "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=['$setWasmTableEntry','$getWasmTableEntry']"
 )
 
+# Opt-in lifecycle host for parent-owned app/tests. Keep this separate from the
+# CPU library so JIT-only probes need not pull in HLE or Asyncify fibers.
+add_library(vita3k_guest_thread_runtime STATIC
+    src/guest_fiber_scheduler.cpp
+    src/guest_thread_runtime.cpp)
+target_include_directories(vita3k_guest_thread_runtime PUBLIC "${CMAKE_CURRENT_LIST_DIR}/src")
+target_link_libraries(vita3k_guest_thread_runtime PUBLIC vita3k_web_runtime_hle vita3k_wasm_jit)
+target_compile_options(vita3k_guest_thread_runtime PUBLIC -fexceptions)
+target_link_options(vita3k_guest_thread_runtime INTERFACE -fexceptions -sASYNCIFY=1)
+
 # Separate fixture-launch targets: opting into tests does not switch the
 # already-working interpreter application. The Worker selects this module only
 # when created with ?backend=jit.
