@@ -1740,6 +1740,7 @@ int main() {
     vector_tests::region_slot_reuse();
     vector_tests::guest_data_movement(mem);
     vector_tests::guest_structure_lanes(mem);
+    vector_tests::guest_structure_multiple(mem);
     vector_integer_tests::ir_arithmetic();
     vector_integer_tests::guest_arithmetic(mem);
     vector_compare_tests::ir_comparisons();
@@ -1755,6 +1756,7 @@ int main() {
     f64_tests::double_to_single();
     f64_tests::compare64();
     f64_tests::mode_guards();
+    f64_tests::integer_widen_shift();
     f64_tests::binary_arithmetic();
     f64_tests::guest_multiply(mem);
     f64_tests::guest_float_to_int(mem);

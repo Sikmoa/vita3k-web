@@ -103,6 +103,38 @@ void run(const IR::Block &block, const JitState &initial, const JitState *expect
     }
 }
 
+// Integer U64 helpers used by NEON structure loads. Use asymmetric words so
+// an incorrect carry direction cannot pass as it would with a zero high word.
+void integer_widen_shift() {
+    for (uint64_t input : {0ull, 1ull, 0x89abcdef01234567ull, 0xffffffffffffffffull}) {
+        for (uint8_t shift : {0, 1, 8, 16, 24, 31, 32, 33, 40, 56, 63, 64, 65, 127, 255}) {
+            for (bool literal : {false, true}) for (bool dynamic : {false, true}) {
+                auto block = blank(0);
+                const auto operand = literal ? Value{input} : read_d(block);
+                const auto amount = dynamic
+                    ? append(block, Op::LeastSignificantByte, {read_s(block, 4)}) : Value{shift};
+                write_d(block, append(block, Op::LogicalShiftLeft64, {operand, amount}));
+                auto state = base_state(0x90000090);
+                set_d_bits(state, input);
+                set_s_bits(state, 0xa5a50000u | shift, 4);
+                auto expected = state;
+                set_d_bits(expected, shift < 64 ? input << shift : 0);
+                run(block, state, &expected);
+            }
+        }
+    }
+    for (uint8_t byte : {0, 1, 127, 128, 255}) {
+        auto block = blank(0);
+        auto narrow = append(block, Op::LeastSignificantByte, {read_s(block)});
+        write_d(block, append(block, Op::ZeroExtendByteToLong, {narrow}));
+        auto state = base_state(0x90000090);
+        set_s_bits(state, 0xdead0000u | byte);
+        auto expected = state;
+        set_d_bits(expected, byte);
+        run(block, state, &expected);
+    }
+}
+
 void binary_arithmetic() {
     struct Case { Op op; uint64_t a, b, result; uint32_t flags; };
     const Case cases[] = {

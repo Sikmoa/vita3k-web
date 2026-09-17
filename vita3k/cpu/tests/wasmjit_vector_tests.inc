@@ -478,6 +478,39 @@ void guest_data_movement(MemState &mem) {
         }
     }
 }
+void guest_structure_multiple(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    // VLD1.8 {d0-d3},[r1]! (Thumb bytes 21 f9 0d 02).
+    CHECK(thumb_word(0xf421020d) == 0x020df921);
+    for (bool region : {false, true}) for (bool thumb : {false, true}) {
+        jit.set_region_mode(region);
+        if (thumb) put_thumb(mem, jit, {0x020df921, 0xbf00df00});
+        else put(mem, jit, {0xf421020d, 0xef000000});
+        auto state = initial(2);
+        state.regs[1] = data + page - 11;
+        auto context = jit.save_context();
+        std::copy_n(state.regs, 15, context.cpu_registers.begin());
+        std::memcpy(context.fpu_registers.data(), state.fpu, sizeof(state.fpu));
+        context.cpsr = state.cpsr | (thumb ? 0x20 : 0);
+        context.fpscr = state.fpscr;
+        jit.load_context(context);
+        std::array<uint8_t, 32> input{};
+        for (unsigned i = 0; i < input.size(); ++i) input[i] = 0x83 + 37 * i;
+        CHECK(mem_write(mem, state.regs[1], input.data(), input.size()));
+        std::memcpy(state.fpu, input.data(), input.size());
+        state.regs[1] += input.size();
+        CHECK(jit.run() == 0 && parent.svc_called);
+        const auto result = jit.save_context();
+        CHECK(std::memcmp(result.fpu_registers.data(), state.fpu, sizeof(state.fpu)) == 0);
+        for (unsigned i = 0; i < 15; ++i) CHECK(result.cpu_registers[i] == state.regs[i]);
+        CHECK(result.cpsr == context.cpsr && result.fpscr == context.fpscr);
+        CHECK(jit.get_pc() == code + (thumb ? 6 : 8));
+    }
+}
+
 void guest_structure_lanes(MemState &mem) {
     CPUState parent{};
     parent.mem = &mem;

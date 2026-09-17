@@ -2779,6 +2779,22 @@ private:
             value_word(inst.GetArg(0)); set(next_local);
             imm(0); set(next_local + 1); // Region bodies reuse these locals.
             return ok;
+        case Op::ZeroExtendByteToLong:
+            // U8 source in a word slot; zero high word (VLD1 byte assembly).
+            value_word(inst.GetArg(0)); mask(0xff); set(next_local);
+            imm(0); set(next_local + 1);
+            return ok;
+        case Op::LogicalShiftLeft64: {
+            // Dynarmic shifts by an unsigned byte and returns zero at >=64;
+            // Wasm alone masks counts modulo 64. Guard before the i64 shift.
+            value_word(inst.GetArg(1)); mask(0xff); imm(64); op(LtU);
+            op(If); op(0x7e); // i64 block result
+            value64(inst.GetArg(0));
+            value_word(inst.GetArg(1)); mask(0xff); op(ExtendU); op(Shl64);
+            op(Else); constant64(code, 0); op(End);
+            store_i64_words(next_local);
+            return ok;
+        }
         case Op::ZeroExtendByteToWord: arg(0); mask(0xff); break;
         case Op::ZeroExtendHalfToWord: arg(0); mask(0xffff); break;
         case Op::ConditionalSelect32:
