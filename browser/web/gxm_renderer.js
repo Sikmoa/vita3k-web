@@ -3,7 +3,8 @@
 // Input: translated WGSL + snapshotted vertex/index/uniform data. Output: tightly
 // packed RGBA8 after GPU completion, suitable for the existing display bridge.
 // Supported initially: one interleaved stream, triangle-list, RGBA8, no depth,
-// blending or MSAA. Optional fragment unit zero: linear RGBA8, one mip,
+// blending or MSAA. Per-draw viewports map NDC to a target sub-rect (depth is
+// always [0, 1]); omitted viewports cover the full target. Optional fragment unit zero: linear RGBA8, one mip,
 // explicit sampler, group 3 bindings 0/1. No guest texture state is inferred.
 
 const formats = Object.freeze({ float32: [4, 4], float32x2: [8, 4],
@@ -212,6 +213,21 @@ export function createGXMRenderer(device) {
           const index = indexSize === 2 ? view.getUint16(offset, true) : view.getUint32(offset, true);
           if (index >= vertexCount) throw new RangeError('index exceeds vertex stream');
         }
+        // Viewport rects are dynamic draw state like vertices, never pipeline
+        // key material. Normalized (non-negative extent, top-left origin) by
+        // the producer; negative extents reject here instead of misrendering.
+        let viewportRect = null;
+        if (draw.viewport !== undefined) {
+          const viewport = draw.viewport;
+          if (!viewport || typeof viewport !== 'object') throw new TypeError('viewport must be an object');
+          const { x, y, width, height } = viewport;
+          for (const [name, value] of [['viewport x', x], ['viewport y', y],
+              ['viewport width', width], ['viewport height', height]])
+            if (typeof value !== 'number' || !Number.isFinite(value))
+              throw new RangeError(`${name} must be finite`);
+          if (width < 0 || height < 0) throw new RangeError('viewport extent must be non-negative');
+          viewportRect = { x, y, width, height };
+        }
         const uniforms = draw.uniforms === undefined ? new Uint8Array() : bytes(draw.uniforms);
         if (uniforms.length !== program.uniformSize) throw new RangeError('uniform size mismatch');
         const supplied = program.explicitBindings ? draw.buffers ?? {} : { 0: uniforms };
@@ -251,7 +267,7 @@ export function createGXMRenderer(device) {
         } else if (draw.fragmentTexture !== undefined) {
           throw new Error('fragment texture supplied to untextured program');
         }
-        return { program, vertices, indices, boundBuffers, sampledTexture, indexFormat: draw.indexFormat,
+        return { program, vertices, indices, boundBuffers, sampledTexture, viewportRect, indexFormat: draw.indexFormat,
           indexCount: indices.length / indexSize };
       });
       busy = true;
@@ -274,6 +290,10 @@ export function createGXMRenderer(device) {
           loadOp: initial ? 'load' : 'clear', storeOp: 'store', clearValue: clearColor }] });
         for (const draw of snapshots) {
           pass.setPipeline(draw.program.pipeline);
+          // Explicit every draw: identical to the default full-target viewport
+          // when omitted, and required before drawIndexed when provided.
+          const viewport = draw.viewportRect ?? { x: 0, y: 0, width: target.width, height: target.height };
+          pass.setViewport(viewport.x, viewport.y, viewport.width, viewport.height, 0, 1);
           pass.setVertexBuffer(0, upload(draw.vertices, GPUBufferUsage.VERTEX));
           pass.setIndexBuffer(upload(draw.indices, GPUBufferUsage.INDEX), draw.indexFormat);
           // Even an empty explicit group must be set with an explicit layout.

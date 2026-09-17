@@ -48,11 +48,18 @@ Host-only shader/renderer checks do not substitute for guest execution.
   (`gxm-probe-worker.js` imports `gxm_hle_bridge.js` first). Acquiring inside the
   suspended (Asyncify) stack intermittently reports "WebGPU adapter unavailable".
 - The guest draw path currently supports ABGR8 linear surfaces, one interleaved
-  F32 vertex stream, U16/U32 indexed triangle lists, default viewport/clip,
-  and metadata-packed vertex/fragment uniform buffers. It preserves the initial
-  guest surface between draws. The bounded GXM2 texture path below is guest
-  GPU-verified. Unsupported depth, blending, other textures, instancing,
-  non-default viewport/clip and other commands are rejected, not silently ignored.
+  F32 vertex stream, U16/U32 indexed triangle lists, arbitrary viewports
+  (forwarded to the WebGPU viewport; draws without recorded viewport state
+  reject), default region clip, and metadata-packed vertex/fragment uniform
+  buffers (indexed and default, both stages: same `set_uniform_buffer` path).
+  It preserves the initial guest surface between draws. The bounded GXM3
+  texture path below is guest GPU-verified. Unsupported depth, blending,
+  other textures, instancing, non-default region clip and other commands are
+  rejected, not silently ignored.
+- C2 (renderer side implemented, unverified) accepts `SignalSyncObject`,
+  `WaitSyncObject` and `NewFrame`, and wakes `sceGxmNotificationWait` via
+  `notification_ready` after `SignalNotification`/`SyncSurfaceData`. NewFrame
+  only records the predicted frame; pixels are NOT presented. See GXM_WEBGPU.md.
 - C1 adds a bounded pipeline cache (reuse verified; eviction/device-loss tests
   outstanding) and ordered guest draw/fill/fence
   queue (GXM_WEBGPU.md). Each draw still translates GXP, uploads buffers and
@@ -70,6 +77,94 @@ Host-only shader/renderer checks do not substitute for guest execution.
   GPU-verified; depth, blending, display queue integration
   and retail-app scheduling remain unfinished.
   `rendererComplete=false` in the probe output remains intentional.
+
+## Task #20 handoff to the HLE owner (Limbo SceGxm static rows)
+
+Limbo (`dec_out/eboot.bin`, module `Limbo`) statically imports 73 SceGxm
+functions. The browser selection already covers 25 of them. The C2 bridge
+slice removes every *renderer-side* blocker for the groups below; selecting
+them needs only `browser/runtime_hle.cmake` edits (NOT this workstream).
+All NIDs are from `vita3k/nids/include/nids/nids.inc`.
+
+Display-queue/sync notification (bridge now handles the commands/notify):
+
+- `sceGxmDisplayQueueAddEntry` 0xEC5C26B5 — emits `NewFrame` (accepted) plus
+  display-queue push. Still needs display-thread scheduling of the guest
+  callback (scheduler owner) and future pixel presentation.
+- `sceGxmSyncObjectCreate` 0x6A6013E1 / `sceGxmSyncObjectDestroy` 0x889AE88C —
+  backend-agnostic `renderer::create/destroy` already linked via
+  `renderer/src/creation.cpp`.
+- `sceGxmGetNotificationRegion` 0x8BDE825A — returns the region allocated in
+  `gxm_initialize`; no renderer involvement.
+- `sceGxmNotificationWait` 0x9F448E79 — now woken by the bridge notify; pure
+  HLE wait on `notification_ready` otherwise.
+- `sceGxmMapMemory` 0xC61E34FC / `sceGxmUnmapMemory` 0x828C68E8 — HLE-side
+  region tracking only (`features.enable_memory_mapping` is false, so no
+  renderer `MemoryMap` command is ever sent and preflight is unaffected).
+  Needed for the MAX_UB size bounding in `gxmSetUniformBuffers`.
+- `sceGxmMapVertexUsseMemory` 0xFA437510 / `sceGxmUnmapVertexUsseMemory`
+  0x099134F5 / `sceGxmMapFragmentUsseMemory` 0x008402C6 /
+  `sceGxmUnmapFragmentUsseMemory` 0x80CCEDBB — STUBBED upstream (always
+  success); already observed in the desktop Limbo boot log.
+
+Viewport state (bridge now forwards; no rejection on non-default):
+
+- `sceGxmSetViewport` 0x3EB3380B, `sceGxmSetViewportEnable` 0x814F61EB.
+
+Uniform buffers (same verified path as the existing default-VB support):
+
+- `sceGxmSetVertexUniformBuffer` 0xC68015E4,
+  `sceGxmSetFragmentUniformBuffer` 0xEA0FC310,
+  `sceGxmSetFragmentDefaultUniformBuffer` 0xA824EB24. All funnel through
+  `gxmSetUniformBuffers` into `GXMState::UniformBuffer`, which the bridge
+  packs from program metadata. (`sceGxmSetVertexDefaultUniformBuffer` is
+  already selected.)
+
+Shader-patcher/program-metadata queries (pure CPU GXP parsing in the already
+linked `shader/src`, `gxm/src`; no renderer commands, no bridge change):
+
+- `sceGxmShaderPatcherReleaseVertexProgram` 0xAC1FF2DA,
+  `sceGxmShaderPatcherReleaseFragmentProgram` 0xBE2743D1,
+  `sceGxmShaderPatcherUnregisterProgram` 0xF103AF8A,
+  `sceGxmShaderPatcherDestroy` 0xEAA5B100,
+  `sceGxmShaderPatcherGetProgramFromId` 0xA949A803,
+  `sceGxmProgramCheck` 0xED8B6C69,
+  `sceGxmProgramGetParameterCount` 0xD5D5FCCD,
+  `sceGxmProgramGetParameter` 0x06FF9151,
+  `sceGxmProgramFindParameterBySemantic` 0x633CAA54,
+  `sceGxmProgramParameterGetCategory` 0x1997DC17,
+  `sceGxmProgramParameterGetType` 0x7B9023C3,
+  `sceGxmProgramParameterGetName` 0x6AF88A5D,
+  `sceGxmProgramParameterGetContainerIndex` 0xBB58267D,
+  `sceGxmProgramParameterGetComponentCount` 0xBD2998D1,
+  `sceGxmProgramParameterGetArraySize` 0xDBA8D061.
+
+Safe descriptors whose *use* stays explicitly rejected at draw time:
+
+- Pure getters: `sceGxmColorSurfaceGetFormat` 0xF3C1C6C6,
+  `sceGxmTextureGetStride` 0xB0BD52F3, `sceGxmTextureGetType` 0xF65D4917.
+- Non-LINEAR layouts: `sceGxmTextureInitSwizzled` 0xD572D547,
+  `sceGxmTextureInitSwizzledArbitrary` 0x5DBFBA2C,
+  `sceGxmTextureInitLinearStrided` 0x6679BEF0, plus
+  `sceGxmTextureSetMipFilter` 0x1CA9FE0B, `sceGxmTextureSetLodBias`
+  0xB65EE6F7, `sceGxmTextureSetLodMin` 0xB79E43DD (draw still rejects
+  anything but unit-zero LINEAR ABGR8).
+- Depth: `sceGxmDepthStencilSurfaceInit` 0xCA9D41D1,
+  `sceGxmDepthStencilSurfaceSetForceLoadMode` 0x0C44ACD7,
+  `sceGxmDepthStencilSurfaceSetForceStoreMode` 0x12AAA7AF (SetContext with a
+  depth surface still rejects).
+- Fixed-function: `sceGxmSetCullMode` 0xE1CA72AE,
+  `sceGxmSetFrontDepthFunc` 0x14BD831F, `sceGxmSetFrontDepthWriteEnable`
+  0xF32CBF34, `sceGxmSetFrontPolygonMode` 0xFD93209D (emit state commands the
+  bridge explicitly rejects unless default).
+- `sceGxmPadHeartbeat` 0x3D25FCE9 (upstream null-checks and returns 0).
+
+Explicitly NOT requested: `sceGxmDisplayQueueFinish` (Limbo does not import
+it), `sceGxmBeginSceneEx`, `sceGxmMidSceneFlush`/`sceGxmExecuteCommandList`/
+deferred contexts, `sceGxmTransferCopy/Downscale`, `sceGxmSetVertexTexture`,
+precomputed paths, `sceGxmSetRegionClip` (not imported; scissor stays
+rejected). Limbo imports neither `sceGxmFinish` nor `sceGxmTransferFill`;
+its sync is display-queue plus notification waits.
 
 ## GXM2 fragment texture wiring (verified bounded path)
 
@@ -97,11 +192,15 @@ Host-only shader/renderer checks do not substitute for guest execution.
 - GXM2 (`0x47584d32`) replaces GXM1, including untextured draws. Following the
   old ten u32 words comes count 0/1; if 1, eight u32s are width, height, GXM
   format, min, mag, U, V, packed byte length. Then old render-info, attributes,
-  six payloads, followed by packed texture bytes. No guest/native pointers
-  or row padding cross into JS. JS checks version/count/size/enums/truncation
-  and trailing bytes before compilation. C++ and JS snapshots happen before
-  suspension; texture validation/readback failures cannot signal later batch
-  notifications. Native and JS must be deployed together.
+  six payloads, followed by packed texture bytes. GXM3 (`0x47584d33`, Task
+  #20, unverified) inserts viewport flat u32 plus six f32 bits
+  (xOffset,yOffset,zOffset,xScale,yScale,zScale) after the texture header and
+  before render info; GXM2 no longer decodes. No guest/native pointers
+  or row padding cross into JS. JS checks version/count/size/enums/viewport
+  finiteness/truncation and trailing bytes before compilation. C++ and JS
+  snapshots happen before suspension; texture validation/readback failures
+  cannot signal later batch notifications. Native and JS must be deployed
+  together.
 - Existing `spirv_recompiler.cpp` uses descriptor set 3 for fragment samplers;
   `vita3k/shader/include/shader/webgpu_spirv.h` splits unit n to texture 2n,
   sampler 2n+1. JS passes explicit ABGR8 translator hints and the consumer's
@@ -126,7 +225,8 @@ rejection); SDK guest build succeeds; shell/JS syntax and `git diff --check`
 pass. The packet test emulates depadding and does **not** execute the C++ loop.
 Parent verification rebuilt `vita3k_web_jit` and passed the real Memory64 guest
 Chromium probe (exit 42, nine draw readbacks, zero missing NIDs). The consumer
-regression also passed all 37 checks. The worker loads `vita3k_web_jit.js`, NOT
+regression also passed all 37 checks (41 after the C2 viewport extension,
+unverified). The worker loads `vita3k_web_jit.js`, NOT
 `vita3k_web.js`: rebuilding the latter leaves a stale JIT packet producer.
 On the verification host, overriding Chromium's TMPDIR to the build scratch
 caused adapter acquisition to fail; the default temporary directory worked.

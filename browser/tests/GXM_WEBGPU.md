@@ -35,11 +35,69 @@ rows, filtering/wrapping, pixel mutation without rebinding and data-address
 replacement. See `GXM_GUEST_INTEGRATION.md` for the exact bounded descriptor
 contract and nine-readback fixture (exit 42).
 
+Per-draw viewports map NDC to a target sub-rect (see C2); omitted viewports
+cover the full target. Viewport rects are dynamic draw state, never pipeline
+key material. Negative/non-finite rects reject; outside-viewport texels keep
+their initial values.
+
 Depth/stencil, blending, MSAA, multiple
-vertex streams, non-default viewport/scissor, additional target formats and
+vertex streams, non-default region-clip/scissor, additional target formats and
 resident framebuffer resolve/presentation remain unsupported. The guest fixture
 verifies only the bounded texture path, not these remaining features. Each draw still
 reads back; this is not a performance result or a completed retail renderer.
+
+## C2 — display-queue/sync commands, viewport state, state-driven render info
+
+Status: implemented, NOT yet run (parent verifies serially). Renderer-side
+slice only; the HLE allowlist additions it unblocks are listed for the HLE
+owner in `GXM_GUEST_INTEGRATION.md` and are not selected here.
+
+Native (`browser/src/gxm_webgpu_bridge.cpp`):
+
+- Accepts `SignalSyncObject` (EndScene fragment completion via
+  `subject_done`), `WaitSyncObject` (BeginScene fragment wait via `wishlist`;
+  steady state is already signaled, genuine backpressure blocks with desktop
+  semantics instead of skipping), and `NewFrame` (display-queue entry records
+  the predicted frame into display state and sets `should_display`; pixels are
+  NOT presented). All other new opcodes (notably `MidSceneFlush`,
+  `TransferCopy/Downscale`, `MemoryMap/Unmap`) still reject in preflight.
+- `SignalNotification` and `SyncSurfaceData` now publish under
+  `notification_mutex` and `notify_all`, mirroring `sync.cpp`
+  `handle_notification` and `scene.cpp` `signal_notifications`. Previously
+  values were written with no wakeup, so a selected
+  `sceGxmNotificationWait` could never observe them. Failed batches still
+  publish nothing.
+- Arbitrary GXM viewports are forwarded instead of rejected. `SetState`
+  Viewport handling mirrors `state_set.cpp` record fields (flip, z
+  offset/scale; flat forces flip `(1,-1,1,1)` and z `(0,1)`); draws without
+  any recorded viewport state reject rather than render implicitly.
+- The vertex render-info block now carries the real flip/flag/screen/z from
+  record state (previously the flag was hardcoded to 1, mis-describing flat
+  viewports to the translated shader). Screen dimensions remain the color
+  surface size, matching `gl/draw.cpp`.
+- Non-default region clip still rejects explicitly; there is no scissor stage.
+  Indexed/default vertex/fragment uniform buffers need no change: they already
+  flow through `set_uniform_buffer` into the packed draw payload.
+
+Packet GXM3 (`0x47584d33`, replaces GXM2; native and JS deploy together):
+fixed words as before, then viewport flat u32 and six f32 bits
+(xOffset,yOffset,zOffset,xScale,yScale,zScale), then render info, attributes,
+payloads and texture bytes. GXM2 now fails loudly in the decoder.
+
+JS (`gxm_hle_bridge.js`): `decodeGuestDrawPacket` validates the viewport
+words (flat must be 0/1, floats finite) and exports pure `gxmViewportRect`,
+which mirrors `vulkan/sync_viewport_real` (res_multiplier 1) with
+negative-height normalization; flat covers the full target. The rect is
+computed before any await and passed per draw to `submit`, which applies
+`setViewport(x, y, w, h, 0, 1)` per draw. Depth stays `[0, 1]` because the
+translated WebGPU shader (`is_vulkan` path) applies z offset/scale itself.
+
+Assumptions to verify: a WebGPU viewport rect renders the same NDC mapping
+as the equivalent Vulkan viewport (affine-equivalent by construction; the
+full-target case is already pixel-verified, the sub-rect case is covered by
+the new smoke checks); `emscripten_sleep` wishlist waits are reachable from
+the HLE submit path; negative xScale games render with abs like both
+production backends.
 
 ## C1 — bounded pipeline cache and ordered guest operations
 
@@ -94,7 +152,7 @@ PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index
 ```
 
 Verified result (exit 0):
-`{"checks":37,"backend":"WebGPU","translatedGuestShader":false,"pipelineCache":true}`.
+`{"checks":41,"backend":"WebGPU","translatedGuestShader":false,"pipelineCache":true}`.
 The eight added texture assertions cover quadrant pixels with snapshot ownership,
 texel changes on later draws, pipeline reuse, missing/partial texture rejection,
 unsupported samplers, rejection of ignored textures, and resource-layout cache keys.
@@ -102,7 +160,10 @@ These use test WGSL, not a guest texturing fixture.
 No game assets or shader compiler are needed. Unavailable WebGPU is a failure
 to verify, never a successful skip.
 
-The historical baseline was 18 checks. Eleven new assertions cover equivalent
+The historical baseline was 18 checks (37 after C1). Four new assertions cover
+viewport clipping to a sub-rect, initial-surface preservation outside the
+viewport, and explicit rejection of negative/non-finite viewport rects.
+Eleven earlier assertions cover equivalent
 descriptors sharing a pipeline but not handles, handle lifetime, changed shader
 pixels, changed vertex layout, changed binding size/visibility, named unsupported
 state rejection, failed compilation not entering the cache, successful reuse

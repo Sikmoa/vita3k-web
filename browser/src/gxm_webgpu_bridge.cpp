@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Browser-only consumer of the production renderer command ABI. No GL/Vulkan.
 #include "gxm_webgpu_bridge.h"
+#include <display/state.h>
 #include <emuenv/state.h>
 #include <gxm/functions.h>
 #include <gxm/state.h>
@@ -8,6 +9,7 @@
 #include <renderer/functions.h>
 #include <renderer/state.h>
 #include <emscripten.h>
+#include <mutex>
 #include <stdexcept>
 #include <array>
 #include <vector>
@@ -72,7 +74,11 @@ namespace {
 }
 struct WebContext final : renderer::Context {
     bool has_surface = false;
+    // Recorded GXM viewport state: [xOffset, yOffset, zOffset, xScale, yScale, zScale].
+    // has_viewport tracks whether a Viewport command arrived; a draw without one
+    // is rejected rather than rendered with an implicit viewport.
     std::array<float, 6> viewport{};
+    bool has_viewport = false;
     std::array<uint32_t, 4> clip{};
     std::array<std::vector<uint8_t>, 2> uniforms;
     bool has_fragment_texture = false;
@@ -150,6 +156,9 @@ void destroy_command_payload(Command &cmd) {
         CommandHelper h(&cmd); h.pop<uint32_t>();
         delete h.pop<const SceGxmTransferImage *>();
     }
+    // NewFrame owns a host DisplayFrameInfo*, released in-handler exactly like
+    // sync.cpp new_frame (copied into display state, then deleted). No guest
+    // pointers or variable payloads cross the other accepted opcodes.
 }
 bool create_context(State &s, std::unique_ptr<Context> &ctx) {
     ctx = std::make_unique<WebContext>();
@@ -250,6 +259,22 @@ static void trace_scene(CommandList &list, MemState &mem) {
             printf("[gxm-decode] sync vertex=%08x fragment=%08x\n", v.address.address(), f.address.address());
             break;
         }
+        case CommandOpcode::SignalSyncObject:
+        case CommandOpcode::WaitSyncObject: {
+            const auto sync = h.pop<Ptr<SceGxmSyncObject>>();
+            const auto timestamp = h.pop<uint32_t>();
+            printf("[gxm-decode] %s sync=%08x timestamp=%u\n",
+                cmd->opcode == CommandOpcode::SignalSyncObject ? "signal" : "wait", sync.address(), timestamp);
+            break;
+        }
+        case CommandOpcode::SignalNotification: {
+            const auto n = h.pop<SceGxmNotification>();
+            printf("[gxm-decode] notification address=%08x value=%u\n", n.address.address(), n.value);
+            break;
+        }
+        case CommandOpcode::NewFrame:
+            printf("[gxm-decode] new frame (display-queue entry)\n");
+            break;
         default: printf("[gxm-decode] opcode=%u\n", unsigned(cmd->opcode)); break;
         }
     }
@@ -283,8 +308,22 @@ static void consume_state(WebContext &ctx, CommandHelper &h, MemState &mem) {
         for (auto &n : ctx.clip) n = h.pop<uint32_t>();
         break;
     case GXMState::Viewport:
+        // Mirror state_set.cpp COMMAND_SET_STATE(viewport) record fields, minus
+        // the MSAA/downscale factor (unsupported render targets are rejected).
         ctx.record.viewport_flat = h.pop<bool>();
-        if (!ctx.record.viewport_flat) for (auto &n : ctx.viewport) n = h.pop<float>();
+        ctx.has_viewport = true;
+        if (!ctx.record.viewport_flat) {
+            for (auto &n : ctx.viewport) n = h.pop<float>();
+            const float ymin = ctx.viewport[1] + ctx.viewport[4];
+            const float ymax = ctx.viewport[1] - ctx.viewport[4] - 1;
+            ctx.record.viewport_flip = { 1.0f, (ymin < ymax) ? -1.0f : 1.0f, 1.0f, 1.0f };
+            ctx.record.z_offset = ctx.viewport[2];
+            ctx.record.z_scale = ctx.viewport[5];
+        } else {
+            ctx.record.viewport_flip = { 1.0f, -1.0f, 1.0f, 1.0f };
+            ctx.record.z_offset = 0.0f;
+            ctx.record.z_scale = 1.0f;
+        }
         break;
     case GXMState::Program: {
         const auto ptr = h.pop<Ptr<const void>>();
@@ -357,13 +396,15 @@ static int consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem) {
         unsupported("only non-instanced indexed triangle lists supported");
     if (!ctx.has_surface || !ctx.record.vertex_program || !ctx.record.fragment_program)
         unsupported("draw without surface/programs");
+    if (!ctx.has_viewport)
+        unsupported("draw without viewport state");
     const auto &surface = ctx.record.color_surface;
     const auto w = surface.width, height = surface.height;
-    const std::array<float, 6> full = {float(w) * .5f, float(height) * .5f, .5f, float(w) * .5f, -float(height) * .5f, .5f};
-    if (ctx.record.viewport_flat || ctx.viewport != full
-        || ctx.record.region_clip_mode != SCE_GXM_REGION_CLIP_OUTSIDE
+    // Arbitrary GXM viewports are forwarded to the WebGPU viewport (GXM3).
+    // Non-default region clip (scissor) stays rejected: no scissor stage exists.
+    if (ctx.record.region_clip_mode != SCE_GXM_REGION_CLIP_OUTSIDE
         || ctx.clip != std::array<uint32_t, 4>{0, w - 1, 0, height - 1})
-        unsupported("non-default viewport/clip");
+        unsupported("non-default region clip");
     const auto *vp = ctx.record.vertex_program.get(mem);
     const auto *fp = ctx.record.fragment_program.get(mem);
     if (!vp->renderer_data || !fp->renderer_data || fp->is_maskupdate
@@ -434,10 +475,16 @@ static int consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem) {
         packet.insert(packet.end(), bytes, bytes + size);
     };
     const auto word = [&](uint32_t value) { append(&value, 4); };
-    // GXM2: GXM1 fixed fields, then texture count (0/1) and, when present,
-    // width,height,GXM format,min,mag,U,V,packed byte length. Texture bytes
-    // follow the six existing payloads. All words are little-endian wasm u32.
-    word(0x47584d32); word(stride); word(index_size);
+    // GXM3 fixed words: magic, stride, indexSize, six payload lengths,
+    // attribute count, texture count (0/1), optional eight texture words,
+    // viewport flat u32, viewport xOffset,yOffset,zOffset,xScale,yScale,zScale
+    // f32 bits. Then render info (48 bytes), attributes, the six payloads,
+    // and packed texture bytes. The vertex shader consumes only flip/flag/
+    // screen/z from render info; x/y mapping is the WebGPU viewport, computed
+    // in JS from these exact GXM floats. GXM2 is no longer accepted: native
+    // and JS deploy together, old packets must fail loudly. All words are
+    // little-endian wasm u32.
+    word(0x47584d33); word(stride); word(index_size);
     for (auto size : {index_bytes, stream.size, size_t(vs->size), size_t(fs->size), ctx.uniforms[0].size(), ctx.uniforms[1].size()}) word(size);
     word(attributes.size());
     word(textured ? 1 : 0);
@@ -447,7 +494,15 @@ static int consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem) {
         word(t.min_filter); word(t.mag_filter); word(t.uaddr_mode); word(t.vaddr_mode);
         word(texture_pixels.size());
     }
-    const float info[12] = {1,1,1,1, 1,float(w),float(height),ctx.viewport[2], ctx.viewport[5],0,0,0};
+    word(ctx.record.viewport_flat ? 1u : 0u);
+    append(ctx.viewport.data(), sizeof(float) * 6);
+    // RenderVertUniformBlock fields, mirroring gl/draw.cpp from record state:
+    // flip, flat?0:1 flag, surface dimensions, z offset/scale. Previously the
+    // flag was hardcoded to 1, mis-describing flat viewports to the shader.
+    const float *flip = ctx.record.viewport_flip.data();
+    const float info[12] = {flip[0], flip[1], flip[2], flip[3],
+        ctx.record.viewport_flat ? 0.0f : 1.0f, float(w), float(height),
+        ctx.record.z_offset, ctx.record.z_scale, 0, 0, 0};
     append(info, sizeof(info));
     for (const auto &a : attributes) for (auto value : a) word(value);
     append(indices.get(mem), index_bytes); append(stream.data.get(mem), stream.size);
@@ -459,13 +514,18 @@ static int consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem) {
 
 void submit_command_list(State &state, Context *ctx, CommandList &list) {
     // Reject unsupported opcodes before publishing any batch completion.
+    // Signal/WaitSyncObject and NewFrame are the display-queue/sync slice:
+    // steady-state waits are already signaled, and NewFrame only records the
+    // predicted frame (presentation is a later slice). Everything else still
+    // rejects here instead of partially executing the batch.
     for (Command *cmd = list.first; cmd; cmd = cmd->next) {
         if (cmd->opcode != CommandOpcode::Nop && cmd->opcode != CommandOpcode::TransferFill
             && cmd->opcode != CommandOpcode::SignalNotification && cmd->opcode != CommandOpcode::SetContext
             && cmd->opcode != CommandOpcode::SetState && cmd->opcode != CommandOpcode::Draw
-            && cmd->opcode != CommandOpcode::SyncSurfaceData) {
+            && cmd->opcode != CommandOpcode::SyncSurfaceData && cmd->opcode != CommandOpcode::SignalSyncObject
+            && cmd->opcode != CommandOpcode::WaitSyncObject && cmd->opcode != CommandOpcode::NewFrame) {
             trace_scene(list, static_cast<WebState &>(state).mem);
-            unsupported("command opcode (drawing not connected)");
+            unsupported("command opcode not implemented");
         }
     }
     if (!list.first) return;
@@ -507,11 +567,65 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
             break;
         case CommandOpcode::SyncSurfaceData: {
             // Draw readback is awaited before execution reaches notifications.
+            // Mirror scene.cpp signal_notifications: publish under the mutex
+            // and wake sceGxmNotificationWait. No notify on validation failure.
             auto &mem = static_cast<WebState &>(state).mem;
             const auto vertex = helper.pop<SceGxmNotification>(), fragment = helper.pop<SceGxmNotification>();
             for (const auto &n : {vertex, fragment}) if (n.address)
                 require_guest(mem, n.address.address(), sizeof(uint32_t));
-            for (const auto &n : {vertex, fragment}) if (n.address) *n.address.get(mem) = n.value;
+            // Signal only when at least one waiter address exists, mirroring
+            // the were_notifications_signaled guard (memory mapping is never
+            // enabled on this backend; disable_surface_sync is false while
+            // the draw readback await stands in for fence completion).
+            if (vertex.address || fragment.address) {
+                // Unlock before notifying, exactly like the desktop path.
+                std::unique_lock<std::mutex> lock(state.notification_mutex);
+                for (const auto &n : {vertex, fragment}) if (n.address) *n.address.get(mem) = n.value;
+                lock.unlock();
+                state.notification_ready.notify_all();
+            }
+            break;
+        }
+        case CommandOpcode::SignalSyncObject: {
+            // EndScene emits this after SyncSurfaceData when a fragment sync
+            // object is bound. Advance exactly like renderer::subject_done so
+            // display-queue waits observe scene completion.
+            const auto sync = helper.pop<Ptr<SceGxmSyncObject>>();
+            const auto timestamp = helper.pop<uint32_t>();
+            auto &mem = static_cast<WebState &>(state).mem;
+            if (!sync) unsupported("sync signal without object");
+            require_guest(mem, sync.address(), sizeof(SceGxmSyncObject));
+            subject_done(sync.get(mem), timestamp);
+            break;
+        }
+        case CommandOpcode::WaitSyncObject: {
+            // BeginScene emits this for the bound fragment sync object. Steady
+            // state is already signaled; genuine backpressure blocks with
+            // desktop wishlist semantics rather than skipping the wait.
+            const auto sync = helper.pop<Ptr<SceGxmSyncObject>>();
+            const auto timestamp = helper.pop<uint32_t>();
+            auto &mem = static_cast<WebState &>(state).mem;
+            if (!sync) unsupported("sync wait without object");
+            require_guest(mem, sync.address(), sizeof(SceGxmSyncObject));
+            if (wishlist(sync.get(mem), timestamp) != SyncWaitResult::Ready)
+                result = -1;
+            break;
+        }
+        case CommandOpcode::NewFrame: {
+            // sceGxmDisplayQueueAddEntry path (always sent with null context).
+            // Record the predicted frame for a future presentation slice;
+            // pixels are NOT presented yet. Mirrors sync.cpp new_frame minus
+            // the backend-specific frame advance.
+            auto *frame = helper.pop<DisplayFrameInfo *>();
+            auto *display = helper.pop<DisplayState *>();
+            helper.pop<Context *>();
+            if (!display) unsupported("new frame without display state");
+            if (frame) {
+                const std::lock_guard<std::mutex> guard(display->display_info_mutex);
+                display->next_rendered_frame = *frame;
+                delete frame;
+                state.should_display = true;
+            }
             break;
         }
         case CommandOpcode::Nop:
@@ -537,13 +651,23 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
             break;
         }
         case CommandOpcode::SignalNotification: {
+            // Mirror sync.cpp handle_notification: publish under the mutex and
+            // wake sceGxmNotificationWait. An invalid address fails the batch
+            // without publishing, exactly as before.
             const auto n = helper.pop<SceGxmNotification>();
             auto &mem = static_cast<WebState &>(state).mem;
             if (n.address) {
                 if (!is_valid_addr_range(mem, n.address.address(), uint64_t(n.address.address()) + sizeof(uint32_t)))
                     result = -1;
-                else *n.address.get(mem) = n.value;
+                else {
+                    std::unique_lock<std::mutex> lock(state.notification_mutex);
+                    *n.address.get(mem) = n.value;
+                    lock.unlock();
+                }
             }
+            // handle_notification notifies unconditionally after the locked
+            // publish; waiters re-check their own predicates.
+            state.notification_ready.notify_all();
             break;
         }
         default: break; // Preflight above excludes all other opcodes.

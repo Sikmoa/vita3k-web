@@ -167,6 +167,25 @@ try {
     check(renderer.pipelineCacheStats().misses === layoutMisses + 1, 'texture layout changes pipeline key');
     renderer.destroyProgram(unusedTexture);
     renderer.destroyProgram(textured);
+    // Per-draw viewports map NDC to a target sub-rect; omitted viewports keep
+    // the default full-target mapping. Outside-viewport texels are preserved.
+    const vpTarget = renderer.createTarget(64, 32);
+    const vpProgram = await renderer.createProgram(definition);
+    const tri = { program: vpProgram, vertices: new Float32Array([-1,-1, 3,-1, -1,3]),
+      indices: new Uint16Array([0,1,2]), uniforms: new Float32Array([1,0,0,1]), indexFormat: 'uint16' };
+    const left = await renderer.submit(vpTarget, [{ ...tri, viewport: { x: 0, y: 0, width: 32, height: 32 } }]);
+    const vpPixel = (image, x, y) => image.pixels.slice((y * 64 + x) * 4, (y * 64 + x) * 4 + 4).join();
+    check(vpPixel(left, 8, 8) === '255,0,0,255' && vpPixel(left, 56, 8) === '0,0,0,255',
+      'viewport clips draw to rect');
+    const right = await renderer.submit(vpTarget, [{ ...tri, viewport: { x: 32, y: 0, width: 32, height: 32 } }],
+      { initialPixels: left.pixels });
+    check(right.pixels.every((v, i) => v === [255,0,0,255][i % 4]),
+      'outside-viewport preserves initial surface');
+    await rejects(() => renderer.submit(vpTarget, [{ ...tri, viewport: { x: 0, y: 0, width: -1, height: 32 } }]),
+      'negative viewport extent rejected');
+    await rejects(() => renderer.submit(vpTarget, [{ ...tri, viewport: { x: NaN, y: 0, width: 32, height: 32 } }]),
+      'non-finite viewport rejected');
+    renderer.destroyProgram(vpProgram); renderer.destroyTarget(vpTarget);
     renderer.destroyProgram(program); renderer.destroyTarget(target);
     await rejects(() => renderer.submit(target, []), 'destroyed target rejected');
     renderer.dispose();
@@ -187,7 +206,7 @@ try {
     device.destroy();
     return { checks, backend: 'WebGPU', translatedGuestShader: false, pipelineCache: true };
   });
-  assert.equal(result.checks, 37);
+  assert.equal(result.checks, 41);
   console.log(JSON.stringify(result));
 } finally {
   clearTimeout(timeout);

@@ -20,6 +20,38 @@ export function configureGuestShaders(urls) {
   shaderPromise = createGXPShaderAdapter(urls);
 }
 
+// GXM viewport (pass-through floats) to a WebGPU viewport rect in top-left
+// device pixels. Mirrors vulkan sync_viewport_real with res_multiplier 1:
+// x = xOffset - |xScale|, y = yOffset - yScale, w = |2*xScale|, h = 2*yScale.
+// A negative height (the normal negative-yScale GXM convention, including the
+// default viewport) is normalized to the same framebuffer rect it describes
+// under Vulkan's negative-height flip. Flat viewports cover the full target.
+// Pure: unit-tested without a compiler or device. Depth is always [0, 1]: the
+// translated shader applies z offset/scale from render info itself.
+export function gxmViewportRect(viewport, width, height) {
+  // Local bounds (gxm_renderer.js owns the shared integer helper and does not
+  // export it): the device-limit check in createTarget stays authoritative.
+  for (const [name, value] of [['surface width', width], ['surface height', height]])
+    if (!Number.isSafeInteger(value) || value < 1 || value > 16384)
+      throw new RangeError(`${name} out of range`);
+  if (!viewport || typeof viewport !== 'object') throw new TypeError('viewport required');
+  const { flat, xOffset, yOffset, xScale, yScale } = viewport;
+  if (typeof flat !== 'boolean') throw new TypeError('viewport flat flag required');
+  if (flat) return { x: 0, y: 0, width, height };
+  for (const [name, value] of [['xOffset', xOffset], ['yOffset', yOffset],
+      ['xScale', xScale], ['yScale', yScale]])
+    if (typeof value !== 'number' || !Number.isFinite(value))
+      throw new RangeError(`${name} must be finite`);
+  // Negative xScale is a game bug that both production backends render with
+  // abs(); reject nothing, match them. Negative height is the norm, not an error.
+  const w = Math.abs(2 * xScale);
+  let h = 2 * yScale, y = yOffset - yScale;
+  if (h < 0) { y += h; h = -h; }
+  const x = xOffset - Math.abs(xScale);
+  if (![x, y, w, h].every(Number.isFinite)) throw new RangeError('viewport rect overflow');
+  return { x, y, width: w, height: h };
+}
+
 // Versioned host-owned packet, not a guest struct containing native pointers.
 // Copy every input before awaiting the compiler or device.
 export async function drawGuestSurface(packet, initialPixels, width, height) {
@@ -27,7 +59,7 @@ export async function drawGuestSurface(packet, initialPixels, width, height) {
   return enqueueGuestWork(() => drawOwnedSurface(packet, initialPixels, width, height));
 }
 // Pure decoder exported for lightweight packet contract tests (no GPU/compiler).
-// Only GXM2 is accepted: never silently interpret an old native producer.
+// Only GXM3 is accepted: never silently interpret an old native producer.
 export function decodeGuestDrawPacket(packet) {
   const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
   let cursor = 0;
@@ -35,11 +67,17 @@ export function decodeGuestDrawPacket(packet) {
     if (cursor + 4 > packet.length) throw new Error('truncated GXM draw packet');
     const n = view.getUint32(cursor, true); cursor += 4; return n;
   };
+  const float = () => {
+    if (cursor + 4 > packet.length) throw new Error('truncated GXM draw packet');
+    const n = view.getFloat32(cursor, true); cursor += 4;
+    if (!Number.isFinite(n)) throw new Error('non-finite GXM viewport float');
+    return n;
+  };
   const take = n => {
     if (!Number.isSafeInteger(n) || n < 0 || cursor + n > packet.length) throw new Error('truncated GXM draw packet');
     const data = packet.slice(cursor, cursor + n); cursor += n; return data;
   };
-  if (word() !== 0x47584d32) throw new Error('unknown GXM draw packet version');
+  if (word() !== 0x47584d33) throw new Error('unknown GXM draw packet version');
   const stride = word(), indexSize = word();
   const lengths = Array.from({ length: 6 }, word);
   const attributeCount = word();
@@ -64,6 +102,10 @@ export function decodeGuestDrawPacket(packet) {
       minFilter: filters[min], magFilter: filters[mag], addressModeU: addresses[u], addressModeV: addresses[v],
     } };
   }
+  const flat = word();
+  if (flat !== 0 && flat !== 1) throw new Error('unsupported viewport flat flag');
+  const viewport = { flat: flat === 1, xOffset: float(), yOffset: float(),
+    zOffset: float(), xScale: float(), yScale: float(), zScale: float() };
   const info = take(48);
   const attributes = Array.from({ length: attributeCount }, () => {
     const shaderLocation = word(), offset = word(), components = word();
@@ -73,12 +115,15 @@ export function decodeGuestDrawPacket(packet) {
   const [indices, vertices, vertexGXP, fragmentGXP, vertexUniforms, fragmentUniforms] = lengths.map(take);
   if (fragmentTexture) fragmentTexture.pixels = take(textureLength);
   if (cursor !== packet.length) throw new Error('trailing GXM draw packet bytes');
-  return { stride, indexSize, info, attributes, indices, vertices, vertexGXP, fragmentGXP,
+  return { stride, indexSize, viewport, info, attributes, indices, vertices, vertexGXP, fragmentGXP,
     vertexUniforms, fragmentUniforms, fragmentTexture };
 }
 async function drawOwnedSurface(packet, initialPixels, width, height) {
-  const { stride, indexSize, info, attributes, indices, vertices, vertexGXP, fragmentGXP,
+  const { stride, indexSize, viewport, info, attributes, indices, vertices, vertexGXP, fragmentGXP,
     vertexUniforms, fragmentUniforms, fragmentTexture } = decodeGuestDrawPacket(packet);
+  // Viewport rect is computed before any await from owned decode output, so
+  // later device work cannot observe mutated state.
+  const viewportRect = gxmViewportRect(viewport, width, height);
   if (!shaderPromise) configureGuestShaders({
     compilerURL: new URL('./shaders/gxp_compiler.mjs', import.meta.url).href,
     nagaURL: new URL('./shaders/naga.wasm', import.meta.url).href,
@@ -113,6 +158,7 @@ async function drawOwnedSurface(packet, initialPixels, width, height) {
     target = renderer.createTarget(width, height);
     return (await renderer.submit(target, [{ program, vertices, indices,
       indexFormat: indexSize === 2 ? 'uint16' : 'uint32', buffers,
+      viewport: viewportRect,
       ...(fragmentTexture ? { fragmentTexture } : {}) }], { initialPixels })).pixels;
   } finally {
     // submit has settled (including GPU readback) before either resource can
