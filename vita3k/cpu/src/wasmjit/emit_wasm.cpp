@@ -1782,6 +1782,103 @@ private:
             get(next_local + 3); op(Select);
             break;
         }
+        case Op::FPFixedS32ToSingle:
+            // This scalar VCVT form explicitly requests nearest/ties-even,
+            // independent of FPSCR.RMode. Other fixed-point modes stay rejected.
+            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0
+                || !inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU8() != 0)
+                return false;
+            load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+            begin_if(); ret(ExitReason::Unsupported); end_if();
+            arg(0); op(0xb2); // f32.convert_i32_s (nearest/ties-even)
+            op(0xbc); set(next_local); // i32.reinterpret_f32, retain result bits
+            get(0); load(offsetof(JitState, fpscr));
+            // f64 represents every i32 exactly. Compare the rounded result
+            // against that exact value to accumulate FPSCR.IXC.
+            arg(0); op(0xb7); // f64.convert_i32_s
+            get(next_local); op(0xbe); op(0xbb); // f32 bits -> f64.promote_f32
+            op(0x62); imm(4); op(Shl); op(Or); store(offsetof(JitState, fpscr));
+            return ok;
+        case Op::FPDiv32: {
+            // Wasm arithmetic rounds to nearest-even. Other guest rounding
+            // modes remain unsupported rather than silently giving RN results.
+            if (start.FPSCR().Value() & 0x00c00000u) return false;
+            load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+            begin_if(); ret(ExitReason::Unsupported); end_if();
+            const auto a = next_local + 1, b = next_local + 2;
+            const auto aa = next_local + 3, ab = next_local + 4;
+            const auto flags = next_local + 5, nan = next_local + 6;
+            imm(0); set(flags); imm(0); set(nan);
+            const auto accumulate = [&](uint32_t bits) {
+                get(flags); imm(bits); op(Or); set(flags);
+            };
+            for (unsigned i = 0; i < 2; ++i) {
+                arg(i); set(a + i);
+                get(a + i); mask(0x7fffffff); set(aa + i);
+                if (start.FPSCR().FTZ()) {
+                    get(aa + i); imm(0x00800000); op(LtU);
+                    get(aa + i); op(Eqz); op(Eqz); op(And); begin_if();
+                    accumulate(0x80); // input denormal flushed to signed zero
+                    get(a + i); mask(0x80000000); set(a + i);
+                    imm(0); set(aa + i); end_if();
+                }
+            }
+            // ARM NaN priority: first signaling operand, then first quiet
+            // operand. Reverse iteration lets the first of each class win.
+            for (bool signaling : {false, true}) for (int i = 1; i >= 0; --i) {
+                get(aa + i); imm(0x7f800000); op(GtU);
+                if (signaling) { get(a + i); mask(0x00400000); op(Eqz); op(And); }
+                begin_if();
+                get(a + i); imm(0x00400000); op(Or); set(nan);
+                if (signaling) accumulate(1);
+                end_if();
+            }
+            get(nan); begin_if();
+            if (start.FPSCR().DN()) imm(0x7fc00000);
+            else get(nan);
+            set(next_local);
+            op(Else);
+            get(aa); op(Eqz); get(ab); op(Eqz); op(And);
+            get(aa); imm(0x7f800000); op(Eq);
+            get(ab); imm(0x7f800000); op(Eq); op(And); op(Or);
+            begin_if(); // 0/0 or infinity/infinity
+            accumulate(1); imm(0x7fc00000); set(next_local);
+            op(Else);
+            get(a); op(0xbe); get(b); op(0xbe); op(0x95); // reinterpret, f32.div
+            op(0xbc); set(next_local); // publish result bits to an i32 SSA slot
+            get(ab); op(Eqz);
+            get(aa); imm(0x7f800000); op(LtU); op(And); begin_if();
+            accumulate(2); // finite nonzero / zero: DZC
+            op(Else);
+            get(aa); imm(0x7f800000); op(LtU);
+            get(ab); imm(0x7f800000); op(LtU); op(And); begin_if();
+            // Binary64 has ample precision/exponent range to distinguish an
+            // exact binary32 quotient from a rounded one (24-bit operands).
+            const auto wide_quotient = [&] {
+                get(a); op(0xbe); op(0xbb);
+                get(b); op(0xbe); op(0xbb); op(0xa3); // f64.div
+            };
+            wide_quotient(); op(0x99); // f64.abs
+            imm(0x00800000); op(0xbe); op(0xbb); op(0x63); // f64.lt min-normal
+            get(aa); op(Eqz); op(Eqz); op(And); set(next_local + 7);
+            if (start.FPSCR().FTZ()) {
+                get(next_local + 7); begin_if();
+                accumulate(8); // FZ underflow does not additionally raise IXC
+                get(a); get(b); op(Xor); mask(0x80000000); set(next_local);
+                op(Else);
+            }
+            wide_quotient(); get(next_local); op(0xbe); op(0xbb); op(0x62);
+            begin_if();
+            accumulate(0x10);
+            get(next_local + 7); begin_if(); accumulate(8); end_if();
+            get(next_local); mask(0x7fffffff); imm(0x7f800000); op(Eq);
+            begin_if(); accumulate(4); end_if();
+            end_if();
+            if (start.FPSCR().FTZ()) end_if();
+            end_if(); end_if(); end_if(); end_if();
+            get(0); load(offsetof(JitState, fpscr)); get(flags); op(Or); store(offsetof(JitState, fpscr));
+            return ok;
+        }
         case Op::FPAbs32: arg(0); mask(0x7fffffff); break;
         case Op::A32GetFpscrNZCV:
             load(offsetof(JitState, fpscr)); mask(0xf0000000); break;

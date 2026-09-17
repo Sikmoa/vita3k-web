@@ -194,6 +194,117 @@ void signed_long_multiply(MemState &mem) {
     }
 }
 
+void float_divide32(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    struct Case { uint32_t a, b, expected, flags; };
+    // s15 = s0/s15 nearest-even. Covers div-by-zero, inf/inf -> NaN, exact
+    // and inexact quotients, signed zeros, NaN propagation.
+    const std::array<Case, 28> cases{{
+        {0x3f800000, 0x40000000, 0x3f000000, 0},
+        {0x40000000, 0x3f800000, 0x40000000, 0},
+        {0x3f800000, 0, 0x7f800000, 2},
+        {0xbf800000, 0, 0xff800000, 2},
+        {0x3f800000, 0x80000000, 0xff800000, 2},
+        {0x7f800000, 0x3f800000, 0x7f800000, 0},
+        {0x7f800000, 0x7f800000, 0x7fc00000, 1},
+        {0x7fc00000, 0x3f800000, 0x7fc00000, 0},
+        {0, 0x40000000, 0, 0},
+        {0x80000000, 0x40000000, 0x80000000, 0},
+        {0x7f7fffff, 0x40000000, 0x7effffff, 0},
+        {0x3f800000, 0x3f000000, 0x40000000, 0},
+        {0, 0, 0x7fc00000, 1},
+        {0x7f800001, 0x3f800000, 0x7fc00000, 1},
+        {0x3f800000, 0x40400000, 0x3eaaaaab, 0x10},
+        {0x7f7fffff, 0x3f000000, 0x7f800000, 0x14},
+        {0x00800000, 0x40000000, 0, 8},
+        {0x80800000, 0x40000000, 0x80000000, 8},
+        {1, 0x3f800000, 0, 0x80},
+        {0x3f800000, 1, 0x7f800000, 0x82},
+        {0x7f800000, 0, 0x7f800000, 0},
+        {0xffc12345, 0x3f800000, 0x7fc00000, 0},
+        {0x7fc12345, 0xff812345, 0x7fc00000, 1},
+        {0x00800000, 0x40400000, 0, 8},
+        {0x00800001, 0x40000000, 0, 8},
+        {0x80000001, 0x3f800000, 0x80000000, 0x80},
+        {0x3f800000, 0x7f800000, 0, 0},
+        {0xbf800000, 0x7f800000, 0x80000000, 0},
+    }};
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        for (bool thumb : {false, true}) for (bool flush : {false, true})
+            for (bool default_nan : {false, true}) for (const auto &c : cases) {
+            uint32_t expected = c.expected, flags = c.flags;
+            if (!flush) {
+                if (c.a == 0x00800000 && c.b == 0x40000000) { expected = 0x00400000; flags = 0; }
+                if (c.a == 0x80800000) { expected = 0x80400000; flags = 0; }
+                if (c.a == 1 || c.a == 0x80000001) { expected = c.a; flags = 0; }
+                if (c.b == 1) { expected = 0x7f800000; flags = 0x14; }
+                if (c.a == 0x00800000 && c.b == 0x40400000) { expected = 0x002aaaab; flags = 0x18; }
+                if (c.a == 0x00800001) { expected = 0x00400000; flags = 0x18; }
+            }
+            if (!default_nan) {
+                if (c.a == 0x7f800001) expected = 0x7fc00001;
+                if (c.a == 0xffc12345) expected = c.a;
+                if (c.b == 0xff812345) expected = 0xffc12345;
+            }
+            if (thumb) put_thumb(mem, jit, {0x7a27eec0, 0xbf00df00});
+            else put(mem, jit, {0xeec07a27, 0xef000000});
+            auto context = jit.save_context();
+            std::memcpy(&context.fpu_registers[0], &c.a, 4);
+            std::memcpy(&context.fpu_registers[15], &c.b, 4);
+            context.fpscr = 0xf0000004 | (flush ? 0x01000000 : 0)
+                | (default_nan ? 0x02000000 : 0); // existing OFC must remain sticky
+            jit.load_context(context);
+            CHECK(jit.run() == 0);
+            CHECK(parent.svc_called);
+            const auto after = jit.save_context();
+            uint32_t result;
+            std::memcpy(&result, &after.fpu_registers[15], 4);
+            CHECK(result == expected);
+            CHECK(after.fpscr == (context.fpscr | flags));
+            CHECK(after.cpsr == context.cpsr);
+        }
+    }
+}
+
+void integer_to_float32(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    const std::array<std::pair<uint32_t, uint32_t>, 8> cases{{
+        {0, 0}, {1, 0x3f800000}, {0xffffffff, 0xbf800000},
+        {0x80000000, 0xcf000000}, {0x7fffffff, 0x4f000000},
+        {16777217, 0x4b800000}, {16777219, 0x4b800002},
+        {uint32_t(-16777217), 0xcb800000},
+    }};
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        for (bool thumb : {false, true}) for (const auto &[input, expected] : cases) {
+            // VCVT.F32.S32 s0,s3 uses round-to-nearest, ties-to-even.
+            if (thumb) put_thumb(mem, jit, {0x0ae1eeb8, 0xbf00df00});
+            else put(mem, jit, {0xeeb80ae1, 0xef000000});
+            auto context = jit.save_context();
+            std::memcpy(&context.fpu_registers[3], &input, 4);
+            context.fpscr = 0xa3000081;
+            jit.load_context(context);
+            CHECK(jit.run() == 0);
+            CHECK(parent.svc_called);
+            const auto after = jit.save_context();
+            uint32_t result;
+            std::memcpy(&result, &after.fpu_registers[0], 4);
+            CHECK(result == expected);
+            const bool inexact = input == 0x7fffffff || input == 16777217
+                || input == 16777219 || input == uint32_t(-16777217);
+            CHECK(after.fpscr == (context.fpscr | (inexact ? 0x10u : 0u)));
+            CHECK(after.cpsr == context.cpsr);
+        }
+    }
+}
+
 void floating_abs32(MemState &mem) {
     CPUState parent{};
     parent.mem = &mem;
@@ -1398,6 +1509,8 @@ int main() {
     signed_long_multiply(mem);
     floating_compare32(mem);
     floating_abs32(mem);
+    integer_to_float32(mem);
+    float_divide32(mem);
     floating_compare_trap_guard(mem);
     backend(mem);
     formation(mem);
