@@ -1,0 +1,249 @@
+NID	NAME	IMPORTER	CLASS	UPSTREAM_EVIDENCE	PROPOSAL
+04BAED82	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+04DCBE87	? (SceFt2/47D4E06B)	SceLibPvf	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+08179EBD	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+08ED1B25	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+0DB6C206	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+144FA354	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+16D7C7CA	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+170D595D	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+17BF2367	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+19B2BB58	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+1AAFA818	? (ForDriver-or-SblACMgr)	SceSysmodule	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+2074A6EB	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+2185BB05	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+243DE290	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+2464F9D0	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+24C6257F	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+260F5A85	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+29AAC768	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+2F0FC3CD	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+306E2A22	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+33AC7A16	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+349B0E73	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+3746501F	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+3DE4F3DB	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+461C5990	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+46358909	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+4A1557A7	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+4AAF0D45	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+4D80D3F7	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+4F781BB6	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+5053B005	? (ForDriver-or-SblACMgr)	SceSysmodule	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+568F0E80	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+5E50CB55	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+61B9B6FA	? (ForDriver-or-SblACMgr)	SceSysmodule	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+64BDF1BB	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+6599E5D9	? (ForDriver-or-SblACMgr)	SceSysmodule	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+67FB1CD3	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+6C5AB07F	? (ForDriver-or-SblACMgr)	SceSysmodule	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+6CDB4EE8	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+6D2A86F0	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+7D30F0A6	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+81FA5DBE	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+8612B243	? (ForDriver-or-SblACMgr)	SceSysmodule	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+88391E03	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+91C2531C	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+93EAE08A	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+9E38815D	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+A374CD7B	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+A4EA9DE0	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+AC1DBE40	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+AF50B945	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+B0E4CB2F	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+B1C3EFCA	? (ForDriver-or-SblACMgr)	SceSysmodule	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+B5A099D2	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+B8E6E249	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+BF99D664	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+C4D984C2	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+C98D82EE	? (ForDriver-or-SblACMgr)	SceSysmodule	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+CC7F4211	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+CE37B69E	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+CEE46B33	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+D141C076	? (ForDriver-or-SblACMgr)	SceSysmodule	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+D1A82B1A	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+D28834E6	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+D3C049B9	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+D4ADF069	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+D68D8421	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+E5EDD91B	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+E746465E	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+E87D1777	? (ForDriver-or-SblACMgr)	SceSysmodule	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+E9176B09	? (SceFt2/47D4E06B)	SceLibPvf	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+EC9FAF42	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+EF9EBAC7	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+F030A0DE	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+F2C9B744	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+F6AFBB09	? (SceFt2/47D4E06B)	SceLibPvf	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+F71DB06F	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+FBEB1FD7	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+FFE2ED51	? (SceSslInternal/68D6C3FF)	SceLibHttp	genuinely-unknown+guest-provided	absent from nids.inc; loader UNRECOGNISED; no EXPORT in vita3k/modules	NO-ACTION (unselectable)
+4C30B03C	sceNetHtonl	Limbo	upstream-implemented+conditionally-used	SceNet.cpp:426 pure	SELECT-A
+9FA3207B	sceNetHtons	Limbo	upstream-implemented+conditionally-used	SceNet.cpp:436 pure	SELECT-A
+D2EAA645	sceNetNtohl	Limbo	upstream-implemented+conditionally-used	SceNet.cpp:501 pure	SELECT-A
+07845128	sceNetNtohs	Limbo	upstream-implemented+conditionally-used	SceNet.cpp:511 pure	SELECT-A
+EB03E265	sceNetInit	Limbo	upstream-implemented+conditionally-used	SceNet.cpp:471 needs emuenv.net+host sockets	DEFER-backend
+EA3CC286	sceNetTerm	Limbo	upstream-implemented+conditionally-used	SceNet.cpp:698	DEFER-backend
+F084FCE3	sceNetSocket	Limbo	upstream-implemented+conditionally-used	SceNet.cpp:661 PosixSocket/P2P backend	DEFER-backend
+29822B4D	sceNetSocketClose	Limbo	upstream-implemented+conditionally-used	SceNet.cpp:681	DEFER-backend
+1296A94B	sceNetBind	Limbo	upstream-implemented+conditionally-used	SceNet.cpp:155	DEFER-backend
+52DB31D5	sceNetSendto	Limbo	upstream-implemented+conditionally-used	SceNet.cpp:606	DEFER-backend
+B226138B	sceNetRecvfrom	Limbo	upstream-implemented+conditionally-used	SceNet.cpp:523	DEFER-backend
+495CA1DB	sceNetCtlInit	Limbo	upstream-implemented+conditionally-used	SceNetCtl.cpp:727; CALL_EXPORT sceNpManagerGetNpId+sceAppUtilSystemParamGetString	DEFER-deps
+CD188648	sceNetCtlTerm	Limbo	upstream-implemented+conditionally-used	SceNetCtl.cpp:744 STUBBED	DEFER
+214926D9	sceHttpInit	Limbo	upstream-implemented+conditionally-used	SceHttp.cpp:758; needs OpenSSL	DEFER-backend
+C9076666	sceHttpTerm	Limbo	upstream-implemented+conditionally-used	SceHttp.cpp:1357; CALL_EXPORT DeleteTemplate/Connection/Request	DEFER-deps
+3C733316	sceSslInit	Limbo	upstream-implemented+conditionally-used	SceSsl.cpp:85; needs OpenSSL SSL_library_init/SSL_CTX_new	DEFER-backend
+03CE6E3A	sceSslTerm	Limbo	upstream-implemented+conditionally-used	SceSsl.cpp:105	DEFER-backend
+54060DF6	sceNpGetServiceState	Limbo	upstream-implemented/stubbed	SceNpManager.cpp:81 STUBBED offline	SELECT-C (opt-in)
+AF0073B2	sceNpManagerGetContentRatingFlag	Limbo	upstream-implemented/stubbed	SceNpManager.cpp:119 STUBBED 0/21	SELECT-C (opt-in)
+FB8D82E5	sceNpCmpNpId	Limbo	upstream-implemented/stubbed	SceNpCommon.cpp:100 pure	SELECT-C (opt-in)
+04D9F484	sceNpInit	Limbo	upstream-implemented+conditionally-used	SceNpManager.cpp:88	DEFER-owner-decides
+19E40AE1	sceNpTerm	Limbo	upstream-implemented+conditionally-used	SceNpManager.cpp:156	DEFER-owner-decides
+3B0AE9A9	sceNpCheckCallback	Limbo	upstream-implemented+conditionally-used	SceNpManager.cpp:69 run_callback JIT risk	DEFER-owner-decides
+3C94B4B4	sceNpManagerGetNpId	Limbo	upstream-implemented+conditionally-used	SceNpManager.cpp:126	DEFER-owner-decides
+44239C35	sceNpRegisterServiceStateCallback	Limbo	upstream-implemented+conditionally-used	SceNpManager.cpp:143	DEFER-owner-decides
+D9E6E56C	sceNpUnregisterServiceStateCallback	Limbo	upstream-implemented+conditionally-used	SceNpManager.cpp:165	DEFER-owner-decides
+34516838	sceNpTrophyInit	Limbo	upstream-implemented+conditionally-used	SceNpTrophy.cpp:486 needs TRP	DEFER-owner-decides
+BFE0F28F	sceNpTrophyTerm	Limbo	upstream-implemented+conditionally-used	SceNpTrophy.cpp:499	DEFER-owner-decides
+C49FD33F	sceNpTrophyCreateContext	Limbo	upstream-implemented+conditionally-used	SceNpTrophy.cpp:146 needs TRP	DEFER-owner-decides
+56F5CBA5	sceNpTrophyDestroyContext	Limbo	upstream-implemented+conditionally-used	SceNpTrophy.cpp:191	DEFER-owner-decides
+4EBC6977	sceNpTrophyCreateHandle	Limbo	upstream-implemented+conditionally-used	SceNpTrophy.cpp:182 STUBBED	DEFER-owner-decides
+FF142071	sceNpTrophyDestroyHandle	Limbo	upstream-implemented+conditionally-used	SceNpTrophy.cpp:202 STUBBED	DEFER-owner-decides
+B397AA24	sceNpTrophyUnlockTrophy	Limbo	upstream-implemented+conditionally-used	SceNpTrophy.cpp:551 writes fs	DEFER-owner-decides
+C8D2A4DE	sceNpTrophyGetTrophyUnlockState	Limbo	upstream-implemented+conditionally-used	SceNpTrophy.cpp:463	DEFER-owner-decides
+9E2C02C9	sceNpTrophySetupDialogInit	Limbo	upstream-implemented+conditionally-used	SceCommonDialog.cpp:771	DEFER-owner-decides
+C3A59547	sceNpTrophySetupDialogGetStatus	Limbo	upstream-implemented+conditionally-used	SceCommonDialog.cpp:765	DEFER-owner-decides
+E37069D5	sceNpTrophySetupDialogGetResult	Limbo	upstream-implemented+conditionally-used	SceCommonDialog.cpp:755	DEFER-owner-decides
+A81082DD	sceNpTrophySetupDialogTerm	Limbo	upstream-implemented+conditionally-used	SceCommonDialog.cpp:782	DEFER-owner-decides
+DF41F308	sceNpBasicGetFriendListEntryCount	Limbo	upstream-implemented+conditionally-used	SceNpBasic.cpp:48 STUBBED no-friends	DEFER-owner-decides
+ED42079F	sceNpAuthCreateStartRequest	Limbo	upstream-implemented+conditionally-used	SceNpCommon.cpp:51 STUBBED+runs guest callback	DEFER-owner-decides
+441D8B4E	sceNpAuthInit	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpCommon.cpp:90 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+6093B689	sceNpAuthTerm	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpCommon.cpp:95 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+59608D1C	sceNpAuthGetTicket	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpCommon.cpp:80 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+E9A003DE	sceNpGetPlatformType	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpCommon.cpp:156 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+EFB91A99	sceNpBasicInit	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpBasic.cpp:93 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+389BCB3B	sceNpBasicTerm	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpBasic.cpp:125 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+26E6E048	sceNpBasicRegisterHandler	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpBasic.cpp:105 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+050AE072	sceNpBasicUnregisterHandler	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpBasic.cpp:129 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+1211AE8E	sceNpBasicGetBlockListEntries	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpBasic.cpp:32 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+407E1E6F	sceNpBasicGetBlockListEntryCount	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpBasic.cpp:36 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+FF07E787	sceNpBasicGetFriendListEntries	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpBasic.cpp:44 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+5183A4B5	sceNpBasicGetFriendOnlineStatus	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpBasic.cpp:57 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+EF8A91BC	sceNpBasicGetGamePresenceOfFriend	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpBasic.cpp:73 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+F51545D8	sceNpBasicCheckIfPlayerIsBlocked	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpBasic.cpp:28 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+4B6ACF47	sceNpSignalingInit	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpSignaling.cpp:76 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+0B48FADB	sceNpSignalingSetCtxOpt	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpSignaling.cpp:80 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+51883EAE	sceNpSignalingGetConnectionInfo	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpSignaling.cpp:48 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+92FFBDE3	sceNpSignalingActivateConnection	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpSignaling.cpp:20 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+A413F8C2	sceNpSignalingTerminateConnection	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpSignaling.cpp:88 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+EAA4B1F3	sceNpSignalingDestroyCtx	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpSignaling.cpp:36 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+F77EF683	sceNpSignalingCreateCtx	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpSignaling.cpp:28 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+BC892D18	sceNpSignalingTerm	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpSignaling.cpp:84 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+C73F209A	sceNpCommerce2Init	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpCommerce2.cpp:156 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+B99958AE	sceNpCommerce2Term	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpCommerce2.cpp:184 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+BC7FDC77	sceNpActivityPostStatus	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceNpActivity.cpp:28 UNIMPLEMENTED	DO-NOT-SELECT (stub parity only)
+0572EDDC	sceRtcGetCurrentClockLocalTime	Limbo(+guest sharers for 23F79274/C995DE02)	upstream-implemented	SceRtcUser.cpp:187 CALL_EXPORT _sceRtcGetCurrentClockLocalTime 41A6C861 (SceRtc.cpp:108)	SELECT-B
+23F79274	sceRtcGetCurrentTick	Limbo(+guest sharers for 23F79274/C995DE02)	upstream-implemented	SceRtcUser.cpp:207 CALL_EXPORT _sceRtcGetCurrentTick 247EE33B (SceRtc.cpp:155)	SELECT-B
+811313B3	sceRtcGetTickResolution	Limbo(+guest sharers for 23F79274/C995DE02)	upstream-implemented	SceRtcUser.cpp:343 pure VITA_CLOCKS_PER_SEC	SELECT-B
+C995DE02	sceRtcGetTime64_t	Limbo(+guest sharers for 23F79274/C995DE02)	upstream-implemented	SceRtcUser.cpp:358 pure	SELECT-B
+775A0CB2	malloc	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+5B9BB802	free	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+A9363E6B	memalign	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+7205BFDB	memcpy	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+AF5C218D	memmove	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+6DC1F0D8	memset	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+1434FA46	strcat	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+85B924B7	strcpy	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+8AECC873	strlen	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+E4299DCB	strncmp	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+9F87712D	strncpy	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+CEFDD143	strrchr	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+A1BFF606	snprintf	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+9A004680	printf	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+FFFBE239	fopen	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+EC97321C	fclose	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+FE83F2E4	vsnprintf	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+9E248B76	_sceLibcErrnoLoc	Limbo	upstream-implemented	SceLibc.cpp implemented	SELECT-B
+006B54BA	realloc	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+2F3E5B16	memchr	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+7747F6D7	memcmp	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+B9336E16	strchr	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+1B58FA3B	strcmp	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+0E29D27A	strcspn	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+FF6F77C7	strdup	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+184C4B07	strcasecmp	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+AF1CA2F1	strncasecmp	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+FBA69BC2	strncat	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+4203B663	strspn	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+0D5200CB	strstr	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+0289B8B3	strtok	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+72BA4468	clearerr	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+B2F318FE	fdopen	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+B724BFC1	ferror	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+5AAD2996	fflush	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+672C58E0	fgetc	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+3CDA3118	fgetpos	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+7E6A6108	fputc	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+B31C73A9	fread	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+C3A7CDE1	fseek	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+DC1BDBD7	fsetpos	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+41C2AF95	ftell	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+8BCDCC4E	fwrite	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+E0C79764	fprintf	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+7449B359	sprintf	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+EC585241	sscanf	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+802FDDF9	vsprintf	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+A9889307	vsscanf	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+2CA980A0	setvbuf	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+2BCB3F01	ungetc	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+D8889FC8	wcsrtombs	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+20FE0FFF	abort	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+826BBBAF	exit	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+A7CBE4A6	qsort	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+C0883865	rand	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+D63330DA	ldiv	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+DAE8D60F	time	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+27EAB8C1	acosf	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+4E09DD53	atan2f	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+6BBFEC89	ceilf	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+56473BC7	expf	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+22BB8237	floor	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+CD7C05BD	floorf	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+798587E4	fmod	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+1CD8F88E	fmodf	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+640DB443	pow	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+A98E941B	tanf	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT
+0402C9F8	_ZNSt6_Mutex7_UnlockEv	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+F9FAB558	_ZNSt6_Mutex5_LockEv	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+A4F99AE7	_ZNSt6_MutexC1Ev	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+9B37CAD9	_ZNSt6_MutexD1Ev	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+ABB11CF9	_ZNSt6_WinitC1Ev	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+579C349B	_ZNSt6_WinitD1Ev	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+5E60B2B3	_ZNSt8ios_base4InitC1Ev	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+65D88619	_ZNSt8ios_base4InitD1Ev	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+78CB190E	_ZNSt8ios_base5_InitEv	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+C9DE8208	_ZNSt8ios_base5clearENSt5_IosbIiE8_IostateEb	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+DCE89E71	_ZNSt8ios_baseD2Ev	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+2F6A7265	_ZSt14_Xlength_errorPKc	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+553E56BD	_ZSt14_Xout_of_rangePKc	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+FD276300	_ZSt7_FiopenPKcNSt5_IosbIiE9_OpenmodeEi	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+EDC939E1	__aeabi_atexit	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+33B83B70	__cxa_atexit	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+D0310E31	__cxa_guard_acquire	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+4ED1056F	__cxa_guard_release	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+BFE02B3A	__cxa_set_dso_handle_main	Limbo	upstream-implemented+startup-sensitive	implemented but host toolchain owns C++ startup	DO-NOT-SELECT (startup ownership)
+BC529B7B	__tls_get_addr	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+54F87EAC	_sceLdTlsRegisterModuleInfo	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+5044FC32	_Lockfilelock	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+FD5DD98C	_Unlockfilelock	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+BF94193B	_Stod	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+6B9E23FE	_Stoll	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+E71C5CDE	_Stoul	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+6794B3C6	_Stoull	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+C5B9C8D8	_FDtest	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+D5BD8D5C	_FLog	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+4A496BC0	_FSin	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+93FC85ED	_FSinx	Limbo	upstream-implemented+startup-sensitive	implemented but host toolchain owns C++ startup	DO-NOT-SELECT (startup ownership)
+67E99979	_Log	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
+D92A7F85	_Sin	Limbo	upstream-stubbed(UNIMPLEMENTED)	SceLibstdcxx.cpp/SceLibc.cpp/SceLibm.cpp UNIMPLEMENTED	DO-NOT-SELECT (host toolchain owns C++ startup)
