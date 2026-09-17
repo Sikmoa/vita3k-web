@@ -36,6 +36,7 @@
 #include <self.h>
 
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -188,6 +189,13 @@ static bool unload_func_imports(const uint32_t *nids, const Ptr<uint32_t> *entri
 }
 
 static bool load_imports(const sce_module_info_raw &module, Ptr<const void> segment_address, const SegmentInfosForReloc &segments, KernelState &kernel, MemState &mem, bool is_unload = false) {
+    // Diagnostic only: enumerate the static import surface before execution,
+    // including modules embedded in the bootimage. Do not alter resolution.
+    // The filter is an exact module name; '*' traces every loaded module.
+    const char *const trace_filter = std::getenv("VITA3K_TRACE_MODULE_IMPORTS");
+    const std::string module_name(module.name, strnlen(module.name, sizeof(module.name)));
+    const bool trace_imports = !is_unload && trace_filter &&
+        (std::strcmp(trace_filter, "*") == 0 || module_name == trace_filter);
     const uint8_t *const base = segment_address.cast<const uint8_t>().get(mem);
     const sce_module_imports_raw *const imports_begin = reinterpret_cast<const sce_module_imports_raw *>(base + module.import_top);
     const sce_module_imports_raw *const imports_end = reinterpret_cast<const sce_module_imports_raw *>(base + module.import_end);
@@ -230,6 +238,12 @@ static bool load_imports(const sce_module_info_raw &module, Ptr<const void> segm
         const Ptr<uint32_t> *const entries = Ptr<Ptr<uint32_t>>(func_entry_table).get(mem);
 
         const size_t num_syms_funcs = imports->num_syms_funcs;
+        if (trace_imports) {
+            for (size_t i = 0; i < num_syms_funcs; ++i)
+                LOG_INFO("Static import: module={} library={} library_nid={:08X} kind=function nid={:08X} name={} entry={:08X}",
+                    module_name, Ptr<const char>(library_name).get(mem), library_nid,
+                    nids[i], import_name(nids[i]), entries[i].address());
+        }
         if (!is_unload && !load_func_imports(nids, entries, num_syms_funcs, library_nid, segments, kernel, mem))
             return false;
         if (is_unload && !unload_func_imports(nids, entries, num_syms_funcs, kernel))
@@ -239,6 +253,12 @@ static bool load_imports(const sce_module_info_raw &module, Ptr<const void> segm
         const Ptr<uint32_t> *const var_entries = Ptr<Ptr<uint32_t>>(var_entry_table).get(mem);
 
         const auto var_count = imports->num_syms_vars;
+        if (trace_imports) {
+            for (size_t i = 0; i < var_count; ++i)
+                LOG_INFO("Static import: module={} library={} library_nid={:08X} kind=variable nid={:08X} name={} entry={:08X}",
+                    module_name, Ptr<const char>(library_name).get(mem), library_nid,
+                    var_nids[i], import_name(var_nids[i]), var_entries[i].address());
+        }
 
         if (kernel.debugger.log_imports && var_count > 0)
             LOG_INFO("Loading var imports from {}", lib_name);

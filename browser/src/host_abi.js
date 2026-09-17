@@ -6,6 +6,17 @@ Module['vita3kMemory64'] = {{{ MEMORY64 ? 'true' : 'false' }}};
 Module['vita3kMemoryModel'] = Module['vita3kMemory64'] ? 'wasm64-direct' : 'wasm32-sparse';
 Module['vita3kHostPointerBits'] = {{{ POINTER_BITS }}};
 
+// Emscripten's libc environment does not inherit Node's process.env. Forward
+// only these opt-in diagnostics, also accepting browser Module options.
+Module['preRun'] = Module['preRun'] || [];
+Module['preRun'].push(() => {
+  for (const name of ['VITA3K_TRACE_MODULE_IMPORTS', 'VITA3K_TRACE_HLE']) {
+    const value = Module[name] ??
+      (typeof process !== 'undefined' ? process.env?.[name] : undefined);
+    if (typeof value === 'string') ENV[name] = value;
+  }
+});
+
 // Typed-array offsets are Numbers; raw Wasm i64 arguments are BigInts. Convert
 // only after an exact range check. No bitwise coercion of native pointers.
 Module['vita3kHostOffset'] = (pointer, length = 0) => {

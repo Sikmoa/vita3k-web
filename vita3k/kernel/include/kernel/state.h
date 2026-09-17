@@ -153,6 +153,11 @@ struct KernelState {
     CorenumAllocator corenum_allocator;
     CallImportFunc call_import;
 
+    // Optional single-host-thread module entry runner. Desktop leaves this
+    // unset and uses create_thread/run_guest_function. The browser supplies
+    // a cooperative runner for both preloaded and dynamically loaded modules.
+    std::function<uint32_t(const SceKernelModuleInfo &, Ptr<const void>, SceSize, Ptr<const void>)> run_module_entry;
+
     // Shared NOP+WFI sentinel used by the Dynarmic as the halt return address
     Block halt_instruction;
     Address halt_instruction_pc;

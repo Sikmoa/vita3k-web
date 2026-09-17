@@ -39,6 +39,7 @@
 
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -88,10 +89,11 @@ bool needs_module_start(const char *path) {
 // browser target has no host threads (SDL_CreateThread/WaitSemaphore would
 // spin forever). Drive the start entry synchronously on a temporary thread
 // with the same init/start/run_loop(true) sequence as the main thread.
-std::uint32_t run_module_start(EmuEnvState &env, const SceKernelModuleInfo &info) {
+std::uint32_t run_module_entry(EmuEnvState &env, const SceKernelModuleInfo &info,
+    Ptr<const void> entry, SceSize args, Ptr<const void> argp) {
     auto module_thread = std::make_shared<ThreadState>(
         env.kernel.get_next_uid(), env.kernel, env.mem);
-    if (module_thread->init(info.module_name, info.start_entry,
+    if (module_thread->init(info.module_name, entry,
             SCE_KERNEL_DEFAULT_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT,
             SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr)
         < 0) {
@@ -109,12 +111,16 @@ std::uint32_t run_module_start(EmuEnvState &env, const SceKernelModuleInfo &info
     load_context(*module_thread->cpu, initial);
     write_tpidruro(*module_thread->cpu, tls);
 #endif
-    if (module_thread->start(0, Ptr<void>{}) < 0) {
+    if (module_thread->start(args, argp.cast<void>()) < 0) {
         std::printf("[vita3k-web] module thread start failed for %s\n", info.module_name);
         env.kernel.threads.erase(module_thread->id);
         return 0xDEADDEAD;
     }
+    // Dynamic module starts nest inside the importing thread's run_loop.
+    // Restore its current-CPU pointer before its HLE dispatcher resumes.
+    auto *previous_cpu = get_current_cpu_state();
     module_thread->run_loop(true);
+    set_current_cpu_state(previous_cpu);
     const std::uint32_t result = module_thread->returned_value;
     env.kernel.threads.erase(module_thread->id);
     module_thread.reset();
@@ -169,6 +175,8 @@ int vita3k_web_run_app() {
     bool exited = false;
     int exit_code = 0;
     unsigned imports = 0;
+    const char *trace_option = std::getenv("VITA3K_TRACE_HLE");
+    const bool trace_hle = trace_option && std::strcmp(trace_option, "1") == 0;
     struct Cleanup {
         EmuEnvState &env;
         ThreadStatePtr &thread;
@@ -180,11 +188,21 @@ int vita3k_web_run_app() {
     } cleanup{*env, thread};
     try {
         if (!env->kernel.init(env->mem, [&](CPUState &cpu, uint32_t nid, SceUID tid) {
-                ++imports;
+                const unsigned import_sequence = ++imports;
+                if (trace_hle) {
+                    std::fprintf(stderr, "[vita3k-web] HLE enter #%u tid=%d NID=%08x PC=%08x name=%s\n",
+                        import_sequence, tid, nid, read_pc(cpu), import_name(nid));
+                    std::fflush(stderr);
+                }
                 if (imports < 400 || imports % 500 == 0)
                     std::printf("[vita3k-web] Vita import #%u: %s NID=%08x PC=%08x\n",
                         imports, import_name(nid), nid, read_pc(cpu));
                 ::call_import(*env, cpu, nid, tid);
+                if (trace_hle) {
+                    std::fprintf(stderr, "[vita3k-web] HLE return #%u tid=%d NID=%08x PC=%08x\n",
+                        import_sequence, tid, nid, read_pc(cpu));
+                    std::fflush(stderr);
+                }
                 if (nid == 0x7A410B64 /* sceDisplaySetFrameBuf */
                     || nid == 0xF51523CB /* _sceDisplaySetFrameBuf */)
                     vita3k_web_present_frame(*env);
@@ -200,6 +218,10 @@ int vita3k_web_run_app() {
             exit_code = status;
             for (auto &[id, active] : env->kernel.threads)
                 active->exit_delete(false);
+        };
+        env->kernel.run_module_entry = [&](const SceKernelModuleInfo &info,
+            Ptr<const void> entry, SceSize args, Ptr<const void> argp) {
+            return run_module_entry(*env, info, entry, args, argp);
         };
         init_device_paths(env->io);
         init_savedata_app_path(env->io, env->vita_fs_path);
@@ -221,7 +243,7 @@ int vita3k_web_run_app() {
             if (needs_module_start(path)) {
                 const auto &info = env->kernel.loaded_modules[uid]->info;
                 if (info.start_entry) {
-                    const std::uint32_t result = run_module_start(*env, info);
+                    const std::uint32_t result = start_module(*env, info);
                     std::printf("[vita3k-web] module_start %s returned %08x\n", info.module_name, result);
                     if (!env->missing_nids.empty()) {
                         for (const auto nid : env->missing_nids)

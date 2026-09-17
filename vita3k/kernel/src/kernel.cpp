@@ -160,6 +160,7 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
     params.kernel = this;
     params.thid = thread->id;
 
+    LOG_DEBUG("Creating host thread for {}", name);
     params.host_may_destroy_params = SDL_CreateSemaphore(0);
     SDL_DetachThread(SDL_CreateThread(&thread_function, thread->name.c_str(), &params));
     SDL_WaitSemaphore(params.host_may_destroy_params);

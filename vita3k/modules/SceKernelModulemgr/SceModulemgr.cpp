@@ -22,6 +22,8 @@
 
 #include <modules/module_parent.h>
 #include <util/lock_and_find.h>
+#include <cstdio>
+#include <cstdlib>
 
 #include <util/tracy.h>
 TRACY_MODULE_NAME(SceModulemgr);
@@ -69,7 +71,10 @@ EXPORT(SceUID, _sceKernelLoadStartModule, const char *moduleFileName, SceSize ar
         return SCE_KERNEL_ERROR_MODULEMGR_INVALID_TYPE;
     }
 
+    const bool trace = std::getenv("VITA3K_TRACE_HLE") != nullptr;
+    if (trace) std::fprintf(stderr, "[module-trace] load path=%s\n", moduleFileName);
     SceUID module_id = load_module(emuenv, moduleFileName);
+    if (trace) std::fprintf(stderr, "[module-trace] loaded uid=%d; starting\n", module_id);
     if (module_id < 0)
         return module_id;
     return kernel_start_module(emuenv, module_id, args, argp, pRes);

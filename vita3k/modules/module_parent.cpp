@@ -337,6 +337,8 @@ int unload_module(EmuEnvState &emuenv, SceUID module_id) {
 uint32_t start_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, SceSize args, Ptr<const void> argp) {
     const auto module_start = module.start_entry;
     if (module_start) {
+        if (emuenv.kernel.run_module_entry)
+            return emuenv.kernel.run_module_entry(module, module_start, args, argp);
         const auto module_name = module.module_name;
 
         LOG_DEBUG("Running module_start of library: {} at address {}", module_name, log_hex(module_start.address()));
@@ -361,6 +363,8 @@ uint32_t start_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, Sc
 uint32_t stop_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, SceSize args, Ptr<const void> argp) {
     const auto module_stop = module.stop_entry;
     if (module_stop) {
+        if (emuenv.kernel.run_module_entry)
+            return emuenv.kernel.run_module_entry(module, module_stop, args, argp);
         const auto module_name = module.module_name;
 
         LOG_DEBUG("Running module_stop of library: {} at address {}", module_name, log_hex(module_stop.address()));
