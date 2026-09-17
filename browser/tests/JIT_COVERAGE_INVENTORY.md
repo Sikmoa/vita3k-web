@@ -10,8 +10,11 @@ The generated counts, hash, line numbers and missing lists below are the
 source proof and pending fixtures. No runtime support result is implied.
 Batch B2 also adds the 27 8/16/32-bit integer comparison/min/max/absolute
 routes listed in [JIT_VECTOR_INTEGER_COMPARISONS.md](JIT_VECTOR_INTEGER_COMPARISONS.md).
-The snapshot below predates **both** batches; neither counts nor hashes were
-regenerated under the no-execution constraint.
+Batch B3 adds the scalar `ByteReverseWord`, `ByteReverseHalf` and
+`ByteReverseDual` routes used by A32 REV/REV16/REVSH and EFlag-aware helpers;
+see [JIT_BYTE_REVERSE.md](JIT_BYTE_REVERSE.md). The snapshot below predates
+all three batches; neither counts nor hashes were regenerated under the
+no-execution constraint.
 
 ## Reproduce
 

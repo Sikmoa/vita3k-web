@@ -123,6 +123,28 @@ be lane-wide ones. Inventory should add 27 routes on top of B1's eleven (38
 over the committed old snapshot). Regenerate the committed inventory only
 after reviewing both batches, not just B1. No complete-NEON claim follows.
 
+## B3 — scalar byte reversal and packed-lane stack correction
+
+Repeat the B1 build/test/mode commands on both ABIs. Expected additional line:
+`Byte reversal: 6 independent IR fixtures passed`, followed by full backend
+success. B1's 25-fixture and B2's 81-fixture lines must still appear. The
+fixtures compare `ByteReverseWord`, `ByteReverseHalf` and `ByteReverseDual`
+against independent byte references, plus ARM REV/REV16/REVSH execution.
+
+```sh
+timeout -s KILL 15s "$VITASDK/bin/arm-vita-eabi-as" browser/tests/jit_byte_reverse_encodings.S -o "$SCRATCH/byte-reverse.o"
+"$VITASDK/bin/arm-vita-eabi-objdump" -d "$SCRATCH/byte-reverse.o"
+```
+
+Compare the assembler output with the ARM words in `guest_reversal`; verify
+the Thumb spellings are accepted by the same assembler. A Wasm validation
+failure in this batch most likely means the i32 packed-lane accumulator was
+accidentally changed back to the i64 scratch local. REVSH sign errors indicate
+missing U16 masking or sign extension; REV64 word-order errors indicate a
+missing swap. Inventory should add three scalar routes after regeneration.
+Do not count the stale committed inventory until the generator has been run
+and reviewed.
+
 ## C1 — pipeline cache and ordered guest device work
 
 The renderer command below needs no game assets. Expected new result is exactly

@@ -92,6 +92,7 @@ void equal_context(const CPUContext &a, const CPUContext &b) {
 #include "wasmjit_vector_tests.inc"
 #include "wasmjit_vector_integer_tests.inc"
 #include "wasmjit_vector_compare_tests.inc"
+#include "wasmjit_byte_reverse_tests.inc"
 
 void tls_read(MemState &mem) {
     CPUState parent{};
@@ -1652,6 +1653,8 @@ int main() {
     vector_integer_tests::guest_arithmetic(mem);
     vector_compare_tests::ir_comparisons();
     vector_compare_tests::guest_comparisons(mem);
+    byte_reverse_tests::ir_reversal();
+    byte_reverse_tests::guest_reversal(mem);
     helpers(mem);
     tls_read(mem);
     leading_zeros(mem);

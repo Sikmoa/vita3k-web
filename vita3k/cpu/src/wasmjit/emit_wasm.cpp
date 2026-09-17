@@ -1012,6 +1012,12 @@ private:
             return ok;
         }
         for (unsigned word = 0; word < 4; ++word) {
+            // Build one packed i32 word explicitly. Without this accumulator,
+            // the second lane would leave the previous result absent from the
+            // Wasm stack when the shifted lane is ORed in.
+            // scratch_local is an i64 local reserved for U64 lowering; use
+            // this instruction's spare i32 SSA slot for packed lanes.
+            imm(0); set(next_local + 4);
             for (unsigned shift = 0; shift < 32; shift += bits) {
                 const unsigned lane = (word * 32 + shift) / bits;
                 vector_element_word(inst.GetArg(0), bits, lane);
@@ -1020,11 +1026,22 @@ private:
                 // Truncate BEFORE combining: carry/borrow/product bits must
                 // never leak from one packed lane to the next.
                 if (bits < 32) mask((1u << bits) - 1);
-                if (shift) { imm(shift); op(Shl); op(Or); }
+                if (shift) { imm(shift); op(Shl); }
+                get(next_local + 4); op(Or); set(next_local + 4);
             }
-            set(next_local + word);
+            get(next_local + 4); set(next_local + word);
         }
         return ok;
+    }
+    void byte_reverse_word_from_local(uint32_t source, uint32_t result) {
+        // This is the scalar equivalent of Dynarmic's bswap. Keep every
+        // partial byte in an i32 lane and combine only after its shift so the
+        // emitter never depends on a host endianness or an i64 scratch slot.
+        get(source); mask(0x000000ff); imm(24); op(Shl);
+        get(source); mask(0x0000ff00); imm(8); op(Shl); op(Or);
+        get(source); mask(0x00ff0000); imm(8); op(ShrU); op(Or);
+        get(source); imm(24); op(ShrU); op(Or);
+        set(result);
     }
     enum class VectorLaneOp { Equal, Greater, Minimum, Maximum, Absolute, AbsoluteDifference };
     bool vector_integer_select(const Inst &inst, unsigned bits, VectorLaneOp operation, bool is_signed) {
@@ -1048,18 +1065,22 @@ private:
                     break;
                 case VectorLaneOp::Minimum:
                 case VectorLaneOp::Maximum:
-                    get(a); get(b);
-                    get(operation == VectorLaneOp::Minimum ? b : a);
-                    get(operation == VectorLaneOp::Minimum ? a : b);
-                    op(is_signed ? GtS : GtU); op(Select);
+                    // wasm.select consumes (if_true, if_false, condition).
+                    // Compare a>b once, then choose b/a for minimum or a/b
+                    // for maximum. Re-reading locals keeps the stack typed.
+                    if (operation == VectorLaneOp::Minimum) { get(b); get(a); }
+                    else { get(a); get(b); }
+                    get(a); get(b); op(is_signed ? GtS : GtU); op(Select);
                     break;
                 case VectorLaneOp::Absolute:
+                    // (0-a) when the sign-extended lane is negative, else a.
                     imm(0); get(a); op(Sub); get(a);
-                    get(a); imm(31); op(ShrU); op(Select);
+                    get(a); imm(31); op(ShrS); op(Select);
                     break;
                 case VectorLaneOp::AbsoluteDifference:
-                    // Select max-min using operand ordering, not the sign of
-                    // an overflowing subtraction (INT_MAX-INT_MIN is UINT_MAX).
+                    // Select a-b when a>b, otherwise b-a. The comparison is
+                    // made before the wrapping subtraction, so signed
+                    // INT_MAX/INT_MIN produces the architectural lane bits.
                     get(a); get(b); op(Sub); get(b); get(a); op(Sub);
                     get(a); get(b); op(is_signed ? GtS : GtU); op(Select);
                     break;
@@ -2139,6 +2160,28 @@ private:
         case Op::IsZero32: arg(0); op(Eqz); break;
         case Op::CountLeadingZeros32: arg(0); op(Clz); break;
         case Op::Mul32: arg(0); arg(1); op(Mul); break;
+        case Op::ByteReverseWord:
+            value_word(inst.GetArg(0)); set(next_local + 4);
+            byte_reverse_word_from_local(next_local + 4, next_local);
+            return ok;
+        case Op::ByteReverseHalf:
+            // ByteReverseHalf is U16 -> U16. Mask before and after the
+            // exchange so the surrounding U32 stack representation cannot
+            // leak bits from the producer's unused high half.
+            value_word(inst.GetArg(0)); set(next_local + 4);
+            get(next_local + 4); mask(0xffff); imm(8); op(Shl);
+            get(next_local + 4); mask(0xffff); imm(8); op(ShrU); op(Or);
+            mask(0xffff); set(next_local);
+            return ok;
+        case Op::ByteReverseDual:
+            // A U64 SSA value is two little-endian i32 words. Reversing all
+            // eight bytes therefore reverses each word and swaps their
+            // positions; publish both words explicitly for later consumers.
+            value_word(inst.GetArg(0), 1); set(next_local + 4);
+            byte_reverse_word_from_local(next_local + 4, next_local);
+            value_word(inst.GetArg(0), 0); set(next_local + 4);
+            byte_reverse_word_from_local(next_local + 4, next_local + 1);
+            return ok;
         case Op::MostSignificantBit: arg(0); imm(31); op(ShrU); break;
         case Op::LeastSignificantByte: arg(0); mask(0xff); break;
         case Op::LeastSignificantHalf: arg(0); mask(0xffff); break;
