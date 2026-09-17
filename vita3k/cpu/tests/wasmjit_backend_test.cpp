@@ -90,6 +90,7 @@ void equal_context(const CPUContext &a, const CPUContext &b) {
 }
 
 #include "wasmjit_vector_tests.inc"
+#include "wasmjit_vector_integer_tests.inc"
 
 void tls_read(MemState &mem) {
     CPUState parent{};
@@ -1646,6 +1647,8 @@ int main() {
     vector_tests::region_slot_reuse();
     vector_tests::guest_data_movement(mem);
     vector_tests::guest_structure_lanes(mem);
+    vector_integer_tests::ir_arithmetic();
+    vector_integer_tests::guest_arithmetic(mem);
     helpers(mem);
     tls_read(mem);
     leading_zeros(mem);

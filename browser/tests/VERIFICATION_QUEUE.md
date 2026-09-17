@@ -60,6 +60,48 @@ seconds reads; verify null optional time pointers, invalid thread/semaphore IDs,
 NOT_DORMANT from a running thread and nonblocking mutex contention errors.
 These clock/query behavior checks are still pending a dedicated fixture.
 
+## B1 — ordinary NEON integer arithmetic
+
+First perform the A1 build commands on both ABIs. Then:
+
+```sh
+timeout -s KILL 40s node build/web/browser/vita3k_jit_backend_test_node.js
+timeout -s KILL 40s "$NODE64" build/web64/browser/vita3k_jit_backend_test_node.js
+for flags in 0 1; do
+  for accounting in 0 1; do
+    VITA3K_WASMJIT_PROMOTE_FLAGS=$flags VITA3K_WASMJIT_PROMOTE_ACCOUNTING=$accounting timeout -s KILL 40s node build/web/browser/vita3k_jit_backend_test_node.js
+    VITA3K_WASMJIT_PROMOTE_FLAGS=$flags VITA3K_WASMJIT_PROMOTE_ACCOUNTING=$accounting timeout -s KILL 40s "$NODE64" build/web64/browser/vita3k_jit_backend_test_node.js
+  done
+done
+```
+
+Expected on each run: exit 0, `NEON integer arithmetic: 25 independent IR
+fixtures passed`, and the final `WasmJit backend: ... checks passed (real
+memory, no interpreter)` line. Do not expect the old exact 99,716 total, since
+new checks were added. No Vector family missing / FAIL / NEON guest failed
+messages. Emission failures identify missing dispatch; Wasm validation failures
+identify stack/local type errors; lane assertions identify carry contamination,
+word ordering or truncation; unchanged-register failures identify D/Q aliasing
+or accidental status writes.
+
+```sh
+: "${VITASDK:?Set VITASDK to the VitaSDK root}"
+timeout -s KILL 15s "$VITASDK/bin/arm-vita-eabi-as" browser/tests/jit_vector_integer_encodings.S -o "$SCRATCH/neon-integer.o"
+"$VITASDK/bin/arm-vita-eabi-objdump" -d "$SCRATCH/neon-integer.o"
+python3 browser/tests/jit_coverage_inventory.py --format markdown --output "$SCRATCH/JIT_COVERAGE_INVENTORY.md"
+python3 browser/tests/jit_coverage_inventory.py --format json --output "$SCRATCH/jit-coverage.json"
+python3 -m unittest discover -s browser/tests -p 'test_jit_coverage_inventory.py'
+```
+
+Compare each ARM encoding with the C++ guest fixture's field formula (and
+Thumb halfwords with `thumb_word`). Representative expected ARM words:
+VADD.I8 q15,q15,q1 = f24ee8c2; VSUB.I64 d31,d2,d31 = f372f82f;
+VMUL.I16 q15,q15,d3[3] = f3dee8eb.
+Assembler disagreement is a fixture problem to investigate, never a reason
+to bypass a rejected guest instruction. Inventory should add eleven dispatch
+routes while retaining VectorMultiply64 as missing. After successful review,
+replace the committed pre-B1 inventory with the generated scratch document.
+
 ## Baseline JIT and renderer regressions
 
 ```sh

@@ -100,7 +100,7 @@ enum Wasm : uint8_t {
     Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtU = 0x49, GtU = 0x4b, LeU = 0x4d, GeU = 0x4e, Eqz64 = 0x50,
     Clz = 0x67, Add = 0x6a, Sub = 0x6b, Mul = 0x6c, And = 0x71, Or = 0x72, Xor = 0x73,
     Shl = 0x74, ShrS = 0x75, ShrU = 0x76, RotR = 0x78,
-    Add64 = 0x7c, Mul64 = 0x7e, Or64 = 0x84, Shl64 = 0x86, ShrU64 = 0x88, ShrS64 = 0x87, Wrap = 0xa7, ExtendU = 0xad,
+    Add64 = 0x7c, Sub64 = 0x7d, Mul64 = 0x7e, Or64 = 0x84, Shl64 = 0x86, ShrU64 = 0x88, ShrS64 = 0x87, Wrap = 0xa7, ExtendU = 0xad,
 };
 
 constexpr bool memory64 = memory_address_type == MemoryAddressType::I64;
@@ -986,6 +986,45 @@ private:
         value_word(source, position / 32 + word);
         if (position % 32) { imm(position % 32); op(ShrU); }
         if (bits < 32) mask((1u << bits) - 1);
+    }
+    bool vector_integer_arithmetic(const Inst &inst, unsigned bits, Wasm operation) {
+        // Ordinary NEON integer arithmetic is modulo 2^esize, independent of
+        // signedness. It changes neither CPSR nor FPSCR (including QC).
+        // Read SSA sources and publish ALL four words before architectural
+        // writeback, including for D-form operations whose high half is dead.
+        if (bits == 64) {
+            if (operation != Add && operation != Sub) {
+                reject("64-bit vector integer arithmetic only supports add/subtract");
+                return false;
+            }
+            for (unsigned word = 0; word < 4; word += 2) {
+                for (unsigned source = 0; source < 2; ++source) {
+                    value_word(inst.GetArg(source), word); op(ExtendU);
+                    value_word(inst.GetArg(source), word + 1); op(ExtendU);
+                    constant64(code, 32); op(Shl64); op(Or64);
+                }
+                op(operation == Add ? Add64 : Sub64);
+                set(scratch_local);
+                get(scratch_local); op(Wrap); set(next_local + word);
+                get(scratch_local); constant64(code, 32); op(ShrU64); op(Wrap);
+                set(next_local + word + 1);
+            }
+            return ok;
+        }
+        for (unsigned word = 0; word < 4; ++word) {
+            for (unsigned shift = 0; shift < 32; shift += bits) {
+                const unsigned lane = (word * 32 + shift) / bits;
+                vector_element_word(inst.GetArg(0), bits, lane);
+                vector_element_word(inst.GetArg(1), bits, lane);
+                op(operation);
+                // Truncate BEFORE combining: carry/borrow/product bits must
+                // never leak from one packed lane to the next.
+                if (bits < 32) mask((1u << bits) - 1);
+                if (shift) { imm(shift); op(Shl); op(Or); }
+            }
+            set(next_local + word);
+        }
+        return ok;
     }
     bool vector_broadcast(const Inst &inst, unsigned bits, bool element = false) {
         unsigned index = 0;
@@ -2115,6 +2154,17 @@ private:
             return inst.GetArg(0).IsImmediate() && inst.GetArg(0).GetType() == Type::U64;
         case Op::A32SetCheckBit:
             value_word(inst.GetArg(0)); set(check_bit_local); check_bit_written = true; return ok;
+        case Op::VectorAdd8: return vector_integer_arithmetic(inst, 8, Add);
+        case Op::VectorAdd16: return vector_integer_arithmetic(inst, 16, Add);
+        case Op::VectorAdd32: return vector_integer_arithmetic(inst, 32, Add);
+        case Op::VectorAdd64: return vector_integer_arithmetic(inst, 64, Add);
+        case Op::VectorSub8: return vector_integer_arithmetic(inst, 8, Sub);
+        case Op::VectorSub16: return vector_integer_arithmetic(inst, 16, Sub);
+        case Op::VectorSub32: return vector_integer_arithmetic(inst, 32, Sub);
+        case Op::VectorSub64: return vector_integer_arithmetic(inst, 64, Sub);
+        case Op::VectorMultiply8: return vector_integer_arithmetic(inst, 8, Mul);
+        case Op::VectorMultiply16: return vector_integer_arithmetic(inst, 16, Mul);
+        case Op::VectorMultiply32: return vector_integer_arithmetic(inst, 32, Mul);
         case Op::VectorBroadcast8: return vector_broadcast(inst, 8);
         case Op::VectorBroadcast16: return vector_broadcast(inst, 16);
         case Op::VectorBroadcast32: return vector_broadcast(inst, 32);
