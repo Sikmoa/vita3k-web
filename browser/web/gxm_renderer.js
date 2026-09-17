@@ -3,7 +3,8 @@
 // Input: translated WGSL + snapshotted vertex/index/uniform data. Output: tightly
 // packed RGBA8 after GPU completion, suitable for the existing display bridge.
 // Supported initially: one interleaved stream, triangle-list, RGBA8, no depth,
-// blending, textures or MSAA. Unsupported state must be rejected by the producer.
+// blending or MSAA. Optional fragment unit zero: linear RGBA8, one mip,
+// explicit sampler, group 3 bindings 0/1. No guest texture state is inferred.
 
 const formats = Object.freeze({ float32: [4, 4], float32x2: [8, 4],
   float32x3: [12, 4], float32x4: [16, 4], unorm8x4: [4, 1] });
@@ -71,8 +72,10 @@ export function createGXMRenderer(device) {
     // WGSL must eventually come from real GXP conversion. The smoke test uses
     // explicit test WGSL and deliberately does not claim guest shader execution.
     async createProgram({ vertexWGSL, fragmentWGSL, stride, attributes, uniformSize = 0,
-      vertexEntryPoint = 'main', fragmentEntryPoint = 'main', bufferBindings, ...unsupportedState }) {
+      vertexEntryPoint = 'main', fragmentEntryPoint = 'main', bufferBindings,
+      fragmentTexture = false, ...unsupportedState }) {
       available();
+      if (typeof fragmentTexture !== 'boolean') throw new TypeError('fragmentTexture must be boolean');
       if (Object.keys(unsupportedState).length)
         throw new Error(`unsupported pipeline state: ${Object.keys(unsupportedState).join(', ')}`);
       if (typeof vertexWGSL !== 'string' || typeof fragmentWGSL !== 'string'
@@ -119,11 +122,12 @@ export function createGXMRenderer(device) {
       layout.sort((a, b) => a.shaderLocation - b.shaderLocation);
       bindingLayout.sort((a, b) => a.binding - b.binding);
       const key = JSON.stringify([vertexWGSL, fragmentWGSL, vertexEntryPoint, fragmentEntryPoint,
-        stride, layout, bindingLayout, 'rgba8unorm', 'triangle-list', 'none',
+        stride, layout, bindingLayout, fragmentTexture, 'rgba8unorm', 'triangle-list', 'none',
         'no-depth-stencil', 'no-blend', 1]);
       const publish = pipeline => {
         const id = nextId++;
-        programs.set(id, { pipeline, stride, uniformSize, bindingLayout, explicitBindings: bufferBindings !== undefined });
+        programs.set(id, { pipeline, stride, uniformSize, bindingLayout, fragmentTexture,
+          explicitBindings: bufferBindings !== undefined });
         return id;
       };
       if (pipelines.has(key)) {
@@ -147,7 +151,19 @@ export function createGXMRenderer(device) {
         const bindGroupLayout = device.createBindGroupLayout({ entries: bindingLayout.map(b => ({
           binding: b.binding, visibility: b.visibility, buffer: { type: b.type, minBindingSize: b.size },
         })) });
-        pipeline = await device.createRenderPipelineAsync({ layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+        const bindGroupLayouts = [bindGroupLayout];
+        if (fragmentTexture) {
+          // Match webgpu_spirv.h: fragment texture unit zero is group 3,
+          // texture binding 0 / sampler binding 1. Groups 1 and 2 are empty.
+          bindGroupLayouts.push(device.createBindGroupLayout({ entries: [] }),
+            device.createBindGroupLayout({ entries: [] }),
+            device.createBindGroupLayout({ entries: [
+              { binding: 0, visibility: GPUShaderStage.FRAGMENT,
+                texture: { sampleType: 'float', viewDimension: '2d', multisampled: false } },
+              { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+            ] }));
+        }
+        pipeline = await device.createRenderPipelineAsync({ layout: device.createPipelineLayout({ bindGroupLayouts }),
           vertex: { module: vertex, entryPoint: vertexEntryPoint, buffers: [{ arrayStride: stride, attributes: layout }] },
           fragment: { module: fragment, entryPoint: fragmentEntryPoint, targets: [{ format: 'rgba8unorm' }] },
           primitive: { topology: 'triangle-list', cullMode: 'none' },
@@ -209,12 +225,38 @@ export function createGXMRenderer(device) {
         for (const data of [vertices, indices, ...boundBuffers.map(b => b.data)])
           if (align(data.length, 4) > device.limits.maxBufferSize)
             throw new RangeError('upload exceeds maxBufferSize');
-        return { program, vertices, indices, boundBuffers, indexFormat: draw.indexFormat,
+        let sampledTexture = null;
+        if (program.fragmentTexture) {
+          const source = draw.fragmentTexture;
+          if (!source || typeof source !== 'object') throw new TypeError('fragment texture required');
+          const { width, height, pixels, format = 'rgba8unorm', sampler = {}, ...extra } = source;
+          if (Object.keys(extra).length || format !== 'rgba8unorm')
+            throw new Error('unsupported fragment texture state');
+          integer(width, 1, device.limits.maxTextureDimension2D, 'texture width');
+          integer(height, 1, device.limits.maxTextureDimension2D, 'texture height');
+          if (width * height * 4 > device.limits.maxBufferSize)
+            throw new RangeError('texture upload exceeds maxBufferSize');
+          const data = bytes(pixels);
+          if (data.length !== width * height * 4) throw new RangeError('texture byte size mismatch');
+          const { minFilter = 'nearest', magFilter = 'nearest', addressModeU = 'clamp-to-edge',
+            addressModeV = 'clamp-to-edge', ...extraSampler } = sampler;
+          if (Object.keys(extraSampler).length
+              || !['nearest', 'linear'].includes(minFilter) || !['nearest', 'linear'].includes(magFilter)
+              || !['clamp-to-edge', 'repeat', 'mirror-repeat'].includes(addressModeU)
+              || !['clamp-to-edge', 'repeat', 'mirror-repeat'].includes(addressModeV))
+            throw new Error('unsupported fragment sampler state');
+          sampledTexture = { width, height, data,
+            sampler: { minFilter, magFilter, addressModeU, addressModeV, mipmapFilter: 'nearest',
+              lodMinClamp: 0, lodMaxClamp: 0 } };
+        } else if (draw.fragmentTexture !== undefined) {
+          throw new Error('fragment texture supplied to untextured program');
+        }
+        return { program, vertices, indices, boundBuffers, sampledTexture, indexFormat: draw.indexFormat,
           indexCount: indices.length / indexSize };
       });
       busy = true;
       device.pushErrorScope('validation');
-      const buffers = [];
+      const buffers = [], textures = [];
       let readback, pixels, failure;
       try {
         const upload = (data, usage) => {
@@ -239,6 +281,19 @@ export function createGXMRenderer(device) {
             entries: draw.boundBuffers.map(b => ({ binding: b.binding, resource: {
               buffer: upload(b.data, b.type === 'uniform' ? GPUBufferUsage.UNIFORM : GPUBufferUsage.STORAGE),
             } })) }));
+          if (draw.sampledTexture) {
+            const source = draw.sampledTexture;
+            const texture = device.createTexture({ size: [source.width, source.height], format: 'rgba8unorm',
+              usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+            textures.push(texture);
+            device.queue.writeTexture({ texture }, source.data,
+              { bytesPerRow: source.width * 4 }, [source.width, source.height]);
+            for (const group of [1, 2]) pass.setBindGroup(group, device.createBindGroup({
+              layout: draw.program.pipeline.getBindGroupLayout(group), entries: [] }));
+            pass.setBindGroup(3, device.createBindGroup({ layout: draw.program.pipeline.getBindGroupLayout(3),
+              entries: [{ binding: 0, resource: texture.createView() },
+                { binding: 1, resource: device.createSampler(source.sampler) }] }));
+          }
           pass.drawIndexed(draw.indexCount);
         }
         pass.end();
@@ -259,6 +314,7 @@ export function createGXMRenderer(device) {
       finally {
         if (readback?.mapState === 'mapped') readback.unmap();
         for (const buffer of buffers) buffer.destroy();
+        for (const texture of textures) texture.destroy();
         try {
           const error = await device.popErrorScope();
           if (error && !failure) failure = new Error(error.message);

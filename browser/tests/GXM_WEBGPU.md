@@ -20,7 +20,18 @@ consumer itself accepts WGSL; it is not the shader translator.
 - Unsupported indices, formats, sizes, shaders and concurrent direct consumer
   operations reject. Native guest state validation remains in force.
 
-Depth/stencil, blending, MSAA, textures/samplers in this consumer, multiple
+The consumer additionally supports optional fragment texture unit zero: group 3
+bindings 0 (2D RGBA8 texture) and 1 (sampler), matching `webgpu_spirv.h`.
+`createProgram({ fragmentTexture: true, ... })` requires each draw to supply
+`fragmentTexture: { width, height, pixels, format: 'rgba8unorm', sampler }`.
+One mip only; nearest/linear min/mag filtering and clamp/repeat/mirror-repeat
+U/V addressing are accepted. Texels and sampler state are snapshotted before
+await, uploaded per draw, and texture resources are destroyed after readback.
+Texture layout participates in the pipeline key; texels and sampler values do
+not. Missing data, wrong sizes and unsupported sampler/texture fields reject.
+**Guest SceGxm texture state is not yet wired into this API.**
+
+Depth/stencil, blending, MSAA, multiple
 vertex streams, non-default viewport/scissor, additional target formats and
 resident framebuffer resolve/presentation remain unsupported. Separate texture
 translation prototypes are not proof of guest texture support. Each draw still
@@ -28,7 +39,9 @@ reads back; this is not a performance result or a completed retail renderer.
 
 ## C1 — bounded pipeline cache and ordered guest operations
 
-Status: source changes and fixtures only; **not run** in this session.
+Status: real Chromium/WebGPU smoke passed, including pipeline-cache checks and
+the consumer texture extension below. Cache eviction and device-loss scenarios
+are not covered by this smoke test.
 
 The consumer retains at most 64 pipeline entries in LRU order per device. The
 key uses exact WGSL strings, entry points, stride, sorted attribute layout,
@@ -76,8 +89,12 @@ PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index
   timeout -s KILL 55s node browser/tests/gxm_webgpu_smoke.mjs
 ```
 
-Expected **pending** result:
-`{"checks":29,"backend":"WebGPU","translatedGuestShader":false,"pipelineCache":true}`.
+Verified result (exit 0):
+`{"checks":37,"backend":"WebGPU","translatedGuestShader":false,"pipelineCache":true}`.
+The eight added texture assertions cover quadrant pixels with snapshot ownership,
+texel changes on later draws, pipeline reuse, missing/partial texture rejection,
+unsupported samplers, rejection of ignored textures, and resource-layout cache keys.
+These use test WGSL, not a guest texturing fixture.
 No game assets or shader compiler are needed. Unavailable WebGPU is a failure
 to verify, never a successful skip.
 

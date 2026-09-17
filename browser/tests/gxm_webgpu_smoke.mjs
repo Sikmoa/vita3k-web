@@ -127,6 +127,46 @@ try {
     const retry = await renderer.createProgram(definition);
     check(renderer.pipelineCacheStats().hits === 2, 'successful pipeline survives unrelated failed creation');
     renderer.destroyProgram(retry);
+
+    // Fragment texture unit zero uses the real translator's group-3 ABI.
+    // Test WGSL isolates the consumer; guest texture packet wiring is separate.
+    const texturedDefinition = { ...definition, uniformSize: 0, fragmentTexture: true,
+      fragmentWGSL: `@group(3) @binding(0) var image: texture_2d<f32>;
+        @group(3) @binding(1) var imageSampler: sampler;
+        @fragment fn main(@builtin(position) p: vec4f) -> @location(0) vec4f {
+          return textureSample(image, imageSampler, p.xy / vec2f(65.0, 33.0));
+        }` };
+    const textured = await renderer.createProgram(texturedDefinition);
+    const texels = new Uint8Array([255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,255]);
+    const textureDraw = { program: textured, vertices: new Float32Array([-1,-1, 3,-1, -1,3]),
+      indices, indexFormat: 'uint16', fragmentTexture: { width: 2, height: 2, pixels: texels } };
+    const texturePending = renderer.submit(target, [textureDraw]);
+    texels.fill(0);
+    const texturedResult = await texturePending;
+    const pixel = (image, x, y) => image.pixels.slice((y * 65 + x) * 4, (y * 65 + x) * 4 + 4).join();
+    check(pixel(texturedResult, 8, 4) === '255,0,0,255'
+      && pixel(texturedResult, 56, 4) === '0,255,0,255'
+      && pixel(texturedResult, 8, 28) === '0,0,255,255'
+      && pixel(texturedResult, 56, 28) === '255,255,255,255', 'sampled quadrants use owned texture snapshot');
+    const changedTexture = await renderer.submit(target, [textureDraw]);
+    check(changedTexture.pixels.every(v => v === 0), 'later draw observes modified texels');
+    const textureReuse = await renderer.createProgram(texturedDefinition);
+    check(renderer.pipelineCacheStats().hits === 3, 'texture pipeline reused independently of texel bytes');
+    renderer.destroyProgram(textureReuse);
+    await rejects(() => renderer.submit(target, [{ ...textureDraw, fragmentTexture: undefined }]), 'missing texture rejected');
+    await rejects(() => renderer.submit(target, [{ ...textureDraw, fragmentTexture: {
+      ...textureDraw.fragmentTexture, pixels: new Uint8Array(4) } }]), 'partial texture rejected');
+    await rejects(() => renderer.submit(target, [{ ...textureDraw, fragmentTexture: {
+      ...textureDraw.fragmentTexture, sampler: { compare: 'less' } } }]), 'unsupported sampler rejected');
+    await rejects(() => renderer.submit(target, [{ ...draw, fragmentTexture: textureDraw.fragmentTexture }]),
+      'texture cannot be silently ignored by untextured program');
+    // The resource layout must participate in the pipeline cache key even if
+    // this particular shader does not use its additional texture bindings.
+    const layoutMisses = renderer.pipelineCacheStats().misses;
+    const unusedTexture = await renderer.createProgram({ ...definition, fragmentTexture: true });
+    check(renderer.pipelineCacheStats().misses === layoutMisses + 1, 'texture layout changes pipeline key');
+    renderer.destroyProgram(unusedTexture);
+    renderer.destroyProgram(textured);
     renderer.destroyProgram(program); renderer.destroyTarget(target);
     await rejects(() => renderer.submit(target, []), 'destroyed target rejected');
     renderer.dispose();
@@ -147,7 +187,7 @@ try {
     device.destroy();
     return { checks, backend: 'WebGPU', translatedGuestShader: false, pipelineCache: true };
   });
-  assert.equal(result.checks, 29);
+  assert.equal(result.checks, 37);
   console.log(JSON.stringify(result));
 } finally {
   clearTimeout(timeout);
