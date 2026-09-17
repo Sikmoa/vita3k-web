@@ -66,11 +66,15 @@ try {
 
     const renderer = bridge.renderer;
     const target = renderer.createTarget(65, 33); // deliberately not 256-byte aligned
-    const program = await renderer.createProgram({ stride: 8,
+    const definition = { stride: 8,
       attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }], uniformSize: 16,
       vertexWGSL: '@vertex fn main(@location(0) p: vec2f) -> @builtin(position) vec4f { return vec4f(p, 0, 1); }',
       fragmentWGSL: '@group(0) @binding(0) var<uniform> color: vec4f; @fragment fn main() -> @location(0) vec4f { return color; }',
-    });
+    };
+    const program = await renderer.createProgram(definition);
+    const reused = await renderer.createProgram({ ...definition, attributes: definition.attributes.map(a => ({ ...a })) });
+    check(reused !== program && renderer.pipelineCacheStats().hits === 1
+      && renderer.pipelineCacheStats().entries === 1, 'equivalent state shares pipeline but not program handle');
     const vertices = new Float32Array([-1,-1, 3,-1, -1,3]);
     const indices = new Uint16Array([0,1,2]); // six bytes: writeBuffer must pad to four
     const uniforms = new Float32Array([1,0,0,1]);
@@ -86,6 +90,31 @@ try {
     check(green.pixels.every((v,i) => v === [0,255,0,255][i%4]), 'uniform changes affect pixels');
     const green32 = await renderer.submit(target, [{ ...draw, indices: new Uint32Array([0,1,2]), indexFormat: 'uint32' }]);
     check(green32.pixels.every((v,i) => v === [0,255,0,255][i%4]), '32-bit index draw');
+    renderer.destroyProgram(reused);
+    const retained = await renderer.submit(target, [draw]);
+    check(retained.pixels.every((v,i) => v === [0,255,0,255][i%4]), 'destroying shared handle preserves original program');
+    const blueProgram = await renderer.createProgram({ ...definition,
+      fragmentWGSL: '@fragment fn main() -> @location(0) vec4f { return vec4f(0, 0, 1, 1); }' });
+    const blue = await renderer.submit(target, [{ ...draw, program: blueProgram }]);
+    check(blue.pixels.every((v,i) => v === [0,0,255,255][i%4])
+      && renderer.pipelineCacheStats().misses === 2, 'fragment shader change misses cache and changes pixels');
+    renderer.destroyProgram(blueProgram);
+    const paddedProgram = await renderer.createProgram({ ...definition, stride: 12,
+      attributes: [{ shaderLocation: 0, offset: 4, format: 'float32x2' }] });
+    const paddedDraw = { ...draw, program: paddedProgram,
+      vertices: new Float32Array([99,-1,-1, 99,3,-1, 99,-1,3]) };
+    const padded = await renderer.submit(target, [paddedDraw]);
+    check(padded.pixels.every((v,i) => v === [0,255,0,255][i%4])
+      && renderer.pipelineCacheStats().misses === 3, 'changed vertex stride and offsets miss cache');
+    renderer.destroyProgram(paddedProgram);
+    const explicitProgram = await renderer.createProgram({ ...definition, uniformSize: 0,
+      bufferBindings: [{ binding: 0, size: 32, type: 'uniform', visibility: GPUShaderStage.FRAGMENT }] });
+    const explicit = await renderer.submit(target, [{ ...draw, program: explicitProgram, uniforms: undefined,
+      buffers: { 0: new Float32Array([1,0,0,1, 0,0,0,0]) } }]);
+    check(explicit.pixels.every((v,i) => v === [255,0,0,255][i%4])
+      && renderer.pipelineCacheStats().misses === 4, 'binding size and visibility miss cache');
+    renderer.destroyProgram(explicitProgram);
+    await rejects(() => renderer.createProgram({ ...definition, blend: {} }), 'unsupported pipeline state is not silently defaulted');
     vertices.fill(0);
     const black = await renderer.submit(target, [draw]);
     check(black.pixels.every((v,i) => v === [0,0,0,255][i%4]), 'vertex changes affect coverage');
@@ -94,15 +123,31 @@ try {
     await rejects(() => renderer.submit(target, [{ ...draw, uniforms: new Uint8Array(4) }]), 'wrong uniform size rejected');
     await rejects(() => renderer.createProgram({ stride: 8, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }],
       vertexWGSL: 'invalid wgsl', fragmentWGSL: 'invalid wgsl' }), 'bad shader rejected');
+    check(renderer.pipelineCacheStats().entries === 4, 'invalid shader never populates pipeline cache');
+    const retry = await renderer.createProgram(definition);
+    check(renderer.pipelineCacheStats().hits === 2, 'successful pipeline survives unrelated failed creation');
+    renderer.destroyProgram(retry);
     renderer.destroyProgram(program); renderer.destroyTarget(target);
     await rejects(() => renderer.submit(target, []), 'destroyed target rejected');
     renderer.dispose();
+    check(renderer.pipelineCacheStats().entries === 0, 'dispose releases pipeline cache');
     await rejects(() => renderer.createTarget(1,1), 'disposed renderer rejected');
     check(errors.length === 0, `uncaptured GPU errors: ${errors.join('; ')}`);
+    // This queue test needs no shader compiler/assets: decoding a malformed
+    // packet fails before device/compiler acquisition. Later operations must
+    // inherit that failure instead of reporting a completed fence or fill.
+    const guest = await import('./gxm_hle_bridge.js');
+    const badDraw = guest.drawGuestSurface(new Uint8Array(4), new Uint8Array(4), 1, 1);
+    const laterFence = guest.finishGuestQueue();
+    const laterFill = guest.fillGuestSurface(0xff000000, 1, 1);
+    const failedQueue = await Promise.allSettled([badDraw, laterFence, laterFill]);
+    check(failedQueue.every(result => result.status === 'rejected'), 'rejected draw poisons queued fence and fill');
+    check(failedQueue[0].reason === failedQueue[1].reason && failedQueue[1].reason === failedQueue[2].reason,
+      'queue preserves original failure diagnostic');
     device.destroy();
-    return { checks, backend: 'WebGPU', translatedGuestShader: false };
+    return { checks, backend: 'WebGPU', translatedGuestShader: false, pipelineCache: true };
   });
-  assert.ok(result.checks >= 18);
+  assert.equal(result.checks, 29);
   console.log(JSON.stringify(result));
 } finally {
   clearTimeout(timeout);

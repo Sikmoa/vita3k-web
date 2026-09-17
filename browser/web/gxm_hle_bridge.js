@@ -3,6 +3,17 @@
 // Queue completion, ABGR8 transfer fill and a deliberately bounded GXP draw path.
 import { createGXMRenderer } from './gxm_renderer.js';
 import { createGXPShaderAdapter } from './gxp_shader_adapter.js';
+// One ordered device stream, including fills and fences. A failed operation
+// poisons later completion requests: none may acknowledge a rejected draw.
+let queueTail = Promise.resolve(), queueFailure, queueFailed = false, guestRenderer;
+function enqueueGuestWork(work) {
+  const result = queueTail.then(() => {
+    if (queueFailed) throw queueFailure;
+    return work();
+  });
+  queueTail = result.catch(error => { queueFailed = true; queueFailure = error; });
+  return result;
+}
 let shaderPromise;
 export function configureGuestShaders(urls) {
   if (shaderPromise) throw new Error('guest shader compiler already initialized');
@@ -12,7 +23,10 @@ export function configureGuestShaders(urls) {
 // Versioned host-owned packet, not a guest struct containing native pointers.
 // Copy every input before awaiting the compiler or device.
 export async function drawGuestSurface(packet, initialPixels, width, height) {
-  packet = new Uint8Array(packet); initialPixels = new Uint8Array(initialPixels);
+  packet = new Uint8Array(packet).slice(); initialPixels = new Uint8Array(initialPixels).slice();
+  return enqueueGuestWork(() => drawOwnedSurface(packet, initialPixels, width, height));
+}
+async function drawOwnedSurface(packet, initialPixels, width, height) {
   const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
   let cursor = 0;
   const word = () => { const n = view.getUint32(cursor, true); cursor += 4; return n; };
@@ -41,7 +55,8 @@ export async function drawGuestSurface(packet, initialPixels, width, height) {
   const compiler = await shaderPromise;
   const vertex = await compiler.translate(vertexGXP);
   const fragment = await compiler.translate(fragmentGXP);
-  const renderer = createGXMRenderer(await initializeGuestDevice());
+  if (!guestRenderer) guestRenderer = createGXMRenderer(await initializeGuestDevice());
+  const renderer = guestRenderer;
   let target, program;
   try {
     // Unused explicit bindings are legal. Nonempty SSBOs use the production
@@ -62,7 +77,19 @@ export async function drawGuestSurface(packet, initialPixels, width, height) {
     target = renderer.createTarget(width, height);
     return (await renderer.submit(target, [{ program, vertices, indices,
       indexFormat: indexSize === 2 ? 'uint16' : 'uint32', buffers }], { initialPixels })).pixels;
-  } finally { renderer.dispose(); }
+  } finally {
+    // submit has settled (including GPU readback) before either resource can
+    // be released. Retain only the bounded device-local pipeline cache.
+    try {
+      if (target !== undefined) renderer.destroyTarget(target);
+      if (program !== undefined) renderer.destroyProgram(program);
+    } catch (error) {
+      // Device loss makes normal destroy methods unavailable. dispose still
+      // releases resources and ensures a poisoned renderer is never reused.
+      renderer.dispose(); guestRenderer = undefined;
+      throw error;
+    }
+  }
 }
 let devicePromise;
 export async function initializeGuestDevice() {
@@ -74,7 +101,10 @@ export async function initializeGuestDevice() {
   })();
   return devicePromise;
 }
-export async function fillGuestSurface(color, width, height) {
+export function fillGuestSurface(color, width, height) {
+  return enqueueGuestWork(() => fillOrderedSurface(color, width, height));
+}
+async function fillOrderedSurface(color, width, height) {
   const gpu = await initializeGuestDevice();
   const pitch = Math.ceil(width * 4 / 256) * 256;
   let texture, readback;
@@ -107,9 +137,11 @@ export async function fillGuestSurface(color, width, height) {
   }
 }
 
-export async function finishGuestQueue() {
-  const gpu = await initializeGuestDevice();
-  const encoder = gpu.createCommandEncoder({ label: 'guest sceGxmFinish fence' });
-  gpu.queue.submit([encoder.finish()]);
-  await gpu.queue.onSubmittedWorkDone();
+export function finishGuestQueue() {
+  return enqueueGuestWork(async () => {
+    const gpu = await initializeGuestDevice();
+    const encoder = gpu.createCommandEncoder({ label: 'guest sceGxmFinish fence' });
+    gpu.queue.submit([encoder.finish()]);
+    await gpu.queue.onSubmittedWorkDone();
+  });
 }

@@ -102,7 +102,25 @@ to bypass a rejected guest instruction. Inventory should add eleven dispatch
 routes while retaining VectorMultiply64 as missing. After successful review,
 replace the committed pre-B1 inventory with the generated scratch document.
 
-## Baseline JIT and renderer regressions
+## C1 — pipeline cache and ordered guest device work
+
+The renderer command below needs no game assets. Expected new result is exactly
+29 checks with `pipelineCache:true`; the former 18-check result is historical.
+Pixel failures after state changes indicate a bad key or stale upload. Extra
+entries after shader failure indicate an invalid pipeline was cached. A
+successful fence/fill after the malformed queued draw indicates early or false
+completion. Inspect uncaptured errors as failures even if pixels look correct.
+
+After portable shader/fixture packaging is available, repeat the real guest
+GXP triangle integration. Expected historical signals remain guest exit 42,
+zero missing NIDs, two indexed-draw readback completion lines, and JIT-only
+execution. `rendererComplete=false` must remain. Also exercise more than 64
+distinct valid pipeline states, reuse live handles after eviction, and inject
+device loss during submission: no stale target/program may be reused and no
+guest sync or callback may signal success. These additional scenarios have
+not been automated or executed by this batch.
+
+## Combined JIT and renderer regressions
 
 ```sh
 timeout -s KILL 40s node build/web/browser/vita3k_jit_backend_test_node.js
@@ -110,6 +128,6 @@ PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index
 ```
 
 Expected: JIT exit 0, no FAIL or missing-family diagnostics; renderer exit 0 and
-`{"checks":18,"backend":"WebGPU","translatedGuestShader":false}`. Chromium
+`{"checks":29,"backend":"WebGPU","translatedGuestShader":false,"pipelineCache":true}`. Chromium
 and WebGPU are required; lack of either is a failure to verify, not a skip.
 The renderer probe needs no game assets and does not prove retail rendering.

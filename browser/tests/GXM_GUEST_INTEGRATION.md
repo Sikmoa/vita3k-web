@@ -20,23 +20,14 @@
 - 4 GiB host-pointer cap in `browser/src/host_abi.js` lifted to the real buffer bound;
   guest surfaces above the direct-mapping base are reachable.
 
-## Exact reproduction commands
+## Reproduction status
 
-```sh
-# Emscripten Memory64 runtime build (existing configured build/web64 directory)
-# Build the shader compiler and install its WASI dependencies first: GXP_TRANSLATION.md.
-export TMPDIR=$PWD/.limbo_work/tmp \
-       EM_CACHE=$PWD/.limbo_work/tmp/gxm-emcache.VwIBm0 \
-       EM_FROZEN_CACHE=0
-timeout -s KILL 240s cmake --build build/web64 --target vita3k_web_jit -j1
-
-# Guest fixture (VitaSDK -> SELF)
-VITASDK=/opt/vitasdk/vitasdk bash browser/tests/build_gxm_guest_probe.sh
-
-# Probe (normal mode asserts success; --expect-missing only documents the old blocker)
-PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index.mjs \
-  timeout -s KILL 60s node browser/tests/gxm_guest_probe_chromium.mjs
-```
+Use VERIFICATION_QUEUE.md for current bounded build/regression commands with
+runner-owned scratch/cache directories. The historical guest-probe builder and
+server still assume a previous host's shader/WASI asset staging arrangement;
+they need portable dependency paths before they are clean-checkout commands.
+The asset-free `gxm_webgpu_smoke.mjs` remains directly runnable. No commands
+were executed in the C1 pipeline-cache batch.
 
 Expected: guest `exit 42`, 56 imports, zero missing NIDs,
 `missingSceGxmBridge=false`, two `GXM WebGPU GXP indexed draw readback completed`
@@ -57,11 +48,13 @@ Host-only shader/renderer checks do not substitute for guest execution.
   and metadata-packed vertex/fragment uniform buffers. It preserves the initial
   guest surface between draws. Unsupported depth, blending, textures, instancing,
   non-default viewport/clip and other commands are rejected, not silently ignored.
-- Each draw currently translates its GXP and creates GPU resources afresh;
-  shader/pipeline caching and persistent surface ownership remain to be implemented.
-- The probe serves compiler, Naga and WASI shim assets from `.limbo_work/gxm`.
-  Production distribution of those assets and ordinary worker integration still
-  need packaging work; the test server is not evidence of a complete app launcher.
+- C1 adds an unverified bounded pipeline cache and ordered guest draw/fill/fence
+  queue (GXM_WEBGPU.md). Each draw still translates GXP, uploads buffers and
+  creates/reads back its target. Shader translation caching and persistent
+  surface ownership remain to be implemented.
+- Production distribution of compiler, Naga and WASI shim assets and ordinary
+  worker integration still need packaging work; the historical test server is
+  not evidence of a complete app launcher.
 - `vita3k/renderer/src/sync.cpp` intentionally NOT linked (single-threaded, GPU-fenced
   bridge replaces its queue thread); `wishlist` / `subject_done` reimplemented locally.
 - `browser/web/gxm_context.js` is owned by main; the bridge uses the separate

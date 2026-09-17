@@ -37,6 +37,10 @@ export function snapshotGuestBytes(heap, address, length) {
 export function createGXMRenderer(device) {
   if (!device) throw new TypeError('WebGPU device required');
   const targets = new Map(), programs = new Map();
+  // Device-local LRU. Program handles and pipeline-cache ownership are separate:
+  // destroying a handle never invalidates another handle using the pipeline.
+  const pipelines = new Map(), pipelineLimit = 64;
+  let pipelineHits = 0, pipelineMisses = 0;
   let nextId = 1, busy = false, disposed = false, lost = null;
   device.lost.then(info => { lost = `WebGPU device lost: ${info.message}`; });
   function available() {
@@ -67,8 +71,13 @@ export function createGXMRenderer(device) {
     // WGSL must eventually come from real GXP conversion. The smoke test uses
     // explicit test WGSL and deliberately does not claim guest shader execution.
     async createProgram({ vertexWGSL, fragmentWGSL, stride, attributes, uniformSize = 0,
-      vertexEntryPoint = 'main', fragmentEntryPoint = 'main', bufferBindings }) {
+      vertexEntryPoint = 'main', fragmentEntryPoint = 'main', bufferBindings, ...unsupportedState }) {
       available();
+      if (Object.keys(unsupportedState).length)
+        throw new Error(`unsupported pipeline state: ${Object.keys(unsupportedState).join(', ')}`);
+      if (typeof vertexWGSL !== 'string' || typeof fragmentWGSL !== 'string'
+          || typeof vertexEntryPoint !== 'string' || typeof fragmentEntryPoint !== 'string')
+        throw new TypeError('shader sources and entry points must be strings');
       integer(stride, 4, device.limits.maxVertexBufferArrayStride, 'vertex stride');
       if (stride % 4) throw new RangeError('vertex stride must be a multiple of four');
       integer(uniformSize, 0, device.limits.maxUniformBufferBindingSize, 'uniform size');
@@ -104,6 +113,26 @@ export function createGXMRenderer(device) {
         integer(visibility, 1, GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, 'binding visibility');
         return { binding, size, type, visibility };
       });
+      // Normalize only ordering, not meaning. The key includes every field in
+      // the descriptor below and explicit fixed render state. No hash collision
+      // can alias guest shaders; dynamic vertices/uniform bytes are NOT state.
+      layout.sort((a, b) => a.shaderLocation - b.shaderLocation);
+      bindingLayout.sort((a, b) => a.binding - b.binding);
+      const key = JSON.stringify([vertexWGSL, fragmentWGSL, vertexEntryPoint, fragmentEntryPoint,
+        stride, layout, bindingLayout, 'rgba8unorm', 'triangle-list', 'none',
+        'no-depth-stencil', 'no-blend', 1]);
+      const publish = pipeline => {
+        const id = nextId++;
+        programs.set(id, { pipeline, stride, uniformSize, bindingLayout, explicitBindings: bufferBindings !== undefined });
+        return id;
+      };
+      if (pipelines.has(key)) {
+        const pipeline = pipelines.get(key);
+        pipelines.delete(key); pipelines.set(key, pipeline);
+        ++pipelineHits;
+        return publish(pipeline);
+      }
+      ++pipelineMisses;
       busy = true;
       device.pushErrorScope('validation');
       let pipeline, failure;
@@ -132,9 +161,11 @@ export function createGXMRenderer(device) {
       }
       if (failure) throw failure;
       if (lost) throw new Error(lost);
-      const id = nextId++;
-      programs.set(id, { pipeline, stride, uniformSize, bindingLayout, explicitBindings: bufferBindings !== undefined });
-      return id;
+      // Failed compilation/validation never populates the cache. Eviction drops
+      // only this reference; live program handles retain their own pipeline.
+      pipelines.set(key, pipeline);
+      if (pipelines.size > pipelineLimit) pipelines.delete(pipelines.keys().next().value);
+      return publish(pipeline);
     },
 
     // Exclusive, completion-safe submission. All input views are copied before
@@ -246,10 +277,14 @@ export function createGXMRenderer(device) {
       lookup(programs, id, 'program');
       programs.delete(id);
     },
+    pipelineCacheStats() {
+      return Object.freeze({ hits: pipelineHits, misses: pipelineMisses,
+        entries: pipelines.size, limit: pipelineLimit });
+    },
     dispose() {
       if (busy) throw new Error('renderer operation in flight; await completion');
       for (const target of targets.values()) target.texture.destroy();
-      targets.clear(); programs.clear(); disposed = true;
+      targets.clear(); programs.clear(); pipelines.clear(); disposed = true;
     },
   });
 }
