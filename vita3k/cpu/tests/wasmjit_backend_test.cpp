@@ -194,6 +194,112 @@ void signed_long_multiply(MemState &mem) {
     }
 }
 
+void scalar_fp_mode_guards(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        for (bool thumb : {false, true}) for (uint32_t opcode :
+             {0xee200a20u, 0xee300a20u, 0xee300a60u, 0xee800a20u, 0xeeb80a61u, 0xeeb80ae1u}) {
+            if (thumb) put_thumb(mem, jit, {(opcode << 16) | (opcode >> 16), 0xbf00df00});
+            else put(mem, jit, {opcode, 0xef000000});
+            jit.set_fpscr(0);
+            CHECK(jit.run() == 0); // populate the compiled-code cache
+            for (uint32_t mode : {0x100u, 0x200u, 0x400u, 0x800u, 0x1000u, 0x8000u,
+                     0x00400000u, 0x00800000u, 0x00c00000u}) {
+                jit.set_pc(code);
+                jit.set_cpsr(thumb ? 0x30 : 0x10);
+                jit.set_fpscr(mode);
+                parent.svc_called = false;
+                const auto before = jit.save_context();
+                CHECK(jit.run() < 0);
+                const auto after = jit.save_context();
+                CHECK(!parent.svc_called);
+                CHECK(after.fpscr == mode);
+                CHECK(std::memcmp(&before.fpu_registers, &after.fpu_registers, sizeof(before.fpu_registers)) == 0);
+            }
+        }
+    }
+}
+
+void scalar_binary32_batch(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    struct Case { uint32_t opcode, a, b, result, flags; };
+    // All instructions use s0 = s0 op s1, exercising source/dest overlap.
+    const Case cases[] = {
+        {0xee200a20, 0x3fc00000, 0x40000000, 0x40400000, 0}, // multiply
+        {0xee200a20, 0x7f800000, 0, 0x7fc00000, 1},
+        {0xee200a20, 0x80000000, 0x40000000, 0x80000000, 0},
+        {0xee200a20, 0x7f7fffff, 0x40000000, 0x7f800000, 0x14},
+        {0xee200a20, 0x00800000, 0x3f000000, 0x00400000, 0},
+        {0xee200a20, 0x00800001, 0x3f000000, 0x00400000, 0x18},
+        {0xee200a20, 0x3f800001, 0x3f800001, 0x3f800002, 0x10},
+        {0xee300a20, 0x3f800000, 0x40000000, 0x40400000, 0}, // add
+        {0xee300a20, 0x7f800000, 0xff800000, 0x7fc00000, 1},
+        {0xee300a20, 0x7f7fffff, 0x7f7fffff, 0x7f800000, 0x14},
+        {0xee300a20, 0x3f800000, 0x33800000, 0x3f800000, 0x10}, // tie
+        {0xee300a20, 0x3f800000, 0x00800000, 0x3f800000, 0x10}, // wide lost addend
+        {0xee300a20, 0x80000000, 0x80000000, 0x80000000, 0},
+        {0xee300a20, 0x3f800000, 0xbf800000, 0, 0}, // exact cancellation
+        {0xee300a60, 0x40400000, 0x3f800000, 0x40000000, 0}, // subtract
+        {0xee300a60, 0x7f800000, 0x7f800000, 0x7fc00000, 1},
+        {0xee300a60, 0x00800001, 0x00800000, 1, 0},
+        {0xee300a60, 0x3f800000, 0x00800000, 0x3f800000, 0x10},
+        {0xee300a60, 0x3f800000, 0x3f800000, 0, 0},
+        {0xee200a20, 0xffc12345, 0x3f800000, 0xffc12345, 0},
+        {0xee200a20, 0x7fc12345, 0xff812345, 0xffc12345, 1},
+        {0xee300a20, 0x7f812345, 0xffc12345, 0x7fc12345, 1},
+        {0xee300a60, 0x3f800000, 0xffc12345, 0xffc12345, 0},
+        {0xee300a60, 0xff812345, 0x7f812345, 0xffc12345, 1},
+        {0xee200a20, 1, 0x3f800000, 1, 0},
+        {0xee200a20, 0x80000001, 0x3f800000, 0x80000001, 0},
+        {0xee300a20, 1, 0x00800000, 0x00800001, 0},
+        {0xee300a60, 0x00800000, 1, 0x007fffff, 0},
+        {0xee200a20, 0x00800000, 0x3f7fffff, 0x00800000, 0x18}, // tiny before rounding
+
+    };
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        for (bool thumb : {false, true}) for (bool flush : {false, true})
+            for (bool default_nan : {false, true}) {
+            for (const auto &c : cases) {
+                if (thumb) put_thumb(mem, jit, {(c.opcode << 16) | (c.opcode >> 16), 0xbf00df00});
+                else put(mem, jit, {c.opcode, 0xef000000});
+                auto before = jit.save_context();
+                std::memcpy(&before.fpu_registers[0], &c.a, 4);
+                std::memcpy(&before.fpu_registers[1], &c.b, 4);
+                before.fpscr = 0xa0000002 | (flush ? 0x01000000 : 0)
+                    | (default_nan ? 0x02000000 : 0);
+                jit.load_context(before);
+                CHECK(jit.run() == 0);
+                const auto after = jit.save_context();
+                uint32_t actual; std::memcpy(&actual, &after.fpu_registers[0], 4);
+                const bool tiny = (c.result & 0x7fffffff) != 0 && (c.result & 0x7fffffff) < 0x00800000;
+                auto expected = default_nan && (c.result & 0x7fffffff) > 0x7f800000
+                    ? 0x7fc00000u : flush && tiny ? c.result & 0x80000000 : c.result;
+                auto flags = flush && tiny ? 8u : c.flags;
+                if (flush && (c.a == 1 || c.a == 0x80000001)) {
+                    expected = c.opcode == 0xee200a20 ? c.a & 0x80000000 : c.b;
+                    flags = 0x80;
+                }
+                if (flush && c.b == 1) { expected = c.a; flags = 0x80; }
+                if (flush && c.a == 0x00800000 && c.b == 0x3f7fffff) { expected = 0; flags = 8; }
+                if (actual != expected || after.fpscr != (before.fpscr | flags))
+                    std::fprintf(stderr, "binary FP op=%08x a=%08x b=%08x got=%08x expected=%08x fpscr=%08x expected=%08x\n", c.opcode, c.a, c.b, actual, expected, after.fpscr, before.fpscr | flags);
+                CHECK(actual == expected);
+                CHECK(after.fpscr == (before.fpscr | flags));
+                CHECK(after.cpsr == before.cpsr);
+                CHECK(parent.svc_called);
+            }
+        }
+    }
+}
+
 void float_divide32(MemState &mem) {
     CPUState parent{};
     parent.mem = &mem;
@@ -270,6 +376,39 @@ void float_divide32(MemState &mem) {
     }
 }
 
+void unsigned_integer_to_float32(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    struct Case { uint32_t input, expected, flags; };
+    const Case cases[] = {{0, 0, 0}, {1, 0x3f800000, 0},
+        {0xffffffff, 0x4f800000, 0x10}, {0x80000000, 0x4f000000, 0},
+        {16777217, 0x4b800000, 0x10}, {16777219, 0x4b800002, 0x10}};
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        for (bool thumb : {false, true}) for (const auto &c : cases) {
+            // VCVT.F32.U32 s0,s3 with FPSCR round-to-nearest.
+            if (thumb) put_thumb(mem, jit, {0x0a61eeb8, 0xbf00df00});
+            else put(mem, jit, {0xeeb80a61, 0xef000000});
+            auto before = jit.save_context();
+            std::memcpy(&before.fpu_registers[3], &c.input, 4);
+            before.fpscr = 0xa3000001;
+            jit.load_context(before);
+            CHECK(jit.run() == 0);
+            const auto after = jit.save_context();
+            uint32_t result; std::memcpy(&result, &after.fpu_registers[0], 4);
+            if (result != c.expected || after.fpscr != (before.fpscr | c.flags))
+                std::fprintf(stderr, "VCVT.U32 input=%08x result=%08x expected=%08x FPSCR=%08x expected=%08x differing-bits=%08x\n",
+                    c.input, result, c.expected, after.fpscr, before.fpscr | c.flags,
+                    after.fpscr ^ (before.fpscr | c.flags));
+            CHECK(result == c.expected);
+            CHECK(after.fpscr == (before.fpscr | c.flags));
+            CHECK(after.cpsr == before.cpsr);
+        }
+    }
+}
+
 void integer_to_float32(MemState &mem) {
     CPUState parent{};
     parent.mem = &mem;
@@ -284,7 +423,7 @@ void integer_to_float32(MemState &mem) {
     for (bool regions : {false, true}) {
         jit.set_region_mode(regions);
         for (bool thumb : {false, true}) for (const auto &[input, expected] : cases) {
-            // VCVT.F32.S32 s0,s3 uses round-to-nearest, ties-to-even.
+            // VCVT.F32.S32 s0,s3 with FPSCR round-to-nearest, ties-to-even.
             if (thumb) put_thumb(mem, jit, {0x0ae1eeb8, 0xbf00df00});
             else put(mem, jit, {0xeeb80ae1, 0xef000000});
             auto context = jit.save_context();
@@ -312,12 +451,12 @@ void floating_abs32(MemState &mem) {
     jit.set_instruction_budget(16);
     for (bool regions : {false, true}) {
         jit.set_region_mode(regions);
-        for (bool thumb : {false, true}) {
+        for (bool thumb : {false, true}) for (bool negate : {false, true}) {
             for (uint32_t bits : {0u, 0x80000000u, 0xbf800000u, 0xff800000u,
                      0xff800001u, 0xffc12345u, 0x80000001u, 0x3f800000u}) {
-                // VABS.F32 s0,s0 must preserve NaN payloads and subnormals.
-                if (thumb) put_thumb(mem, jit, {0x0ac0eeb0, 0xbf00df00});
-                else put(mem, jit, {0xeeb00ac0, 0xef000000});
+                // VABS/VNEG.F32 s0,s0 preserve NaN payloads and subnormals.
+                if (thumb) put_thumb(mem, jit, {negate ? 0x0a40eeb1u : 0x0ac0eeb0u, 0xbf00df00});
+                else put(mem, jit, {negate ? 0xeeb10a40u : 0xeeb00ac0u, 0xef000000});
                 auto context = jit.save_context();
                 std::memcpy(&context.fpu_registers[0], &bits, 4);
                 context.fpscr = 0xf3000091;
@@ -327,7 +466,7 @@ void floating_abs32(MemState &mem) {
                 const auto after = jit.save_context();
                 uint32_t result;
                 std::memcpy(&result, &after.fpu_registers[0], 4);
-                CHECK(result == (bits & 0x7fffffffu));
+                CHECK(result == (negate ? bits ^ 0x80000000u : bits & 0x7fffffffu));
                 CHECK(after.fpscr == context.fpscr);
                 CHECK(after.cpsr == context.cpsr);
             }
@@ -1509,8 +1648,11 @@ int main() {
     signed_long_multiply(mem);
     floating_compare32(mem);
     floating_abs32(mem);
+    unsigned_integer_to_float32(mem);
     integer_to_float32(mem);
     float_divide32(mem);
+    scalar_binary32_batch(mem);
+    scalar_fp_mode_guards(mem);
     floating_compare_trap_guard(mem);
     backend(mem);
     formation(mem);

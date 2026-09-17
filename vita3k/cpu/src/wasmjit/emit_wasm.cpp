@@ -1783,23 +1783,32 @@ private:
             break;
         }
         case Op::FPFixedS32ToSingle:
-            // This scalar VCVT form explicitly requests nearest/ties-even,
-            // independent of FPSCR.RMode. Other fixed-point modes stay rejected.
+        case Op::FPFixedU32ToSingle:
+            // The IR carries an explicit rounding mode (scalar integer VCVT
+            // gets it from FPSCR). Only unscaled nearest/ties-even is supported.
             if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0
                 || !inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU8() != 0)
                 return false;
             load(offsetof(JitState, fpscr)); mask(0x00009f00u);
             begin_if(); ret(ExitReason::Unsupported); end_if();
-            arg(0); op(0xb2); // f32.convert_i32_s (nearest/ties-even)
+            arg(0); op(kind == Op::FPFixedU32ToSingle ? 0xb3 : 0xb2); // f32.convert_i32_u/s
             op(0xbc); set(next_local); // i32.reinterpret_f32, retain result bits
             get(0); load(offsetof(JitState, fpscr));
             // f64 represents every i32 exactly. Compare the rounded result
             // against that exact value to accumulate FPSCR.IXC.
-            arg(0); op(0xb7); // f64.convert_i32_s
+            arg(0); op(kind == Op::FPFixedU32ToSingle ? 0xb8 : 0xb7); // f64.convert_i32_u/s
             get(next_local); op(0xbe); op(0xbb); // f32 bits -> f64.promote_f32
             op(0x62); imm(4); op(Shl); op(Or); store(offsetof(JitState, fpscr));
             return ok;
+        case Op::FPAdd32:
+        case Op::FPSub32:
+        case Op::FPMul32:
         case Op::FPDiv32: {
+            const bool division = kind == Op::FPDiv32;
+            const bool multiply = kind == Op::FPMul32;
+            const bool subtract = kind == Op::FPSub32;
+            const uint8_t narrow_op = division ? 0x95 : multiply ? 0x94 : subtract ? 0x93 : 0x92;
+            const uint8_t wide_op = division ? 0xa3 : multiply ? 0xa2 : subtract ? 0xa1 : 0xa0;
             // Wasm arithmetic rounds to nearest-even. Other guest rounding
             // modes remain unsupported rather than silently giving RN results.
             if (start.FPSCR().Value() & 0x00c00000u) return false;
@@ -1838,36 +1847,63 @@ private:
             else get(nan);
             set(next_local);
             op(Else);
-            get(aa); op(Eqz); get(ab); op(Eqz); op(And);
-            get(aa); imm(0x7f800000); op(Eq);
-            get(ab); imm(0x7f800000); op(Eq); op(And); op(Or);
-            begin_if(); // 0/0 or infinity/infinity
+            if (division) {
+                get(aa); op(Eqz); get(ab); op(Eqz); op(And);
+                get(aa); imm(0x7f800000); op(Eq);
+                get(ab); imm(0x7f800000); op(Eq); op(And); op(Or);
+            } else if (multiply) {
+                get(aa); op(Eqz); get(ab); imm(0x7f800000); op(Eq); op(And);
+                get(ab); op(Eqz); get(aa); imm(0x7f800000); op(Eq); op(And); op(Or);
+            } else {
+                get(aa); imm(0x7f800000); op(Eq);
+                get(ab); imm(0x7f800000); op(Eq); op(And);
+                get(a); get(b); op(Xor); mask(0x80000000);
+                if (subtract) op(Eqz);
+                else { op(Eqz); op(Eqz); }
+                op(And);
+            }
+            begin_if(); // invalid finite/infinity combination
             accumulate(1); imm(0x7fc00000); set(next_local);
             op(Else);
-            get(a); op(0xbe); get(b); op(0xbe); op(0x95); // reinterpret, f32.div
+            get(a); op(0xbe); get(b); op(0xbe); op(narrow_op);
             op(0xbc); set(next_local); // publish result bits to an i32 SSA slot
-            get(ab); op(Eqz);
-            get(aa); imm(0x7f800000); op(LtU); op(And); begin_if();
+            if (division) {
+                get(ab); op(Eqz);
+                get(aa); imm(0x7f800000); op(LtU); op(And);
+            } else imm(0);
+            begin_if();
             accumulate(2); // finite nonzero / zero: DZC
             op(Else);
             get(aa); imm(0x7f800000); op(LtU);
             get(ab); imm(0x7f800000); op(LtU); op(And); begin_if();
-            // Binary64 has ample precision/exponent range to distinguish an
-            // exact binary32 quotient from a rounded one (24-bit operands).
-            const auto wide_quotient = [&] {
+            // Every binary32 product is exact in binary64; binary64 division
+            // also distinguishes exact from inexact binary32 quotients.
+            // Addition/subtraction need a lost-addend check (below).
+            const auto wide_result = [&] {
                 get(a); op(0xbe); op(0xbb);
-                get(b); op(0xbe); op(0xbb); op(0xa3); // f64.div
+                get(b); op(0xbe); op(0xbb); op(wide_op);
             };
-            wide_quotient(); op(0x99); // f64.abs
+            wide_result(); op(0x99); // f64.abs
             imm(0x00800000); op(0xbe); op(0xbb); op(0x63); // f64.lt min-normal
-            get(aa); op(Eqz); op(Eqz); op(And); set(next_local + 7);
+            wide_result(); imm(0); op(0xbe); op(0xbb); op(0x62);
+            op(And); set(next_local + 7);
             if (start.FPSCR().FTZ()) {
                 get(next_local + 7); begin_if();
                 accumulate(8); // FZ underflow does not additionally raise IXC
-                get(a); get(b); op(Xor); mask(0x80000000); set(next_local);
+                get(next_local); mask(0x80000000); set(next_local);
                 op(Else);
             }
-            wide_quotient(); get(next_local); op(0xbe); op(0xbb); op(0x62);
+            wide_result(); get(next_local); op(0xbe); op(0xbb); op(0x62);
+            if (!division && !multiply) {
+                // If the exponent gap exceeds binary64 precision, even the
+                // wide result can lose a nonzero addend. Reverse both sums
+                // to detect that case instead of missing FPSCR.IXC.
+                wide_result(); get(a); op(0xbe); op(0xbb); op(0xa1);
+                get(b); op(0xbe); op(0xbb); if (subtract) op(0x9a);
+                op(0x62); op(Or);
+                wide_result(); get(b); op(0xbe); op(0xbb); op(subtract ? 0xa0 : 0xa1);
+                get(a); op(0xbe); op(0xbb); op(0x62); op(Or);
+            }
             begin_if();
             accumulate(0x10);
             get(next_local + 7); begin_if(); accumulate(8); end_if();
@@ -1879,6 +1915,7 @@ private:
             get(0); load(offsetof(JitState, fpscr)); get(flags); op(Or); store(offsetof(JitState, fpscr));
             return ok;
         }
+        case Op::FPNeg32: arg(0); imm(0x80000000); op(Xor); break;
         case Op::FPAbs32: arg(0); mask(0x7fffffff); break;
         case Op::A32GetFpscrNZCV:
             load(offsetof(JitState, fpscr)); mask(0xf0000000); break;
