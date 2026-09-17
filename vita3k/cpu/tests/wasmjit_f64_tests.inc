@@ -387,6 +387,240 @@ void double_to_single() {
     }
 }
 
+// Float-to-integer conversion (VCVT.S32.F32/F64, fbits == 0). Rounding
+// immediates follow Dynarmic::FP::RoundingMode: 0 is nearest-even (VCVTR
+// under a default FPSCR), 3 is towards-zero (plain VCVT). Expected values
+// below are hand-derived from the exact binary value: saturation with IOC
+// for NaN/infinity/overflow, IXC for any dropped fraction, and the
+// 2^31 boundary staying exact only for negative signed. Sticky FPSCR bits
+// must survive; only the new flags are accumulated.
+void float_to_int32() {
+    struct Case { Op op; uint64_t input; uint32_t result; uint32_t flags; uint8_t rounding; };
+    const Case cases[] = {
+        // binary32, towards-zero
+        {Op::FPSingleToFixedS32, 0x00000000, 0x00000000u, 0, 3}, // +0 exact
+        {Op::FPSingleToFixedS32, 0x80000000, 0x00000000u, 0, 3}, // -0 exact
+        {Op::FPSingleToFixedS32, 0x3f800000, 1, 0, 3}, // 1.0
+        {Op::FPSingleToFixedS32, 0xbf800000, 0xffffffffu, 0, 3}, // -1.0
+        {Op::FPSingleToFixedS32, 0x3fc00000, 1, 0x10, 3}, // 1.5 truncates
+        {Op::FPSingleToFixedS32, 0xbfc00000, 0xffffffffu, 0x10, 3}, // -1.5
+        {Op::FPSingleToFixedS32, 0x40200000, 2, 0x10, 3}, // 2.5
+        {Op::FPSingleToFixedS32, 0xc0200000, 0xfffffffeu, 0x10, 3}, // -2.5
+        {Op::FPSingleToFixedS32, 0x3f000000, 0, 0x10, 3}, // 0.5
+        {Op::FPSingleToFixedS32, 0xbf000000, 0, 0x10, 3}, // -0.5 -> +0
+        {Op::FPSingleToFixedS32, 0x4f000000, 0x7fffffffu, 1, 3}, // 2^31 saturates
+        {Op::FPSingleToFixedS32, 0xcf000000, 0x80000000u, 0, 3}, // -2^31 exact
+        {Op::FPSingleToFixedS32, 0x4f000001, 0x7fffffffu, 1, 3}, // just above 2^31
+        {Op::FPSingleToFixedS32, 0xceffffff, 0x80000080u, 0, 3}, // just above -2^31
+        {Op::FPSingleToFixedS32, 0x4b800000, 0x01000000u, 0, 3}, // 2^24
+        {Op::FPSingleToFixedS32, 0x4b800001, 0x01000002u, 0, 3}, // 2^24 + 2
+        {Op::FPSingleToFixedS32, 0xcb800000, 0xff000000u, 0, 3}, // -2^24
+        {Op::FPSingleToFixedS32, 0x33800000, 0, 0x10, 3}, // tiny normal
+        {Op::FPSingleToFixedS32, 0x7f800000, 0x7fffffffu, 1, 3}, // +inf
+        {Op::FPSingleToFixedS32, 0xff800000, 0x80000000u, 1, 3}, // -inf
+        {Op::FPSingleToFixedS32, 0x7fc00000, 0, 1, 3}, // quiet NaN
+        {Op::FPSingleToFixedS32, 0x7f800001, 0, 1, 3}, // signaling NaN
+        {Op::FPSingleToFixedS32, 0xffc00000, 0, 1, 3}, // negative NaN
+        {Op::FPSingleToFixedS32, 0x00000001, 0, 0x10, 3}, // min denormal
+        {Op::FPSingleToFixedS32, 0x007fffff, 0, 0x10, 3}, // max denormal
+        {Op::FPSingleToFixedS32, 0x00800000, 0, 0x10, 3}, // min normal
+        // binary32, nearest-even
+        {Op::FPSingleToFixedS32, 0x3f000000, 0, 0x10, 0}, // 0.5 ties to even 0
+        {Op::FPSingleToFixedS32, 0x3fc00000, 2, 0x10, 0}, // 1.5 rounds to 2
+        {Op::FPSingleToFixedS32, 0x40200000, 2, 0x10, 0}, // 2.5 ties to even 2
+        {Op::FPSingleToFixedS32, 0x40200001, 3, 0x10, 0}, // above the tie
+        {Op::FPSingleToFixedS32, 0xbf000000, 0, 0x10, 0}, // -0.5 ties to 0
+        {Op::FPSingleToFixedS32, 0xbfc00000, 0xfffffffeu, 0x10, 0}, // -1.5 to -2
+        {Op::FPSingleToFixedS32, 0xc0200000, 0xfffffffeu, 0x10, 0}, // -2.5 to -2
+        {Op::FPSingleToFixedS32, 0x3f800000, 1, 0, 0}, // 1.0 exact
+        {Op::FPSingleToFixedS32, 0x3f800001, 1, 0x10, 0}, // 1 + ulp
+        {Op::FPSingleToFixedS32, 0x4f000000, 0x7fffffffu, 1, 0}, // overflow
+        {Op::FPSingleToFixedS32, 0xcf000000, 0x80000000u, 0, 0}, // -2^31 exact
+        {Op::FPSingleToFixedS32, 0x7fc00000, 0, 1, 0}, // NaN
+        {Op::FPSingleToFixedS32, 0x7f800000, 0x7fffffffu, 1, 0}, // +inf
+        // binary64, towards-zero
+        {Op::FPDoubleToFixedS32, 0x3ff0000000000000ull, 1, 0, 3}, // 1.0
+        {Op::FPDoubleToFixedS32, 0xbff8000000000000ull, 0xffffffffu, 0x10, 3}, // -1.5
+        {Op::FPDoubleToFixedS32, 0xc004000000000000ull, 0xfffffffeu, 0x10, 3}, // -2.5
+        {Op::FPDoubleToFixedS32, 0x41e0000000000000ull, 0x7fffffffu, 1, 3}, // 2^31
+        {Op::FPDoubleToFixedS32, 0xc1e0000000000000ull, 0x80000000u, 0, 3}, // -2^31 exact
+        {Op::FPDoubleToFixedS32, 0x41d0000000000000ull, 0x40000000u, 0, 3}, // 2^30
+        {Op::FPDoubleToFixedS32, 0x3ff0000000000001ull, 1, 0x10, 3}, // 1 + ulp
+        {Op::FPDoubleToFixedS32, 0x4330000000000000ull, 0x7fffffffu, 1, 3}, // 2^52
+        {Op::FPDoubleToFixedS32, 0x7ff0000000000000ull, 0x7fffffffu, 1, 3}, // +inf
+        {Op::FPDoubleToFixedS32, 0xfff0000000000000ull, 0x80000000u, 1, 3}, // -inf
+        {Op::FPDoubleToFixedS32, 0x7ff8000000000000ull, 0, 1, 3}, // quiet NaN
+        {Op::FPDoubleToFixedS32, 0x7ff0000000000001ull, 0, 1, 3}, // signaling NaN
+        {Op::FPDoubleToFixedS32, 0x0000000000000001ull, 0, 0x10, 3}, // min denormal
+        {Op::FPDoubleToFixedS32, 0x0010000000000000ull, 0, 0x10, 3}, // min normal
+        // binary64, nearest-even
+        {Op::FPDoubleToFixedS32, 0x3ff8000000000000ull, 2, 0x10, 0}, // 1.5 to 2
+        {Op::FPDoubleToFixedS32, 0x4004000000000000ull, 2, 0x10, 0}, // 2.5 to 2
+        {Op::FPDoubleToFixedS32, 0x3fe0000000000000ull, 0, 0x10, 0}, // 0.5 to 0
+        {Op::FPDoubleToFixedS32, 0x3ff0000000000000ull, 1, 0, 0}, // 1.0 exact
+        {Op::FPDoubleToFixedS32, 0xc1e0000000000000ull, 0x80000000u, 0, 0},
+        {Op::FPDoubleToFixedS32, 0x7ff8000000000000ull, 0, 1, 0}, // NaN
+    };
+    for (const auto &c : cases) {
+        auto block = blank(0);
+        const bool is_double = c.op == Op::FPDoubleToFixedS32;
+        const auto value = is_double
+            ? append(block, c.op, {read_d(block), Value{uint8_t(0)}, Value{c.rounding}})
+            : append(block, c.op, {read_s(block), Value{uint8_t(0)}, Value{c.rounding}});
+        write_s(block, value);
+        auto state = base_state(0x9000001cu), expected = state;
+        if (is_double) set_d_bits(state, c.input);
+        else set_s_bits(state, uint32_t(c.input));
+        expected = state;
+        set_s_bits(expected, c.result);
+        expected.fpscr |= c.flags;
+        run(block, state, &expected);
+    }
+    // FZ flushes a denormal input to a signed zero and raises IDC, while a
+    // tiny normal input still truncates with IXC.
+    struct FlushCase { Op op; uint64_t input; uint32_t result; };
+    const FlushCase flushes[] = {
+        {Op::FPSingleToFixedS32, 0x00400000, 0},
+        {Op::FPSingleToFixedS32, 0x80400000, 0},
+        {Op::FPDoubleToFixedS32, 0x0008000000000000ull, 0},
+        {Op::FPDoubleToFixedS32, 0x8008000000000000ull, 0},
+    };
+    for (const auto &c : flushes) {
+        auto block = blank(fpscr_fz);
+        const bool is_double = c.op == Op::FPDoubleToFixedS32;
+        const auto value = is_double
+            ? append(block, c.op, {read_d(block), Value{uint8_t(0)}, Value{uint8_t(3)}})
+            : append(block, c.op, {read_s(block), Value{uint8_t(0)}, Value{uint8_t(3)}});
+        write_s(block, value);
+        auto state = base_state(fpscr_fz), expected = state;
+        if (is_double) set_d_bits(state, c.input);
+        else set_s_bits(state, uint32_t(c.input));
+        expected = state;
+        set_s_bits(expected, c.result);
+        expected.fpscr = fpscr_fz | 0x80;
+        run(block, state, &expected);
+    }
+    for (uint64_t input : {0x00800000ull, 0x80800000ull}) {
+        auto block = blank(fpscr_fz);
+        write_s(block, append(block, Op::FPSingleToFixedS32,
+            {read_s(block), Value{uint8_t(0)}, Value{uint8_t(3)}}));
+        auto state = base_state(fpscr_fz), expected = state;
+        set_s_bits(state, uint32_t(input));
+        expected = state;
+        set_s_bits(expected, 0);
+        expected.fpscr = fpscr_fz | 0x10;
+        run(block, state, &expected);
+    }
+    // DN has no integer result to canonicalize, so a NaN converts as usual.
+    {
+        auto block = blank(fpscr_dn);
+        write_s(block, append(block, Op::FPSingleToFixedS32,
+            {read_s(block), Value{uint8_t(0)}, Value{uint8_t(3)}}));
+        auto state = base_state(fpscr_dn), expected = state;
+        set_s_bits(state, 0xffc00001u);
+        expected = state;
+        set_s_bits(expected, 0);
+        expected.fpscr = fpscr_dn | 1;
+        run(block, state, &expected);
+    }
+    // Scaled fixed-point forms stay rejected, as do the other explicit
+    // rounding modes (VCVTA/VCVTP/VCVTM); the route must fail closed.
+    auto scaled = blank(0);
+    write_s(scaled, append(scaled, Op::FPSingleToFixedS32,
+        {read_s(scaled), Value{uint8_t(8)}, Value{uint8_t(3)}}));
+    CHECK(vita3k::wasmjit::emit_block(scaled).empty());
+    for (uint8_t rounding : {1, 2, 4, 5}) {
+        for (Op op : {Op::FPSingleToFixedS32, Op::FPSingleToFixedU32,
+                 Op::FPDoubleToFixedS32, Op::FPDoubleToFixedU32}) {
+            auto bad = blank(0);
+            const bool is_double = op == Op::FPDoubleToFixedS32 || op == Op::FPDoubleToFixedU32;
+            const auto input = is_double ? read_d(bad) : read_s(bad);
+            write_s(bad, append(bad, op, {input, Value{uint8_t(0)}, Value{rounding}}));
+            CHECK(vita3k::wasmjit::emit_block(bad).empty());
+            const A32::LocationDescriptor at{bad.Location()};
+            CHECK(vita3k::wasmjit::emit_region({&bad}, {{at.PC(), PSR_DISPATCH_MASK,
+                at.CPSR().Value() & PSR_DISPATCH_MASK, 1}}).empty());
+        }
+    }
+}
+
+void float_to_uint32() {
+    struct Case { Op op; uint64_t input; uint32_t result; uint32_t flags; uint8_t rounding; };
+    const Case cases[] = {
+        // binary32, towards-zero. Negative inputs (other than -0) saturate
+        // to zero with IOC, taking precedence over any truncation.
+        {Op::FPSingleToFixedU32, 0x3f800000, 1, 0, 3}, // 1.0
+        {Op::FPSingleToFixedU32, 0x3fc00000, 1, 0x10, 3}, // 1.5
+        {Op::FPSingleToFixedU32, 0x4f7fffff, 0xffffff00u, 0, 3}, // largest exact
+        {Op::FPSingleToFixedU32, 0x4f800000, 0xffffffffu, 1, 3}, // 2^32 saturates
+        {Op::FPSingleToFixedU32, 0x4f000000, 0x80000000u, 0, 3}, // 2^31 exact
+        {Op::FPSingleToFixedU32, 0xcf800000, 0, 1, 3}, // -1.0
+        {Op::FPSingleToFixedU32, 0xbf800000, 0, 1, 3}, // -0.5, not IXC
+        {Op::FPSingleToFixedU32, 0x80000000, 0, 0, 3}, // -0 exact, no IOC
+        {Op::FPSingleToFixedU32, 0x80000001, 0, 1, 3}, // negative denormal
+        {Op::FPSingleToFixedU32, 0x7fc00000, 0, 1, 3}, // NaN
+        {Op::FPSingleToFixedU32, 0x7f800000, 0xffffffffu, 1, 3}, // +inf
+        {Op::FPSingleToFixedU32, 0xff800000, 0, 1, 3}, // -inf
+        {Op::FPSingleToFixedU32, 0x00000001, 0, 0x10, 3}, // min denormal
+        // binary32, nearest-even
+        {Op::FPSingleToFixedU32, 0x3fc00000, 2, 0x10, 0},
+        {Op::FPSingleToFixedU32, 0x40200000, 2, 0x10, 0},
+        {Op::FPSingleToFixedU32, 0x3f000000, 0, 0x10, 0},
+        // binary64, towards-zero
+        {Op::FPDoubleToFixedU32, 0x3ff8000000000000ull, 1, 0x10, 3}, // 1.5
+        {Op::FPDoubleToFixedU32, 0x41efffffffffffffull, 0xffffffffu, 0x10, 3}, // max - ulp
+        {Op::FPDoubleToFixedU32, 0xbff0000000000000ull, 0, 1, 3}, // -1.0
+        {Op::FPDoubleToFixedU32, 0xc1e0000000000000ull, 0, 1, 3}, // -2^31
+        {Op::FPDoubleToFixedU32, 0xfff0000000000000ull, 0, 1, 3}, // -inf
+        {Op::FPDoubleToFixedU32, 0x41e0000000000000ull, 0x80000000u, 0, 3}, // 2^31
+        {Op::FPDoubleToFixedU32, 0x41f0000000000000ull, 0xffffffffu, 1, 3}, // 2^32
+        {Op::FPDoubleToFixedU32, 0x7ff8000000000000ull, 0, 1, 3}, // NaN
+        {Op::FPDoubleToFixedU32, 0x7ff0000000000000ull, 0xffffffffu, 1, 3}, // +inf
+        // binary64, nearest-even
+        {Op::FPDoubleToFixedU32, 0x3ff8000000000000ull, 2, 0x10, 0},
+        {Op::FPDoubleToFixedU32, 0x4004000000000000ull, 2, 0x10, 0},
+    };
+    for (const auto &c : cases) {
+        auto block = blank(0);
+        const bool is_double = c.op == Op::FPDoubleToFixedU32;
+        const auto value = is_double
+            ? append(block, c.op, {read_d(block), Value{uint8_t(0)}, Value{c.rounding}})
+            : append(block, c.op, {read_s(block), Value{uint8_t(0)}, Value{c.rounding}});
+        write_s(block, value);
+        auto state = base_state(0x9000001cu), expected = state;
+        if (is_double) set_d_bits(state, c.input);
+        else set_s_bits(state, uint32_t(c.input));
+        expected = state;
+        set_s_bits(expected, c.result);
+        expected.fpscr |= c.flags;
+        run(block, state, &expected);
+    }
+    // An FZ-flushed negative denormal raises IDC; without the flush the
+    // same input would be an invalid negative conversion.
+    for (uint64_t input : {0x80400000ull, 0x80000001ull}) {
+        auto block = blank(fpscr_fz);
+        write_s(block, append(block, Op::FPSingleToFixedU32,
+            {read_s(block), Value{uint8_t(0)}, Value{uint8_t(3)}}));
+        auto state = base_state(fpscr_fz), expected = state;
+        set_s_bits(state, uint32_t(input));
+        expected = state;
+        set_s_bits(expected, 0);
+        expected.fpscr = fpscr_fz | 0x80;
+        run(block, state, &expected);
+    }
+    {
+        auto block = blank(fpscr_fz);
+        write_s(block, append(block, Op::FPDoubleToFixedU32,
+            {read_d(block), Value{uint8_t(0)}, Value{uint8_t(3)}}));
+        auto state = base_state(fpscr_fz), expected = state;
+        set_d_bits(state, 0x8008000000000000ull);
+        expected = state;
+        set_s_bits(expected, 0);
+        expected.fpscr = fpscr_fz | 0x80;
+        run(block, state, &expected);
+    }
+}
+
 void compare64() {
     // VCMPSD/VCMPS-style NZCV results from the two operands. C=1,V=1 unordered;
     // Z,C equal; N less; C greater.
@@ -436,15 +670,23 @@ void compare64() {
 // Trap enables are live state, not part of the location key. Reuse each
 // compiled module with every enable and require a bail before architectural writes.
 void mode_guards() {
-    for (Op opcode : {Op::FPSingleToDouble, Op::FPDoubleToSingle, Op::FPCompare64}) {
+    for (Op opcode : {Op::FPSingleToDouble, Op::FPDoubleToSingle, Op::FPCompare64,
+             Op::FPSingleToFixedS32, Op::FPSingleToFixedU32, Op::FPDoubleToFixedS32,
+             Op::FPDoubleToFixedU32}) {
         auto block = blank(0);
         if (opcode == Op::FPSingleToDouble)
             write_d(block, append(block, opcode, {read_s(block), Value{uint8_t(0)}}));
         else if (opcode == Op::FPDoubleToSingle)
             write_s(block, append(block, opcode, {read_d(block), Value{uint8_t(0)}}));
-        else
+        else if (opcode == Op::FPCompare64)
             append(block, Op::A32SetFpscrNZCV, {append(block, opcode,
                 {read_d(block), read_d(block, 1), Value{false}})});
+        else if (opcode == Op::FPSingleToFixedS32 || opcode == Op::FPSingleToFixedU32)
+            write_s(block, append(block, opcode,
+                {read_s(block), Value{uint8_t(0)}, Value{uint8_t(3)}}));
+        else
+            write_s(block, append(block, opcode,
+                {read_d(block), Value{uint8_t(0)}, Value{uint8_t(3)}}));
         const A32::LocationDescriptor at{block.Location()};
         for (bool region : {false, true}) {
             const auto bytes = region ? vita3k::wasmjit::emit_region({&block},
@@ -480,6 +722,69 @@ void mode_guards() {
                 write_s(block, append(block, opcode, {read_d(block), Value{rounding}}));
             CHECK(vita3k::wasmjit::emit_block(block).empty());
         }
+    }
+}
+
+// Real VCVT encodings through the translator and dispatcher, ARM and Thumb,
+// single-block and region. Dest is always s2; f32 sources read s5 and f64
+// sources read d7, so overlapping lanes cannot hide a miswired operand.
+// The Thumb words are the half-swapped ARM encodings, verified against the
+// A32 decoder patterns (VCVT to u32/s32) and a Thumb disassembler.
+void guest_float_to_int(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    struct Case { uint32_t opcode; bool from_double; uint64_t input; uint32_t result; uint32_t flags; };
+    const Case cases[] = {
+        {0xeebd1ae2u, false, 0x3fc00000, 1, 0x10}, // VCVT.S32.F32 1.5 -> 1
+        {0xeebd1ae2u, false, 0xbfc00000, 0xffffffffu, 0x10}, // -1.5 -> -1
+        {0xeebd1ae2u, false, 0x4f000000, 0x7fffffffu, 1}, // 2^31 saturates
+        {0xeebd1ae2u, false, 0xcf000000, 0x80000000u, 0}, // -2^31 exact
+        {0xeebd1ae2u, false, 0x7fc00001, 0, 1}, // NaN -> 0
+        {0xeebd1a62u, false, 0x3fc00000, 2, 0x10}, // VCVTR.S32.F32 1.5 -> 2
+        {0xeebd1a62u, false, 0x40200000, 2, 0x10}, // VCVTR 2.5 ties to 2
+        {0xeebc1ae2u, false, 0x3fc00000, 1, 0x10}, // VCVT.U32.F32
+        {0xeebc1ae2u, false, 0xcf800000, 0, 1}, // -1.0 invalid, not inexact
+        {0xeebc1ae2u, false, 0x4f7fffff, 0xffffff00u, 0}, // largest exact u32
+        {0xeebc1ae2u, false, 0x4f800000, 0xffffffffu, 1}, // 2^32 saturates
+        {0xeebd1bc7u, true, 0xc004000000000000ull, 0xfffffffeu, 0x10}, // VCVT.S32.F64 -2.5
+        {0xeebd1bc7u, true, 0x41e0000000000000ull, 0x7fffffffu, 1}, // 2^31
+        {0xeebd1bc7u, true, 0xc1e0000000000000ull, 0x80000000u, 0}, // -2^31
+        {0xeebd1bc7u, true, 0x7ff8000000000000ull, 0, 1}, // NaN
+        {0xeebc1bc7u, true, 0x3ff8000000000000ull, 1, 0x10}, // VCVT.U32.F64 1.5
+        {0xeebc1bc7u, true, 0xbff0000000000000ull, 0, 1}, // -1.0 invalid
+        {0xeebc1bc7u, true, 0x41e0000000000000ull, 0x80000000u, 0}, // 2^31 exact
+        {0xeebc1bc7u, true, 0x41f0000000000000ull, 0xffffffffu, 1}, // 2^32
+    };
+    for (bool regions : {false, true}) for (bool thumb : {false, true}) for (const auto &c : cases) {
+        jit.set_region_mode(regions);
+        if (thumb) put_thumb(mem, jit, {(c.opcode << 16) | (c.opcode >> 16), 0xbf00df00u});
+        else put(mem, jit, {c.opcode, 0xef000000u});
+        auto before = jit.save_context();
+        if (c.from_double) std::memcpy(&before.fpu_registers[14], &c.input, 8);
+        else {
+            const uint32_t bits = uint32_t(c.input);
+            std::memcpy(&before.fpu_registers[5], &bits, 4);
+        }
+        before.fpscr = 0x90000080u;
+        jit.load_context(before);
+        if (jit.run() != 0) {
+            std::fprintf(stderr, "vcvt guest failed: %08x (%s): %s\n", c.opcode,
+                thumb ? "Thumb" : "ARM", jit.get_last_error().c_str());
+            CHECK(false);
+        }
+        CHECK(parent.svc_called);
+        const auto after = jit.save_context();
+        uint32_t result;
+        std::memcpy(&result, &after.fpu_registers[2], 4);
+        if (result != c.result || after.fpscr != (before.fpscr | c.flags))
+            std::fprintf(stderr, "vcvt op=%08x input=%llx got=%08x expected=%08x fpscr=%08x expected=%08x\n",
+                c.opcode, (unsigned long long)c.input, result, c.result,
+                after.fpscr, before.fpscr | c.flags);
+        CHECK(result == c.result);
+        CHECK(after.fpscr == (before.fpscr | c.flags));
+        CHECK(after.cpsr == before.cpsr);
     }
 }
 } // namespace f64_tests

@@ -1660,6 +1660,8 @@ int main() {
     byte_reverse_tests::guest_reversal(mem);
     exclusive_tests::guest_exclusive(mem);
     f64_tests::integer_to_double();
+    f64_tests::float_to_int32();
+    f64_tests::float_to_uint32();
     f64_tests::negate_and_absolute();
     f64_tests::single_to_double();
     f64_tests::double_to_single();
@@ -1667,6 +1669,7 @@ int main() {
     f64_tests::mode_guards();
     f64_tests::binary_arithmetic();
     f64_tests::guest_multiply(mem);
+    f64_tests::guest_float_to_int(mem);
     f64_tests::guest_tls_write(mem);
     fp64_helper_tests::run();
     helpers(mem);

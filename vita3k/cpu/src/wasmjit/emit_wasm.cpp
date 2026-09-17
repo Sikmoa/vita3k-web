@@ -1983,6 +1983,222 @@ public:
     uint32_t ssa_words() const { return next_local - ssa_base; }
 
 private:
+    // Float-to-integer conversion (VCVT.S32/U32.F32/F64, fbits == 0).
+    // Pure bit-pattern integer lowering: no host FP and no trapping Wasm
+    // conversion is used, so NaN/infinity/overflow saturation, rounding
+    // and cumulative flags match Dynarmic's FPToFixed exactly. Plain VCVT
+    // truncates towards zero; VCVTR snapshots the FPSCR mode into the
+    // rounding immediate, of which only nearest-even is emitted (wasm has
+    // no round-to-nearest float-to-int). Scaled fixed-point forms and the
+    // other explicit rounding modes stay rejected rather than silently
+    // converting with the wrong scale or mode.
+    bool fp_to_fixed(const Inst &inst, bool is_signed, bool is_double) {
+        if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0) return false;
+        if (!inst.GetArg(2).IsImmediate()) return false;
+        const uint8_t rounding = inst.GetArg(2).GetU8();
+        const bool to_nearest = rounding == 0;
+        if (!to_nearest && rounding != 3) return false;
+        if (inst.GetArg(0).GetType() != (is_double ? Type::U64 : Type::U32)) return false;
+        // Exception enables are live state, not part of the location key.
+        load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+        begin_if(); ret(ExitReason::Unsupported); end_if();
+        // Emission-time scratch assignment. The sign slot is shared; the
+        // magnitude slot holds the rounded i32 magnitude for the tail.
+        uint32_t sign_slot = 0, flags_slot = 0, mag_slot = 0;
+        const auto accumulate = [&](uint32_t bit) {
+            get(flags_slot); imm(bit); op(Or); set(flags_slot);
+        };
+        // Pushes the saturated result for a NaN/infinity/overflow input:
+        // the signed extrema by sign, or unsigned max/zero by sign.
+        const auto saturate = [&] {
+            if (is_signed) { imm(0x80000000u); imm(0x7fffffffu); }
+            else { imm(0); imm(0xffffffffu); }
+            get(sign_slot); op(Select);
+        };
+        // Overflow tail shared by every magnitude path. A rounded-up 2^31
+        // stays exact for a negative signed result only; anything larger
+        // saturates with IOC and never additionally IXC.
+        const auto publish_mag = [&] {
+            if (is_signed) {
+                get(mag_slot); imm(0x80000000u); imm(0x7fffffffu); get(sign_slot); op(Select); op(GtU);
+            } else {
+                get(mag_slot); imm(0xffffffffu); op(GtU);
+            }
+            begin_if();
+            accumulate(1);
+            saturate(); set(next_local);
+            op(Else);
+            if (is_signed) { imm(0); get(mag_slot); op(Sub); get(mag_slot); get(sign_slot); op(Select); }
+            else get(mag_slot);
+            set(next_local);
+            end_if();
+        };
+        if (!is_double) {
+            const auto bits = next_local + 1, expr = next_local + 3, frac = next_local + 4;
+            const auto count = next_local + 7, trunc = next_local + 8, half = next_local + 9;
+            sign_slot = next_local + 2; flags_slot = next_local + 5; mag_slot = next_local + 6;
+            value_word(inst.GetArg(0)); set(bits);
+            get(bits); imm(31); op(ShrU); set(sign_slot);
+            get(bits); imm(23); op(ShrU); mask(0xff); set(expr);
+            get(bits); mask(0x7fffff); set(frac);
+            imm(0); set(flags_slot);
+            // Whole magnitudes of 2^23 and above shift left exactly; the
+            // remaining range shifts right with at most 31 dropped bits.
+            const auto range = [&] {
+                // Tiny magnitudes truncate to zero (nearest-even cannot
+                // reach 1 below one half); non-FZ denormals land here too.
+                get(expr); imm(118); op(LeU);
+                begin_if(); accumulate(0x10); imm(0); set(next_local);
+                op(Else);
+                // Overflow: magnitudes of 2^32 and above exceed every range.
+                get(expr); imm(159); op(GeU);
+                begin_if(); accumulate(1); saturate(); set(next_local);
+                op(Else);
+                get(expr); imm(150); op(GeU);
+                begin_if();
+                get(expr); imm(150); op(Sub); set(count);
+                get(frac); imm(0x800000); op(Or); set(frac);
+                get(frac); get(count); op(Shl); set(mag_slot);
+                publish_mag();
+                op(Else);
+                imm(150); get(expr); op(Sub); set(count);
+                get(frac); imm(0x800000); op(Or); set(frac);
+                get(frac); get(count); op(ShrU); set(mag_slot);
+                imm(1); get(count); op(Shl); imm(1); op(Sub);
+                get(frac); op(And); set(trunc);
+                get(flags_slot); get(trunc); op(Eqz); op(Eqz); imm(0x10); op(Mul); op(Or);
+                set(flags_slot);
+                if (to_nearest) {
+                    imm(1); get(count); imm(1); op(Sub); op(Shl); set(half);
+                    get(trunc); get(half); op(GtU);
+                    get(trunc); get(half); op(Eq); get(mag_slot); imm(1); op(And); op(And);
+                    op(Or);
+                    get(mag_slot); op(Add); set(mag_slot);
+                }
+                publish_mag();
+                end_if(); end_if(); end_if();
+            };
+            const auto classify = [&] {
+                // Signed zeros convert exactly, with no flags.
+                get(expr); get(frac); op(Or); op(Eqz);
+                begin_if(); imm(0); set(next_local);
+                op(Else);
+                // Any NaN converts to zero with IOC, like FPToFixed.
+                get(expr); imm(0xff); op(Eq); get(frac); op(Eqz); op(Eqz); op(And);
+                begin_if(); accumulate(1); imm(0); set(next_local);
+                op(Else);
+                // Infinity saturates with IOC.
+                get(expr); imm(0xff); op(Eq);
+                begin_if(); accumulate(1); saturate(); set(next_local);
+                op(Else);
+                if (!is_signed) {
+                    // A nonzero negative input is invalid (zero returned above).
+                    get(sign_slot);
+                    begin_if(); accumulate(1); imm(0); set(next_local);
+                    op(Else);
+                }
+                range();
+                if (!is_signed) end_if();
+                end_if(); end_if(); end_if();
+            };
+            // FZ flushes a denormal input to a signed zero and raises IDC,
+            // exactly like the other FP lowerings; without FZ it is tiny.
+            if (start.FPSCR().FTZ()) {
+                get(expr); op(Eqz); get(frac); op(Eqz); op(Eqz); op(And);
+                begin_if(); accumulate(0x80); imm(0); set(next_local);
+                op(Else); classify(); end_if();
+            } else classify();
+            get(0); load(offsetof(JitState, fpscr)); get(flags_slot); op(Or);
+            store(offsetof(JitState, fpscr));
+            return ok;
+        }
+        const auto hi = next_local + 1, expr = next_local + 3;
+        const auto frac_lo = next_local + 4, frac_hi = next_local + 5;
+        const auto mag_lo = next_local + 6, mag_hi = next_local + 7;
+        const auto count = next_local + 9;
+        sign_slot = next_local + 2; flags_slot = next_local + 8; mag_slot = next_local + 1;
+        value_word(inst.GetArg(0), 1); set(hi);
+        value_word(inst.GetArg(0), 0); set(frac_lo);
+        get(hi); imm(31); op(ShrU); set(sign_slot);
+        get(hi); imm(20); op(ShrU); mask(0x7ff); set(expr);
+        get(hi); mask(0xfffff); set(frac_hi);
+        imm(0); set(flags_slot);
+        const auto push_frac = [&] {
+            get(frac_lo); op(ExtendU);
+            get(frac_hi); op(ExtendU); constant64(code, 32); op(Shl64); op(Or64);
+        };
+        const auto push_mag = [&] {
+            get(mag_lo); op(ExtendU);
+            get(mag_hi); op(ExtendU); constant64(code, 32); op(Shl64); op(Or64);
+        };
+        // In-range doubles always shift right (counts 21..63); the
+        // truncated bits are recovered by shifting the mantissa left, so
+        // no third i64 word pair is needed for the rounding decision.
+        const auto range = [&] {
+            // Tiny magnitudes truncate to zero in both modes.
+            get(expr); imm(1011); op(LeU);
+            begin_if(); accumulate(0x10); imm(0); set(next_local);
+            op(Else);
+            // Overflow at 2^32 and above.
+            get(expr); imm(1055); op(GeU);
+            begin_if(); accumulate(1); saturate(); set(next_local);
+            op(Else);
+            imm(1075); get(expr); op(Sub); set(count);
+            push_frac(); constant64(code, 0x10000000000000LL); op(Or64);
+            get(count); op(ExtendU); op(ShrU64);
+            store_i64_words(mag_lo);
+            push_frac(); constant64(code, 0x10000000000000LL); op(Or64);
+            imm(64); get(count); op(Sub); op(ExtendU); op(Shl64);
+            store_i64_words(frac_lo);
+            get(flags_slot); get(frac_lo); get(frac_hi); op(Or); op(Eqz); op(Eqz);
+            imm(0x10); op(Mul); op(Or); set(flags_slot);
+            push_mag(); op(Wrap); set(mag_slot);
+            if (to_nearest) {
+                // top = shifted >> 63; rest = (shifted << 1) != 0; round
+                // up when the truncated part exceeds half, or ties it
+                // with an odd kept bit.
+                push_frac(); constant64(code, 63); op(ShrU64); set(scratch_local);
+                get(scratch_local); op(Wrap);
+                push_frac(); constant64(code, 1); op(Shl64);
+                constant64(code, 0); op(0x51); op(Eqz);
+                get(mag_slot); imm(1); op(And);
+                op(Or); op(And);
+                get(mag_slot); op(Add); set(mag_slot);
+            }
+            publish_mag();
+            end_if(); end_if();
+        };
+        const auto classify = [&] {
+            get(expr); get(frac_lo); get(frac_hi); op(Or); op(Or); op(Eqz);
+            begin_if(); imm(0); set(next_local);
+            op(Else);
+            get(expr); imm(0x7ff); op(Eq);
+            get(frac_lo); get(frac_hi); op(Or); op(Eqz); op(Eqz); op(And);
+            begin_if(); accumulate(1); imm(0); set(next_local);
+            op(Else);
+            get(expr); imm(0x7ff); op(Eq);
+            begin_if(); accumulate(1); saturate(); set(next_local);
+            op(Else);
+            if (!is_signed) {
+                get(sign_slot);
+                begin_if(); accumulate(1); imm(0); set(next_local);
+                op(Else);
+            }
+            range();
+            if (!is_signed) end_if();
+            end_if(); end_if(); end_if();
+        };
+        if (start.FPSCR().FTZ()) {
+            get(expr); op(Eqz);
+            get(frac_lo); get(frac_hi); op(Or); op(Eqz); op(Eqz); op(And);
+            begin_if(); accumulate(0x80); imm(0); set(next_local);
+            op(Else); classify(); end_if();
+        } else classify();
+        get(0); load(offsetof(JitState, fpscr)); get(flags_slot); op(Or);
+        store(offsetof(JitState, fpscr));
+        return ok;
+    }
+
     bool instruction(const Inst &inst) {
         const Op kind = inst.GetOpcode();
         // One consumer pre-scan per block (short-circuits after the first
@@ -2278,6 +2494,10 @@ private:
             op(kind == Op::FPFixedU32ToDouble ? 0xb8 : 0xb7); // f64.convert_i32_u/s
             store_f64_words(next_local);
             return ok;
+        case Op::FPSingleToFixedS32: return fp_to_fixed(inst, true, false);
+        case Op::FPSingleToFixedU32: return fp_to_fixed(inst, false, false);
+        case Op::FPDoubleToFixedS32: return fp_to_fixed(inst, true, true);
+        case Op::FPDoubleToFixedU32: return fp_to_fixed(inst, false, true);
         case Op::FPSingleToDouble: {
             // Widening binary32 to binary64 is exact for every finite input,
             // so the rounding mode cannot change the result. FZ flushes a

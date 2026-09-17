@@ -156,6 +156,17 @@ faults after a completed store, Thumb continuation PCs, and preservation of
 predicated/single-instruction boundaries. They are added for execution on a
 machine with the toolchain; tests and builds were not run for this change.
 
+Scalar float-to-integer conversion (`wasmjit_f64_tests.inc`: `float_to_int32`,
+`float_to_uint32`, extended `mode_guards`, `guest_float_to_int`) covers the
+observed Limbo frontier past VMUL.F64: independent IR fixtures over zeros,
+halves, nearest-even ties, exact 2^31/2^32 boundaries, infinities,
+quiet/signaling NaNs, denormals with and without FZ, DN indifference, sticky
+FPSCR preservation, trap-enable bails with zero drift, fail-closed scaled
+forms and explicit VCVTA/P/M rounding modes, plus real ARM/Thumb VCVT[S][R]
+encodings (S32/U32, F32/F64 sources) through the translator and dispatcher in
+both block and region modes. Added for execution on a machine with the
+toolchain; tests and builds were not run for this change.
+
 ## ABI / integration
 
 `vita3k::wasmjit::emit_block(const Dynarmic::IR::Block&)` returns raw Wasm bytes,
@@ -223,6 +234,15 @@ must match the full frontend location/mode; entry state must match that mode.
   like the x64 backend's `shr r64,32`+`setc`), `LogicalShiftRight64` and
   `Pack2x32To1x64` (U64 producers whose **both** words are published via the
   i64 scratch local), `VectorBroadcast32` (all four lanes).
+- `FPSingleToFixedS32`, `FPSingleToFixedU32`, `FPDoubleToFixedS32`,
+  `FPDoubleToFixedU32` (VCVT.S32/U32.F32/F64 with fbits == 0; rounding
+  immediates 0 = nearest-even and 3 = towards-zero only, matching plain
+  VCVT and VCVTR under a default FPSCR; other explicit modes and scaled
+  fixed-point forms fail closed). Bit-pattern integer lowering with no
+  host FP and no trapping Wasm conversion: NaN/infinity/overflow and
+  negative-to-unsigned inputs saturate with IOC, dropped fractions raise
+  IXC, FZ-flushed denormals raise IDC, DN is ignored, and live trap
+  enables bail to Unsupported like every other FP lowering.
 - `A32GetVector`/`A32SetVector` with explicit D or Q registers (Dn words
   2n/2n+1, Qn words 4n..4n+3; a D access never touches its neighbour's
   words; S registers are rejected), `A32GetExtendedRegister64`/
