@@ -102,6 +102,27 @@ to bypass a rejected guest instruction. Inventory should add eleven dispatch
 routes while retaining VectorMultiply64 as missing. After successful review,
 replace the committed pre-B1 inventory with the generated scratch document.
 
+## B2 — NEON integer comparison/min/max/absolute family
+
+Repeat the B1 build/test/mode commands on both ABIs. Expected additional line:
+`NEON integer comparisons: 81 independent IR fixtures passed`, followed by
+full backend success. B1's 25-fixture line must still appear. Raw IR and
+guest tests compare all four result words, untouched registers and status.
+
+```sh
+timeout -s KILL 15s "$VITASDK/bin/arm-vita-eabi-as" browser/tests/jit_vector_compare_encodings.S -o "$SCRATCH/neon-compare.o"
+"$VITASDK/bin/arm-vita-eabi-objdump" -d "$SCRATCH/neon-compare.o"
+python3 browser/tests/jit_coverage_inventory.py --format markdown --output "$SCRATCH/JIT_COVERAGE_INVENTORY.md"
+python3 -m unittest discover -s browser/tests -p 'test_jit_coverage_inventory.py'
+```
+
+Compare assembler words against `guest_comparisons` and `thumb_word`. Predicates
+must produce lane-wide ones, signed/unsigned order must differ at the sign bit,
+abs(INT_MIN) must retain its bits without QC, and signed extreme distance must
+be lane-wide ones. Inventory should add 27 routes on top of B1's eleven (38
+over the committed old snapshot). Regenerate the committed inventory only
+after reviewing both batches, not just B1. No complete-NEON claim follows.
+
 ## C1 — pipeline cache and ordered guest device work
 
 The renderer command below needs no game assets. Expected new result is exactly

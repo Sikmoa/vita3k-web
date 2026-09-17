@@ -8,6 +8,10 @@ The generated counts, hash, line numbers and missing lists below are the
 **pre-B1 snapshot** until the verifier regenerates them. See
 [JIT_VECTOR_INTEGER_ARITHMETIC.md](JIT_VECTOR_INTEGER_ARITHMETIC.md) for the
 source proof and pending fixtures. No runtime support result is implied.
+Batch B2 also adds the 27 8/16/32-bit integer comparison/min/max/absolute
+routes listed in [JIT_VECTOR_INTEGER_COMPARISONS.md](JIT_VECTOR_INTEGER_COMPARISONS.md).
+The snapshot below predates **both** batches; neither counts nor hashes were
+regenerated under the no-execution constraint.
 
 ## Reproduce
 

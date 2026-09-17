@@ -97,7 +97,7 @@ enum Wasm : uint8_t {
     CallIndirect = 0x11, Select = 0x1b,
     Get = 0x20, Set = 0x21, Load = 0x28, Load64 = 0x29, Load8U = 0x2d, Load16U = 0x2f,
     Store = 0x36, Store8 = 0x3a, Store16 = 0x3b, Const = 0x41,
-    Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtU = 0x49, GtU = 0x4b, LeU = 0x4d, GeU = 0x4e, Eqz64 = 0x50,
+    Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtU = 0x49, GtS = 0x4a, GtU = 0x4b, LeU = 0x4d, GeU = 0x4e, Eqz64 = 0x50,
     Clz = 0x67, Add = 0x6a, Sub = 0x6b, Mul = 0x6c, And = 0x71, Or = 0x72, Xor = 0x73,
     Shl = 0x74, ShrS = 0x75, ShrU = 0x76, RotR = 0x78,
     Add64 = 0x7c, Sub64 = 0x7d, Mul64 = 0x7e, Or64 = 0x84, Shl64 = 0x86, ShrU64 = 0x88, ShrS64 = 0x87, Wrap = 0xa7, ExtendU = 0xad,
@@ -1019,6 +1019,51 @@ private:
                 op(operation);
                 // Truncate BEFORE combining: carry/borrow/product bits must
                 // never leak from one packed lane to the next.
+                if (bits < 32) mask((1u << bits) - 1);
+                if (shift) { imm(shift); op(Shl); op(Or); }
+            }
+            set(next_local + word);
+        }
+        return ok;
+    }
+    enum class VectorLaneOp { Equal, Greater, Minimum, Maximum, Absolute, AbsoluteDifference };
+    bool vector_integer_select(const Inst &inst, unsigned bits, VectorLaneOp operation, bool is_signed) {
+        // A32 integer comparisons/min/max/abs use 8/16/32-bit lanes. Signed
+        // ordering requires sign extension BEFORE comparison, but the result
+        // always contains the original low lane bits. These are not saturating
+        // operations: abs(INT_MIN) retains INT_MIN's bits and must not set QC.
+        const uint32_t a = next_local + 4, b = next_local + 5;
+        for (unsigned word = 0; word < 4; ++word) {
+            for (unsigned shift = 0; shift < 32; shift += bits) {
+                for (unsigned source = 0; source < (operation == VectorLaneOp::Absolute ? 1u : 2u); ++source) {
+                    vector_element_word(inst.GetArg(source), bits, (word * 32 + shift) / bits);
+                    if (is_signed && bits < 32) { imm(32 - bits); op(Shl); imm(32 - bits); op(ShrS); }
+                    set(source == 0 ? a : b);
+                }
+                switch (operation) {
+                case VectorLaneOp::Equal:
+                case VectorLaneOp::Greater:
+                    imm(0); get(a); get(b); op(operation == VectorLaneOp::Equal ? Eq : GtS);
+                    op(Sub); // predicate 0/1 -> architectural lane 0/all-ones
+                    break;
+                case VectorLaneOp::Minimum:
+                case VectorLaneOp::Maximum:
+                    get(a); get(b);
+                    get(operation == VectorLaneOp::Minimum ? b : a);
+                    get(operation == VectorLaneOp::Minimum ? a : b);
+                    op(is_signed ? GtS : GtU); op(Select);
+                    break;
+                case VectorLaneOp::Absolute:
+                    imm(0); get(a); op(Sub); get(a);
+                    get(a); imm(31); op(ShrU); op(Select);
+                    break;
+                case VectorLaneOp::AbsoluteDifference:
+                    // Select max-min using operand ordering, not the sign of
+                    // an overflowing subtraction (INT_MAX-INT_MIN is UINT_MAX).
+                    get(a); get(b); op(Sub); get(b); get(a); op(Sub);
+                    get(a); get(b); op(is_signed ? GtS : GtU); op(Select);
+                    break;
+                }
                 if (bits < 32) mask((1u << bits) - 1);
                 if (shift) { imm(shift); op(Shl); op(Or); }
             }
@@ -2154,6 +2199,33 @@ private:
             return inst.GetArg(0).IsImmediate() && inst.GetArg(0).GetType() == Type::U64;
         case Op::A32SetCheckBit:
             value_word(inst.GetArg(0)); set(check_bit_local); check_bit_written = true; return ok;
+        case Op::VectorEqual8: return vector_integer_select(inst, 8, VectorLaneOp::Equal, false);
+        case Op::VectorEqual16: return vector_integer_select(inst, 16, VectorLaneOp::Equal, false);
+        case Op::VectorEqual32: return vector_integer_select(inst, 32, VectorLaneOp::Equal, false);
+        case Op::VectorGreaterS8: return vector_integer_select(inst, 8, VectorLaneOp::Greater, true);
+        case Op::VectorGreaterS16: return vector_integer_select(inst, 16, VectorLaneOp::Greater, true);
+        case Op::VectorGreaterS32: return vector_integer_select(inst, 32, VectorLaneOp::Greater, true);
+        case Op::VectorMinS8: return vector_integer_select(inst, 8, VectorLaneOp::Minimum, true);
+        case Op::VectorMinS16: return vector_integer_select(inst, 16, VectorLaneOp::Minimum, true);
+        case Op::VectorMinS32: return vector_integer_select(inst, 32, VectorLaneOp::Minimum, true);
+        case Op::VectorMinU8: return vector_integer_select(inst, 8, VectorLaneOp::Minimum, false);
+        case Op::VectorMinU16: return vector_integer_select(inst, 16, VectorLaneOp::Minimum, false);
+        case Op::VectorMinU32: return vector_integer_select(inst, 32, VectorLaneOp::Minimum, false);
+        case Op::VectorMaxS8: return vector_integer_select(inst, 8, VectorLaneOp::Maximum, true);
+        case Op::VectorMaxS16: return vector_integer_select(inst, 16, VectorLaneOp::Maximum, true);
+        case Op::VectorMaxS32: return vector_integer_select(inst, 32, VectorLaneOp::Maximum, true);
+        case Op::VectorMaxU8: return vector_integer_select(inst, 8, VectorLaneOp::Maximum, false);
+        case Op::VectorMaxU16: return vector_integer_select(inst, 16, VectorLaneOp::Maximum, false);
+        case Op::VectorMaxU32: return vector_integer_select(inst, 32, VectorLaneOp::Maximum, false);
+        case Op::VectorAbs8: return vector_integer_select(inst, 8, VectorLaneOp::Absolute, true);
+        case Op::VectorAbs16: return vector_integer_select(inst, 16, VectorLaneOp::Absolute, true);
+        case Op::VectorAbs32: return vector_integer_select(inst, 32, VectorLaneOp::Absolute, true);
+        case Op::VectorSignedAbsoluteDifference8: return vector_integer_select(inst, 8, VectorLaneOp::AbsoluteDifference, true);
+        case Op::VectorSignedAbsoluteDifference16: return vector_integer_select(inst, 16, VectorLaneOp::AbsoluteDifference, true);
+        case Op::VectorSignedAbsoluteDifference32: return vector_integer_select(inst, 32, VectorLaneOp::AbsoluteDifference, true);
+        case Op::VectorUnsignedAbsoluteDifference8: return vector_integer_select(inst, 8, VectorLaneOp::AbsoluteDifference, false);
+        case Op::VectorUnsignedAbsoluteDifference16: return vector_integer_select(inst, 16, VectorLaneOp::AbsoluteDifference, false);
+        case Op::VectorUnsignedAbsoluteDifference32: return vector_integer_select(inst, 32, VectorLaneOp::AbsoluteDifference, false);
         case Op::VectorAdd8: return vector_integer_arithmetic(inst, 8, Add);
         case Op::VectorAdd16: return vector_integer_arithmetic(inst, 16, Add);
         case Op::VectorAdd32: return vector_integer_arithmetic(inst, 32, Add);

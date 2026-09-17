@@ -48,8 +48,8 @@ JitState initial(unsigned pattern) {
     for (unsigned r = 0; r < 15; ++r) state.regs[r] = 0xabc00000 + r;
     state.regs[1] = pattern == 0 ? 0 : pattern == 1 ? UINT32_MAX : 0xa58173df;
     state.regs[15] = code;
-    state.cpsr = 0xf80f0010; // NZCV, Q and GE must survive data movement.
-    state.fpscr = 0x08009f9f; // QC, cumulative flags and enabled traps too.
+    state.cpsr = pattern == 0 ? 0x10 : 0xf80f0010; // NZCV, Q and GE must survive.
+    state.fpscr = pattern == 0 ? 0 : 0x08009f9f; // Check both clear and set QC/sticky/trap bits.
     return state;
 }
 // Byte-based reference, independent of the emitter's i32-word operations.
