@@ -89,6 +89,240 @@ void equal_context(const CPUContext &a, const CPUContext &b) {
     CHECK(std::memcmp(a.fpu_registers.data(), b.fpu_registers.data(), sizeof(a.fpu_registers)) == 0);
 }
 
+void tls_read(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        // MRC p15,0,r0,c13,c0,3; SVC #0. Same Thumb instruction
+        // that stopped retail libc, with no proprietary code or data.
+        for (uint32_t tls : {0x87654321u, 0x12345000u}) {
+            jit.set_tpidruro(tls);
+            put_thumb(mem, jit, {0x0f70ee1d, 0xbf00df00});
+            CHECK(jit.run() == 0);
+            CHECK(parent.svc_called);
+            CHECK(jit.get_reg(0) == tls);
+            CHECK(jit.get_tpidruro() == tls);
+            put(mem, jit, {0xee1d0f70, 0xef000000});
+            CHECK(jit.run() == 0);
+            CHECK(parent.svc_called);
+            CHECK(jit.get_reg(0) == tls);
+        }
+    }
+}
+
+void leading_zeros(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        for (const auto &[input, expected] : std::array<std::pair<uint32_t, uint32_t>, 6>{{
+                 {0, 32}, {1, 31}, {0x80000000, 0}, {0xffffffff, 0}, {0x10000, 15}, {0x1234, 19}}}) {
+            for (bool thumb : {false, true}) {
+                // CLZ r4,r3 followed by SVC; both ARM encodings tested.
+                if (thumb) put_thumb(mem, jit, {0xf483fab3, 0xbf00df00});
+                else put(mem, jit, {0xe16f4f13, 0xef000000});
+                jit.set_reg(3, input);
+                jit.set_cpsr(jit.get_cpsr() | 0xa0000000);
+                const auto flags = jit.get_cpsr();
+                CHECK(jit.run() == 0);
+                CHECK(parent.svc_called);
+                CHECK(jit.get_reg(4) == expected);
+                CHECK(jit.get_reg(3) == input);
+                CHECK(jit.get_cpsr() == flags);
+            }
+        }
+    }
+}
+
+void unsigned_long_multiply(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        for (const auto &[a, b] : std::array<std::pair<uint32_t, uint32_t>, 5>{{
+                 {0, 0xffffffff}, {1, 7}, {0xffffffff, 0xffffffff},
+                 {0x80000000, 2}, {0x12345678, 0xabcdef01}}}) {
+            // UMULL r1,r0,r5,r0: destination overlaps a source.
+            put_thumb(mem, jit, {0x1000fba5, 0xbf00df00});
+            jit.set_reg(5, a);
+            jit.set_reg(0, b);
+            const auto flags = jit.get_cpsr();
+            CHECK(jit.run() == 0);
+            const uint64_t product = uint64_t(a) * b;
+            CHECK(jit.get_reg(1) == uint32_t(product));
+            CHECK(jit.get_reg(0) == uint32_t(product >> 32));
+            CHECK(jit.get_reg(5) == a);
+            CHECK(jit.get_cpsr() == flags);
+        }
+    }
+}
+
+void signed_long_multiply(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        for (const auto &[a, b] : std::array<std::pair<int32_t, int32_t>, 7>{{
+                 {0, -1}, {1, 7}, {-1, -1}, {-1, 7},
+                 {INT32_MIN, 2}, {INT32_MIN, INT32_MIN}, {INT32_MAX, INT32_MIN}}}) {
+            for (bool thumb : {false, true}) {
+                // SMULL r2,r1,r1,r0: high destination overlaps a source.
+                if (thumb) put_thumb(mem, jit, {0x2100fb81, 0xbf00df00});
+                else put(mem, jit, {0xe0c12091, 0xef000000});
+                jit.set_reg(1, uint32_t(a));
+                jit.set_reg(0, uint32_t(b));
+                jit.set_cpsr(jit.get_cpsr() | 0xa0000000);
+                const auto flags = jit.get_cpsr();
+                CHECK(jit.run() == 0);
+                CHECK(parent.svc_called);
+                const uint64_t product = uint64_t(int64_t(a) * int64_t(b));
+                CHECK(jit.get_reg(2) == uint32_t(product));
+                CHECK(jit.get_reg(1) == uint32_t(product >> 32));
+                CHECK(jit.get_reg(0) == uint32_t(b));
+                CHECK(jit.get_cpsr() == flags);
+            }
+        }
+    }
+}
+
+void floating_abs32(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        for (bool thumb : {false, true}) {
+            for (uint32_t bits : {0u, 0x80000000u, 0xbf800000u, 0xff800000u,
+                     0xff800001u, 0xffc12345u, 0x80000001u, 0x3f800000u}) {
+                // VABS.F32 s0,s0 must preserve NaN payloads and subnormals.
+                if (thumb) put_thumb(mem, jit, {0x0ac0eeb0, 0xbf00df00});
+                else put(mem, jit, {0xeeb00ac0, 0xef000000});
+                auto context = jit.save_context();
+                std::memcpy(&context.fpu_registers[0], &bits, 4);
+                context.fpscr = 0xf3000091;
+                jit.load_context(context);
+                CHECK(jit.run() == 0);
+                CHECK(parent.svc_called);
+                const auto after = jit.save_context();
+                uint32_t result;
+                std::memcpy(&result, &after.fpu_registers[0], 4);
+                CHECK(result == (bits & 0x7fffffffu));
+                CHECK(after.fpscr == context.fpscr);
+                CHECK(after.cpsr == context.cpsr);
+            }
+        }
+    }
+}
+
+void floating_compare32(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    struct Case { uint32_t a, b, nzcv, ioc; };
+    const std::array<Case, 10> cases{{
+        {0, 0x80000000, 0x60000000, 0},
+        {0xbf800000, 0, 0x80000000, 0},
+        {0x3f800000, 0, 0x20000000, 0},
+        {0x7f800000, 0x7f800000, 0x60000000, 0},
+        {0xff800000, 0x7f800000, 0x80000000, 0},
+        {0x7fc00001, 0, 0x30000000, 0},
+        {0, 0xffc00001, 0x30000000, 0},
+        {0x7f800001, 0, 0x30000000, 1},
+        {0, 0xff800001, 0x30000000, 1},
+        {1, 0, 0x20000000, 0},
+    }};
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        for (bool thumb : {false, true}) for (bool zero : {false, true}) {
+            for (bool signal : {false, true}) for (bool flush : {false, true}) {
+                for (const auto &c : cases) {
+                    if (zero && c.b != 0) continue;
+                    const uint32_t instruction = (zero ? 0xeef50a40u : 0xeef40a41u)
+                        | (signal ? 0x80u : 0u);
+                    // VCMP[E].F32 s1,s2/#0; VMRS APSR_nzcv,FPSCR; SVC.
+                    if (thumb) put_thumb(mem, jit, {(instruction << 16) | (instruction >> 16), 0xfa10eef1, 0xbf00df00});
+                    else put(mem, jit, {instruction, 0xeef1fa10, 0xef000000});
+                    auto context = jit.save_context();
+                    std::memcpy(&context.fpu_registers[1], &c.a, 4);
+                    std::memcpy(&context.fpu_registers[2], &c.b, 4);
+                    jit.load_context(context);
+                    const uint32_t control = (flush ? 1u << 24 : 0) | (1u << 25) | 0x10;
+                    jit.set_fpscr(control | 0xf0000000);
+                    const uint32_t psr = jit.get_cpsr() & 0x0fffffff;
+                    CHECK(jit.run() == 0);
+                    CHECK(parent.svc_called);
+                    const bool denormal = c.a == 1;
+                    const auto nzcv = flush && denormal ? 0x60000000u : c.nzcv;
+                    const auto ioc = c.ioc | (signal && c.nzcv == 0x30000000 ? 1u : 0u);
+                    CHECK(jit.get_fpscr() == (control | nzcv | ioc | (flush && denormal ? 0x80u : 0u)));
+                    CHECK(jit.get_cpsr() == (psr | nzcv));
+                }
+            }
+        }
+    }
+}
+
+void floating_compare_trap_guard(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        put_thumb(mem, jit, {0x0a40eef5, 0xbf00df00});
+        jit.set_fpscr(0);
+        CHECK(jit.run() == 0);
+        // Reuse the compiled code: exception enables aren't in its cache key.
+        jit.set_pc(code);
+        jit.set_cpsr(0x30);
+        jit.set_fpscr(0x100);
+        parent.svc_called = false;
+        CHECK(jit.run() < 0);
+        CHECK(!parent.svc_called);
+        CHECK(jit.get_fpscr() == 0x100);
+    }
+}
+
+void multiply32(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        // MUL r0,r2,r0 (Thumb T2 00 fb 02 f0); flags never written.
+        // Same instruction that stopped Limbo, with overlap dest/source.
+        for (const auto &[a, b] : std::array<std::pair<uint32_t, uint32_t>, 5>{{
+                 {0, 0}, {5, 7}, {1, 0xffffffffu},
+                 {0x12345678u, 0x9abcdef0u}, {0xffffffffu, 0xffffffffu}}}) {
+            for (bool thumb : {false, true}) {
+                if (thumb) put_thumb(mem, jit, {0xf002fb00, 0xbf00df00});
+                else put(mem, jit, {0xe0000290, 0xef000000});
+                jit.set_reg(0, a);
+                jit.set_reg(2, b);
+                jit.set_cpsr(jit.get_cpsr() | 0xf0000000);
+                const auto flags = jit.get_cpsr();
+                CHECK(jit.run() == 0);
+                CHECK(parent.svc_called);
+                CHECK(jit.get_reg(0) == static_cast<uint32_t>(static_cast<uint64_t>(a) * b));
+                CHECK(jit.get_reg(2) == b);
+                CHECK(jit.get_cpsr() == flags);
+            }
+        }
+    }
+}
+
 void backend(MemState &mem) {
     CPUState parent{};
     parent.mem = &mem;
@@ -1157,6 +1391,14 @@ int main() {
     CHECK(try_alloc_at(mem, code, page, "JIT backend tests") == code);
     CHECK(try_alloc_at(mem, data, 2 * page, "JIT checked memory") == data);
     helpers(mem);
+    tls_read(mem);
+    leading_zeros(mem);
+    multiply32(mem);
+    unsigned_long_multiply(mem);
+    signed_long_multiply(mem);
+    floating_compare32(mem);
+    floating_abs32(mem);
+    floating_compare_trap_guard(mem);
     backend(mem);
     formation(mem);
     region_exec(mem);

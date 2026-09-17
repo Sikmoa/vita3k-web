@@ -1725,6 +1725,70 @@ private:
             pc_written |= index == 15;
             return ok;
         }
+        case Op::A32CoprocGetOneWord: {
+            const auto info = inst.GetArg(0);
+            // MRC p15,0,Rt,c13,c0,3: read the current thread's TLS base.
+            // All other coprocessor operations remain unsupported.
+            if (!info.IsImmediate() || info.GetType() != Type::CoprocInfo
+                || info.GetCoprocInfo() != Dynarmic::IR::Value::CoprocessorInfo{15, 0, 0, 13, 0, 3})
+                return false;
+            load(offsetof(JitState, tpidruro));
+            break;
+        }
+        case Op::FPCompare32: {
+            // Compare IEEE-754 bit patterns without host FP conversion: preserve
+            // signaling NaNs, signed zeros and guest flush-to-zero behavior.
+            if (!inst.GetArg(2).IsImmediate()) return false;
+            // Exception enables are NOT in Dynarmic's location key. Check
+            // the live FPSCR rather than silently ignoring enabled traps.
+            load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+            begin_if(); ret(ExitReason::Unsupported); end_if();
+            const bool signal = inst.GetArg(2).GetU1();
+            imm(0); set(next_local + 3); // any NaN
+            imm(0); set(next_local + 4); // invalid-operation cumulative bit
+            for (unsigned i = 0; i < 2; ++i) {
+                const auto slot = next_local + 1 + i;
+                arg(i); set(slot);
+                get(slot); mask(0x7fffffff); imm(0x7f800000); op(GtU);
+                begin_if();
+                imm(1); set(next_local + 3);
+                get(next_local + 4);
+                if (signal) imm(1);
+                else { get(slot); mask(0x00400000); op(Eqz); }
+                op(Or); set(next_local + 4);
+                end_if();
+                if (start.FPSCR().Value() & (1u << 24)) {
+                    get(slot); mask(0x7fffffff); imm(0x00800000); op(LtU);
+                    get(slot); mask(0x7fffffff); op(Eqz); op(Eqz); op(And);
+                    begin_if();
+                    get(0); load(offsetof(JitState, fpscr)); imm(0x80); op(Or); store(offsetof(JitState, fpscr));
+                    get(slot); mask(0x80000000); set(slot);
+                    end_if();
+                }
+                // Canonicalize both zeros before forming an unsigned sortable
+                // key: complement negatives, toggle the sign of nonnegatives.
+                get(slot); mask(0x7fffffff); op(Eqz); begin_if();
+                imm(0); set(slot); end_if();
+                get(slot); imm(0xffffffff); imm(0x80000000);
+                get(slot); imm(31); op(ShrU); op(Select); op(Xor); set(slot);
+            }
+            get(0); load(offsetof(JitState, fpscr)); get(next_local + 4); op(Or); store(offsetof(JitState, fpscr));
+            imm(0x30000000); // unordered: C,V
+            imm(0x60000000); // equal: Z,C
+            imm(0x80000000); // less: N
+            imm(0x20000000); // greater: C
+            get(next_local + 1); get(next_local + 2); op(LtU); op(Select);
+            get(next_local + 1); get(next_local + 2); op(Eq); op(Select);
+            get(next_local + 3); op(Select);
+            break;
+        }
+        case Op::FPAbs32: arg(0); mask(0x7fffffff); break;
+        case Op::A32GetFpscrNZCV:
+            load(offsetof(JitState, fpscr)); mask(0xf0000000); break;
+        case Op::A32SetFpscrNZCV:
+            get(0); load(offsetof(JitState, fpscr)); mask(0x0fffffff);
+            arg(0); mask(0xf0000000); op(Or); store(offsetof(JitState, fpscr));
+            return ok;
         case Op::A32GetCpsr: state.read_full_cpsr(code); break;
         case Op::A32ReadMemory8: memory_call(inst, false, 1); return ok;
         case Op::A32ReadMemory16: memory_call(inst, false, 2); return ok;
@@ -1757,6 +1821,8 @@ private:
         case Op::Not32: arg(0); imm(0xffffffff); op(Xor); break;
         case Op::AndNot32: arg(0); arg(1); imm(0xffffffff); op(Xor); op(And); break;
         case Op::IsZero32: arg(0); op(Eqz); break;
+        case Op::CountLeadingZeros32: arg(0); op(Clz); break;
+        case Op::Mul32: arg(0); arg(1); op(Mul); break;
         case Op::MostSignificantBit: arg(0); imm(31); op(ShrU); break;
         case Op::LeastSignificantByte: arg(0); mask(0xff); break;
         case Op::LeastSignificantHalf: arg(0); mask(0xffff); break;
@@ -1783,6 +1849,11 @@ private:
             return ok;
         case Op::SignExtendByteToWord: arg(0); imm(24); op(Shl); imm(24); op(ShrS); break;
         case Op::SignExtendHalfToWord: arg(0); imm(16); op(Shl); imm(16); op(ShrS); break;
+        case Op::SignExtendWordToLong:
+            value_word(inst.GetArg(0)); set(next_local);
+            // U64 SSA slots are two i32 words; replicate the source sign bit.
+            value_word(inst.GetArg(0)); imm(31); op(ShrS); set(next_local + 1);
+            return ok;
         case Op::ZeroExtendWordToLong:
             value_word(inst.GetArg(0)); set(next_local);
             imm(0); set(next_local + 1); // Region bodies reuse these locals.
@@ -1856,6 +1927,14 @@ private:
             for (unsigned i = 0; i < words; ++i) { get(0); value_word(inst.GetArg(1), i); store(offsetof(JitState, fpu) + (base + i) * sizeof(uint32_t)); }
             return ok;
         }
+        case Op::Mul64:
+            // SSA storage uses i32 words even for U64 results. Publish both
+            // halves before any overlapping architectural destination writes.
+            value64(inst.GetArg(0)); value64(inst.GetArg(1)); op(Mul64);
+            set(scratch_local);
+            get(scratch_local); op(Wrap); set(next_local);
+            get(scratch_local); op(0x42); uleb(code, 32); op(ShrU64); op(Wrap); set(next_local + 1);
+            return ok;
         case Op::Pack2x32To1x64:
             // U64 result: assemble in the i64 scratch local, then publish as
             // two words. Leaving the i64 on the stack would type-error on the

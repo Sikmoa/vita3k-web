@@ -38,6 +38,10 @@ set(_hle_exports
     sceKernelGetModuleInfoByAddr
     sceKernelCallAbortHandler
     sceIoWrite
+    sceKernelUnlockLwMutex2 sceKernelRegisterThreadEventHandler
+    # Nonblocking semaphore operations use the production kernel objects.
+    # Blocking waits need cooperative scheduling before they can be selected.
+    sceKernelCreateSema sceKernelDeleteSema sceKernelPollSema sceKernelSignalSema
 )
 
 # Take NID values from the one authoritative database, never a second resolver.

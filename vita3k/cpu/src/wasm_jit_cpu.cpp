@@ -763,8 +763,16 @@ struct WasmJitCPU::Impl {
                 ++region_misses;
                 auto region = std::make_shared<Region>();
                 std::vector<Dynarmic::IR::Block> ir_blocks;
-                if (!form_region(*parent->mem, pc, state.cpsr, state.fpscr, *region, ir_blocks))
-                    return fail("region formation failed at entry");
+                if (!form_region(*parent->mem, pc, state.cpsr, state.fpscr, *region, ir_blocks)) {
+                    // Report the actual failing instruction, not just the
+                    // region failure (which hides the unsupported op).
+                    try {
+                        return reject(vita3k::wasmjit::translate_block(*parent->mem,
+                            pc, state.cpsr, 1, state.fpscr));
+                    } catch (const std::exception &error) {
+                        return fail(error.what());
+                    }
+                }
                 std::vector<const Dynarmic::IR::Block *> block_ptrs;
                 std::vector<vita3k::wasmjit::RegionBlockMeta> meta;
                 block_ptrs.reserve(region->blocks.size());
