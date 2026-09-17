@@ -121,6 +121,94 @@ void tls_read(MemState &mem) {
     }
 }
 
+void memory_barriers(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        for (uint32_t option : {0x5fu, 0x4fu, 0x6fu}) {
+        // DMB/DSB/ISB SY; NOP; SVC #0, in Thumb then ARM. Barrier
+        // lowering must preserve registers and reach the following SVC.
+        jit.set_reg(0, 0xdeadbeefu);
+        put_thumb(mem, jit, {0x8f00f3bfu | (option << 16), 0xdf00bf00});
+        CHECK(jit.run() == 0);
+        CHECK(parent.svc_called);
+        CHECK(jit.get_reg(0) == 0xdeadbeefu);
+        parent.svc_called = false;
+        put(mem, jit, {0xf57ff000u | option, 0xe1a00000, 0xef000000});
+        CHECK(jit.run() == 0);
+        CHECK(parent.svc_called);
+        CHECK(jit.get_reg(0) == 0xdeadbeefu);
+        parent.svc_called = false;
+        }
+    }
+}
+
+// A scheduler must be able to preempt a polling guest without calling it
+// finished or losing its continuation. Two independent CPUs share only memory.
+void cooperative_slices(MemState &mem) {
+    for (bool regions : {false, true}) {
+        CPUState parent{}, child{};
+        parent.mem = child.mem = &mem;
+        WasmJitCPU a(&parent, 0), b(&child, 0);
+        a.set_region_mode(regions);
+        b.set_region_mode(regions);
+        // Parent: while (*r1) {}; SVC. Child: *r1 = 0; SVC.
+        put(mem, a, {0xe5910000, 0xe3500000, 0x1afffffc, 0xef000000});
+        const uint32_t worker[] = {0xe3a00000, 0xe5810000, 0xef000000};
+        CHECK(mem_write(mem, code + 0x100, worker, sizeof(worker)));
+        b.set_cpsr(0x10);
+        b.set_pc(code + 0x100);
+        a.set_reg(1, data);
+        b.set_reg(1, data);
+        a.set_tpidruro(0x11110000);
+        b.set_tpidruro(0x22220000);
+        uint32_t flag = 1;
+        CHECK(mem_write(mem, data, &flag, sizeof(flag)));
+        const auto before = a.instructions_executed();
+        CHECK(a.run_slice(64) == WasmJitCPU::slice_yield);
+        CHECK(a.instructions_executed() > before);
+        CHECK(a.instructions_executed() - before <= 64);
+        CHECK(!parent.svc_called);
+        CHECK(a.get_last_error().empty());
+        CHECK(a.get_pc() >= code && a.get_pc() < code + 12);
+        for (unsigned slice = 0; slice < 3; ++slice) {
+            const auto tick = a.instructions_executed();
+            CHECK(a.run_slice(64) == WasmJitCPU::slice_yield);
+            CHECK(a.instructions_executed() > tick);
+            CHECK(a.instructions_executed() - tick <= 64);
+            CHECK(!parent.svc_called);
+        }
+        const auto paused = a.save_context();
+        const auto tick = a.instructions_executed();
+        CHECK(a.run_slice(0) == WasmJitCPU::slice_yield);
+        equal_context(a.save_context(), paused);
+        CHECK(a.instructions_executed() == tick);
+        CHECK(b.run_slice(64) == 0);
+        CHECK(child.svc_called);
+        CHECK(mem_read(mem, data, &flag, sizeof(flag)) && flag == 0);
+        equal_context(a.save_context(), paused);
+        CHECK(a.run_slice(64) == 0);
+        CHECK(parent.svc_called);
+        CHECK(a.get_reg(0) == 0);
+        CHECK(a.get_tpidruro() == 0x11110000);
+        CHECK(b.get_tpidruro() == 0x22220000);
+        // A scheduler slice must not turn the existing runaway guard into
+        // successful completion, or hide an instruction fault.
+        put(mem, a, {0xeafffffe});
+        a.set_instruction_budget(64);
+        CHECK(a.run_slice(16) == WasmJitCPU::slice_yield);
+        const auto guarded = a.instructions_executed();
+        CHECK(a.run() < 0);
+        CHECK(a.instructions_executed() - guarded == 64);
+        CHECK(a.get_last_error().find("instruction budget exhausted") != std::string::npos);
+        a.set_pc(0x83000000);
+        CHECK(a.run_slice(64) < 0);
+    }
+}
+
 void leading_zeros(MemState &mem) {
     CPUState parent{};
     parent.mem = &mem;
@@ -1674,6 +1762,8 @@ int main() {
     fp64_helper_tests::run();
     helpers(mem);
     tls_read(mem);
+    memory_barriers(mem);
+    cooperative_slices(mem);
     leading_zeros(mem);
     multiply32(mem);
     unsigned_long_multiply(mem);

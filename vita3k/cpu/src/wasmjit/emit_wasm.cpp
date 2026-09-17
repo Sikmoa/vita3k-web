@@ -2209,6 +2209,13 @@ private:
         const auto arg = [&](size_t n) { value(inst.GetArg(n)); };
         switch (kind) {
         case Op::Void: return true; // Dynarmic's invalidated/dead instruction marker
+        case Op::A32DataMemoryBarrier:
+        case Op::A32DataSynchronizationBarrier:
+        case Op::A32InstructionSynchronizationBarrier:
+            // Single host thread: no other observer of guest memory exists,
+            // and the JIT holds no stale translations needing an ISB flush.
+            // Revisit if guest threads ever run on parallel host threads.
+            return true;
         case Op::Identity: {
             const auto type = inst.GetType();
             if (type != Type::U128 && !scalar(type)) return false;

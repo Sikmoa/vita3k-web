@@ -688,6 +688,11 @@ struct WasmJitCPU::Impl {
     // Region-mode execution: form/compile a region on miss, then let the
     // generated module's in-Wasm dispatch loop run many guest blocks per
     // host entry. Handles all ExitReason values from REGION_ABI.md.
+    bool scheduler_slice = false;
+    int budget_exhausted() {
+        return scheduler_slice ? WasmJitCPU::slice_yield : fail("instruction budget exhausted");
+    }
+
     int execute_regions(uint64_t remaining_budget) {
         if (parent->mem->direct_host_memory) {
             // The hint map/table are process-global. Discard hints from any
@@ -738,7 +743,7 @@ struct WasmJitCPU::Impl {
                     return 1;
             }
             if (remaining_budget == 0)
-                return fail("instruction budget exhausted");
+                return budget_exhausted();
             // M16: the shared region table must exist before any region
             // install in this iteration publishes into it (installs that
             // run before the first dispatcher setup would otherwise leave
@@ -931,12 +936,12 @@ struct WasmJitCPU::Impl {
                 // like single-block mode and the interpreter oracle: the
                 // budget is a runaway guard, not a completion.
                 if (remaining_budget == 0)
-                    return fail("instruction budget exhausted");
+                    return budget_exhausted();
                 // No forward progress: the next block cannot fit the remaining
                 // budget slice. Report a clean slice boundary so the caller
                 // can re-grant; not an error, and not a livelock.
                 if (state.executed == budget_progress_mark)
-                    return 0;
+                    return scheduler_slice ? WasmJitCPU::slice_yield : 0;
                 budget_progress_mark = state.executed;
                 continue; // re-enter with the remaining budget
             case ExitReason::Smc:
@@ -1104,7 +1109,20 @@ int WasmJitCPU::run() {
         const int result = impl->execute(limit);
         if (result || impl->parent->svc_called) return result;
     }
-    return impl->fail("instruction budget exhausted");
+    return impl->budget_exhausted();
+}
+int WasmJitCPU::run_slice(uint64_t instructions) {
+    const auto previous = impl->budget;
+    const auto previous_slice = impl->scheduler_slice;
+    struct Restore {
+        Impl &impl;
+        uint64_t budget;
+        bool slice;
+        ~Restore() { impl.budget = budget; impl.scheduler_slice = slice; }
+    } restore{*impl, previous, previous_slice};
+    impl->budget = instructions;
+    impl->scheduler_slice = true;
+    return run();
 }
 int WasmJitCPU::step() {
     impl->parent->svc_called = false;

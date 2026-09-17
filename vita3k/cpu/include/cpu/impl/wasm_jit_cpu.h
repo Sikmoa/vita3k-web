@@ -32,6 +32,10 @@ public:
     void invalidate_jit_cache(Address, size_t) override;
 
     void set_instruction_budget(uint64_t value);
+    // Explicit scheduler boundary, distinct from halt (1), SVC (0), and
+    // fault (<0). Ordinary run() retains its fatal runaway-budget contract.
+    static constexpr int slice_yield = 2;
+    int run_slice(uint64_t instructions);
     // Region modules (many blocks, in-Wasm dispatch) vs single-block modules.
     // Default: region mode (M14c production path).
     void set_region_mode(bool value);
