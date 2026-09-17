@@ -1,4 +1,4 @@
-// Focused wasm32 backend integration tests. Compile this TU INSTEAD OF
+// Focused wasm32/Memory64 backend integration tests. Compile this TU INSTEAD OF
 // wasm_jit_cpu.cpp so the anonymous checked helpers can also be tested directly.
 // Uses production MemState and Dynarmic translation; no interpreter or mocks.
 #include "../src/wasm_jit_cpu.cpp"
@@ -88,6 +88,8 @@ void equal_context(const CPUContext &a, const CPUContext &b) {
     CHECK(a.cpsr == b.cpsr && a.fpscr == b.fpscr);
     CHECK(std::memcmp(a.fpu_registers.data(), b.fpu_registers.data(), sizeof(a.fpu_registers)) == 0);
 }
+
+#include "wasmjit_vector_tests.inc"
 
 void tls_read(MemState &mem) {
     CPUState parent{};
@@ -1640,6 +1642,10 @@ int main() {
     CHECK(init(mem, true));
     CHECK(try_alloc_at(mem, code, page, "JIT backend tests") == code);
     CHECK(try_alloc_at(mem, data, 2 * page, "JIT checked memory") == data);
+    vector_tests::ir_data_movement();
+    vector_tests::region_slot_reuse();
+    vector_tests::guest_data_movement(mem);
+    vector_tests::guest_structure_lanes(mem);
     helpers(mem);
     tls_read(mem);
     leading_zeros(mem);

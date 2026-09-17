@@ -24,7 +24,7 @@ python3 -m unittest discover -s browser/tests -p 'test_jit_coverage_inventory.py
 Sources may be edited concurrently: regenerate after emitter changes. The JSON records SHA-256 for every scanned input; this snapshot identifies the key inputs below.
 
 - `external/dynarmic/src/dynarmic/ir/opcodes.inc` SHA-256 `3809ad4d53e577c24740cc3dedfb432c063cac582f4c6e2088bf827a5b9a6011`
-- `vita3k/cpu/src/wasmjit/emit_wasm.cpp` SHA-256 `1bc27cf72bdcf8d88a295904105ab65d9474363df6feb45195b3424dc9e5155b`
+- `vita3k/cpu/src/wasmjit/emit_wasm.cpp` SHA-256 `cf84b38b4b0779780d550f6a428ca3e4aa295e55da0e5513037f8bc0572f0ce0`
 - `external/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.cpp` SHA-256 `bf885d41e83798f2b4ad92ceaf058f6052d66030648bdd9042f2d98d9bb4c1a8`
 - `external/dynarmic/src/dynarmic/ir/ir_emitter.cpp` SHA-256 `761363bca99fa7bac25ef7d76b00226cd61815a6fd638e1324e4074fba9153f2`
 
@@ -32,9 +32,9 @@ Sources may be edited concurrently: regenerate after emitter changes. The JSON r
 | --- | ---: |
 | defined | 725 |
 | candidate_a32 | 526 |
-| candidate_with_dispatch | 75 |
-| candidate_missing_dispatch | 451 |
-| dispatch_routes | 80 |
+| candidate_with_dispatch | 104 |
+| candidate_missing_dispatch | 422 |
+| dispatch_routes | 111 |
 | unwitnessed_definitions | 199 |
 
 ## Family breakdown
@@ -49,10 +49,10 @@ Sources may be edited concurrently: regenerate after emitter changes. The JSON r
 | Packed integer/DSP | 34 | 0 | 34 |
 | Pseudo flags/results | 5 | 5 | 0 |
 | Scalar floating point/conversion | 61 | 9 | 52 |
-| Scalar integer/miscellaneous | 56 | 31 | 25 |
+| Scalar integer/miscellaneous | 56 | 37 | 19 |
 | Scalar saturation | 4 | 0 | 4 |
 | Vector floating point | 59 | 0 | 59 |
-| Vector integer/data movement | 238 | 1 | 237 |
+| Vector integer/data movement | 238 | 24 | 214 |
 
 ## Candidate missing opcodes
 
@@ -82,9 +82,9 @@ Every name below has a lexical witness but no recognized dispatch route. Widths/
 
 `FPAbs16`, `FPAbs64`, `FPAdd64`, `FPCompare64`, `FPDiv64`, `FPDoubleToFixedS16`, `FPDoubleToFixedS32`, `FPDoubleToFixedU16`, `FPDoubleToFixedU32`, `FPDoubleToHalf`, `FPDoubleToSingle`, `FPFixedS16ToDouble`, `FPFixedS16ToSingle`, `FPFixedS32ToDouble`, `FPFixedS64ToDouble`, `FPFixedS64ToSingle`, `FPFixedU16ToDouble`, `FPFixedU16ToSingle`, `FPFixedU32ToDouble`, `FPFixedU64ToDouble`, `FPFixedU64ToSingle`, `FPHalfToDouble`, `FPHalfToFixedS16`, `FPHalfToFixedS32`, `FPHalfToFixedU16`, `FPHalfToFixedU32`, `FPHalfToSingle`, `FPMaxNumeric32`, `FPMaxNumeric64`, `FPMinNumeric32`, `FPMinNumeric64`, `FPMul64`, `FPMulAdd16`, `FPMulAdd32`, `FPMulAdd64`, `FPMulSub16`, `FPMulSub32`, `FPMulSub64`, `FPNeg16`, `FPNeg64`, `FPRoundInt16`, `FPRoundInt32`, `FPRoundInt64`, `FPSingleToDouble`, `FPSingleToFixedS16`, `FPSingleToFixedS32`, `FPSingleToFixedU16`, `FPSingleToFixedU32`, `FPSingleToHalf`, `FPSqrt32`, `FPSqrt64`, `FPSub64`
 
-### Scalar integer/miscellaneous (25)
+### Scalar integer/miscellaneous (19)
 
-`Add64`, `And64`, `AndNot64`, `ArithmeticShiftRight64`, `ByteReverseDual`, `ByteReverseHalf`, `ByteReverseWord`, `ConditionalSelect64`, `CountLeadingZeros64`, `Eor64`, `IsZero64`, `LogicalShiftLeft64`, `Not64`, `Or64`, `RotateRight64`, `SignExtendByteToLong`, `SignExtendHalfToLong`, `SignedDiv32`, `SignedDiv64`, `Sub64`, `UnsignedDiv32`, `UnsignedDiv64`, `ZeroExtendByteToLong`, `ZeroExtendHalfToLong`, `ZeroExtendLongToQuad`
+`Add64`, `ArithmeticShiftRight64`, `ByteReverseDual`, `ByteReverseHalf`, `ByteReverseWord`, `ConditionalSelect64`, `CountLeadingZeros64`, `IsZero64`, `LogicalShiftLeft64`, `RotateRight64`, `SignExtendByteToLong`, `SignExtendHalfToLong`, `SignedDiv32`, `SignedDiv64`, `Sub64`, `UnsignedDiv32`, `UnsignedDiv64`, `ZeroExtendByteToLong`, `ZeroExtendHalfToLong`
 
 ### Scalar saturation (4)
 
@@ -94,94 +94,125 @@ Every name below has a lexical witness but no recognized dispatch route. Widths/
 
 `FPVectorAbs16`, `FPVectorAbs32`, `FPVectorAbs64`, `FPVectorAdd32`, `FPVectorAdd64`, `FPVectorEqual16`, `FPVectorEqual32`, `FPVectorEqual64`, `FPVectorFromHalf32`, `FPVectorFromSignedFixed32`, `FPVectorFromSignedFixed64`, `FPVectorFromUnsignedFixed32`, `FPVectorFromUnsignedFixed64`, `FPVectorGreater32`, `FPVectorGreater64`, `FPVectorGreaterEqual32`, `FPVectorGreaterEqual64`, `FPVectorMax32`, `FPVectorMax64`, `FPVectorMaxNumeric32`, `FPVectorMaxNumeric64`, `FPVectorMin32`, `FPVectorMin64`, `FPVectorMinNumeric32`, `FPVectorMinNumeric64`, `FPVectorMul32`, `FPVectorMul64`, `FPVectorMulAdd16`, `FPVectorMulAdd32`, `FPVectorMulAdd64`, `FPVectorNeg16`, `FPVectorNeg32`, `FPVectorNeg64`, `FPVectorPairedAddLower32`, `FPVectorPairedAddLower64`, `FPVectorRSqrtEstimate16`, `FPVectorRSqrtEstimate32`, `FPVectorRSqrtEstimate64`, `FPVectorRSqrtStepFused16`, `FPVectorRSqrtStepFused32`, `FPVectorRSqrtStepFused64`, `FPVectorRecipEstimate16`, `FPVectorRecipEstimate32`, `FPVectorRecipEstimate64`, `FPVectorRecipStepFused16`, `FPVectorRecipStepFused32`, `FPVectorRecipStepFused64`, `FPVectorRoundInt16`, `FPVectorRoundInt32`, `FPVectorRoundInt64`, `FPVectorSub32`, `FPVectorSub64`, `FPVectorToHalf32`, `FPVectorToSignedFixed16`, `FPVectorToSignedFixed32`, `FPVectorToSignedFixed64`, `FPVectorToUnsignedFixed16`, `FPVectorToUnsignedFixed32`, `FPVectorToUnsignedFixed64`
 
-### Vector integer/data movement (237)
+### Vector integer/data movement (214)
 
-`VectorAbs16`, `VectorAbs32`, `VectorAbs64`, `VectorAbs8`, `VectorAdd16`, `VectorAdd32`, `VectorAdd64`, `VectorAdd8`, `VectorAnd`, `VectorAndNot`, `VectorArithmeticShiftRight16`, `VectorArithmeticShiftRight32`, `VectorArithmeticShiftRight64`, `VectorArithmeticShiftRight8`, `VectorArithmeticVShift16`, `VectorArithmeticVShift32`, `VectorArithmeticVShift64`, `VectorArithmeticVShift8`, `VectorBroadcast16`, `VectorBroadcast64`, `VectorBroadcast8`, `VectorBroadcastElement16`, `VectorBroadcastElement32`, `VectorBroadcastElement64`, `VectorBroadcastElement8`, `VectorCountLeadingZeros16`, `VectorCountLeadingZeros32`, `VectorCountLeadingZeros8`, `VectorDeinterleaveEven16`, `VectorDeinterleaveEven32`, `VectorDeinterleaveEven64`, `VectorDeinterleaveEven8`, `VectorDeinterleaveEvenLower16`, `VectorDeinterleaveEvenLower32`, `VectorDeinterleaveEvenLower8`, `VectorDeinterleaveOdd16`, `VectorDeinterleaveOdd32`, `VectorDeinterleaveOdd64`, `VectorDeinterleaveOdd8`, `VectorDeinterleaveOddLower16`, `VectorDeinterleaveOddLower32`, `VectorDeinterleaveOddLower8`, `VectorEor`, `VectorEqual128`, `VectorEqual16`, `VectorEqual32`, `VectorEqual64`, `VectorEqual8`, `VectorExtract`, `VectorExtractLower`, `VectorGetElement16`, `VectorGetElement32`, `VectorGetElement64`, `VectorGetElement8`, `VectorGreaterS16`, `VectorGreaterS32`, `VectorGreaterS64`, `VectorGreaterS8`, `VectorHalvingAddS16`, `VectorHalvingAddS32`, `VectorHalvingAddS8`, `VectorHalvingAddU16`, `VectorHalvingAddU32`, `VectorHalvingAddU8`, `VectorHalvingSubS16`, `VectorHalvingSubS32`, `VectorHalvingSubS8`, `VectorHalvingSubU16`, `VectorHalvingSubU32`, `VectorHalvingSubU8`, `VectorInterleaveLower16`, `VectorInterleaveLower32`, `VectorInterleaveLower64`, `VectorInterleaveLower8`, `VectorInterleaveUpper16`, `VectorInterleaveUpper32`, `VectorInterleaveUpper64`, `VectorInterleaveUpper8`, `VectorLogicalShiftLeft16`, `VectorLogicalShiftLeft32`, `VectorLogicalShiftLeft64`, `VectorLogicalShiftLeft8`, `VectorLogicalShiftRight16`, `VectorLogicalShiftRight32`, `VectorLogicalShiftRight64`, `VectorLogicalShiftRight8`, `VectorLogicalVShift16`, `VectorLogicalVShift32`, `VectorLogicalVShift64`, `VectorLogicalVShift8`, `VectorMaxS16`, `VectorMaxS32`, `VectorMaxS64`, `VectorMaxS8`, `VectorMaxU16`, `VectorMaxU32`, `VectorMaxU64`, `VectorMaxU8`, `VectorMinS16`, `VectorMinS32`, `VectorMinS64`, `VectorMinS8`, `VectorMinU16`, `VectorMinU32`, `VectorMinU64`, `VectorMinU8`, `VectorMultiply16`, `VectorMultiply32`, `VectorMultiply64`, `VectorMultiply8`, `VectorMultiplySignedWiden16`, `VectorMultiplySignedWiden32`, `VectorMultiplySignedWiden8`, `VectorMultiplyUnsignedWiden16`, `VectorMultiplyUnsignedWiden32`, `VectorMultiplyUnsignedWiden8`, `VectorNarrow16`, `VectorNarrow32`, `VectorNarrow64`, `VectorNot`, `VectorOr`, `VectorPairedAddLower16`, `VectorPairedAddLower32`, `VectorPairedAddLower8`, `VectorPairedAddSignedWiden16`, `VectorPairedAddSignedWiden32`, `VectorPairedAddSignedWiden8`, `VectorPairedAddUnsignedWiden16`, `VectorPairedAddUnsignedWiden32`, `VectorPairedAddUnsignedWiden8`, `VectorPolynomialMultiply8`, `VectorPolynomialMultiplyLong64`, `VectorPolynomialMultiplyLong8`, `VectorPopulationCount`, `VectorReverseElementsInHalfGroups8`, `VectorReverseElementsInLongGroups16`, `VectorReverseElementsInLongGroups32`, `VectorReverseElementsInLongGroups8`, `VectorReverseElementsInWordGroups16`, `VectorReverseElementsInWordGroups8`, `VectorRoundingHalvingAddS16`, `VectorRoundingHalvingAddS32`, `VectorRoundingHalvingAddS8`, `VectorRoundingHalvingAddU16`, `VectorRoundingHalvingAddU32`, `VectorRoundingHalvingAddU8`, `VectorRoundingShiftLeftS16`, `VectorRoundingShiftLeftS32`, `VectorRoundingShiftLeftS64`, `VectorRoundingShiftLeftS8`, `VectorRoundingShiftLeftU16`, `VectorRoundingShiftLeftU32`, `VectorRoundingShiftLeftU64`, `VectorRoundingShiftLeftU8`, `VectorSetElement16`, `VectorSetElement32`, `VectorSetElement64`, `VectorSetElement8`, `VectorSignExtend16`, `VectorSignExtend32`, `VectorSignExtend64`, `VectorSignExtend8`, `VectorSignedAbsoluteDifference16`, `VectorSignedAbsoluteDifference32`, `VectorSignedAbsoluteDifference8`, `VectorSignedSaturatedAbs16`, `VectorSignedSaturatedAbs32`, `VectorSignedSaturatedAbs64`, `VectorSignedSaturatedAbs8`, `VectorSignedSaturatedAdd16`, `VectorSignedSaturatedAdd32`, `VectorSignedSaturatedAdd64`, `VectorSignedSaturatedAdd8`, `VectorSignedSaturatedDoublingMultiplyHigh16`, `VectorSignedSaturatedDoublingMultiplyHigh32`, `VectorSignedSaturatedDoublingMultiplyHighRounding16`, `VectorSignedSaturatedDoublingMultiplyHighRounding32`, `VectorSignedSaturatedDoublingMultiplyLong16`, `VectorSignedSaturatedDoublingMultiplyLong32`, `VectorSignedSaturatedNarrowToSigned16`, `VectorSignedSaturatedNarrowToSigned32`, `VectorSignedSaturatedNarrowToSigned64`, `VectorSignedSaturatedNarrowToUnsigned16`, `VectorSignedSaturatedNarrowToUnsigned32`, `VectorSignedSaturatedNarrowToUnsigned64`, `VectorSignedSaturatedNeg16`, `VectorSignedSaturatedNeg32`, `VectorSignedSaturatedNeg64`, `VectorSignedSaturatedNeg8`, `VectorSignedSaturatedShiftLeft16`, `VectorSignedSaturatedShiftLeft32`, `VectorSignedSaturatedShiftLeft64`, `VectorSignedSaturatedShiftLeft8`, `VectorSignedSaturatedShiftLeftUnsigned16`, `VectorSignedSaturatedShiftLeftUnsigned32`, `VectorSignedSaturatedShiftLeftUnsigned64`, `VectorSignedSaturatedShiftLeftUnsigned8`, `VectorSignedSaturatedSub16`, `VectorSignedSaturatedSub32`, `VectorSignedSaturatedSub64`, `VectorSignedSaturatedSub8`, `VectorSub16`, `VectorSub32`, `VectorSub64`, `VectorSub8`, `VectorTable`, `VectorTableLookup128`, `VectorTableLookup64`, `VectorTranspose16`, `VectorTranspose32`, `VectorTranspose64`, `VectorTranspose8`, `VectorUnsignedAbsoluteDifference16`, `VectorUnsignedAbsoluteDifference32`, `VectorUnsignedAbsoluteDifference8`, `VectorUnsignedRecipEstimate`, `VectorUnsignedRecipSqrtEstimate`, `VectorUnsignedSaturatedAdd16`, `VectorUnsignedSaturatedAdd32`, `VectorUnsignedSaturatedAdd64`, `VectorUnsignedSaturatedAdd8`, `VectorUnsignedSaturatedNarrow16`, `VectorUnsignedSaturatedNarrow32`, `VectorUnsignedSaturatedNarrow64`, `VectorUnsignedSaturatedShiftLeft16`, `VectorUnsignedSaturatedShiftLeft32`, `VectorUnsignedSaturatedShiftLeft64`, `VectorUnsignedSaturatedShiftLeft8`, `VectorUnsignedSaturatedSub16`, `VectorUnsignedSaturatedSub32`, `VectorUnsignedSaturatedSub64`, `VectorUnsignedSaturatedSub8`, `VectorZeroExtend16`, `VectorZeroExtend32`, `VectorZeroExtend64`, `VectorZeroExtend8`, `ZeroVector`
+`VectorAbs16`, `VectorAbs32`, `VectorAbs64`, `VectorAbs8`, `VectorAdd16`, `VectorAdd32`, `VectorAdd64`, `VectorAdd8`, `VectorArithmeticShiftRight16`, `VectorArithmeticShiftRight32`, `VectorArithmeticShiftRight64`, `VectorArithmeticShiftRight8`, `VectorArithmeticVShift16`, `VectorArithmeticVShift32`, `VectorArithmeticVShift64`, `VectorArithmeticVShift8`, `VectorCountLeadingZeros16`, `VectorCountLeadingZeros32`, `VectorCountLeadingZeros8`, `VectorDeinterleaveEven16`, `VectorDeinterleaveEven32`, `VectorDeinterleaveEven64`, `VectorDeinterleaveEven8`, `VectorDeinterleaveEvenLower16`, `VectorDeinterleaveEvenLower32`, `VectorDeinterleaveEvenLower8`, `VectorDeinterleaveOdd16`, `VectorDeinterleaveOdd32`, `VectorDeinterleaveOdd64`, `VectorDeinterleaveOdd8`, `VectorDeinterleaveOddLower16`, `VectorDeinterleaveOddLower32`, `VectorDeinterleaveOddLower8`, `VectorEqual128`, `VectorEqual16`, `VectorEqual32`, `VectorEqual64`, `VectorEqual8`, `VectorGreaterS16`, `VectorGreaterS32`, `VectorGreaterS64`, `VectorGreaterS8`, `VectorHalvingAddS16`, `VectorHalvingAddS32`, `VectorHalvingAddS8`, `VectorHalvingAddU16`, `VectorHalvingAddU32`, `VectorHalvingAddU8`, `VectorHalvingSubS16`, `VectorHalvingSubS32`, `VectorHalvingSubS8`, `VectorHalvingSubU16`, `VectorHalvingSubU32`, `VectorHalvingSubU8`, `VectorInterleaveLower16`, `VectorInterleaveLower32`, `VectorInterleaveLower64`, `VectorInterleaveLower8`, `VectorInterleaveUpper16`, `VectorInterleaveUpper32`, `VectorInterleaveUpper64`, `VectorInterleaveUpper8`, `VectorLogicalShiftLeft16`, `VectorLogicalShiftLeft32`, `VectorLogicalShiftLeft64`, `VectorLogicalShiftLeft8`, `VectorLogicalShiftRight16`, `VectorLogicalShiftRight32`, `VectorLogicalShiftRight64`, `VectorLogicalShiftRight8`, `VectorLogicalVShift16`, `VectorLogicalVShift32`, `VectorLogicalVShift64`, `VectorLogicalVShift8`, `VectorMaxS16`, `VectorMaxS32`, `VectorMaxS64`, `VectorMaxS8`, `VectorMaxU16`, `VectorMaxU32`, `VectorMaxU64`, `VectorMaxU8`, `VectorMinS16`, `VectorMinS32`, `VectorMinS64`, `VectorMinS8`, `VectorMinU16`, `VectorMinU32`, `VectorMinU64`, `VectorMinU8`, `VectorMultiply16`, `VectorMultiply32`, `VectorMultiply64`, `VectorMultiply8`, `VectorMultiplySignedWiden16`, `VectorMultiplySignedWiden32`, `VectorMultiplySignedWiden8`, `VectorMultiplyUnsignedWiden16`, `VectorMultiplyUnsignedWiden32`, `VectorMultiplyUnsignedWiden8`, `VectorNarrow16`, `VectorNarrow32`, `VectorNarrow64`, `VectorPairedAddLower16`, `VectorPairedAddLower32`, `VectorPairedAddLower8`, `VectorPairedAddSignedWiden16`, `VectorPairedAddSignedWiden32`, `VectorPairedAddSignedWiden8`, `VectorPairedAddUnsignedWiden16`, `VectorPairedAddUnsignedWiden32`, `VectorPairedAddUnsignedWiden8`, `VectorPolynomialMultiply8`, `VectorPolynomialMultiplyLong64`, `VectorPolynomialMultiplyLong8`, `VectorPopulationCount`, `VectorReverseElementsInHalfGroups8`, `VectorReverseElementsInLongGroups16`, `VectorReverseElementsInLongGroups32`, `VectorReverseElementsInLongGroups8`, `VectorReverseElementsInWordGroups16`, `VectorReverseElementsInWordGroups8`, `VectorRoundingHalvingAddS16`, `VectorRoundingHalvingAddS32`, `VectorRoundingHalvingAddS8`, `VectorRoundingHalvingAddU16`, `VectorRoundingHalvingAddU32`, `VectorRoundingHalvingAddU8`, `VectorRoundingShiftLeftS16`, `VectorRoundingShiftLeftS32`, `VectorRoundingShiftLeftS64`, `VectorRoundingShiftLeftS8`, `VectorRoundingShiftLeftU16`, `VectorRoundingShiftLeftU32`, `VectorRoundingShiftLeftU64`, `VectorRoundingShiftLeftU8`, `VectorSignExtend16`, `VectorSignExtend32`, `VectorSignExtend64`, `VectorSignExtend8`, `VectorSignedAbsoluteDifference16`, `VectorSignedAbsoluteDifference32`, `VectorSignedAbsoluteDifference8`, `VectorSignedSaturatedAbs16`, `VectorSignedSaturatedAbs32`, `VectorSignedSaturatedAbs64`, `VectorSignedSaturatedAbs8`, `VectorSignedSaturatedAdd16`, `VectorSignedSaturatedAdd32`, `VectorSignedSaturatedAdd64`, `VectorSignedSaturatedAdd8`, `VectorSignedSaturatedDoublingMultiplyHigh16`, `VectorSignedSaturatedDoublingMultiplyHigh32`, `VectorSignedSaturatedDoublingMultiplyHighRounding16`, `VectorSignedSaturatedDoublingMultiplyHighRounding32`, `VectorSignedSaturatedDoublingMultiplyLong16`, `VectorSignedSaturatedDoublingMultiplyLong32`, `VectorSignedSaturatedNarrowToSigned16`, `VectorSignedSaturatedNarrowToSigned32`, `VectorSignedSaturatedNarrowToSigned64`, `VectorSignedSaturatedNarrowToUnsigned16`, `VectorSignedSaturatedNarrowToUnsigned32`, `VectorSignedSaturatedNarrowToUnsigned64`, `VectorSignedSaturatedNeg16`, `VectorSignedSaturatedNeg32`, `VectorSignedSaturatedNeg64`, `VectorSignedSaturatedNeg8`, `VectorSignedSaturatedShiftLeft16`, `VectorSignedSaturatedShiftLeft32`, `VectorSignedSaturatedShiftLeft64`, `VectorSignedSaturatedShiftLeft8`, `VectorSignedSaturatedShiftLeftUnsigned16`, `VectorSignedSaturatedShiftLeftUnsigned32`, `VectorSignedSaturatedShiftLeftUnsigned64`, `VectorSignedSaturatedShiftLeftUnsigned8`, `VectorSignedSaturatedSub16`, `VectorSignedSaturatedSub32`, `VectorSignedSaturatedSub64`, `VectorSignedSaturatedSub8`, `VectorSub16`, `VectorSub32`, `VectorSub64`, `VectorSub8`, `VectorTable`, `VectorTableLookup128`, `VectorTableLookup64`, `VectorTranspose16`, `VectorTranspose32`, `VectorTranspose64`, `VectorTranspose8`, `VectorUnsignedAbsoluteDifference16`, `VectorUnsignedAbsoluteDifference32`, `VectorUnsignedAbsoluteDifference8`, `VectorUnsignedRecipEstimate`, `VectorUnsignedRecipSqrtEstimate`, `VectorUnsignedSaturatedAdd16`, `VectorUnsignedSaturatedAdd32`, `VectorUnsignedSaturatedAdd64`, `VectorUnsignedSaturatedAdd8`, `VectorUnsignedSaturatedNarrow16`, `VectorUnsignedSaturatedNarrow32`, `VectorUnsignedSaturatedNarrow64`, `VectorUnsignedSaturatedShiftLeft16`, `VectorUnsignedSaturatedShiftLeft32`, `VectorUnsignedSaturatedShiftLeft64`, `VectorUnsignedSaturatedShiftLeft8`, `VectorUnsignedSaturatedSub16`, `VectorUnsignedSaturatedSub32`, `VectorUnsignedSaturatedSub64`, `VectorUnsignedSaturatedSub8`, `VectorZeroExtend16`, `VectorZeroExtend32`, `VectorZeroExtend64`, `VectorZeroExtend8`
 
 ## Dispatch evidence (not full support)
 
 | Opcode | Route | Source |
 | --- | --- | --- |
-| `A32BXWritePC` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2006` |
-| `A32CallSupervisor` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2124` |
-| `A32CoprocGetOneWord` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1728` |
-| `A32GetCFlag` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1935` |
-| `A32GetCpsr` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1926` |
-| `A32GetExtendedRegister32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2082` |
-| `A32GetExtendedRegister64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2101` |
-| `A32GetFpscrNZCV` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1920` |
-| `A32GetRegister` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1700` |
-| `A32GetVector` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2026` |
-| `A32ReadMemory16` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1928` |
-| `A32ReadMemory32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1929` |
-| `A32ReadMemory64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1930` |
-| `A32ReadMemory8` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1927` |
-| `A32SetCheckBit` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2018` |
-| `A32SetCpsrNZ` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1936` |
-| `A32SetCpsrNZC` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1937` |
-| `A32SetCpsrNZCV` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1938` |
-| `A32SetCpsrNZCVRaw` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1939` |
-| `A32SetExtendedRegister32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2092` |
-| `A32SetExtendedRegister64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2113` |
-| `A32SetFpscrNZCV` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1922` |
-| `A32SetRegister` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1701` |
-| `A32SetVector` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2044` |
-| `A32UpdateUpperLocationDescriptor` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2001` |
-| `A32WriteMemory16` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1932` |
-| `A32WriteMemory32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1933` |
-| `A32WriteMemory64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1934` |
-| `A32WriteMemory8` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1931` |
+| `A32BXWritePC` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2104` |
+| `A32CallSupervisor` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2277` |
+| `A32CoprocGetOneWord` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1826` |
+| `A32GetCFlag` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2033` |
+| `A32GetCpsr` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2024` |
+| `A32GetExtendedRegister32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2235` |
+| `A32GetExtendedRegister64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2254` |
+| `A32GetFpscrNZCV` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2018` |
+| `A32GetRegister` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1798` |
+| `A32GetVector` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2177` |
+| `A32ReadMemory16` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2026` |
+| `A32ReadMemory32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2027` |
+| `A32ReadMemory64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2028` |
+| `A32ReadMemory8` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2025` |
+| `A32SetCheckBit` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2116` |
+| `A32SetCpsrNZ` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2034` |
+| `A32SetCpsrNZC` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2035` |
+| `A32SetCpsrNZCV` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2036` |
+| `A32SetCpsrNZCVRaw` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2037` |
+| `A32SetExtendedRegister32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2245` |
+| `A32SetExtendedRegister64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2266` |
+| `A32SetFpscrNZCV` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2020` |
+| `A32SetRegister` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1799` |
+| `A32SetVector` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2197` |
+| `A32UpdateUpperLocationDescriptor` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2099` |
+| `A32WriteMemory16` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2030` |
+| `A32WriteMemory32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2031` |
+| `A32WriteMemory64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2032` |
+| `A32WriteMemory8` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2029` |
 | `Add32` | positive predicate arithmetic | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:205` |
-| `And32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1952` |
-| `AndNot32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1956` |
+| `And32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2050` |
+| `And64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2136` |
+| `AndNot32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2054` |
+| `AndNot64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2137` |
 | `ArithmeticShiftRight32` | positive predicate shift | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:209` |
-| `ConditionalSelect32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1997` |
-| `ConditionalSelectNZCV` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1998` |
-| `CountLeadingZeros32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1958` |
-| `Eor32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1953` |
-| `FPAbs32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1919` |
-| `FPAdd32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1803` |
-| `FPCompare32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1738` |
-| `FPDiv32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1806` |
-| `FPFixedS32ToSingle` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1785` |
-| `FPFixedU32ToSingle` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1786` |
-| `FPMul32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1805` |
-| `FPNeg32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1918` |
-| `FPSub32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1804` |
-| `GetCFlagFromNZCV` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1951` |
-| `GetCarryFromOp` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1947` |
-| `GetGEFromOp` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1949` |
-| `GetNZCVFromOp` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1946` |
-| `GetNZFromOp` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1945` |
-| `GetOverflowFromOp` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1948` |
-| `Identity` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1699` |
-| `IsZero32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1957` |
-| `LeastSignificantByte` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1961` |
-| `LeastSignificantHalf` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1962` |
-| `LeastSignificantWord` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1963` |
+| `ConditionalSelect32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2095` |
+| `ConditionalSelectNZCV` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2096` |
+| `CountLeadingZeros32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2056` |
+| `Eor32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2051` |
+| `Eor64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2139` |
+| `FPAbs32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2017` |
+| `FPAdd32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1901` |
+| `FPCompare32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1836` |
+| `FPDiv32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1904` |
+| `FPFixedS32ToSingle` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1883` |
+| `FPFixedU32ToSingle` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1884` |
+| `FPMul32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1903` |
+| `FPNeg32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2016` |
+| `FPSub32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1902` |
+| `GetCFlagFromNZCV` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2049` |
+| `GetCarryFromOp` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2045` |
+| `GetGEFromOp` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2047` |
+| `GetNZCVFromOp` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2044` |
+| `GetNZFromOp` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2043` |
+| `GetOverflowFromOp` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2046` |
+| `Identity` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1791` |
+| `IsZero32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2055` |
+| `LeastSignificantByte` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2059` |
+| `LeastSignificantHalf` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2060` |
+| `LeastSignificantWord` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2061` |
 | `LogicalShiftLeft32` | positive predicate shift | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:209` |
 | `LogicalShiftRight32` | positive predicate shift | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:209` |
-| `LogicalShiftRight64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1971` |
-| `MostSignificantBit` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1960` |
-| `MostSignificantWord` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1964` |
-| `Mul32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1959` |
-| `Mul64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2064` |
-| `NZCVFromPackedFlags` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1950` |
-| `Not32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1955` |
-| `Or32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1954` |
-| `Pack2x32To1x64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2072` |
-| `PushRSB` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2014` |
+| `LogicalShiftRight64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2069` |
+| `MostSignificantBit` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2058` |
+| `MostSignificantWord` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2062` |
+| `Mul32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2057` |
+| `Mul64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2217` |
+| `NZCVFromPackedFlags` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2048` |
+| `Not32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2053` |
+| `Not64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2140` |
+| `Or32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2052` |
+| `Or64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2138` |
+| `Pack2x32To1x64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2225` |
+| `Pack2x64To1x128` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2174` |
+| `PushRSB` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2112` |
 | `RotateRight32` | positive predicate shift | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:209` |
 | `RotateRightExtended` | positive predicate shift | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:209` |
-| `SignExtendByteToWord` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1984` |
-| `SignExtendHalfToWord` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1985` |
-| `SignExtendWordToLong` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1986` |
+| `SignExtendByteToWord` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2082` |
+| `SignExtendHalfToWord` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2083` |
+| `SignExtendWordToLong` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2084` |
 | `Sub32` | positive predicate arithmetic | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:205` |
-| `VectorBroadcast32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2020` |
-| `Void` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1698` |
-| `ZeroExtendByteToWord` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1995` |
-| `ZeroExtendHalfToWord` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1996` |
-| `ZeroExtendWordToLong` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1991` |
+| `VectorAnd` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2141` |
+| `VectorAndNot` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2142` |
+| `VectorBroadcast16` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2119` |
+| `VectorBroadcast32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2120` |
+| `VectorBroadcast64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2121` |
+| `VectorBroadcast8` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2118` |
+| `VectorBroadcastElement16` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2123` |
+| `VectorBroadcastElement32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2124` |
+| `VectorBroadcastElement64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2125` |
+| `VectorBroadcastElement8` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2122` |
+| `VectorEor` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2144` |
+| `VectorExtract` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2134` |
+| `VectorExtractLower` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2135` |
+| `VectorGetElement16` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2127` |
+| `VectorGetElement32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2128` |
+| `VectorGetElement64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2129` |
+| `VectorGetElement8` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2126` |
+| `VectorNot` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2145` |
+| `VectorOr` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2143` |
+| `VectorSetElement16` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2131` |
+| `VectorSetElement32` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2132` |
+| `VectorSetElement64` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2133` |
+| `VectorSetElement8` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2130` |
+| `VectorZeroUpper` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2167` |
+| `Void` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1790` |
+| `ZeroExtendByteToWord` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2093` |
+| `ZeroExtendHalfToWord` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2094` |
+| `ZeroExtendLongToQuad` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2166` |
+| `ZeroExtendWordToLong` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2089` |
+| `ZeroVector` | instruction switch case | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2163` |
 
 ## Partial-support restrictions: source review checklist
 
@@ -199,56 +230,66 @@ Sites containing `return false`, `reject(...)` or `ExitReason::Unsupported`; JSO
 
 | Function | Source | Source context (up to two preceding lines) |
 | --- | --- | --- |
-| `condition` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1027` | `case Cond::LE: flag(30); flag(31); flag(28); op(Ne); op(Or); break;         case Cond::AL: imm(1); break;         default: reject("cond NV"); break; // NV is not an unconditional alias` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1704` | `const auto reg = inst.GetArg(0);             if (!reg.IsImmediate() &#124;&#124; reg.GetType() != Type::A32Reg)                 return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1706` | `return false;             const auto index = static_cast<uint32_t>(reg.GetA32RegRef());             if (index >= 16) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1734` | `if (!info.IsImmediate() &#124;&#124; info.GetType() != Type::CoprocInfo                 &#124;&#124; info.GetCoprocInfo() != Dynarmic::IR::Value::CoprocessorInfo{15, 0, 0, 13, 0, 3})                 return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1741` | `// Compare IEEE-754 bit patterns without host FP conversion: preserve             // signaling NaNs, signed zeros and guest flush-to-zero behavior.             if (!inst.GetArg(2).IsImmediate()) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1745` | `// the live FPSCR rather than silently ignoring enabled traps.             load(offsetof(JitState, fpscr)); mask(0x00009f00u);             begin_if(); ret(ExitReason::Unsupported); end_if();` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1791` | `if (!inst.GetArg(1).IsImmediate() &#124;&#124; inst.GetArg(1).GetU8() != 0                 &#124;&#124; !inst.GetArg(2).IsImmediate() &#124;&#124; inst.GetArg(2).GetU8() != 0)                 return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1793` | `return false;             load(offsetof(JitState, fpscr)); mask(0x00009f00u);             begin_if(); ret(ExitReason::Unsupported); end_if();` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1814` | `// Wasm arithmetic rounds to nearest-even. Other guest rounding             // modes remain unsupported rather than silently giving RN results.             if (start.FPSCR().Value() & 0x00c00000u) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1816` | `if (start.FPSCR().Value() & 0x00c00000u) return false;             load(offsetof(JitState, fpscr)); mask(0x00009f00u);             begin_if(); ret(ExitReason::Unsupported); end_if();` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1999` | `case Op::ConditionalSelect32:         case Op::ConditionalSelectNZCV:             if (!inst.GetArg(0).IsImmediate() &#124;&#124; inst.GetArg(0).GetType() != Type::Cond) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2028` | `case Op::A32GetVector: {             const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2032` | `unsigned base, words;             if (Dynarmic::A32::IsQuadExtReg(ext)) {                 if (Dynarmic::A32::RegNumber(ext) >= 16) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2035` | `base = Dynarmic::A32::RegNumber(ext) * 4; words = 4;             } else if (Dynarmic::A32::IsDoubleExtReg(ext)) {                 if (Dynarmic::A32::RegNumber(ext) >= 32) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2038` | `base = Dynarmic::A32::RegNumber(ext) * 2; words = 2;             } else {                 return false; // single registers use GetExtendedRegister32` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2046` | `case Op::A32SetVector: {             const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2053` | `unsigned base, words;             if (Dynarmic::A32::IsQuadExtReg(ext)) {                 if (Dynarmic::A32::RegNumber(ext) >= 16) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2056` | `base = Dynarmic::A32::RegNumber(ext) * 4; words = 4;             } else if (Dynarmic::A32::IsDoubleExtReg(ext)) {                 if (Dynarmic::A32::RegNumber(ext) >= 32) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2059` | `base = Dynarmic::A32::RegNumber(ext) * 2; words = 2;             } else {                 return false; // single registers use SetExtendedRegister32` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2084` | `case Op::A32GetExtendedRegister32: {             const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2085` | `const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;             if (!Dynarmic::A32::IsSingleExtReg(reg.GetA32ExtRegRef())) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2087` | `if (!Dynarmic::A32::IsSingleExtReg(reg.GetA32ExtRegRef())) return false;             const auto n = Dynarmic::A32::RegNumber(reg.GetA32ExtRegRef());             if (n >= 32) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2094` | `case Op::A32SetExtendedRegister32: {             const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2095` | `const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;             if (!Dynarmic::A32::IsSingleExtReg(reg.GetA32ExtRegRef())) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2097` | `if (!Dynarmic::A32::IsSingleExtReg(reg.GetA32ExtRegRef())) return false;             const auto n = Dynarmic::A32::RegNumber(reg.GetA32ExtRegRef());             if (n >= 32) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2103` | `case Op::A32GetExtendedRegister64: {             const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2104` | `const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;             if (!Dynarmic::A32::IsDoubleExtReg(reg.GetA32ExtRegRef())) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2106` | `if (!Dynarmic::A32::IsDoubleExtReg(reg.GetA32ExtRegRef())) return false;             const auto n = Dynarmic::A32::RegNumber(reg.GetA32ExtRegRef());             if (n >= 32) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2115` | `case Op::A32SetExtendedRegister64: {             const auto reg = inst.GetArg(0);             if (!reg.IsImmediate()) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2118` | `// RegNumber alone cannot distinguish S/D/Q; only a D register has             // this 64-bit footprint (the x64 backend asserts the same).             if (!Dynarmic::A32::IsDoubleExtReg(reg.GetA32ExtRegRef())) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2120` | `if (!Dynarmic::A32::IsDoubleExtReg(reg.GetA32ExtRegRef())) return false;             const auto n = Dynarmic::A32::RegNumber(reg.GetA32ExtRegRef());             if (n >= 32) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2125` | `}         case Op::A32CallSupervisor:             if (!pc_written) return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2129` | `svc = true;             return ok;         default: return false;` |
-| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2132` | `}         if (!scalar(inst.GetType()))             return false;` |
+| `condition` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1119` | `case Cond::LE: flag(30); flag(31); flag(28); op(Ne); op(Or); break;         case Cond::AL: imm(1); break;         default: reject("cond NV"); break; // NV is not an unconditional alias` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1793` | `case Op::Identity: {             const auto type = inst.GetType();             if (type != Type::U128 && !scalar(type)) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1802` | `const auto reg = inst.GetArg(0);             if (!reg.IsImmediate() &#124;&#124; reg.GetType() != Type::A32Reg)                 return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1804` | `return false;             const auto index = static_cast<uint32_t>(reg.GetA32RegRef());             if (index >= 16) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1832` | `if (!info.IsImmediate() &#124;&#124; info.GetType() != Type::CoprocInfo                 &#124;&#124; info.GetCoprocInfo() != Dynarmic::IR::Value::CoprocessorInfo{15, 0, 0, 13, 0, 3})                 return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1839` | `// Compare IEEE-754 bit patterns without host FP conversion: preserve             // signaling NaNs, signed zeros and guest flush-to-zero behavior.             if (!inst.GetArg(2).IsImmediate()) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1843` | `// the live FPSCR rather than silently ignoring enabled traps.             load(offsetof(JitState, fpscr)); mask(0x00009f00u);             begin_if(); ret(ExitReason::Unsupported); end_if();` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1889` | `if (!inst.GetArg(1).IsImmediate() &#124;&#124; inst.GetArg(1).GetU8() != 0                 &#124;&#124; !inst.GetArg(2).IsImmediate() &#124;&#124; inst.GetArg(2).GetU8() != 0)                 return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1891` | `return false;             load(offsetof(JitState, fpscr)); mask(0x00009f00u);             begin_if(); ret(ExitReason::Unsupported); end_if();` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1912` | `// Wasm arithmetic rounds to nearest-even. Other guest rounding             // modes remain unsupported rather than silently giving RN results.             if (start.FPSCR().Value() & 0x00c00000u) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1914` | `if (start.FPSCR().Value() & 0x00c00000u) return false;             load(offsetof(JitState, fpscr)); mask(0x00009f00u);             begin_if(); ret(ExitReason::Unsupported); end_if();` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2097` | `case Op::ConditionalSelect32:         case Op::ConditionalSelectNZCV:             if (!inst.GetArg(0).IsImmediate() &#124;&#124; inst.GetArg(0).GetType() != Type::Cond) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2179` | `case Op::A32GetVector: {             const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2183` | `unsigned base, words;             if (Dynarmic::A32::IsQuadExtReg(ext)) {                 if (Dynarmic::A32::RegNumber(ext) >= 16) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2186` | `base = Dynarmic::A32::RegNumber(ext) * 4; words = 4;             } else if (Dynarmic::A32::IsDoubleExtReg(ext)) {                 if (Dynarmic::A32::RegNumber(ext) >= 32) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2189` | `base = Dynarmic::A32::RegNumber(ext) * 2; words = 2;             } else {                 return false; // single registers use GetExtendedRegister32` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2199` | `case Op::A32SetVector: {             const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2206` | `unsigned base, words;             if (Dynarmic::A32::IsQuadExtReg(ext)) {                 if (Dynarmic::A32::RegNumber(ext) >= 16) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2209` | `base = Dynarmic::A32::RegNumber(ext) * 4; words = 4;             } else if (Dynarmic::A32::IsDoubleExtReg(ext)) {                 if (Dynarmic::A32::RegNumber(ext) >= 32) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2212` | `base = Dynarmic::A32::RegNumber(ext) * 2; words = 2;             } else {                 return false; // single registers use SetExtendedRegister32` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2237` | `case Op::A32GetExtendedRegister32: {             const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2238` | `const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;             if (!Dynarmic::A32::IsSingleExtReg(reg.GetA32ExtRegRef())) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2240` | `if (!Dynarmic::A32::IsSingleExtReg(reg.GetA32ExtRegRef())) return false;             const auto n = Dynarmic::A32::RegNumber(reg.GetA32ExtRegRef());             if (n >= 32) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2247` | `case Op::A32SetExtendedRegister32: {             const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2248` | `const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;             if (!Dynarmic::A32::IsSingleExtReg(reg.GetA32ExtRegRef())) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2250` | `if (!Dynarmic::A32::IsSingleExtReg(reg.GetA32ExtRegRef())) return false;             const auto n = Dynarmic::A32::RegNumber(reg.GetA32ExtRegRef());             if (n >= 32) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2256` | `case Op::A32GetExtendedRegister64: {             const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2257` | `const auto reg = inst.GetArg(0);             if (reg.GetType() != Type::A32ExtReg) return false;             if (!Dynarmic::A32::IsDoubleExtReg(reg.GetA32ExtRegRef())) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2259` | `if (!Dynarmic::A32::IsDoubleExtReg(reg.GetA32ExtRegRef())) return false;             const auto n = Dynarmic::A32::RegNumber(reg.GetA32ExtRegRef());             if (n >= 32) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2268` | `case Op::A32SetExtendedRegister64: {             const auto reg = inst.GetArg(0);             if (!reg.IsImmediate()) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2271` | `// RegNumber alone cannot distinguish S/D/Q; only a D register has             // this 64-bit footprint (the x64 backend asserts the same).             if (!Dynarmic::A32::IsDoubleExtReg(reg.GetA32ExtRegRef())) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2273` | `if (!Dynarmic::A32::IsDoubleExtReg(reg.GetA32ExtRegRef())) return false;             const auto n = Dynarmic::A32::RegNumber(reg.GetA32ExtRegRef());             if (n >= 32) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2278` | `}         case Op::A32CallSupervisor:             if (!pc_written) return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2282` | `svc = true;             return ok;         default: return false;` |
+| `instruction` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:2285` | `}         if (!scalar(inst.GetType()))             return false;` |
 | `memory_call` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:940` | `void memory_call(const Inst &inst, bool write, unsigned bytes) {         if (inst.GetArg(1).GetType() != Type::U32) { reject("memory_call arg1 not U32"); return; }` |
 | `memory_call` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:941` | `void memory_call(const Inst &inst, bool write, unsigned bytes) {         if (inst.GetArg(1).GetType() != Type::U32) { reject("memory_call arg1 not U32"); return; }         if (!inst.GetArg(0).IsImmediate()) { reject("memory_call arg0 not imm"); return; }` |
-| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1304` | `if (inst.GetOpcode() == Op::GetNZFromOp) {             if (arg.GetType() != Type::U32)                 return false;` |
-| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1308` | `} else {             if (arg.IsImmediate())                 return false;` |
-| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1312` | `const auto it = locals.find(producer);             if (it == locals.end())                 return false;` |
-| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1316` | `switch (inst.GetOpcode()) {             case Op::GetGEFromOp:                 if (producer->GetOpcode() != Op::PackedAddU8) return false;` |
-| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1320` | `break;             case Op::GetCarryFromOp:                 if (!arith && !shift(producer->GetOpcode()) && producer->GetOpcode() != Op::MostSignificantWord) return false;` |
-| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1324` | `break;             case Op::GetOverflowFromOp:                 if (!arith) return false;` |
-| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1328` | `break;             case Op::GetNZCVFromOp:                 if (!arith) return false;` |
-| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1333` | `get(it->second + 5); imm(28); op(Shl); op(Or);                 break;             default: return false;` |
-| `shift_imm` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1183` | `if (kind == Op::RotateRight32) {             const uint32_t s = k & 31;             if (k == 0) return false;` |
-| `shift_imm` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1234` | `return true;         }         return false;` |
+| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1396` | `if (inst.GetOpcode() == Op::GetNZFromOp) {             if (arg.GetType() != Type::U32)                 return false;` |
+| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1400` | `} else {             if (arg.IsImmediate())                 return false;` |
+| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1404` | `const auto it = locals.find(producer);             if (it == locals.end())                 return false;` |
+| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1408` | `switch (inst.GetOpcode()) {             case Op::GetGEFromOp:                 if (producer->GetOpcode() != Op::PackedAddU8) return false;` |
+| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1412` | `break;             case Op::GetCarryFromOp:                 if (!arith && !shift(producer->GetOpcode()) && producer->GetOpcode() != Op::MostSignificantWord) return false;` |
+| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1416` | `break;             case Op::GetOverflowFromOp:                 if (!arith) return false;` |
+| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1420` | `break;             case Op::GetNZCVFromOp:                 if (!arith) return false;` |
+| `pseudo` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1425` | `get(it->second + 5); imm(28); op(Shl); op(Or);                 break;             default: return false;` |
+| `shift_imm` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1275` | `if (kind == Op::RotateRight32) {             const uint32_t s = k & 31;             if (k == 0) return false;` |
+| `shift_imm` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1326` | `return true;         }         return false;` |
 | `slow_reason_detail` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:471` | `if (const char *e = std::getenv("VITA3K_WASMJIT_SLOW_REASONS"))             return std::strcmp(e, "1") == 0;         return false;` |
 | `value_word` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:952` | `const auto type = v.GetType();         const unsigned words = type == Type::U128 ? 4 : type == Type::U64 ? 2 : 1;         if (word >= words) { reject("value word>=words"); return; }` |
 | `value_word` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:954` | `if (word >= words) { reject("value word>=words"); return; }         if (v.IsImmediate()) {             if (type == Type::NZCVFlags &#124;&#124; type == Type::Opaque &#124;&#124; type == Type::Void) { reject("value NZCV/Opaque/Void"); return; }` |
 | `value_word` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:958` | `} else {             const auto it = locals.find(v.GetInstRecursive());             if (it == locals.end()) { reject("value producer missing"); return; }` |
+| `vector_broadcast` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:992` | `bool vector_broadcast(const Inst &inst, unsigned bits, bool element = false) {         unsigned index = 0;         if (element && !vector_index(inst, bits, index)) return false;` |
+| `vector_extract` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1039` | `if (!offset.IsImmediate() &#124;&#124; offset.GetType() != Type::U8             &#124;&#124; offset.GetU8() > words * 32 &#124;&#124; offset.GetU8() % 8) {             reject("vector extract requires an in-range byte-aligned bit offset");` |
+| `vector_extract` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1040` | `&#124;&#124; offset.GetU8() > words * 32 &#124;&#124; offset.GetU8() % 8) {             reject("vector extract requires an in-range byte-aligned bit offset");             return false;` |
+| `vector_get_element` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1008` | `bool vector_get_element(const Inst &inst, unsigned bits) {         unsigned index;         if (!vector_index(inst, bits, index)) return false;` |
+| `vector_index` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:974` | `const auto lane = inst.GetArg(1);         if (!lane.IsImmediate() &#124;&#124; lane.GetType() != Type::U8) {             reject("vector lane must be an immediate U8");` |
+| `vector_index` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:975` | `if (!lane.IsImmediate() &#124;&#124; lane.GetType() != Type::U8) {             reject("vector lane must be an immediate U8");             return false;` |
+| `vector_index` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:979` | `index = lane.GetU8();         if (index >= 128 / bits) {             reject("vector lane out of range");` |
+| `vector_index` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:980` | `if (index >= 128 / bits) {             reject("vector lane out of range");             return false;` |
+| `vector_set_element` | `vita3k/cpu/src/wasmjit/emit_wasm.cpp:1016` | `bool vector_set_element(const Inst &inst, unsigned bits) {         unsigned index;         if (!vector_index(inst, bits, index)) return false;` |
 
 ## Unresolved frontend method references
 

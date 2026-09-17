@@ -966,6 +966,98 @@ private:
         value_word(v, 1); op(ExtendU); op(0x42); uleb(code, 32); op(Shl64); op(Or64);
     }
 
+    // Vectors use four consecutive i32 SSA words, not host SIMD locals. All
+    // producers define every word; region members reuse the same SSA slots.
+    bool vector_index(const Inst &inst, unsigned bits, unsigned &index) {
+        const auto lane = inst.GetArg(1);
+        if (!lane.IsImmediate() || lane.GetType() != Type::U8) {
+            reject("vector lane must be an immediate U8");
+            return false;
+        }
+        index = lane.GetU8();
+        if (index >= 128 / bits) {
+            reject("vector lane out of range");
+            return false;
+        }
+        return true;
+    }
+    void vector_element_word(const Value &source, unsigned bits, unsigned index, unsigned word = 0) {
+        const unsigned position = bits * index;
+        value_word(source, position / 32 + word);
+        if (position % 32) { imm(position % 32); op(ShrU); }
+        if (bits < 32) mask((1u << bits) - 1);
+    }
+    bool vector_broadcast(const Inst &inst, unsigned bits, bool element = false) {
+        unsigned index = 0;
+        if (element && !vector_index(inst, bits, index)) return false;
+        const unsigned words = bits == 64 ? 2 : 1;
+        for (unsigned i = 0; i < words; ++i) {
+            if (element) vector_element_word(inst.GetArg(0), bits, index, i);
+            else value_word(inst.GetArg(0), i);
+            if (bits < 32) {
+                mask((1u << bits) - 1);
+                imm(bits == 8 ? 0x01010101 : 0x00010001); op(Mul);
+            }
+            set(next_local + i);
+        }
+        for (unsigned i = words; i < 4; ++i) { get(next_local + i % words); set(next_local + i); }
+        return ok;
+    }
+    bool vector_get_element(const Inst &inst, unsigned bits) {
+        unsigned index;
+        if (!vector_index(inst, bits, index)) return false;
+        for (unsigned i = 0; i < (bits == 64 ? 2u : 1u); ++i) {
+            vector_element_word(inst.GetArg(0), bits, index, i); set(next_local + i);
+        }
+        return ok;
+    }
+    bool vector_set_element(const Inst &inst, unsigned bits) {
+        unsigned index;
+        if (!vector_index(inst, bits, index)) return false;
+        const unsigned first = bits * index / 32, shift = bits * index % 32;
+        for (unsigned word = 0; word < 4; ++word) {
+            if (word < first || word >= first + (bits == 64 ? 2u : 1u)) {
+                value_word(inst.GetArg(0), word);
+            } else if (bits >= 32) {
+                value_word(inst.GetArg(2), word - first);
+            } else {
+                const uint32_t lane_mask = (1u << bits) - 1;
+                value_word(inst.GetArg(0), word); mask(~(lane_mask << shift));
+                value_word(inst.GetArg(2)); mask(lane_mask);
+                if (shift) { imm(shift); op(Shl); }
+                op(Or);
+            }
+            set(next_local + word);
+        }
+        return ok;
+    }
+    bool vector_extract(const Inst &inst, bool lower) {
+        const auto offset = inst.GetArg(2);
+        const unsigned words = lower ? 2 : 4;
+        if (!offset.IsImmediate() || offset.GetType() != Type::U8
+            || offset.GetU8() > words * 32 || offset.GetU8() % 8) {
+            reject("vector extract requires an in-range byte-aligned bit offset");
+            return false;
+        }
+        const unsigned position = offset.GetU8();
+        // Concatenate b:a, with a least significant. Lower uses just each
+        // operand's low 64 bits, not a's possibly undefined upper lanes.
+        const auto joined_word = [&](unsigned index) {
+            value_word(inst.GetArg(index < words ? 0 : 1), index % words);
+        };
+        for (unsigned i = 0; i < words; ++i) {
+            const unsigned index = position / 32 + i, shift = position % 32;
+            joined_word(index);
+            if (shift) {
+                imm(shift); op(ShrU);
+                joined_word(index + 1); imm(32 - shift); op(Shl); op(Or);
+            }
+            set(next_local + i);
+        }
+        for (unsigned i = words; i < 4; ++i) { imm(0); set(next_local + i); }
+        return ok;
+    }
+
     bool valid_location(const Location &loc) const {
         return (loc.TFlag() || loc.IT().Value() == 0) && (loc.PC() & (loc.TFlag() ? 1 : 3)) == 0
             && loc.FPSCR() == start.FPSCR();
@@ -1696,7 +1788,13 @@ private:
         const auto arg = [&](size_t n) { value(inst.GetArg(n)); };
         switch (kind) {
         case Op::Void: return true; // Dynarmic's invalidated/dead instruction marker
-        case Op::Identity: arg(0); break;
+        case Op::Identity: {
+            const auto type = inst.GetType();
+            if (type != Type::U128 && !scalar(type)) return false;
+            const unsigned words = type == Type::U128 ? 4 : type == Type::U64 ? 2 : 1;
+            for (unsigned i = 0; i < words; ++i) { value_word(inst.GetArg(0), i); set(next_local + i); }
+            return ok;
+        }
         case Op::A32GetRegister:
         case Op::A32SetRegister: {
             const auto reg = inst.GetArg(0);
@@ -2017,11 +2115,64 @@ private:
             return inst.GetArg(0).IsImmediate() && inst.GetArg(0).GetType() == Type::U64;
         case Op::A32SetCheckBit:
             value_word(inst.GetArg(0)); set(check_bit_local); check_bit_written = true; return ok;
-        case Op::VectorBroadcast32:
-            // Lanes live in words 0..3 of the slot: value_word reads lane i
-            // from word i, and a 4-word stride would collide with the
-            // carry/overflow words and the next instruction's slot.
-            for (unsigned i = 0; i < 4; ++i) { arg(0); set(next_local + i); }
+        case Op::VectorBroadcast8: return vector_broadcast(inst, 8);
+        case Op::VectorBroadcast16: return vector_broadcast(inst, 16);
+        case Op::VectorBroadcast32: return vector_broadcast(inst, 32);
+        case Op::VectorBroadcast64: return vector_broadcast(inst, 64);
+        case Op::VectorBroadcastElement8: return vector_broadcast(inst, 8, true);
+        case Op::VectorBroadcastElement16: return vector_broadcast(inst, 16, true);
+        case Op::VectorBroadcastElement32: return vector_broadcast(inst, 32, true);
+        case Op::VectorBroadcastElement64: return vector_broadcast(inst, 64, true);
+        case Op::VectorGetElement8: return vector_get_element(inst, 8);
+        case Op::VectorGetElement16: return vector_get_element(inst, 16);
+        case Op::VectorGetElement32: return vector_get_element(inst, 32);
+        case Op::VectorGetElement64: return vector_get_element(inst, 64);
+        case Op::VectorSetElement8: return vector_set_element(inst, 8);
+        case Op::VectorSetElement16: return vector_set_element(inst, 16);
+        case Op::VectorSetElement32: return vector_set_element(inst, 32);
+        case Op::VectorSetElement64: return vector_set_element(inst, 64);
+        case Op::VectorExtract: return vector_extract(inst, false);
+        case Op::VectorExtractLower: return vector_extract(inst, true);
+        case Op::And64:
+        case Op::AndNot64:
+        case Op::Or64:
+        case Op::Eor64:
+        case Op::Not64:
+        case Op::VectorAnd:
+        case Op::VectorAndNot:
+        case Op::VectorOr:
+        case Op::VectorEor:
+        case Op::VectorNot: {
+            // D modified immediates use scalar U64 IR; Q and register forms
+            // use U128. Both keep high words and masks entirely in Wasm.
+            const bool unary_not = kind == Op::VectorNot || kind == Op::Not64;
+            const bool and_not = kind == Op::VectorAndNot || kind == Op::AndNot64;
+            const unsigned words = inst.GetType() == Type::U64 ? 2 : 4;
+            for (unsigned i = 0; i < words; ++i) {
+                value_word(inst.GetArg(0), i);
+                if (!unary_not) value_word(inst.GetArg(1), i);
+                if (unary_not || and_not) { imm(UINT32_MAX); op(Xor); }
+                if (!unary_not) {
+                    op(kind == Op::VectorOr || kind == Op::Or64 ? Or
+                        : kind == Op::VectorEor || kind == Op::Eor64 ? Xor : And);
+                }
+                set(next_local + i);
+            }
+            return ok;
+        }
+        case Op::ZeroVector:
+            for (unsigned i = 0; i < 4; ++i) { imm(0); set(next_local + i); }
+            return ok;
+        case Op::ZeroExtendLongToQuad:
+        case Op::VectorZeroUpper:
+            for (unsigned i = 0; i < 4; ++i) {
+                if (i < 2) value_word(inst.GetArg(0), i);
+                else imm(0);
+                set(next_local + i);
+            }
+            return ok;
+        case Op::Pack2x64To1x128:
+            for (unsigned i = 0; i < 4; ++i) { value_word(inst.GetArg(i / 2), i % 2); set(next_local + i); }
             return ok;
         case Op::A32GetVector: {
             const auto reg = inst.GetArg(0);
@@ -2038,7 +2189,9 @@ private:
                 return false; // single registers use GetExtendedRegister32
             }
             for (unsigned i = 0; i < words; ++i) { load(offsetof(JitState, fpu) + (base + i) * sizeof(uint32_t)); set(next_local + i); }
-            for (unsigned i = words; i < 4; ++i) { imm(0); set(next_local + i); } // undefined upper lanes
+            // Match Dynarmic's D reload/forwarding contract: zero-extend the
+            // temporary, without reading or modifying the paired D register.
+            for (unsigned i = words; i < 4; ++i) { imm(0); set(next_local + i); }
             return ok; // U128 result: all four words were just defined
         }
         case Op::A32SetVector: {
