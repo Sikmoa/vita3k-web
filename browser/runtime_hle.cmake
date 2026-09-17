@@ -38,11 +38,21 @@ set(_hle_exports
     ksceKernelCreateMutex ksceKernelDeleteMutex ksceKernelLockMutex ksceKernelUnlockMutex
     sceClibMemcpy sceClibMemset
     sceIoOpen sceIoClose
+    # Synchronous file metadata and reads/seeks reuse production IO implementations.
+    sceIoGetstat sceIoGetstatByFd sceIoRead sceIoLseek sceIoLseek32
     _sceDisplaySetFrameBuf sceDisplaySetFrameBuf sceDisplayWaitVblankStart
     sceDisplayGetVcount sceDisplayGetRefreshRate
     sceKernelCreateLwCond
     sceFiosOverlayGetList02
     sceKernelGetModuleInfoByAddr
+    # sceAppUtilInit is UNIMPLEMENTED() upstream (returns 0), so this matches the
+    # desktop behaviour the game already runs with instead of adding a new stub.
+    sceAppUtilInit sceAppUtilShutdown
+    # Parameter queries read EmuEnvState config/licence fields only; no new stubs.
+    sceAppUtilAppParamGetInt sceAppUtilSystemParamGetInt sceAppUtilSystemParamGetString
+    # Common-dialog entry points are UNIMPLEMENTED()/STUBBED() upstream; selecting
+    # them reproduces desktop behaviour instead of inventing new return values.
+    sceCommonDialogSetConfigParam sceCommonDialogUpdate sceCommonDialogIsRunning sceCommonDialogGetWorkerThreadId
     sceKernelCallAbortHandler
     sceIoWrite
     sceKernelUnlockLwMutex2 sceKernelRegisterThreadEventHandler
@@ -97,6 +107,8 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceDisplay/SceDisplay.cpp"
     "${_HLE_ROOT}/modules/SceDriverUser/SceDisplayUser.cpp"
     "${_HLE_ROOT}/modules/SceDriverUser/SceFios2User.cpp"
+    "${_HLE_ROOT}/modules/SceAppUtil/SceAppUtil.cpp"
+    "${_HLE_ROOT}/modules/SceCommonDialog/SceCommonDialog.cpp"
 )
 # Compile the existing implementation files through registration-only adapters.
 # This is necessary because EXPORT's make_bridge initialization roots even
