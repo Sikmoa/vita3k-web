@@ -73,6 +73,17 @@ struct JitState {
     // of region->region transfers completed inside Wasm. The host accumulates
     // it into process counters the same way it does `dispatches`.
     uint32_t tx_wasm;         // +416 in-Wasm cached-region transfers
+    // Exclusive monitor (A32 LDREX/STREX family). exclusive_size == 0 means no
+    // reservation is held. A reservation is consumed by the exclusive store
+    // that uses it (success or failure), dropped by A32ClearExclusive, and
+    // dropped by clear_exclusive() when the guest switches threads. Ordinary
+    // stores do NOT clear it: like Dynarmic's ExclusiveMonitor, validity is
+    // decided by re-reading memory and comparing with exclusive_value, so a
+    // lost update between LDREX and STREX makes the pair fail.
+    uint32_t exclusive_address;  // +420 guest address of the last exclusive read
+    uint32_t exclusive_value;    // +424 value that read observed (low word)
+    uint32_t exclusive_value_hi; // +428 high word for a 64-bit exclusive read
+    uint32_t exclusive_size;     // +432 reserved width in bytes; 0 = none
 };
 static_assert(std::is_standard_layout_v<JitState>);
 static_assert(sizeof(JitState::regs) == 16 * sizeof(uint32_t));
@@ -94,7 +105,11 @@ static_assert(offsetof(JitState, mem_fast_reads) == 404);
 static_assert(offsetof(JitState, mem_fast_writes) == 408);
 static_assert(offsetof(JitState, smc_page) == 412);
 static_assert(offsetof(JitState, tx_wasm) == 416);
-static_assert(sizeof(JitState) == 420);
+static_assert(offsetof(JitState, exclusive_address) == 420);
+static_assert(offsetof(JitState, exclusive_value) == 424);
+static_assert(offsetof(JitState, exclusive_value_hi) == 428);
+static_assert(offsetof(JitState, exclusive_size) == 432);
+static_assert(sizeof(JitState) == 436);
 #else
 static_assert(sizeof(HostAddress) == sizeof(void *));
 static_assert(offsetof(JitState, memory_cookie) % alignof(HostAddress) == 0);
@@ -156,7 +171,8 @@ static_assert(offsetof(JitState, page_perms_base) % alignof(HostAddress) == 0);
 // There is no mid-block budget check. Cache keys must include the A32 location
 // descriptor's mode bits; entry state must match it. IT is advanced from the
 // frontend descriptors on both successful and condition-failed paths.
-// Unknown operations fail closed, including FP arithmetic and exclusive memory.
+// Unknown operations fail closed, including FP arithmetic and unusable
+// exclusive memory reservations.
 // Limits: 4096 IR instructions, 4096 guest ticks, terminal depth 16 / 256 nodes.
 std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block);
 

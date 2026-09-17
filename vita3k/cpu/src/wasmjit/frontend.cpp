@@ -65,7 +65,9 @@ public:
             using Op = Dynarmic::IR::Opcode;
             const auto op = it->GetOpcode();
             wrote_memory |= op == Op::A32WriteMemory8 || op == Op::A32WriteMemory16
-                || op == Op::A32WriteMemory32 || op == Op::A32WriteMemory64;
+                || op == Op::A32WriteMemory32 || op == Op::A32WriteMemory64
+                || op == Op::A32ExclusiveWriteMemory8 || op == Op::A32ExclusiveWriteMemory16
+                || op == Op::A32ExclusiveWriteMemory32 || op == Op::A32ExclusiveWriteMemory64;
             ++ir_count;
         }
         if (remaining == 0 || (wrote_memory

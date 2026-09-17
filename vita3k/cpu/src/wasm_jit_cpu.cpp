@@ -1164,7 +1164,12 @@ void WasmJitCPU::set_log_code(bool v) { impl->log_code = v; }
 void WasmJitCPU::set_log_mem(bool v) { impl->log_mem = v; }
 bool WasmJitCPU::get_log_code() { return impl->log_code; }
 bool WasmJitCPU::get_log_mem() { return impl->log_mem; }
-void WasmJitCPU::clear_exclusive() { /* Exclusive IR is rejected; no monitor is acquired. */ }
+void WasmJitCPU::clear_exclusive() {
+    // A reservation is only valid within the thread that took it: the kernel
+    // calls this on a guest context switch. Ordinary stores deliberately do
+    // not clear it (validity is decided by re-reading memory at STREX).
+    impl->state.exclusive_size = 0;
+}
 std::size_t WasmJitCPU::processor_id() const { return impl->core; }
 void WasmJitCPU::set_instruction_budget(uint64_t v) { impl->budget = v; }
 void WasmJitCPU::set_region_mode(bool v) { impl->region_mode = v; }

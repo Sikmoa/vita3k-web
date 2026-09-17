@@ -517,7 +517,11 @@ public:
             has_memory |= opcode == Op::A32ReadMemory8 || opcode == Op::A32ReadMemory16
                 || opcode == Op::A32ReadMemory32 || opcode == Op::A32ReadMemory64
                 || opcode == Op::A32WriteMemory8 || opcode == Op::A32WriteMemory16
-                || opcode == Op::A32WriteMemory32 || opcode == Op::A32WriteMemory64;
+                || opcode == Op::A32WriteMemory32 || opcode == Op::A32WriteMemory64
+                || opcode == Op::A32ExclusiveReadMemory8 || opcode == Op::A32ExclusiveReadMemory16
+                || opcode == Op::A32ExclusiveReadMemory32 || opcode == Op::A32ExclusiveReadMemory64
+                || opcode == Op::A32ExclusiveWriteMemory8 || opcode == Op::A32ExclusiveWriteMemory16
+                || opcode == Op::A32ExclusiveWriteMemory32 || opcode == Op::A32ExclusiveWriteMemory64;
         }
         if (has_memory && block.CycleCount() != 1)
             return {};
@@ -944,6 +948,55 @@ private:
             memory_fast_or_slow(inst, write, bytes);
         else
             memory_slow_call(inst, write, bytes);
+    }
+
+    // Exclusive load/store (A32 LDREX/STREX family). Both accesses use the
+    // checked helper path: an exclusive access must fault exactly like a plain
+    // one, and the store needs a fresh read of the target to decide whether the
+    // reservation is still valid. The reservation is (address, width, value);
+    // STREX succeeds only when all three still match, which is the
+    // compare-and-swap Dynarmic's native backend performs through
+    // ExclusiveMonitor plus MemoryWriteExclusive. Ordinary stores do not clear
+    // the reservation: the fresh read is what makes a lost update fail.
+    void exclusive_read(const Inst &inst, unsigned bytes) {
+        if (inst.GetArg(1).GetType() != Type::U32) { reject("exclusive read arg1 not U32"); return; }
+        if (!inst.GetArg(0).IsImmediate()) { reject("exclusive read arg0 not imm"); return; }
+        value_word(inst.GetArg(1)); set(next_local + 5);
+        pending_fault_location = inst.GetArg(0).GetImmediateAsU64();
+        memory_slow_call(inst, false, bytes);
+        get(0); get(next_local + 5); store(offsetof(JitState, exclusive_address));
+        for (unsigned i = 0; i < (bytes + 3) / 4; ++i) {
+            get(0); get(next_local + i);
+            store(offsetof(JitState, exclusive_value) + i * 4);
+        }
+        if (bytes <= 4)
+            store_constant(offsetof(JitState, exclusive_value_hi), 0);
+        store_constant(offsetof(JitState, exclusive_size), bytes);
+    }
+    void exclusive_write(const Inst &inst, unsigned bytes) {
+        if (inst.GetArg(1).GetType() != Type::U32) { reject("exclusive write arg1 not U32"); return; }
+        if (!inst.GetArg(0).IsImmediate()) { reject("exclusive write arg0 not imm"); return; }
+        value_word(inst.GetArg(1)); set(next_local + 5);
+        pending_fault_location = inst.GetArg(0).GetImmediateAsU64();
+        // Words 0..1 take the fresh read; the result is staged in word 4 and
+        // published after the branch, because the write arm reads inst arg2.
+        memory_slow_call(inst, false, bytes);
+        imm(1); set(next_local + 4); // STREX fails unless the branch stores
+        load(offsetof(JitState, exclusive_size)); imm(bytes); op(Eq);
+        load(offsetof(JitState, exclusive_address)); get(next_local + 5); op(Eq); op(And);
+        for (unsigned i = 0; i < (bytes + 3) / 4; ++i) {
+            load(offsetof(JitState, exclusive_value) + i * 4); get(next_local + i); op(Eq); op(And);
+        }
+        begin_if();
+        pending_fault_location = inst.GetArg(0).GetImmediateAsU64();
+        memory_slow_call(inst, true, bytes);
+        store_constant(offsetof(JitState, exclusive_size), 0);
+        imm(0); set(next_local + 4);
+        op(Else);
+        // A failed store still consumes the reservation on ARM.
+        store_constant(offsetof(JitState, exclusive_size), 0);
+        end_if();
+        get(next_local + 4); set(next_local);
     }
 
     void value_word(const Value &v, unsigned word = 0) {
@@ -2135,6 +2188,17 @@ private:
         case Op::A32WriteMemory16: memory_call(inst, true, 2); return ok;
         case Op::A32WriteMemory32: memory_call(inst, true, 4); return ok;
         case Op::A32WriteMemory64: memory_call(inst, true, 8); return ok;
+        case Op::A32ClearExclusive:
+            store_constant(offsetof(JitState, exclusive_size), 0);
+            return ok;
+        case Op::A32ExclusiveReadMemory8: exclusive_read(inst, 1); return ok;
+        case Op::A32ExclusiveReadMemory16: exclusive_read(inst, 2); return ok;
+        case Op::A32ExclusiveReadMemory32: exclusive_read(inst, 4); return ok;
+        case Op::A32ExclusiveReadMemory64: exclusive_read(inst, 8); return ok;
+        case Op::A32ExclusiveWriteMemory8: exclusive_write(inst, 1); return ok;
+        case Op::A32ExclusiveWriteMemory16: exclusive_write(inst, 2); return ok;
+        case Op::A32ExclusiveWriteMemory32: exclusive_write(inst, 4); return ok;
+        case Op::A32ExclusiveWriteMemory64: exclusive_write(inst, 8); return ok;
         case Op::A32GetCFlag: flag(29); break;
         case Op::A32SetCpsrNZ:
         case Op::A32SetCpsrNZC:

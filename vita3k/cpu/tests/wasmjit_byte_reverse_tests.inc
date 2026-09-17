@@ -23,7 +23,10 @@ void ir_reversal() {
     h.test(Op::ByteReverseHalf, [&](auto &b) {
         const auto input = append(b, Op::LeastSignificantHalf,
             {append(b, Op::A32GetRegister, {Value{A32::Reg::R1}})});
-        append(b, Op::A32SetRegister, {Value{A32::Reg::R0}, append(b, Op::ByteReverseHalf, {input})});
+        // ByteReverseHalf is U16; A32SetRegister needs U32, so widen first.
+        const auto reversed = append(b, Op::ByteReverseHalf, {input});
+        append(b, Op::A32SetRegister, {Value{A32::Reg::R0},
+            append(b, Op::ZeroExtendHalfToWord, {reversed})});
     }, [&](auto &s) { s.regs[0] = reverse_half(uint16_t(s.regs[1])); });
     h.test(Op::ByteReverseDual, [&](auto &b) {
         const auto input = append(b, Op::A32GetExtendedRegister64, {Value{A32::ExtReg::D2}});
@@ -39,7 +42,8 @@ void ir_reversal() {
     }, [&](auto &s) { s.regs[0] = 0x67452301; });
     h.test(Op::ByteReverseHalf, [&](auto &b) {
         append(b, Op::A32SetRegister, {Value{A32::Reg::R0},
-            append(b, Op::ByteReverseHalf, {Value{uint16_t(0xabcd)}})});
+            append(b, Op::ZeroExtendHalfToWord,
+                {append(b, Op::ByteReverseHalf, {Value{uint16_t(0xabcd)}})})});
     }, [&](auto &s) { s.regs[0] = 0xcdab; });
     h.test(Op::ByteReverseDual, [&](auto &b) {
         append(b, Op::A32SetExtendedRegister64, {Value{A32::ExtReg::D0},
