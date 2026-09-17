@@ -136,6 +136,7 @@ struct SceNetCtlIfStat {
     SceUInt32 reserved[8];
 };
 
+#ifndef __EMSCRIPTEN__
 static void adhoc_thread(EmuEnvState &emuenv, int thread_id) {
     LOG_INFO("Adhoc thread started");
     constexpr uint16_t AUTH_RECV_VPORT = 0x8235;
@@ -362,6 +363,7 @@ static void adhoc_thread(EmuEnvState &emuenv, int thread_id) {
 
     LOG_INFO("Adhoc thread stopped");
 }
+#endif
 
 EXPORT(int, sceNetCtlAdhocDisconnect) {
     TRACY_FUNC(sceNetCtlAdhocDisconnect);
@@ -735,8 +737,17 @@ EXPORT(int, sceNetCtlInit) {
     emuenv.netctl.callbacks.fill({ 0, 0 });
 
     emuenv.netctl.inited = true;
+#ifdef __EMSCRIPTEN__
+    // Offline control state only. No connection is established and no host
+    // socket worker exists. Adhoc connection operations remain unselected.
+    emuenv.netctl.adhocThreadRun = false;
+    emuenv.netctl.adhocState = SCE_NET_CTL_STATE_DISCONNECTED;
+    emuenv.netctl.adhocEvent = SCE_NET_CTL_EVENT_TYPE_NONE;
+    emuenv.netctl.lastNotifiedAdhocEvent = SCE_NET_CTL_EVENT_TYPE_NONE;
+#else
     emuenv.netctl.adhocThreadRun = true;
     emuenv.netctl.adhocThread = std::thread(adhoc_thread, std::ref(emuenv), thread_id);
+#endif
 
     return STUBBED("Stub");
 }
