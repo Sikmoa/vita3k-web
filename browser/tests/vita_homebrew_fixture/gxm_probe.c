@@ -15,6 +15,12 @@ static unsigned int frame[32 * 32] __attribute__((aligned(64)));
 static float vertices[] __attribute__((aligned(16))) = {
     -1,-1,0,1, 1,0,0,1, 3,-1,0,1, 1,0,0,1, -1,3,0,1, 1,0,0,1
 };
+// LINEAR ABGR8 width=4 has an eight-pixel physical pitch. Padding is poison.
+static unsigned int texels[8 * 4] __attribute__((aligned(64)));
+static unsigned int replacement[8 * 4] __attribute__((aligned(64)));
+static float textured_vertices[] __attribute__((aligned(16))) = {
+    -1,-1,0,1, 0,0, 3,-1,0,1, 0,0, -1,3,0,1, 0,0
+};
 static const unsigned short indices[] __attribute__((aligned(16))) = {0,1,2};
 static float matrix[] __attribute__((aligned(16))) = {
     1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1
@@ -94,6 +100,77 @@ int main(void) {
     sceGxmFinish(context);
     if (frame[16 * 32 + 16] != 0xff00ff00) return 49;
     if (frame[0] != 0xff0000ff || frame[32 * 32 - 1] != 0xff0000ff) return 50;
+    // Repository texture_v/texture_f GXP goes through the same real translator.
+    // No shader lookup/substitute WGSL, and no host-injected texture pixels.
+    SceGxmShaderPatcherId tvid, tfid;
+    const SceGxmProgram *tvgxp = (const SceGxmProgram *)texture_v;
+    if (sceGxmShaderPatcherRegisterProgram(patcher, tvgxp, &tvid)) return 51;
+    if (sceGxmShaderPatcherRegisterProgram(patcher, (const SceGxmProgram *)texture_f, &tfid)) return 52;
+    pos = sceGxmProgramFindParameterByName(tvgxp, "aPosition");
+    const SceGxmProgramParameter *uv = sceGxmProgramFindParameterByName(tvgxp, "aTexcoord");
+    if (!pos || !uv) return 53;
+    attrs[0].regIndex = sceGxmProgramParameterGetResourceIndex(pos);
+    attrs[1].regIndex = sceGxmProgramParameterGetResourceIndex(uv);
+    attrs[1].componentCount = 2; stream.stride = 24;
+    SceGxmVertexProgram *tvp; SceGxmFragmentProgram *tfp;
+    if (sceGxmShaderPatcherCreateVertexProgram(patcher, tvid, attrs, 2, &stream, 1, &tvp)) return 54;
+    if (sceGxmShaderPatcherCreateFragmentProgram(patcher, tfid, SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
+        SCE_GXM_MULTISAMPLE_NONE, NULL, tvgxp, &tfp)) return 55;
+    for (unsigned y = 0; y < 4; ++y) for (unsigned x = 0; x < 8; ++x) {
+        texels[y * 8 + x] = x < 4 ? ((64 + x + y) << 24) | (17 << 16) | (y * 50 << 8) | (x * 40) : 0xeeeeeeee;
+        replacement[y * 8 + x] = x < 4 ? 0x11224488 : 0xeeeeeeee;
+    }
+    SceGxmTexture texture;
+    if (sceGxmTextureInitLinear(&texture, texels, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, 4, 4, 1)) return 56;
+    matrix[0] = matrix[5] = 1;
+    const float coords[6][2] = {{.125f,.125f}, {.875f,.875f}, {1.875f,-.125f}, {.5f,.5f}, {.5f,.5f}, {.5f,.5f}};
+    const unsigned expected[6] = {0x40110000, 0x46119678, 0x46119678, 0x43114b3c, 0x80402010, 0x11224488};
+    for (unsigned draw = 0; draw < 6; ++draw) {
+        for (unsigned i = 0; i < 3; ++i) {
+            textured_vertices[i * 6 + 4] = coords[draw][0];
+            textured_vertices[i * 6 + 5] = coords[draw][1];
+        }
+        if (draw == 2) {
+            if (sceGxmTextureSetUAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_REPEAT)
+                || sceGxmTextureSetVAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_REPEAT)) return 57;
+        }
+        if (draw == 3) {
+            if (sceGxmTextureSetMinFilter(&texture, SCE_GXM_TEXTURE_FILTER_LINEAR)
+                || sceGxmTextureSetMagFilter(&texture, SCE_GXM_TEXTURE_FILTER_LINEAR)
+                || sceGxmTextureSetUAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_CLAMP)
+                || sceGxmTextureSetVAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_CLAMP)) return 58;
+        }
+        if (draw == 4) // No descriptor rebind: changing memory alone must upload anew.
+            for (unsigned y = 0; y < 4; ++y) for (unsigned x = 0; x < 4; ++x)
+                texels[y * 8 + x] = 0x80402010;
+        if (draw == 5 && sceGxmTextureSetData(&texture, replacement)) return 59;
+        if (sceGxmBeginScene(context, 0, target, NULL, NULL, NULL, &surface, NULL)) return 60;
+        if (draw == 0) {
+            sceGxmSetVertexProgram(context, tvp); sceGxmSetFragmentProgram(context, tfp);
+            if (sceGxmSetVertexStream(context, 0, textured_vertices)
+                || sceGxmSetVertexDefaultUniformBuffer(context, matrix)) return 61;
+        }
+        if (draw != 4 && sceGxmSetFragmentTexture(context, 0, &texture)) return 62;
+        if (sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, indices, 3)) return 63;
+        if (sceGxmEndScene(context, NULL, NULL)) return 64;
+        sceGxmFinish(context);
+        for (unsigned i = 0; i < 32 * 32; ++i) for (unsigned c = 0; c < 4; ++c) {
+            int actual = (frame[i] >> (c * 8)) & 255;
+            int want = (expected[draw] >> (c * 8)) & 255;
+            // Linear interpolation/UNORM rounding permits one LSB only.
+            int tolerance = draw == 3 ? 1 : 0;
+            if (actual < want - tolerance || actual > want + tolerance) return 65 + draw;
+        }
+    }
+    // Stale bound texture must not force a group-3 draw on an untextured GXP.
+    if (sceGxmBeginScene(context, 0, target, NULL, NULL, NULL, &surface, NULL)) return 71;
+    sceGxmSetVertexProgram(context, vp); sceGxmSetFragmentProgram(context, fp);
+    if (sceGxmSetVertexStream(context, 0, vertices)
+        || sceGxmSetVertexDefaultUniformBuffer(context, matrix)) return 72;
+    if (sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, indices, 3)) return 73;
+    if (sceGxmEndScene(context, NULL, NULL)) return 74;
+    sceGxmFinish(context);
+    for (unsigned i = 0; i < 32 * 32; ++i) if (frame[i] != 0xff00ff00) return 75;
     if (sceGxmDestroyRenderTarget(target)) return 45;
     if (sceGxmDestroyContext(context) != 0) return 19;
     if (sceGxmTerminate() != 0) return 15;

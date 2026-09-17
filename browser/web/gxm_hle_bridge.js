@@ -26,19 +26,44 @@ export async function drawGuestSurface(packet, initialPixels, width, height) {
   packet = new Uint8Array(packet).slice(); initialPixels = new Uint8Array(initialPixels).slice();
   return enqueueGuestWork(() => drawOwnedSurface(packet, initialPixels, width, height));
 }
-async function drawOwnedSurface(packet, initialPixels, width, height) {
+// Pure decoder exported for lightweight packet contract tests (no GPU/compiler).
+// Only GXM2 is accepted: never silently interpret an old native producer.
+export function decodeGuestDrawPacket(packet) {
   const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
   let cursor = 0;
-  const word = () => { const n = view.getUint32(cursor, true); cursor += 4; return n; };
+  const word = () => {
+    if (cursor + 4 > packet.length) throw new Error('truncated GXM draw packet');
+    const n = view.getUint32(cursor, true); cursor += 4; return n;
+  };
   const take = n => {
     if (!Number.isSafeInteger(n) || n < 0 || cursor + n > packet.length) throw new Error('truncated GXM draw packet');
     const data = packet.slice(cursor, cursor + n); cursor += n; return data;
   };
-  if (word() !== 0x47584d31) throw new Error('unknown GXM draw packet version');
+  if (word() !== 0x47584d32) throw new Error('unknown GXM draw packet version');
   const stride = word(), indexSize = word();
   const lengths = Array.from({ length: 6 }, word);
   const attributeCount = word();
-  if (![2,4].includes(indexSize) || attributeCount > 16) throw new Error('unsupported draw layout');
+  if (![2,4].includes(indexSize) || !attributeCount || attributeCount > 16
+      || stride < 4 || stride % 4 || lengths.some(n => n > 16 * 1024 * 1024))
+    throw new Error('unsupported draw layout');
+  const textureCount = word();
+  if (textureCount > 1) throw new Error('unsupported fragment texture count');
+  let fragmentTexture, textureLength = 0;
+  if (textureCount) {
+    const width = word(), height = word(), format = word();
+    const min = word(), mag = word(), u = word(), v = word();
+    textureLength = word();
+    // GXM LINEAR ABGR8 is little-endian RGBA bytes, already depadded by C++.
+    // Packet sampler codes are the production enums, not WebGPU constants.
+    if (!width || !height || width > 4096 || height > 4096 || format !== 0x0c000000
+        || textureLength !== width * height * 4 || textureLength > 16 * 1024 * 1024
+        || min > 1 || mag > 1 || u > 2 || v > 2)
+      throw new Error('unsupported fragment texture packet');
+    const filters = ['nearest', 'linear'], addresses = ['repeat', 'mirror-repeat', 'clamp-to-edge'];
+    fragmentTexture = { width, height, format: 'rgba8unorm', sampler: {
+      minFilter: filters[min], magFilter: filters[mag], addressModeU: addresses[u], addressModeV: addresses[v],
+    } };
+  }
   const info = take(48);
   const attributes = Array.from({ length: attributeCount }, () => {
     const shaderLocation = word(), offset = word(), components = word();
@@ -46,15 +71,25 @@ async function drawOwnedSurface(packet, initialPixels, width, height) {
     return { shaderLocation, offset, format: components === 1 ? 'float32' : `float32x${components}` };
   });
   const [indices, vertices, vertexGXP, fragmentGXP, vertexUniforms, fragmentUniforms] = lengths.map(take);
+  if (fragmentTexture) fragmentTexture.pixels = take(textureLength);
   if (cursor !== packet.length) throw new Error('trailing GXM draw packet bytes');
+  return { stride, indexSize, info, attributes, indices, vertices, vertexGXP, fragmentGXP,
+    vertexUniforms, fragmentUniforms, fragmentTexture };
+}
+async function drawOwnedSurface(packet, initialPixels, width, height) {
+  const { stride, indexSize, info, attributes, indices, vertices, vertexGXP, fragmentGXP,
+    vertexUniforms, fragmentUniforms, fragmentTexture } = decodeGuestDrawPacket(packet);
   if (!shaderPromise) configureGuestShaders({
     compilerURL: new URL('./shaders/gxp_compiler.mjs', import.meta.url).href,
     nagaURL: new URL('./shaders/naga.wasm', import.meta.url).href,
     wasiShimURL: new URL('./shaders/wasi/index.js', import.meta.url).href,
   });
   const compiler = await shaderPromise;
-  const vertex = await compiler.translate(vertexGXP);
-  const fragment = await compiler.translate(fragmentGXP);
+  // Explicit format hints match the only accepted guest texture format. The
+  // translator retains descriptor sets 2/3 and splits unit n into 2n / 2n+1.
+  const textureFormats = new Uint32Array(32).fill(0x0c000000);
+  const vertex = await compiler.translate(vertexGXP, { textureFormats });
+  const fragment = await compiler.translate(fragmentGXP, { textureFormats });
   if (!guestRenderer) guestRenderer = createGXMRenderer(await initializeGuestDevice());
   const renderer = guestRenderer;
   let target, program;
@@ -72,11 +107,13 @@ async function drawOwnedSurface(packet, initialPixels, width, height) {
       bufferBindings.push({ binding, size: data.length, type: 'read-only-storage', visibility });
     }
     program = await renderer.createProgram({ stride, attributes, bufferBindings,
+      fragmentTexture: fragmentTexture !== undefined,
       vertexWGSL: vertex.wgsl, fragmentWGSL: fragment.wgsl,
       vertexEntryPoint: 'main_vs', fragmentEntryPoint: 'main_fs' });
     target = renderer.createTarget(width, height);
     return (await renderer.submit(target, [{ program, vertices, indices,
-      indexFormat: indexSize === 2 ? 'uint16' : 'uint32', buffers }], { initialPixels })).pixels;
+      indexFormat: indexSize === 2 ? 'uint16' : 'uint32', buffers,
+      ...(fragmentTexture ? { fragmentTexture } : {}) }], { initialPixels })).pixels;
   } finally {
     // submit has settled (including GPU readback) before either resource can
     // be released. Retain only the bounded device-local pipeline cache.

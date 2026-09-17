@@ -75,6 +75,8 @@ struct WebContext final : renderer::Context {
     std::array<float, 6> viewport{};
     std::array<uint32_t, 4> clip{};
     std::array<std::vector<uint8_t>, 2> uniforms;
+    bool has_fragment_texture = false;
+    SceGxmTexture fragment_texture{}; // Command-owned descriptor, not a guest pointer.
 };
 
 struct WebState final : renderer::State {
@@ -258,6 +260,22 @@ static void require_guest(MemState &mem, Address address, size_t size) {
         unsupported("invalid guest draw range");
 }
 
+// Match gxm/src/textures.cpp and SceGxm's accessors, not a tightly packed
+// interpretation of the guest descriptor. LINEAR_STRIDED has different packed
+// control fields and is deliberately NOT accepted here.
+static void validate_fragment_texture(const SceGxmTexture &t) {
+    if (t.texture_type() != SCE_GXM_TEXTURE_LINEAR
+        || gxm::get_format(t) != SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR
+        || t.true_mip_count() != 1 || t.mip_filter
+        || !t.normalize_mode || t.gamma_mode || t.lod_bias != 31
+        || t.lod_min0 || t.lod_min1 || t.palette_addr || t.unk0 || t.unk1 || t.unk2)
+        unsupported("fragment texture layout/format/mips/LOD/normalization");
+    if ((t.min_filter != SCE_GXM_TEXTURE_FILTER_POINT && t.min_filter != SCE_GXM_TEXTURE_FILTER_LINEAR)
+        || (t.mag_filter != SCE_GXM_TEXTURE_FILTER_POINT && t.mag_filter != SCE_GXM_TEXTURE_FILTER_LINEAR)
+        || t.uaddr_mode > SCE_GXM_TEXTURE_ADDR_CLAMP || t.vaddr_mode > SCE_GXM_TEXTURE_ADDR_CLAMP)
+        unsupported("fragment texture sampler");
+}
+
 static void consume_state(WebContext &ctx, CommandHelper &h, MemState &mem) {
     switch (h.pop<GXMState>()) {
     case GXMState::RegionClip:
@@ -306,6 +324,17 @@ static void consume_state(WebContext &ctx, CommandHelper &h, MemState &mem) {
         memcpy(bytes.data() + size_t(offset) * 4, ptr.get(mem), copied);
         break;
     }
+    case GXMState::Texture: {
+        // renderer::set_texture sends uint32_t index then SceGxmTexture by
+        // value. Fragment indices start at 0; vertex indices start at 16.
+        const auto index = h.pop<uint32_t>();
+        const auto texture = h.pop<SceGxmTexture>();
+        if (index != 0) unsupported("only fragment texture unit zero supported");
+        validate_fragment_texture(texture);
+        ctx.fragment_texture = texture;
+        ctx.has_fragment_texture = true;
+        break;
+    }
     case GXMState::VertexStream: {
         const auto ptr = h.pop<Ptr<const uint8_t>>();
         const auto index = h.pop<size_t>(), size = h.pop<size_t>();
@@ -338,9 +367,33 @@ static int consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem) {
     const auto *vp = ctx.record.vertex_program.get(mem);
     const auto *fp = ctx.record.fragment_program.get(mem);
     if (!vp->renderer_data || !fp->renderer_data || fp->is_maskupdate
-        || vp->renderer_data->textures_used.any() || fp->renderer_data->textures_used.any()
+        || vp->renderer_data->textures_used.any()
+        || (fp->renderer_data->textures_used >> 1).any()
         || vp->streams.size() != 1 || vp->attributes.empty() || vp->attributes.size() > 16)
-        unsupported("textures/mask/multiple streams or missing program metadata");
+        unsupported("vertex/nonzero fragment textures/mask/multiple streams or missing program metadata");
+    const bool textured = fp->renderer_data->textures_used[0];
+    std::vector<uint8_t> texture_pixels;
+    uint32_t texture_width = 0, texture_height = 0;
+    if (textured) {
+        if (!ctx.has_fragment_texture) unsupported("missing fragment texture unit zero");
+        const auto &t = ctx.fragment_texture;
+        validate_fragment_texture(t);
+        texture_width = gxm::get_width(t); texture_height = gxm::get_height(t);
+        if (!texture_width || !texture_height || texture_width > 4096 || texture_height > 4096)
+            unsupported("fragment texture dimensions");
+        const uint64_t pitch = uint64_t((texture_width + 7) & ~7u) * 4;
+        const uint64_t footprint = pitch * texture_height;
+        if (footprint > 16 * 1024 * 1024) unsupported("fragment texture upload size");
+        const Address address = uint32_t(t.data_addr) << 2; // sceGxmTextureGetData
+        require_guest(mem, address, footprint);
+        // Snapshot every draw, even without a dirty descriptor: guest pixels
+        // can change independently. Strip row padding before the first await.
+        texture_pixels.resize(size_t(texture_width) * texture_height * 4);
+        const auto *source = Ptr<const uint8_t>(address).get(mem);
+        for (uint32_t y = 0; y < texture_height; ++y)
+            memcpy(texture_pixels.data() + size_t(y) * texture_width * 4,
+                source + size_t(y) * pitch, size_t(texture_width) * 4);
+    }
     const size_t index_size = format == SCE_GXM_INDEX_FORMAT_U16 ? 2 : 4;
     const size_t index_bytes = size_t(count) * index_size;
     const auto &stream = ctx.record.vertex_streams[0];
@@ -381,15 +434,26 @@ static int consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem) {
         packet.insert(packet.end(), bytes, bytes + size);
     };
     const auto word = [&](uint32_t value) { append(&value, 4); };
-    word(0x47584d31); word(stride); word(index_size);
+    // GXM2: GXM1 fixed fields, then texture count (0/1) and, when present,
+    // width,height,GXM format,min,mag,U,V,packed byte length. Texture bytes
+    // follow the six existing payloads. All words are little-endian wasm u32.
+    word(0x47584d32); word(stride); word(index_size);
     for (auto size : {index_bytes, stream.size, size_t(vs->size), size_t(fs->size), ctx.uniforms[0].size(), ctx.uniforms[1].size()}) word(size);
     word(attributes.size());
+    word(textured ? 1 : 0);
+    if (textured) {
+        const auto &t = ctx.fragment_texture;
+        word(texture_width); word(texture_height); word(gxm::get_format(t));
+        word(t.min_filter); word(t.mag_filter); word(t.uaddr_mode); word(t.vaddr_mode);
+        word(texture_pixels.size());
+    }
     const float info[12] = {1,1,1,1, 1,float(w),float(height),ctx.viewport[2], ctx.viewport[5],0,0,0};
     append(info, sizeof(info));
     for (const auto &a : attributes) for (auto value : a) word(value);
     append(indices.get(mem), index_bytes); append(stream.data.get(mem), stream.size);
     append(vs, vs->size); append(fs, fs->size);
     for (const auto &data : ctx.uniforms) append(data.data(), data.size());
+    append(texture_pixels.data(), texture_pixels.size());
     return web_gxm_draw(packet.data(), packet.size(), w, height, surface.strideInPixels * 4, surface.data.get(mem));
 }
 

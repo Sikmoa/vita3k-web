@@ -9,7 +9,7 @@ python3 - <<'PY'
 from pathlib import Path
 out = Path('.limbo_work/gxm/probe_shaders.h')
 with out.open('w') as f:
-    for name in ('color_v', 'color_f'):
+    for name in ('color_v', 'color_f', 'texture_v', 'texture_f'):
         data = Path(f'tools/native-tool/src/shaders/{name}.gxp').read_bytes()
         f.write(f'static const unsigned char {name}[] __attribute__((aligned(16))) = {{')
         f.write(','.join(str(b) for b in data))

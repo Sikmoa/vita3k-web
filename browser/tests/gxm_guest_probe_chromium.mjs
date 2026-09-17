@@ -82,7 +82,7 @@ try {
   assert.match(logs, /CPU backend: WasmJitCPU \(no fallback\)/);
   assert.match(logs, /sceGxmInitialize NID=b0f1e4ec/i);
   const missing = /Import function for NID 0xB0F1E4EC not found/i.test(logs);
-  console.log(JSON.stringify({ probe: 'guest GXP indexed draws and pixel readback',
+  console.log(JSON.stringify({ probe: 'guest GXP color and LINEAR ABGR8 texture draws and pixel readback',
     expectedExit: process.argv.includes('--expect-missing') ? -8 : 42,
     actualExit: outcome.exit, missingSceGxmInitializeBridge: missing,
     backend: outcome.ready.backend, memoryModel: outcome.ready.memoryModel }));
@@ -92,8 +92,8 @@ try {
   } else {
     assert.equal(missing, false, 'sceGxmInitialize bridge must be registered (see HLE log above)');
     assert.equal(outcome.exit, 42, 'guest GXP pixel assertions and lifecycle operations must succeed');
-    assert.equal((logs.match(/GXM WebGPU GXP indexed draw readback completed/g) || []).length, 2,
-      'both guest draws must complete GPU readback');
+    assert.equal((logs.match(/GXM WebGPU GXP indexed draw readback completed/g) || []).length, 9,
+      'two color, six textured and final untextured guest draws must complete GPU readback');
     assert.match(logs, /missing_nids=0/);
     assert.match(logs, /GXM finish entered/);
     assert.match(logs, /GXM WebGPU queue fence completed/);

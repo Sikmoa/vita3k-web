@@ -16,6 +16,11 @@ set(_hle_exports
     sceGxmCreateRenderTarget sceGxmDestroyRenderTarget sceGxmColorSurfaceInit
     sceGxmBeginScene sceGxmEndScene sceGxmSetVertexProgram sceGxmSetFragmentProgram
     sceGxmSetVertexStream sceGxmSetVertexDefaultUniformBuffer sceGxmDraw
+    # Bounded fragment unit-zero LINEAR ABGR8 path. Keep production descriptor
+    # validation/setters; unsupported layouts remain rejected at draw time.
+    sceGxmTextureInitLinear sceGxmSetFragmentTexture sceGxmTextureSetData
+    sceGxmTextureSetMinFilter sceGxmTextureSetMagFilter
+    sceGxmTextureSetUAddrMode sceGxmTextureSetVAddrMode
     sceKernelExitProcess
     sceKernelAllocMemBlock sceKernelFreeMemBlock sceKernelGetMemBlockBase
     sceKernelCreateLwMutex sceKernelDeleteLwMutex sceKernelLockLwMutex
@@ -37,6 +42,8 @@ set(_hle_exports
     ksceKernelGetProcessLocalStorageAddr ksceKernelGetProcessLocalStorageAddrForPid
     ksceKernelCreateMutex ksceKernelDeleteMutex ksceKernelLockMutex ksceKernelUnlockMutex
     sceClibMemcpy sceClibMemset
+    # Production kernel memset, required by the observed firmware import.
+    kmemset
     sceIoOpen sceIoClose
     # Synchronous file metadata and reads/seeks reuse production IO implementations.
     sceIoGetstat sceIoGetstatByFd sceIoRead sceIoLseek sceIoLseek32
@@ -57,6 +64,9 @@ set(_hle_exports
     sceKernelCallAbortHandler
     sceIoWrite
     sceKernelUnlockLwMutex2 sceKernelRegisterThreadEventHandler
+    # Firmware import: retain the upstream UNIMPLEMENTED warning/return value.
+    # Identity and semantics remain unknown; this is stub parity, not support.
+    SceThreadmgrForDriver_20C228E4
     # Nonblocking semaphore operations use the production kernel objects.
     # Blocking waits need cooperative scheduling before they can be selected.
     sceKernelCreateSema sceKernelDeleteSema sceKernelPollSema sceKernelSignalSema
@@ -100,6 +110,7 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceKernelThreadMgr/SceThreadmgrCoredumpTime.cpp"
     "${_HLE_ROOT}/modules/SceKernelThreadMgr/SceThreadmgrForDriver.cpp"
     "${_HLE_ROOT}/modules/SceSysmem/SceSysmem.cpp"
+    "${_HLE_ROOT}/modules/SceSysmem/SceSysclibForDriver.cpp"
     "${_HLE_ROOT}/modules/SceSysmem/SceSysmemForDriver.cpp"
     "${_HLE_ROOT}/modules/SceSysmem/SceProcEventForDriver.cpp"
     "${_HLE_ROOT}/modules/SceProcessmgr/SceProcessmgr.cpp"

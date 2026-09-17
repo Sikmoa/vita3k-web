@@ -29,12 +29,16 @@ U/V addressing are accepted. Texels and sampler state are snapshotted before
 await, uploaded per draw, and texture resources are destroyed after readback.
 Texture layout participates in the pipeline key; texels and sampler values do
 not. Missing data, wrong sizes and unsupported sampler/texture fields reject.
-**Guest SceGxm texture state is not yet wired into this API.**
+**Guest SceGxm unit-zero LINEAR ABGR8 texture state is wired and verified.**
+The Memory64 JIT guest probe performs six textured GXP draws, including padded
+rows, filtering/wrapping, pixel mutation without rebinding and data-address
+replacement. See `GXM_GUEST_INTEGRATION.md` for the exact bounded descriptor
+contract and nine-readback fixture (exit 42).
 
 Depth/stencil, blending, MSAA, multiple
 vertex streams, non-default viewport/scissor, additional target formats and
-resident framebuffer resolve/presentation remain unsupported. Separate texture
-translation prototypes are not proof of guest texture support. Each draw still
+resident framebuffer resolve/presentation remain unsupported. The guest fixture
+verifies only the bounded texture path, not these remaining features. Each draw still
 reads back; this is not a performance result or a completed retail renderer.
 
 ## C1 — bounded pipeline cache and ordered guest operations
