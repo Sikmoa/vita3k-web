@@ -42,7 +42,6 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
         ThreadStatePtr thread;
         Scheduler::TaskId task = 0;
         bool deleting = false;
-        bool semaphore_wait = false;
         bool faulted = false;
         std::optional<uint64_t> deadline;
         ThreadStatePtr joining;
@@ -98,15 +97,19 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
         return true;
     }
 
+    void activate(Record &r) {
+        // Called both on first entry AND on return from a suspended stack.
+        // entry() alone misses A -> B -> A once both fibers have started.
+        if (last_dispatched && last_dispatched != &r)
+            invalidate_jit_cache(*last_dispatched->thread->cpu, 0, UINT32_MAX);
+        last_dispatched = &r;
+        active = &r;
+    }
+
     static void entry(Scheduler &, void *argument) {
         auto &r = *static_cast<Record *>(argument);
         auto &self = r.owner;
-        // Cross-CPU switch happened while this fiber was suspended: retire the
-        // previously dispatched CPU's JS-side state before this CPU executes.
-        if (self.last_dispatched && self.last_dispatched != &r)
-            invalidate_jit_cache(*self.last_dispatched->thread->cpu, 0, UINT32_MAX);
-        self.last_dispatched = &r;
-        self.active = &r;
+        self.activate(r);
         try {
             // Persistent top-level frame: dormant/suspended states park instead
             // of losing lifecycle/callback state. Only deletion returns it.
@@ -146,12 +149,12 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
         // The JS dispatch map has no CPU owner in its key. Invalidation is
         // DEFERRED to the next dispatch: re-running the same CPU (the hot
         // polling path) keeps its compiled state, a different CPU triggers the
-        // outgoing caches' retirement in entry() before any guest code runs.
+        // outgoing caches' retirement in activate() before any guest code runs.
         active = nullptr;
         set_current_cpu_state(root_cpu);
         const bool switched = parked ? scheduler.park() : scheduler.yield();
-        active = r;
         set_current_cpu_state(cpu);
+        activate(*r);
         if (!switched)
             throw std::logic_error("unsafe guest fiber suspension");
     }
@@ -172,11 +175,10 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
     void park(ThreadState &) override { suspend(true); }
     bool stopping() const noexcept override { return stopping_; }
 
-    WaitResult wait_semaphore(ThreadState &thread, std::optional<uint32_t> timeout) override {
+    WaitResult wait_sync(ThreadState &thread, std::optional<uint32_t> timeout) override {
         if (!active || active->thread.get() != &thread)
             return WaitResult::cancelled;
         auto &r = *active;
-        r.semaphore_wait = true;
         r.deadline = timeout ? std::optional<uint64_t>(GuestThreadRuntime::now_us() + *timeout) : std::nullopt;
         WaitResult result;
         for (;;) {
@@ -185,7 +187,6 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
             if (r.deadline && GuestThreadRuntime::now_us() >= *r.deadline) { result = WaitResult::timeout; break; }
             suspend(true);
         }
-        r.semaphore_wait = false;
         r.deadline.reset();
         return result;
     }

@@ -107,7 +107,7 @@ typedef std::map<uint32_t, uint32_t> ModuleUidByNid;
 
 // Optional single-OS-thread execution host. Notifications/creation NEVER switch
 // stacks and may run under kernel/thread locks. run_cpu, checkpoint, park,
-// wait_semaphore and run_guest_function are called with NO kernel locks held.
+// wait_sync and run_guest_function are called with NO kernel locks held.
 // The owner must remain alive until all continuations have retired and detach
 // before KernelState/MemState destruction. Desktop leaves execution_host null.
 struct KernelExecutionHost {
@@ -119,7 +119,8 @@ struct KernelExecutionHost {
     virtual int run_cpu(ThreadState &thread, bool step) = 0; // 0 continue, 1 return, <0 fault
     virtual void checkpoint(ThreadState &thread) = 0;
     virtual void park(ThreadState &thread) = 0;
-    virtual WaitResult wait_semaphore(ThreadState &thread, std::optional<uint32_t> timeout_us) = 0;
+    // Only opted-in semaphore and mutex queues use this continuation contract.
+    virtual WaitResult wait_sync(ThreadState &thread, std::optional<uint32_t> timeout_us) = 0;
     virtual uint32_t run_guest_function(ThreadState &thread, Address entry, SceSize args, Ptr<void> argp) = 0;
     virtual bool stopping() const noexcept = 0;
     virtual void process_exit() = 0;

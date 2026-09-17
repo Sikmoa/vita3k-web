@@ -25,9 +25,10 @@ namespace vita3k::web {
 // lifecycle callbacks may run additional invocations before the next switch.
 // Synchronous HLE/compilation wall time is NOT preemptible.
 //
-// Supported waits: ordinary semaphore waits, production signal/cancel queues,
-// relative microsecond timeout, thread deletion/shutdown cancellation. Semaphore
-// deletion with waiters returns ILLEGAL_CONTEXT. CB notification processing,
+// Supported waits: ordinary semaphore and mutex/LwMutex waits, production
+// signal/cancel/unlock queues, relative microsecond timeout, thread deletion/
+// shutdown cancellation. Semaphore/mutex deletion with waiters returns
+// ILLEGAL_CONTEXT. CB notification processing,
 // other wait families, device waits and host-blocking HLE are NOT implemented.
 // Known wait imports are rejected with ILLEGAL_CONTEXT, never fake success.
 // Custom import callbacks must neither block nor switch with a lock held.
@@ -36,10 +37,11 @@ namespace vita3k::web {
 //
 // Not Vita multicore: one logical CPU (processor ID 0), affinity is metadata.
 // Dispatch uses creation-time priority, lower numeric first/FIFO equals, with
-// no priority inheritance or dynamic reprioritization. Semaphore ordering is
-// the existing production FIFO/priority queue, including its priority ordering.
-// To isolate the process-global JS JIT dispatch hints, compiled caches are
-// conservatively invalidated on every suspension and terminal exit (not fast).
+// no priority inheritance or dynamic reprioritization. Sync wait ordering uses
+// the existing production FIFO/priority queues, including their priority order.
+// To isolate process-global JS JIT dispatch hints, outgoing compiled caches are
+// invalidated on CPU changes (first entry and resumed fibers) and terminal exit.
+// Repeated slices on the same CPU keep their compiled state.
 // The legacy synchronous run_guest_function/run_module_entry host API pumps at
 // most 4096 dispatches, then requests deletion and returns ILLEGAL_CONTEXT if
 // unfinished. Prefer create/start + resume for asynchronous host launches.

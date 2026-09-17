@@ -118,4 +118,65 @@ inline void build_waiter(MemState &mem, Address code, SceUID sema, Address timeo
     p.emit(0xe8bd8010);
     p.finish(mem);
 }
+
+// Same ARM call shape for a heavy UID or a lightweight workarea address.
+inline void build_mutex_waiter(MemState &mem, Address code, uint32_t lock_argument,
+    bool light, int count, Address timeout, Address result) {
+    const Address stub_address = code + 0x100;
+    const uint32_t stub[] = {0xef000000, 0xe1a0f00e, light ? 0x46e7be7bu : 0x1d8d7945u};
+    std::memcpy(Ptr<void>(stub_address).get(mem), stub, sizeof(stub));
+    Arm p(code);
+    p.emit(0xe92d4010);
+    p.constant(4, result); p.constant(0, lock_argument);
+    p.constant(1, count); p.constant(2, timeout);
+    p.call(stub_address);
+    p.store(0, 0);
+    p.emit(0xe8bd8010);
+    p.finish(mem);
+}
+
+// Contended lightweight-mutex pair. The host creates the mutex (init 0) at
+// data+0x300. Parent: lock (uncontended), publish marker, poll a host gate,
+// unlock, poll child completion. Child: poll marker, lock (contended -> must
+// PARK on the runtime), publish result, signal state 2. Offsets into data:
+// 0x40 parent lock result, 0x44 marker, 0x48 child state, 0x4c unlock result,
+// 0x50 child lock result, 0x54 host gate.
+inline void build_lwmutex_pair(MemState &mem, Address code, Address data) {
+    const Address lock_stub = code + 0x300, unlock_stub = code + 0x320;
+    const uint32_t lock_words[] = {0xef000000, 0xe1a0f00e, 0x46e7be7b};   // sceKernelLockLwMutex
+    const uint32_t unlock_words[] = {0xef000000, 0xe1a0f00e, 0x120afc8c}; // sceKernelUnlockLwMutex2
+    std::memcpy(Ptr<void>(lock_stub).get(mem), lock_words, sizeof(lock_words));
+    std::memcpy(Ptr<void>(unlock_stub).get(mem), unlock_words, sizeof(unlock_words));
+    const Address work = data + 0x300;
+    Arm p(code);
+    p.emit(0xe92d4010); // push {r4,lr}
+    p.constant(4, data);
+    p.constant(0, work); p.constant(1, 1); p.constant(2, 0);
+    p.call(lock_stub);
+    p.store(0, 0x40);
+    p.constant(0, 1); p.store(0, 0x44); // marker: child may contend now
+    const Address gate_loop = p.pc();
+    p.load(0, 0x54); p.emit(0xe3500000); p.emit(0x0a000000u | ((static_cast<uint32_t>(static_cast<int32_t>(gate_loop - (p.pc() + 8))) >> 2) & 0xffffffu)); // beq gate_loop
+    p.constant(0, work); p.constant(1, 1);
+    p.call(unlock_stub);
+    p.store(0, 0x4c);
+    const Address done_loop = p.pc();
+    p.load(0, 0x48); p.emit(0xe3500002); p.emit(0x1a000000u | ((static_cast<uint32_t>(static_cast<int32_t>(done_loop - (p.pc() + 8))) >> 2) & 0xffffffu));
+    p.constant(0, 42);
+    p.emit(0xe8bd8010); // pop {r4,pc}
+    p.finish(mem);
+
+    Arm c(code + 0x400);
+    c.emit(0xe92d4010);
+    c.constant(4, data);
+    const Address marker_loop = c.pc();
+    c.load(0, 0x44); c.emit(0xe3500001); c.emit(0x1a000000u | ((static_cast<uint32_t>(static_cast<int32_t>(marker_loop - (c.pc() + 8))) >> 2) & 0xffffffu));
+    c.constant(0, work); c.constant(1, 1); c.constant(2, 0);
+    c.call(lock_stub);
+    c.store(0, 0x50);
+    c.constant(0, 2); c.store(0, 0x48);
+    c.constant(0, 43);
+    c.emit(0xe8bd8010);
+    c.finish(mem);
+}
 } // namespace guest_thread_fixture

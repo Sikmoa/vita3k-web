@@ -81,7 +81,7 @@ inline static int handle_timeout(KernelState &kernel, const ThreadStatePtr &thre
     std::unique_lock<std::mutex> &primitive_lock, WaitingThreadQueuePtr &queue,
     const ThreadDataQueueInterator<WaitingThreadData> &data_it, const char *export_name,
     SceUInt *const timeout) {
-    // Only semaphore waits have a cooperative continuation contract for now.
+    // Only semaphore/mutex waits opt into handle_cooperative_wait below.
     // Roll back the queue/status before returning an explicit unsupported-context
     // error; never fall through to a host condition-variable wait in the browser.
     if (kernel.execution_host) {
@@ -122,6 +122,48 @@ inline static int handle_timeout(KernelState &kernel, const ThreadStatePtr &thre
     }
 
     return SCE_KERNEL_OK;
+}
+
+// Opt-in only: primitive_lock is held, thread_lock is not. The caller's
+// cancellation flag (if any) lives on the parked fiber until we unlink it.
+inline static int handle_cooperative_wait(KernelState &kernel, const ThreadStatePtr &thread,
+    std::unique_lock<std::mutex> &thread_lock, std::unique_lock<std::mutex> &primitive_lock,
+    WaitingThreadQueuePtr &queue, SceUInt *timeout) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto duration = timeout ? std::optional<uint32_t>(*timeout) : std::nullopt;
+    primitive_lock.unlock();
+    KernelExecutionHost::WaitResult result;
+    try {
+        result = kernel.execution_host->wait_sync(*thread, duration);
+    } catch (...) {
+        // Never retain a pointer to the unwinding fiber's cancellation flag.
+        primitive_lock.lock();
+        const auto pending = queue->find(thread);
+        if (pending != queue->end())
+            queue->erase(pending);
+        thread_lock.lock();
+        thread->update_status(ThreadStatus::run);
+        thread_lock.unlock();
+        throw;
+    }
+    primitive_lock.lock();
+    // Unlock/signal/cancel may already have erased the original iterator.
+    const auto pending = queue->find(thread);
+    const bool still_queued = pending != queue->end();
+    if (still_queued)
+        queue->erase(pending);
+    thread_lock.lock();
+    thread->update_status(ThreadStatus::run);
+    thread_lock.unlock();
+    if (timeout) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        *timeout = elapsed >= *duration ? 0 : *duration - static_cast<uint32_t>(elapsed);
+    }
+    if (still_queued)
+        return result == KernelExecutionHost::WaitResult::timeout
+            ? SCE_KERNEL_ERROR_WAIT_TIMEOUT : SCE_KERNEL_ERROR_WAIT_CANCEL;
+    return SCE_KERNEL_OK; // caller checks its explicit cancellation flag
 }
 
 // *****************
@@ -591,6 +633,8 @@ SceUID mutex_create(SceUID *uid_out, KernelState &kernel, MemState &mem, const c
         workarea_mem->lockCount = init_count;
         if (workarea_mem->lockCount)
             workarea_mem->owner = thread_id;
+        else if (kernel.execution_host)
+            workarea_mem->owner = static_cast<uint32_t>(-1);
         workarea_mem->attr = attr;
     }
 
@@ -676,11 +720,17 @@ inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char
         data.thread = thread;
         data.lock_count = lock_count;
         data.priority = thread->priority;
+        bool was_canceled = false;
+        data.was_canceled = &was_canceled;
 
         const auto data_it = mutex->waiting_threads->push(data);
         thread_lock.unlock();
 
-        int res = handle_timeout(kernel, thread, thread_lock, mutex_lock, mutex->waiting_threads, data_it, export_name, timeout);
+        int res = kernel.execution_host
+            ? handle_cooperative_wait(kernel, thread, thread_lock, mutex_lock, mutex->waiting_threads, timeout)
+            : handle_timeout(kernel, thread, thread_lock, mutex_lock, mutex->waiting_threads, data_it, export_name, timeout);
+        if (kernel.execution_host && was_canceled)
+            res = SCE_KERNEL_ERROR_WAIT_CANCEL;
 
         if (weight == SyncWeight::Light) {
             mutex->workarea.get(mem)->lockCount = mutex->lock_count;
@@ -742,17 +792,28 @@ inline static int mutex_unlock_impl(KernelState &kernel, const char *export_name
         if (mutex->lock_count == 0) {
             mutex->owner = nullptr;
 
-            if (!mutex->waiting_threads->empty()) {
+            while (!mutex->waiting_threads->empty()) {
                 const auto waiting_thread_data = *mutex->waiting_threads->begin();
                 const auto waiting_thread = waiting_thread_data.thread;
                 const auto waiting_lock_count = waiting_thread_data.lock_count;
 
                 const std::lock_guard<std::mutex> waiting_thread_lock(waiting_thread->mutex);
-                waiting_thread->update_status(ThreadStatus::run, ThreadStatus::wait);
-
+                // Deletion wakes a parked waiter before its HLE continuation
+                // unlinks itself. Skip it and keep searching: ownership must
+                // never be handed to a cancelled waiter, nor lost behind it.
+                if (kernel.execution_host && waiting_thread->status != ThreadStatus::wait) {
+                    *waiting_thread_data.was_canceled = true;
+                    mutex->waiting_threads->pop();
+                    continue;
+                }
+                if (!kernel.execution_host)
+                    waiting_thread->update_status(ThreadStatus::run, ThreadStatus::wait);
                 mutex->waiting_threads->pop();
                 mutex->lock_count += waiting_lock_count;
                 mutex->owner = waiting_thread;
+                if (kernel.execution_host)
+                    waiting_thread->update_status(ThreadStatus::run, ThreadStatus::wait);
+                break;
             }
         }
     }
@@ -773,7 +834,19 @@ int mutex_unlock(KernelState &kernel, const char *export_name, SceUID thread_id,
             mutex->waiting_threads->size());
     }
 
-    return mutex_unlock_impl(kernel, export_name, thread_id, unlock_count, mutex);
+    const int result = mutex_unlock_impl(kernel, export_name, thread_id, unlock_count, mutex);
+    if (kernel.execution_host && weight == SyncWeight::Light) {
+        // The unlock API has no MemState argument. The calling CPU belongs to
+        // this runtime's memory. No swap occurs during unlock or notification.
+        const auto thread = kernel.get_thread(thread_id);
+        if (thread) {
+            const std::lock_guard<std::mutex> lock(mutex->mutex);
+            auto *work = mutex->workarea.get(*thread->cpu->mem);
+            work->lockCount = mutex->lock_count;
+            work->owner = mutex->owner ? static_cast<uint32_t>(mutex->owner->id) : static_cast<uint32_t>(-1);
+        }
+    }
+    return result;
 }
 
 int mutex_delete(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID mutexid, SyncWeight weight) {
@@ -790,6 +863,9 @@ int mutex_delete(KernelState &kernel, const char *export_name, SceUID thread_id,
             mutex->waiting_threads->size());
     }
 
+    // Production deletion does not implement waking live mutex waiters.
+    if (kernel.execution_host && !mutex->waiting_threads->empty())
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
     if (mutex->waiting_threads->empty()) {
         const std::lock_guard<std::mutex> kernel_guard(kernel.mutex);
         mutexes->erase(mutexid);
@@ -1079,45 +1155,7 @@ SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thr
 
         int res;
         if (kernel.execution_host) {
-            const auto start = std::chrono::steady_clock::now();
-            const auto duration = pTimeout ? std::optional<uint32_t>(*pTimeout) : std::nullopt;
-            // The stack-local cancellation flag remains alive on the fiber.
-            // Neither the primitive nor the thread mutex may cross a swap.
-            semaphore_lock.unlock();
-            KernelExecutionHost::WaitResult result;
-            try {
-                result = kernel.execution_host->wait_semaphore(*thread, duration);
-            } catch (...) {
-                // A failed host callback must not leave was_canceled pointing
-                // into a destroyed fiber frame in the production queue.
-                semaphore_lock.lock();
-                const auto pending = semaphore->waiting_threads->find(thread);
-                if (pending != semaphore->waiting_threads->end())
-                    semaphore->waiting_threads->erase(pending);
-                thread_lock.lock();
-                thread->update_status(ThreadStatus::run);
-                thread_lock.unlock();
-                throw;
-            }
-            semaphore_lock.lock();
-            // Signal/cancel may already have erased data_it. Never reuse it.
-            const auto pending = semaphore->waiting_threads->find(thread);
-            const bool still_queued = pending != semaphore->waiting_threads->end();
-            if (still_queued)
-                semaphore->waiting_threads->erase(pending);
-            thread_lock.lock();
-            thread->update_status(ThreadStatus::run);
-            thread_lock.unlock();
-            res = SCE_KERNEL_OK;
-            if (still_queued) {
-                res = result == KernelExecutionHost::WaitResult::timeout
-                    ? SCE_KERNEL_ERROR_WAIT_TIMEOUT : SCE_KERNEL_ERROR_WAIT_CANCEL;
-            }
-            if (pTimeout) {
-                const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - start).count();
-                *pTimeout = elapsed >= *duration ? 0 : *duration - static_cast<uint32_t>(elapsed);
-            }
+            res = handle_cooperative_wait(kernel, thread, thread_lock, semaphore_lock, semaphore->waiting_threads, pTimeout);
         } else {
             res = handle_timeout(kernel, thread, thread_lock, semaphore_lock, semaphore->waiting_threads, data_it, export_name, pTimeout);
         }
