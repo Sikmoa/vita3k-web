@@ -42,8 +42,8 @@ set(_hle_exports
     ksceKernelGetProcessLocalStorageAddr ksceKernelGetProcessLocalStorageAddrForPid
     ksceKernelCreateMutex ksceKernelDeleteMutex ksceKernelLockMutex ksceKernelUnlockMutex
     sceClibMemcpy sceClibMemset
-    # Production kernel memset, required by the observed firmware import.
-    kmemset
+    # Production kernel memset/memcpy, required by observed firmware imports.
+    kmemset kmemcpy
     sceIoOpen sceIoClose
     # Synchronous file metadata and reads/seeks reuse production IO implementations.
     sceIoGetstat sceIoGetstatByFd sceIoRead sceIoLseek sceIoLseek32
@@ -67,6 +67,23 @@ set(_hle_exports
     # Firmware import: retain the upstream UNIMPLEMENTED warning/return value.
     # Identity and semantics remain unknown; this is stub parity, not support.
     SceThreadmgrForDriver_20C228E4
+    # Observed next firmware import; also an upstream warning-producing stub.
+    # No QAF semantics are implemented or inferred from its return value.
+    SceQafMgrForDriver_B9770A13
+    # Remaining SceSysmodule static imports, resolved by one-pass enumeration
+    # (VITA3K_TRACE_MODULE_IMPORTS). Named exports reuse the upstream bodies:
+    # UNIMPLEMENTED() warning stubs below are stub parity with desktop Vita3K,
+    # not implemented semantics; production bodies are noted per name.
+    ksceKernelSetPermission ksceKernelGetThreadId
+    __kstack_chk_fail
+    ksceKernelMemcpyKernelToUser ksceKernelMemcpyUserToKernel
+    ksceKernelCheckDipsw
+    ksceDebugPrintf
+    ksceKernelLoadStartModuleForPid ksceKernelLoadStartSharedModuleForPid
+    ksceKernelStopUnloadModuleForPid ksceKernelStopUnloadSharedModuleForPid
+    # CALL_EXPORT dependencies of the ForPid wrappers above must also be
+    # registered: retained bodies call into these user-side entry points.
+    _sceKernelStopUnloadModule
     # Nonblocking semaphore operations use the production kernel objects.
     # Blocking waits need cooperative scheduling before they can be selected.
     sceKernelCreateSema sceKernelDeleteSema sceKernelPollSema sceKernelSignalSema
@@ -75,6 +92,10 @@ set(_hle_exports
     # wait on host condition variables (or sleep) and cannot yield guest threads.
     # GetSystemTime and GetThreadRunStatus are UNIMPLEMENTED upstream. There
     # is no user sceKernelGetSystemTimeLow in nids.inc; do not invent one.
+    # Immediate Limbo frontier (imports=3995 missing_nids=1 PC=8126af40):
+    # sceCtrlSetSamplingMode is a production body (validates the mode range,
+    # stores emuenv.ctrl.input_mode, returns the previous mode), not a stub.
+    sceCtrlSetSamplingMode
 )
 
 # Take NID values from the one authoritative database, never a second resolver.
@@ -111,6 +132,11 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceKernelThreadMgr/SceThreadmgrForDriver.cpp"
     "${_HLE_ROOT}/modules/SceSysmem/SceSysmem.cpp"
     "${_HLE_ROOT}/modules/SceSysmem/SceSysclibForDriver.cpp"
+    "${_HLE_ROOT}/modules/SceSysmem/SceQafMgrForDriver.cpp"
+    "${_HLE_ROOT}/modules/SceSysmem/SceDebugForDriver.cpp"
+    "${_HLE_ROOT}/modules/SceSysmem/SceDipswForDriver.cpp"
+    "${_HLE_ROOT}/modules/SceKernelModulemgr/SceModulemgrForDriver.cpp"
+    "${_HLE_ROOT}/modules/SceKernelModulemgr/SceModulemgr.cpp"
     "${_HLE_ROOT}/modules/SceSysmem/SceSysmemForDriver.cpp"
     "${_HLE_ROOT}/modules/SceSysmem/SceProcEventForDriver.cpp"
     "${_HLE_ROOT}/modules/SceProcessmgr/SceProcessmgr.cpp"
@@ -121,6 +147,8 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceDriverUser/SceFios2User.cpp"
     "${_HLE_ROOT}/modules/SceAppUtil/SceAppUtil.cpp"
     "${_HLE_ROOT}/modules/SceCommonDialog/SceCommonDialog.cpp"
+    # No LIBRARY_INIT; startup_libraries.inc stays LIBRARY(SceSysmem).
+    "${_HLE_ROOT}/modules/SceCtrl/SceCtrl.cpp"
 )
 # Compile the existing implementation files through registration-only adapters.
 # This is necessary because EXPORT's make_bridge initialization roots even

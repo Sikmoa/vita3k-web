@@ -15,9 +15,13 @@ target_link_options(vita3k_wasm_jit INTERFACE
 # Separate fixture-launch targets: opting into tests does not switch the
 # already-working interpreter application. The Worker selects this module only
 # when created with ?backend=jit.
+# vita_self_decrypt.cpp provides the decrypt_fself link shim that
+# module_parent.cpp calls for every loaded module. The HLE module set now
+# keeps load_module reachable in this target (as in vita3k_web_app_bench),
+# so the shim must be linked here too.
 add_executable(vita3k_web_jit
     src/main.cpp src/vita_runtime.cpp src/vita_display_bridge.cpp
-    src/memory.cpp src/interpreter.cpp src/guest.cpp)
+    src/memory.cpp src/interpreter.cpp src/guest.cpp src/vita_self_decrypt.cpp)
 target_compile_definitions(vita3k_web_jit PRIVATE VITA3K_WEB=1 VITA3K_USE_WASM_JIT=1)
 target_link_libraries(vita3k_web_jit PRIVATE vita3k_web_runtime_hle vita3k_wasm_jit)
 target_link_options(vita3k_web_jit PRIVATE
