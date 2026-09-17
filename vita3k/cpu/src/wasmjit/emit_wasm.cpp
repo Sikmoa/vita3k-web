@@ -218,9 +218,8 @@ bool shift(Op op) {
 // branching, so they skip the reload and the search entirely.
 constexpr uint32_t kLightDispatchSentinel = 0xffffffffu;
 // Function index space counts IMPORTED functions first: mem_read=0,
-// mem_write=1, run=2, and the R3j outlined fault function=3 (never
-// exported; called only from run()'s fault arms).
-constexpr uint32_t kFaultFuncIndex = 3;
+// mem_write=1, fp64=2, run=3, and the outlined fault function=4.
+constexpr uint32_t kFaultFuncIndex = 4;
 // member_index() result for a location that is not a region member.
 constexpr uint32_t kNoMember = 0xffffffffu;
 constexpr uint32_t kRegionRegBase = 11;
@@ -576,13 +575,14 @@ public:
         Bytes module{0, 'a', 's', 'm', 1, 0, 0, 0};
         section(module, 1, {2, 0x60, 1, host_type, 1, 0x7f,
             0x60, 3, host_type, 0x7f, 0x7f, 1, 0x7f}); // block and checked helpers
-        auto imports = memory_imports(3);
+        auto imports = memory_imports(4);
         imports.insert(imports.end(), {
             3, 'e', 'n', 'v', 8, 'm', 'e', 'm', '_', 'r', 'e', 'a', 'd', 0, 1,
-            3, 'e', 'n', 'v', 9, 'm', 'e', 'm', '_', 'w', 'r', 'i', 't', 'e', 0, 1});
+            3, 'e', 'n', 'v', 9, 'm', 'e', 'm', '_', 'w', 'r', 'i', 't', 'e', 0, 1,
+            3, 'e', 'n', 'v', 4, 'f', 'p', '6', '4', 0, 1});
         section(module, 2, imports);
         section(module, 3, {1, 0}); // one function, type 0
-        section(module, 7, {1, 5, 'b', 'l', 'o', 'c', 'k', 0, 2});
+        section(module, 7, {1, 5, 'b', 'l', 'o', 'c', 'k', 0, 3});
         section(module, 10, functions);
         return module;
     }
@@ -2038,6 +2038,18 @@ private:
             load(offsetof(JitState, tpidruro));
             break;
         }
+        case Op::A32CoprocSendOneWord: {
+            // MCR p15,0,Rt,c13,c0,3: store the guest TLS base. The matching
+            // MRC read above observes it; all other registers remain
+            // unsupported. Both SendOneWord and GetOneWord carry the same
+            // six fields; only InternalOperation includes CRd.
+            const auto info = inst.GetArg(0);
+            if (!info.IsImmediate() || info.GetType() != Type::CoprocInfo
+                || info.GetCoprocInfo() != Dynarmic::IR::Value::CoprocessorInfo{15, 0, 0, 13, 0, 3})
+                return false;
+            get(0); arg(1); store(offsetof(JitState, tpidruro));
+            return ok; // Void operation: do not publish a scalar SSA result.
+        }
         case Op::FPCompare32: {
             // Compare IEEE-754 bit patterns without host FP conversion: preserve
             // signaling NaNs, signed zeros and guest flush-to-zero behavior.
@@ -2103,6 +2115,30 @@ private:
             get(next_local); op(0xbe); op(0xbb); // f32 bits -> f64.promote_f32
             op(0x62); imm(4); op(Shl); op(Or); store(offsetof(JitState, fpscr));
             return ok;
+        case Op::FPAdd64:
+        case Op::FPSub64:
+        case Op::FPMul64:
+        case Op::FPDiv64: {
+            // Exact integer arithmetic in a native Wasm helper, not a JS or
+            // interpreter fallback. The helper observes only memory_value and
+            // the explicitly supplied FPSCR; cached registers/flags stay local.
+            load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+            begin_if(); ret(ExitReason::Unsupported); end_if();
+            for (unsigned operand = 0; operand < 2; ++operand)
+                for (unsigned word = 0; word < 2; ++word) {
+                    get(0); value_word(inst.GetArg(operand), word);
+                    store(offsetof(JitState, memory_value) + 4 * (operand * 2 + word));
+                }
+            get(0);
+            imm(kind == Op::FPAdd64 ? 0 : kind == Op::FPSub64 ? 1 : kind == Op::FPMul64 ? 2 : 3);
+            load(offsetof(JitState, fpscr));
+            op(Call); uleb(code, 2); set(next_local + 2);
+            get(0); load(offsetof(JitState, fpscr)); get(next_local + 2); op(Or);
+            store(offsetof(JitState, fpscr));
+            load(offsetof(JitState, memory_value)); set(next_local);
+            load(offsetof(JitState, memory_value) + 4); set(next_local + 1);
+            return ok;
+        }
         case Op::FPAdd32:
         case Op::FPSub32:
         case Op::FPMul32:
@@ -3041,15 +3077,16 @@ std::vector<uint8_t> emit_region(
         types.insert(types.end(), {0x60, 3, host_type, 0x7f, 0x7f, 0}); // type 2: fault (A)
     }
     section(module, 1, types);
-    auto imports = memory_imports(3);
+    auto imports = memory_imports(4);
     imports.insert(imports.end(), {
         3, 'e', 'n', 'v', 8, 'm', 'e', 'm', '_', 'r', 'e', 'a', 'd', 0, 1,
-        3, 'e', 'n', 'v', 9, 'm', 'e', 'm', '_', 'w', 'r', 'i', 't', 'e', 0, 1});
+        3, 'e', 'n', 'v', 9, 'm', 'e', 'm', '_', 'w', 'r', 'i', 't', 'e', 0, 1,
+        3, 'e', 'n', 'v', 4, 'f', 'p', '6', '4', 0, 1});
     section(module, 2, imports);
     section(module, 3, {2, 0, 2}); // run (type 0), fault (type 2)
     // Function index space counts IMPORTED functions first: mem_read=0,
-    // mem_write=1, our run=2, fault=3. (Same layout as the single-block module.)
-    section(module, 7, {1, 3, 'r', 'u', 'n', 0, 2});
+    // mem_write=1, fp64=2, our run=3, fault=4.
+    section(module, 7, {1, 3, 'r', 'u', 'n', 0, 3});
     section(module, 10, functions);
     if (module.size() > kMaxModule)
         return {};

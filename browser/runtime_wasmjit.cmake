@@ -3,6 +3,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/runtime_dynarmic_frontend.cmake)
 add_library(vita3k_wasm_jit STATIC
     "${VITA_ROOT}/cpu/src/wasm_jit_cpu.cpp"
     "${VITA_ROOT}/cpu/src/wasmjit/emit_wasm.cpp"
+    "${VITA_ROOT}/cpu/src/wasmjit/fp64.cpp"
 )
 target_link_libraries(vita3k_wasm_jit PUBLIC vita3k_dynarmic_frontend vita3k_web_runtime_core)
 target_include_directories(vita3k_wasm_jit PRIVATE "${VITA_ROOT}/cpu/src")
@@ -54,7 +55,8 @@ target_link_options(vita3k_jit_tests PRIVATE
 # exercise its anonymous-namespace checked-memory helpers, so it links the
 # frontend/core but NOT the vita3k_wasm_jit library (no duplicate symbols).
 add_executable(vita3k_jit_backend_test_node "${VITA_ROOT}/cpu/tests/wasmjit_backend_test.cpp"
-    "${VITA_ROOT}/cpu/src/wasmjit/emit_wasm.cpp")
+    "${VITA_ROOT}/cpu/src/wasmjit/emit_wasm.cpp"
+    "${VITA_ROOT}/cpu/src/wasmjit/fp64.cpp")
 target_include_directories(vita3k_jit_backend_test_node PRIVATE "${VITA_ROOT}/cpu/src")
 target_link_libraries(vita3k_jit_backend_test_node PRIVATE vita3k_dynarmic_frontend vita3k_web_runtime_core)
 target_link_options(vita3k_jit_backend_test_node PRIVATE

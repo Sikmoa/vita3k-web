@@ -94,6 +94,7 @@ void equal_context(const CPUContext &a, const CPUContext &b) {
 #include "wasmjit_vector_compare_tests.inc"
 #include "wasmjit_byte_reverse_tests.inc"
 #include "wasmjit_f64_tests.inc"
+#include "fp64_helper_tests.inc"
 #include "wasmjit_exclusive_tests.inc"
 
 void tls_read(MemState &mem) {
@@ -1664,6 +1665,10 @@ int main() {
     f64_tests::double_to_single();
     f64_tests::compare64();
     f64_tests::mode_guards();
+    f64_tests::binary_arithmetic();
+    f64_tests::guest_multiply(mem);
+    f64_tests::guest_tls_write(mem);
+    fp64_helper_tests::run();
     helpers(mem);
     tls_read(mem);
     leading_zeros(mem);

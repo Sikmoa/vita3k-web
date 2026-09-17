@@ -50,6 +50,7 @@ set(_hle_exports
     sceAppUtilInit sceAppUtilShutdown
     # Parameter queries read EmuEnvState config/licence fields only; no new stubs.
     sceAppUtilAppParamGetInt sceAppUtilSystemParamGetInt sceAppUtilSystemParamGetString
+    sceAppUtilDrmOpen sceAppUtilDrmClose
     # Common-dialog entry points are UNIMPLEMENTED()/STUBBED() upstream; selecting
     # them reproduces desktop behaviour instead of inventing new return values.
     sceCommonDialogSetConfigParam sceCommonDialogUpdate sceCommonDialogIsRunning sceCommonDialogGetWorkerThreadId

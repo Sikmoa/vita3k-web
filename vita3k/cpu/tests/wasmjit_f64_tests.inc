@@ -103,6 +103,105 @@ void run(const IR::Block &block, const JitState &initial, const JitState *expect
     }
 }
 
+void binary_arithmetic() {
+    struct Case { Op op; uint64_t a, b, result; uint32_t flags; };
+    const Case cases[] = {
+        {Op::FPMul64, 0x3ff0000000000001ull, 0x3ff0000000000001ull, 0x3ff0000000000002ull, 0x10},
+        {Op::FPMul64, 0x7fefffffffffffffull, 0x4000000000000000ull, 0x7ff0000000000000ull, 0x14},
+        {Op::FPMul64, 0x0010000000000001ull, 0x3fe0000000000000ull, 0x0008000000000000ull, 0x18},
+        {Op::FPMul64, 0x0010000000000000ull, 0x3fe0000000000000ull, 0x0008000000000000ull, 0},
+        {Op::FPMul64, 0x0010000000000000ull, 0x3fefffffffffffffull, 0x0010000000000000ull, 0x18},
+        {Op::FPMul64, 0x7ff0000000000000ull, 0, 0x7ff8000000000000ull, 1},
+        {Op::FPMul64, 0x8000000000000000ull, 0x4000000000000000ull, 0x8000000000000000ull, 0},
+        {Op::FPAdd64, 0x3ff0000000000000ull, 0x3ca0000000000000ull, 0x3ff0000000000000ull, 0x10},
+        {Op::FPAdd64, 0x3ff0000000000000ull, 1, 0x3ff0000000000000ull, 0x10},
+        {Op::FPAdd64, 0x7ff0000000000000ull, 0xfff0000000000000ull, 0x7ff8000000000000ull, 1},
+        {Op::FPAdd64, 0x8000000000000000ull, 0x8000000000000000ull, 0x8000000000000000ull, 0},
+        {Op::FPSub64, 0x3ff0000000000000ull, 0x3ff0000000000000ull, 0, 0},
+        {Op::FPSub64, 0x0010000000000001ull, 0x0010000000000000ull, 1, 0},
+        {Op::FPSub64, 0x3ff0000000000000ull, 0xfff8123456789abcull, 0xfff8123456789abcull, 0},
+        {Op::FPSub64, 0x7ff8123456789abcull, 0xfff0123456789abcull, 0xfff8123456789abcull, 1},
+        {Op::FPDiv64, 0x3ff0000000000000ull, 0x4008000000000000ull, 0x3fd5555555555555ull, 0x10},
+        {Op::FPDiv64, 0x3ff0000000000000ull, 0, 0x7ff0000000000000ull, 2},
+        {Op::FPDiv64, 0, 0, 0x7ff8000000000000ull, 1},
+        {Op::FPDiv64, 0x7ff0000000000000ull, 0x7ff0000000000000ull, 0x7ff8000000000000ull, 1},
+        {Op::FPDiv64, 1, 0x4000000000000000ull, 0, 0x18},
+    };
+    for (const auto &c : cases) {
+        auto block = blank(0);
+        write_d(block, append(block, c.op, {read_d(block), read_d(block, 1)}));
+        auto state = base_state(0x80000080u); // preserve NZCV and sticky IDC
+        set_d_bits(state, c.a); set_d_bits(state, c.b, 1);
+        auto expected = state;
+        set_d_bits(expected, c.result); expected.fpscr |= c.flags;
+        run(block, state, &expected);
+    }
+    for (Op op : {Op::FPAdd64, Op::FPSub64, Op::FPMul64, Op::FPDiv64}) {
+        auto block = blank(0);
+        write_d(block, append(block, op, {read_d(block), read_d(block, 1)}));
+        auto state = base_state(0);
+        set_d_bits(state, 0x4018000000000000ull); // 6
+        set_d_bits(state, 0x4000000000000000ull, 1); // 2
+        auto expected = state;
+        set_d_bits(expected, op == Op::FPAdd64 ? 0x4020000000000000ull :
+            op == Op::FPSub64 ? 0x4010000000000000ull :
+            op == Op::FPMul64 ? 0x4028000000000000ull : 0x4008000000000000ull);
+        run(block, state, &expected);
+    }
+}
+
+// Exact opcode at Limbo's current frontier: VMUL.F64 d1,d1,d2.
+void guest_multiply(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    for (bool regions : {false, true}) for (bool thumb : {false, true}) {
+        jit.set_region_mode(regions);
+        if (thumb) put_thumb(mem, jit, {0x1b02ee21u, 0xbf00df00u});
+        else put(mem, jit, {0xee211b02u, 0xef000000u});
+        auto before = jit.save_context();
+        const uint64_t a = 0x3ff0000000000001ull, b = a;
+        std::memcpy(&before.fpu_registers[2], &a, 8);
+        std::memcpy(&before.fpu_registers[4], &b, 8);
+        before.fpscr = 0x90000080u;
+        jit.load_context(before);
+        CHECK(jit.run() == 0);
+        const auto after = jit.save_context();
+        uint64_t result;
+        std::memcpy(&result, &after.fpu_registers[2], 8);
+        CHECK(result == 0x3ff0000000000002ull);
+        CHECK(after.fpscr == (before.fpscr | 0x10));
+        CHECK(after.cpsr == before.cpsr);
+        CHECK(parent.svc_called);
+    }
+}
+
+// MCR p15,0,Rt,c13,c0,3 stores the guest TLS base; the matching MRC read is
+// already supported and must observe the written value in later blocks.
+void guest_tls_write(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        // MCR p15,0,r2,c13,c0,3 (Thumb 0x0d 0xee 0x70 0x2f) then read it back
+        // through the MRC form so the stored value is architecturally visible.
+        put_thumb(mem, jit, {0x2f70ee0du, 0x3f70ee1du, 0xbf00df00u});
+        auto before = jit.save_context();
+        before.cpu_registers[2] = 0x12345678;
+        before.cpu_registers[3] = 0x0f0f0f0f;
+        jit.load_context(before);
+        CHECK(jit.run() == 0);
+        const auto after = jit.save_context();
+        CHECK(after.cpu_registers[3] == 0x12345678);
+        CHECK(after.cpu_registers[2] == 0x12345678);
+        CHECK(after.cpsr == before.cpsr);
+        CHECK(parent.svc_called);
+    }
+}
+
 // Integer -> binary64 conversions are exact for fbits == 0, so they must not
 // disturb FPSCR and must not read the source after writing the destination.
 void integer_to_double() {

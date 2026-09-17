@@ -6,6 +6,7 @@
 #include <cpu/state.h>
 #include "wasmjit/frontend.h"
 #include "wasmjit/emit_wasm.h"
+#include "wasmjit/fp64.h"
 #include <dynarmic/frontend/A32/a32_location_descriptor.h>
 #include <dynarmic/ir/basic_block.h>
 #include <emscripten.h>
@@ -426,13 +427,23 @@ EMSCRIPTEN_KEEPALIVE uint32_t checked_memory_write(JitState *state, uint32_t add
     }
     return 0;
 }
+// Native Wasm helper: only the four scratch words are read/written. Flags
+// are returned, not stored, so no promoted architectural state is observed.
+uint32_t fp64_helper(JitState *state, uint32_t operation, uint32_t fpscr) noexcept {
+    const auto a = uint64_t(state->memory_value[0]) | (uint64_t(state->memory_value[1]) << 32);
+    const auto b = uint64_t(state->memory_value[2]) | (uint64_t(state->memory_value[3]) << 32);
+    const auto result = vita3k::wasmjit::fp64_arithmetic(operation, a, b, fpscr);
+    state->memory_value[0] = uint32_t(result.bits);
+    state->memory_value[1] = uint32_t(result.bits >> 32);
+    return result.flags;
+}
 } // namespace
 
 // Compilation and host entry into generated functions cross JS. Inside a
 // generated region, dispatch and checked memory helpers stay in Wasm.
 // Imported helper pointers arrive as table indices.
-EM_JS(int, vita3k_jit_install, (const uint8_t *bytes, unsigned length,
-    MemoryFunction read_memory, MemoryFunction write_memory), {
+EM_JS(int, vita3k_jit_install_impl, (const uint8_t *bytes, unsigned length,
+    MemoryFunction read_memory, MemoryFunction write_memory, MemoryFunction arithmetic), {
     let slot = -1;
     const freeSlots = Module['vita3kJitFreeSlots'] || (Module['vita3kJitFreeSlots'] = []);
     try {
@@ -442,7 +453,8 @@ EM_JS(int, vita3k_jit_install, (const uint8_t *bytes, unsigned length,
         const instance = new WebAssembly.Instance(module, {env: {
             memory: wasmMemory,
             mem_read: Module['vita3kNativeFunction'](read_memory),
-            mem_write: Module['vita3kNativeFunction'](write_memory)
+            mem_write: Module['vita3kNativeFunction'](write_memory),
+            fp64: Module['vita3kNativeFunction'](arithmetic)
         }});
         // This is Emscripten's native function table, whose indexing ABI is
         // toolchain-owned. The independent M16 region table remains i32.
@@ -456,6 +468,10 @@ EM_JS(int, vita3k_jit_install, (const uint8_t *bytes, unsigned length,
         return -1;
     }
 });
+int vita3k_jit_install(const uint8_t *bytes, unsigned length,
+    MemoryFunction read_memory, MemoryFunction write_memory) {
+    return vita3k_jit_install_impl(bytes, length, read_memory, write_memory, fp64_helper);
+}
 EM_JS(uint32_t, vita3k_jit_call, (int slot, uintptr_t state), {
     const fn = Module['vita3kNativeFunction'](slot);
     return fn(Module['vita3kHostPointer'](state));
@@ -475,8 +491,8 @@ EM_JS(void, vita3k_jit_table_ensure, (), {
     if (!Module['vita3kJitTable'])
         Module['vita3kJitTable'] = new WebAssembly.Table({initial: 512, element: 'anyfunc'});
 });
-EM_JS(int, vita3k_jit_install_region, (const uint8_t *bytes, unsigned length,
-    MemoryFunction read_memory, MemoryFunction write_memory), {
+EM_JS(int, vita3k_jit_install_region_impl, (const uint8_t *bytes, unsigned length,
+    MemoryFunction read_memory, MemoryFunction write_memory, MemoryFunction arithmetic), {
     const regions = Module['vita3kJitRegions'] || (Module['vita3kJitRegions'] = new Map());
     let slot = -1;
     const freeSlots = Module['vita3kJitFreeRegionSlots'] || (Module['vita3kJitFreeRegionSlots'] = []);
@@ -487,7 +503,8 @@ EM_JS(int, vita3k_jit_install_region, (const uint8_t *bytes, unsigned length,
         const instance = new WebAssembly.Instance(module, {env: {
             memory: wasmMemory,
             mem_read: Module['vita3kNativeFunction'](read_memory),
-            mem_write: Module['vita3kNativeFunction'](write_memory)
+            mem_write: Module['vita3kNativeFunction'](write_memory),
+            fp64: Module['vita3kNativeFunction'](arithmetic)
         }});
         const run = instance.exports.run;
         if (typeof run !== 'function') throw new Error('region module does not export run');
@@ -508,6 +525,10 @@ EM_JS(int, vita3k_jit_install_region, (const uint8_t *bytes, unsigned length,
         return -1;
     }
 });
+int vita3k_jit_install_region(const uint8_t *bytes, unsigned length,
+    MemoryFunction read_memory, MemoryFunction write_memory) {
+    return vita3k_jit_install_region_impl(bytes, length, read_memory, write_memory, fp64_helper);
+}
 // The multi-region dispatcher module is built once per process; it imports
 // the shared region table and the same linear memory as the regions.
 EM_JS(int, vita3k_jit_install_dispatch, (const uint8_t *bytes, unsigned length), {
