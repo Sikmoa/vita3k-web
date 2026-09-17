@@ -18,11 +18,15 @@
 #include <util/log.h>
 #include <util/net_utils.h>
 
+#ifndef __EMSCRIPTEN__
 #include <curl/curl.h>
+#endif
 
 #ifdef _WIN32
 #include <iphlpapi.h>
 #include <winsock2.h>
+#elif defined(__EMSCRIPTEN__)
+#include <arpa/inet.h>
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -319,6 +323,11 @@ bool parseResponse(const std::string &res, SceRequestResponse &reqres) {
 }
 
 bool socketSetBlocking(int sockfd, bool blocking) {
+#ifdef __EMSCRIPTEN__
+    // Sockets are unsupported on the browser target; keep the symbol.
+    (void)sockfd; (void)blocking;
+    return false;
+#else
 #ifdef _WIN32
     u_long blocking_tmp = blocking;
     ioctlsocket(sockfd, FIONBIO, &blocking_tmp);
@@ -330,11 +339,19 @@ bool socketSetBlocking(int sockfd, bool blocking) {
         int flags = fcntl(sockfd, F_GETFL); // Get flags
         fcntl(sockfd, F_SETFL, flags | O_NONBLOCK); // Set NONBLOCK flag on
     }
-#endif
+#endif // _WIN32
+#endif // __EMSCRIPTEN__
     return true;
 }
 
 std::string get_web_response(const std::string &url) {
+#ifdef __EMSCRIPTEN__
+    // No host network in the browser target; HTTP backends are rejected
+    // upstream, so this helper never runs there.
+    (void)url;
+    LOG_WARN("get_web_response unavailable on the browser target");
+    return {};
+#else
     auto curl = curl_easy_init();
     if (!curl)
         return {};
@@ -365,6 +382,7 @@ std::string get_web_response(const std::string &url) {
         return response_string;
 
     return {};
+#endif
 }
 
 std::string get_web_regex_result(const std::string &url, const std::regex &regex) {
@@ -395,7 +413,13 @@ std::vector<AssignedAddr> get_all_assigned_addrs() {
         return out_addrs;
     };
 
-#ifdef _WIN32
+#if defined(__EMSCRIPTEN__)
+    // The browser target has no host interface enumeration and no curl.
+    // Adhoc and infrastructure networking remain unsupported there; report
+    // the loopback address so net-state initialization keeps deterministic
+    // semantics.
+    out_addrs.push_back({ "loopback", "127.0.0.1", "255.255.255.255" });
+#elif defined(_WIN32)
     PIP_ADAPTER_INFO pAdapterInfo;
     DWORD dwRetVal = 0;
     UINT i;

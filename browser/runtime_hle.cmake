@@ -87,6 +87,12 @@ set(_hle_exports
     # Nonblocking semaphore operations use the production kernel objects.
     # Blocking waits need cooperative scheduling before they can be selected.
     sceKernelCreateSema sceKernelDeleteSema sceKernelPollSema sceKernelSignalSema
+    # Lifecycle/semaphore integration under test; requires GuestThreadRuntime.
+    sceKernelCreateThread sceKernelStartThread sceKernelDeleteThread
+    sceKernelWaitSema sceKernelCancelSema
+    # Network init/term: production bodies are net-state writes only
+    # (SceNet.cpp:471/698); net_utils gets a loopback Emscripten branch.
+    sceNetInit sceNetTerm
     # Keep sceKernelWaitSema/CB, DelayThread/CB/200, WaitThreadEnd/CB,
     # WaitEventFlag/CB and WaitLwCond/CB unselected: their production paths
     # wait on host condition variables (or sleep) and cannot yield guest threads.
@@ -96,6 +102,58 @@ set(_hle_exports
     # sceCtrlSetSamplingMode is a production body (validates the mode range,
     # stores emuenv.ctrl.input_mode, returns the previous mode), not a stub.
     sceCtrlSetSamplingMode
+    # Next Limbo frontier (imports=4005 missing_nids=1 PC=8126af50):
+    # sceTouchGetPanelInfo fills constant panel geometry, sceTouchSetSamplingState
+    # stores the per-port mode, and sceTouchPeek takes the non-blocking
+    # touch_get peek path (no vblank wait; the blocking sceTouchRead is not
+    # imported by the game). All three are production bodies, not stubs.
+    sceTouchGetPanelInfo sceTouchSetSamplingState sceTouchPeek
+    # Limbo graphics-memory mapping (imports=4033 missing_nids=1 PC=8126b2d0):
+    # sceGxmMap/UnmapMemory record regions in gxm.memory_mapped_regions and
+    # return 0 while enable_memory_mapping stays false (the default); the
+    # USSE map/unmap pair are always-success upstream stubs (desktop parity).
+    sceGxmMapMemory sceGxmUnmapMemory
+    sceGxmMapFragmentUsseMemory sceGxmUnmapFragmentUsseMemory
+    sceGxmMapVertexUsseMemory sceGxmUnmapVertexUsseMemory
+    # Remaining Limbo texture descriptor imports (imports=4146 missing_nids=1
+    # PC=8126b050): pure descriptor readers/writers, no renderer waits or
+    # threads. Unsupported layouts still reject later at draw validation.
+    sceGxmTextureSetMipFilter sceGxmTextureSetLodBias sceGxmTextureSetLodMin
+    sceGxmTextureGetStride sceGxmTextureGetType
+    sceGxmTextureInitLinearStrided sceGxmTextureInitSwizzled sceGxmTextureInitSwizzledArbitrary
+    # Fixed-function state setters (imports=4155 missing_nids=1 PC=8126b340):
+    # pure context-state writes plus renderer command-queue appends, no waits.
+    # The bridge records cull/polygon/depth state and draws proceed only on
+    # default state; anything else fails loudly naming the state.
+    sceGxmSetCullMode sceGxmSetViewport sceGxmSetViewportEnable
+    sceGxmSetFrontDepthFunc sceGxmSetFrontDepthWriteEnable sceGxmSetFrontPolygonMode
+    sceGxmSetFragmentDefaultUniformBuffer sceGxmSetFragmentUniformBuffer sceGxmSetVertexUniformBuffer
+    # Depth-stencil surface descriptor init (imports=4218 missing_nids=1
+    # PC=8126b300): pure descriptor fill, no renderer interaction. Binding a
+    # real depth surface still rejects later at scene setup with a named error.
+    sceGxmDepthStencilSurfaceInit
+    # Sync objects (imports=4228 missing_nids=1 PC=8126b140): guest allocation
+    # plus renderer::create/destroy, which only initialize object fields.
+    sceGxmSyncObjectCreate sceGxmSyncObjectDestroy
+    # Program validation (imports=4429 missing_nids=1 PC=8126b3a0): memcmp of
+    # the GXP magic, no state changes.
+    sceGxmProgramCheck
+    # Patcher program lookup (imports=4433 missing_nids=1 PC=8126b200): pure
+    # guest-memory pointer chase, no renderer interaction.
+    sceGxmShaderPatcherGetProgramFromId
+    # Color-surface format query (imports=4706 missing_nids=1 PC=8126b3e0):
+    # pure struct field read.
+    sceGxmColorSurfaceGetFormat
+    # Power configuration (imports=4711 missing_nids=1 PC=8126bbb0): argument
+    # validation returning 0; no host power interaction.
+    scePowerSetConfigurationMode
+    # Program metadata readers (imports=4434 missing_nids=1 PC=8126b320): pure
+    # guest-struct field reads, no state changes or renderer interaction.
+    sceGxmProgramGetParameter sceGxmProgramGetParameterCount
+    sceGxmProgramFindParameterBySemantic
+    sceGxmProgramParameterGetArraySize sceGxmProgramParameterGetCategory
+    sceGxmProgramParameterGetComponentCount sceGxmProgramParameterGetContainerIndex
+    sceGxmProgramParameterGetName sceGxmProgramParameterGetType
 )
 
 # Take NID values from the one authoritative database, never a second resolver.
@@ -145,10 +203,18 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceDisplay/SceDisplay.cpp"
     "${_HLE_ROOT}/modules/SceDriverUser/SceDisplayUser.cpp"
     "${_HLE_ROOT}/modules/SceDriverUser/SceFios2User.cpp"
+    "${_HLE_ROOT}/modules/SceNet/SceNet.cpp"
     "${_HLE_ROOT}/modules/SceAppUtil/SceAppUtil.cpp"
     "${_HLE_ROOT}/modules/SceCommonDialog/SceCommonDialog.cpp"
     # No LIBRARY_INIT; startup_libraries.inc stays LIBRARY(SceSysmem).
     "${_HLE_ROOT}/modules/SceCtrl/SceCtrl.cpp"
+    "${_HLE_ROOT}/modules/SceTouch/SceTouch.cpp"
+    "${_HLE_ROOT}/modules/ScePower/ScePower.cpp"
+    # sceTouchPeek needs touch_get; touch_get's vblank wait needs wait_vblank.
+    # Both TUs are Emscripten-aware (browser cooperative vblank, no host
+    # threads) and define no EXPORTs, so they only contribute link symbols.
+    "${_HLE_ROOT}/touch/src/touch.cpp"
+    "${_HLE_ROOT}/display/src/display.cpp"
 )
 # Compile the existing implementation files through registration-only adapters.
 # This is necessary because EXPORT's make_bridge initialization roots even
@@ -208,6 +274,7 @@ add_library(vita3k_web_runtime_hle STATIC
     "${_HLE_ROOT}/io/src/filesystem.cpp"
     "${_HLE_ROOT}/io/src/state_functions.cpp"
     "${_HLE_ROOT}/util/src/string_utils.cpp"
+    "${_HLE_ROOT}/util/src/net_utils.cpp"
     "${_HLE_ROOT}/emuenv/src/emuenv.cpp"
     "${_HLE_ROOT}/display/src/display.cpp"
     "${_HLE_ROOT}/motion/src/motion_input.cpp"

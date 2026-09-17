@@ -23,6 +23,7 @@
 #include <cpu/impl/interpreter_cpu.h>
 #ifdef VITA3K_USE_WASM_JIT
 #include <cpu/impl/wasm_jit_cpu.h>
+#include "guest_thread_runtime.h"
 #endif
 #include <emuenv/state.h>
 #include <io/functions.h>
@@ -172,6 +173,9 @@ int vita3k_web_run_app() {
     if (config.has_klic) std::memcpy(license.key, config.klic, sizeof(license.key));
 
     ThreadStatePtr thread;
+#ifdef VITA3K_USE_WASM_JIT
+    vita3k::web::GuestThreadRuntime runtime;
+#endif
     bool exited = false;
     int exit_code = 0;
     unsigned imports = 0;
@@ -180,12 +184,23 @@ int vita3k_web_run_app() {
     struct Cleanup {
         EmuEnvState &env;
         ThreadStatePtr &thread;
+#ifdef VITA3K_USE_WASM_JIT
+        vita3k::web::GuestThreadRuntime &runtime;
+#endif
         ~Cleanup() {
+#ifdef VITA3K_USE_WASM_JIT
+            // Never release guest memory while a suspended HLE frame refers to it.
+            if (!runtime.shutdown()) std::terminate();
+#endif
             if (thread) { env.kernel.threads.erase(thread->id); thread.reset(); }
             env.kernel.deinit(env.mem);
             deinit_mem(env.mem);
         }
-    } cleanup{*env, thread};
+    } cleanup{*env, thread
+#ifdef VITA3K_USE_WASM_JIT
+        , runtime
+#endif
+    };
     try {
         if (!env->kernel.init(env->mem, [&](CPUState &cpu, uint32_t nid, SceUID tid) {
                 const unsigned import_sequence = ++imports;
@@ -223,6 +238,9 @@ int vita3k_web_run_app() {
             Ptr<const void> entry, SceSize args, Ptr<const void> argp) {
             return run_module_entry(*env, info, entry, args, argp);
         };
+#ifdef VITA3K_USE_WASM_JIT
+        if (!runtime.attach(*env)) return -11;
+#endif
         init_device_paths(env->io);
         init_savedata_app_path(env->io, env->vita_fs_path);
         init_libraries(*env);
@@ -267,23 +285,32 @@ int vita3k_web_run_app() {
             if (param->main_thread_stacksize) stack_size = *Ptr<SceInt32>(param->main_thread_stacksize).get(env->mem);
             if (param->main_thread_cpu_affinity_mask) affinity = *Ptr<SceInt32>(param->main_thread_cpu_affinity_mask).get(env->mem);
         }
+#ifdef VITA3K_USE_WASM_JIT
+        thread = env->kernel.create_thread(env->mem, config.title_id.c_str(), module.start_entry,
+            priority, affinity, stack_size, nullptr);
+        if (!thread) return -6;
+        std::puts("[vita3k-web] CPU backend: WasmJitCPU with guest fibers (single logical CPU)");
+#else
         thread = std::make_shared<ThreadState>(env->kernel.get_next_uid(), env->kernel, env->mem);
         if (thread->init(config.title_id.c_str(), module.start_entry, priority, affinity, stack_size, nullptr) < 0) return -6;
-#ifdef VITA3K_USE_WASM_JIT
-        const auto initial = save_context(*thread->cpu);
-        const auto tls = read_tpidruro(*thread->cpu);
-        const auto core = get_processor_id(*thread->cpu);
-        thread->cpu->cpu = std::make_unique<WasmJitCPU>(thread->cpu.get(), core);
-        load_context(*thread->cpu, initial);
-        write_tpidruro(*thread->cpu, tls);
-        std::puts("[vita3k-web] CPU backend: WasmJitCPU (no fallback)");
-#else
         std::puts("[vita3k-web] CPU backend: InterpreterCPU");
-#endif
         env->kernel.threads.emplace(thread->id, thread);
+#endif
         env->main_thread_id = thread->id;
         if (thread->start(0, Ptr<void>{}, true) < 0) return -7;
+#ifdef VITA3K_USE_WASM_JIT
+        vita3k::web::GuestThreadRuntime::Progress progress;
+        std::size_t dispatched = 0;
+        do {
+            progress = runtime.resume(256);
+            dispatched += progress.dispatches;
+        } while (!exited && env->missing_nids.empty() && !progress.failed
+            && !progress.idle && dispatched < 100000);
+        std::printf("[vita3k-web] Guest scheduler: dispatches=%zu runnable=%zu waiting=%zu dormant=%zu failed=%zu idle=%d\n",
+            dispatched, progress.runnable, progress.waiting, progress.dormant, progress.failed, progress.idle);
+#else
         thread->run_loop(true);
+#endif
         std::printf("[vita3k-web] Vita result: process_exit=%d code=%d imports=%u missing_nids=%zu PC=%08x\n",
             exited, exit_code, imports, env->missing_nids.size(), read_pc(*thread->cpu));
         for (const auto nid : env->missing_nids)

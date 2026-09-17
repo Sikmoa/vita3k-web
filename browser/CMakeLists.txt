@@ -57,10 +57,17 @@ if(EMSCRIPTEN)
     target_link_libraries(vita3k_web_app_bench PRIVATE vita3k_web_runtime_hle)
     if(TARGET vita3k_wasm_jit)
         target_compile_definitions(vita3k_web_app_bench PRIVATE VITA3K_WEB=1 VITA3K_USE_WASM_JIT=1)
-        target_link_libraries(vita3k_web_app_bench PRIVATE vita3k_wasm_jit)
+        target_link_libraries(vita3k_web_app_bench PRIVATE vita3k_guest_thread_runtime)
     else()
         message(FATAL_ERROR "vita3k_web_app_bench requires VITA3K_WEB_JIT_TESTS=ON")
     endif()
+    add_executable(vita3k_guest_thread_tests
+        tests/guest_thread_lifecycle_test.cpp
+        src/vita_self_decrypt.cpp
+    )
+    target_link_libraries(vita3k_guest_thread_tests PRIVATE vita3k_guest_thread_runtime)
+    target_link_options(vita3k_guest_thread_tests PRIVATE
+        ${VITA3K_WEB_GROWTH_LINK_OPTION} "SHELL:-sSTACK_SIZE=1048576")
     target_link_options(vita3k_web_app_bench PRIVATE
         ${VITA3K_WEB_GROWTH_LINK_OPTION}
         "SHELL:-sSTACK_SIZE=1048576"
