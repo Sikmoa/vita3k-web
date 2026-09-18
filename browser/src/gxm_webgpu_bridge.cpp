@@ -382,6 +382,30 @@ static void consume_state(WebContext &ctx, CommandHelper &h, MemState &mem) {
         ctx.record.vertex_streams[index] = {ptr, size};
         break;
     }
+    case GXMState::CullMode:
+        ctx.record.cull_mode = h.pop<SceGxmCullMode>();
+        break;
+    case GXMState::PolygonMode: {
+        const bool front = h.pop<bool>();
+        const auto mode = h.pop<SceGxmPolygonMode>();
+        if (front) ctx.record.front_polygon_mode = mode;
+        else ctx.record.back_polygon_mode = mode;
+        break;
+    }
+    case GXMState::DepthFunc: {
+        const bool front = h.pop<bool>();
+        const auto func = h.pop<SceGxmDepthFunc>();
+        if (front) ctx.record.front_depth_func = func;
+        else ctx.record.back_depth_func = func;
+        break;
+    }
+    case GXMState::DepthWriteEnable: {
+        const bool front = h.pop<bool>();
+        const auto mode = h.pop<SceGxmDepthWriteMode>();
+        if (front) ctx.record.front_depth_write_mode = mode;
+        else ctx.record.back_depth_write_mode = mode;
+        break;
+    }
     default: unsupported("render state not implemented");
     }
 }
@@ -405,6 +429,19 @@ static int consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem) {
     if (ctx.record.region_clip_mode != SCE_GXM_REGION_CLIP_OUTSIDE
         || ctx.clip != std::array<uint32_t, 4>{0, w - 1, 0, height - 1})
         unsupported("non-default region clip");
+    // Fixed-function state the consumer cannot express yet. Draws proceed
+    // only on default state; anything else fails loudly naming the state
+    // instead of rendering incorrectly.
+    if (ctx.record.cull_mode != SCE_GXM_CULL_NONE)
+        unsupported("cull mode not implemented");
+    if (ctx.record.front_polygon_mode != SCE_GXM_POLYGON_MODE_TRIANGLE_FILL
+        || ctx.record.back_polygon_mode != SCE_GXM_POLYGON_MODE_TRIANGLE_FILL)
+        unsupported("polygon mode not implemented");
+    if (ctx.record.front_depth_func != SCE_GXM_DEPTH_FUNC_LESS_EQUAL
+        || ctx.record.back_depth_func != SCE_GXM_DEPTH_FUNC_LESS_EQUAL
+        || ctx.record.front_depth_write_mode != SCE_GXM_DEPTH_WRITE_ENABLED
+        || ctx.record.back_depth_write_mode != SCE_GXM_DEPTH_WRITE_ENABLED)
+        unsupported("depth test state not implemented");
     const auto *vp = ctx.record.vertex_program.get(mem);
     const auto *fp = ctx.record.fragment_program.get(mem);
     if (!vp->renderer_data || !fp->renderer_data || fp->is_maskupdate
