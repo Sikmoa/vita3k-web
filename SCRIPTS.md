@@ -150,9 +150,18 @@ Open the printed URL (`HOST=0.0.0.0` lists the machine's addresses; add
 (`LIMBO_STAGE`, `LIMBO_TITLE`, `LIMBO_APP`), boots the retail app through the
 same Worker messages the headless probe uses, and draws every presented frame
 to a canvas next to a live guest log. Query parameters: `?memory=w64|w32|auto`
-(auto probes Memory64 and falls back), `?backend=jit|interp`. Requires WebGPU;
-the wasm32 fallback is a separate target (`vita3k_web`) and only presents frames
-when it was built from the same tree as the wasm64 module.
+(auto probes Memory64 and falls back), `?backend=jit|interp`.
+
+**WebGPU needs a secure origin.** `navigator.gpu` is exposed only to secure
+contexts, so a page served over plain HTTP from a non-loopback address reaches
+`Vita import #NNNN` lines and then fails at the first draw with "WebGPU
+unavailable". Either put a TLS reverse proxy (e.g. Caddy) in front and open
+`https://<name>/`, or forward the port and open `http://localhost:<PORT>/`
+(loopback is a secure context). The page and the bridge both name this reason
+when it applies. A Chromium without a usable GPU additionally needs
+`--enable-unsafe-webgpu --enable-unsafe-swiftshader`. The wasm32 fallback is a
+separate target (`vita3k_web`) and only presents frames when it was built from
+the same tree as the wasm64 module.
 
 Headless equivalent that mirrors frames into the workspace as they arrive (use
 it when the page's port is not reachable from this machine):

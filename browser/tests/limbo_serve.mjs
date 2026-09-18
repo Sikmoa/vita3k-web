@@ -8,8 +8,14 @@
 //   PORT=9000 LIMBO_MEMORY=w32 node browser/tests/limbo_serve.mjs
 //
 // Query parameters: ?backend=jit|interp  ?memory=auto|w64|w32  ?auto=1 (start
-// immediately). Requires a WebGPU browser; a Chromium without a usable GPU
-// needs --enable-unsafe-webgpu --enable-unsafe-swiftshader. The page probes
+// immediately). Requires a WebGPU browser **on a secure origin**: WebGPU is
+// exposed only to secure contexts, so a page served over plain HTTP from a
+// non-loopback address has no navigator.gpu and the first draw fails. Serve it
+// through a TLS reverse proxy (e.g. Caddy) and open https://<name>/, or forward
+// the port and open http://localhost:<PORT>/ (loopback is secure). Both the page
+// and the bridge name this reason explicitly instead of failing late.
+// A Chromium without a usable GPU needs
+// --enable-unsafe-webgpu --enable-unsafe-swiftshader. The page probes
 // Memory64 and the worker falls back to the wasm32 module when it is missing,
 // but the wasm32 module must have been built from the same tree (the wasm64
 // build is the primary one).
@@ -78,6 +84,8 @@ const page = `<!doctype html>
   header { padding: 10px 14px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
   canvas { display: block; margin: 0 auto; max-width: 100%; background: #000; image-rendering: pixelated; }
   #log { margin: 0; padding: 10px 14px; height: 30vh; overflow: auto; white-space: pre-wrap; color: #9c9; }
+  #warning { display: none; margin: 8px 14px; padding: 8px 10px; background: #4a2222; color: #fdd;
+    border-left: 3px solid #f66; max-width: 70ch; }
   button { font: inherit; padding: 4px 12px; }
   #status { color: #fc6; }
 </style>
@@ -90,6 +98,7 @@ const page = `<!doctype html>
   <span id="status">idle</span>
   <span id="stats"></span>
 </header>
+<div id="warning"></div>
 <canvas id="screen" width="960" height="544"></canvas>
 <pre id="log"></pre>
 <script type="module">
@@ -100,7 +109,17 @@ const TITLE = ${JSON.stringify(title)}, APP = ${JSON.stringify(app)};
 const screen = document.querySelector('#screen'), ctx = screen.getContext('2d');
 const status = document.querySelector('#status'), stats = document.querySelector('#stats');
 const logBox = document.querySelector('#log'), runButton = document.querySelector('#run');
-const stopButton = document.querySelector('#stop');
+const stopButton = document.querySelector('#stop'), warningBox = document.querySelector('#warning');
+// WebGPU is exposed only in a secure context; say so before the run instead of
+// letting the first draw fail with a device error.
+function webgpuProblem() {
+  if ('gpu' in navigator) return null;
+  if (isSecureContext)
+    return 'navigator.gpu is missing: this browser does not expose WebGPU (Chrome: --enable-unsafe-webgpu or chrome://flags; Firefox: dom.webgpu.enabled).';
+  return 'navigator.gpu is missing because ' + location.origin + ' is not a secure context. Open this page over https:// (a TLS reverse proxy in front of this server) or as http://localhost:' + location.port + '/ with the port forwarded.';
+}
+const webgpuBlocked = webgpuProblem();
+if (webgpuBlocked) { warningBox.textContent = webgpuBlocked; warningBox.style.display = 'block'; }
 let worker = null, frames = 0, firstFrameAt = 0, startedAt = 0;
 const log = (text) => {
   const lines = logBox.textContent.split('\\n');
@@ -122,6 +141,7 @@ async function run() {
   stop();
   frames = 0; firstFrameAt = 0; logBox.textContent = ''; startedAt = performance.now();
   status.textContent = 'loading module…';
+  if (webgpuBlocked) log('warning: ' + webgpuBlocked);
   runButton.disabled = true; stopButton.disabled = false;
   worker = new Worker(\`./worker.js?backend=\${backend}&memory=\${memory}\`, { type: 'module' });
   worker.onerror = (event) => { log('worker error: ' + event.message); status.textContent = 'worker error'; };

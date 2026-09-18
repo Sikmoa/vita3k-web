@@ -287,9 +287,15 @@ async function drawOwnedSurface(packet, initialPixels, width, height) {
 let devicePromise;
 export async function initializeGuestDevice() {
   if (!devicePromise) devicePromise = (async () => {
-    if (!globalThis.navigator?.gpu) throw new Error('WebGPU unavailable');
+    // WebGPU is exposed only to secure contexts. A page served over plain HTTP
+    // from a non-loopback address has no navigator.gpu at all, which is the
+    // most common reason a browser is reached but the first draw fails here.
+    if (!globalThis.navigator?.gpu)
+      throw new Error(globalThis.isSecureContext
+        ? 'WebGPU unavailable: navigator.gpu is missing in this browser context (unsupported, or disabled by a flag/preference)'
+        : `WebGPU unavailable: ${globalThis.location?.origin ?? 'this origin'} is not a secure context, and WebGPU is exposed only on secure origins (https:// or http://localhost)`);
     const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) throw new Error('WebGPU adapter unavailable');
+    if (!adapter) throw new Error('WebGPU adapter unavailable: requestAdapter() returned null');
     return adapter.requestDevice();
   })();
   return devicePromise;
