@@ -121,6 +121,102 @@ struct Harness {
     }
 };
 
+// Bit-exact i32/u32 -> binary32 lane conversion built from integer bit
+// fields, independent of Wasm's f32.convert and of host FP. IEEE RN
+// (ties-to-even) is applied explicitly: ties do occur whenever exactly one
+// low bit is dropped, and the retained parity then picks the result.
+uint32_t int_to_float_bits(uint64_t magnitude, bool sign) {
+    if (magnitude == 0) return sign ? 0x80000000u : 0;
+    unsigned top = 31;
+    while ((magnitude >> top & 1) == 0) --top;
+    // Normalize so the leading bit sits at position 23 (1.f form); the
+    // biased exponent is then simply 127 + top in both branches.
+    uint64_t fraction;
+    if (top < 24) {
+        fraction = magnitude << (23 - top);
+    } else {
+        const unsigned shift = top - 23; // 1..8: every magnitude fits 32 bits
+        fraction = magnitude >> shift;
+        if ((magnitude & ((uint64_t(1) << shift) - 1)) != 0) {
+            const uint64_t half = uint64_t(1) << (shift - 1);
+            const uint64_t remainder = magnitude & ((uint64_t(1) << shift) - 1);
+            if (remainder > half || (remainder == half && (fraction & 1))) ++fraction;
+        }
+        if (fraction == uint64_t(1) << 24) { fraction >>= 1; ++top; }
+    }
+    const uint32_t biased = 127 + int32_t(top);
+    return (sign ? 0x80000000u : 0) | (biased << 23) | uint32_t(fraction & 0x007fffff);
+}
+
+void ir_vector_int_to_float() {
+    Harness h;
+    const Op ops[2] = {Op::FPVectorFromSignedFixed32, Op::FPVectorFromUnsignedFixed32};
+    for (unsigned variant = 0; variant < 2; ++variant) {
+        h.test(ops[variant], [&](auto &block) {
+            // fbits=0, RN-even, not FPSCR-controlled — the standard-FPSCR
+            // shape the A32 translator emits for VCVT (integer form).
+            write_q(block, append(block, ops[variant], {read_q(block),
+                Value{uint8_t(0)}, Value{uint8_t(0)}, Value{false}}));
+        }, [&](auto &state) {
+            for (unsigned lane_index = 0; lane_index < 4; ++lane_index) {
+                const auto input = lane(state, 32, lane_index);
+                const bool negative = variant == 0 && (input >> 31) != 0;
+                const uint64_t magnitude = variant == 0 && negative
+                    ? uint64_t(0u - uint32_t(input)) // two's-complement negation
+                    : input;
+                set_lane(state, 32, lane_index, int_to_float_bits(magnitude, negative));
+            }
+        });
+    }
+    std::printf("Vector int->float: %u fixtures; %zu missing routes\n", h.cases, h.missing.size());
+    CHECK(h.missing.empty());
+}
+
+void ir_shift32_frontier() {
+    Harness h;
+    h.test(Op::VectorLogicalShiftLeft32, [](auto &block) {
+        write_q(block, append(block, Op::VectorLogicalShiftLeft32, {read_q(block), Value{uint8_t(1)}}));
+    }, [](auto &state) {
+        for (unsigned i = 0; i < 4; ++i) state.fpu[i] = uint32_t(uint64_t(state.fpu[i]) * 2);
+    });
+    CHECK(h.missing.empty());
+    std::puts("VectorLogicalShiftLeft32 #1: exact lane output and preserved state passed");
+}
+
+void ir_immediate_shifts() {
+    Harness h;
+    const Op ops[3][4] = {
+        {Op::VectorLogicalShiftLeft8, Op::VectorLogicalShiftLeft16, Op::VectorLogicalShiftLeft32, Op::VectorLogicalShiftLeft64},
+        {Op::VectorLogicalShiftRight8, Op::VectorLogicalShiftRight16, Op::VectorLogicalShiftRight32, Op::VectorLogicalShiftRight64},
+        {Op::VectorArithmeticShiftRight8, Op::VectorArithmeticShiftRight16, Op::VectorArithmeticShiftRight32, Op::VectorArithmeticShiftRight64},
+    };
+    for (unsigned kind = 0; kind < 3; ++kind) for (unsigned width = 0; width < 4; ++width) {
+        const unsigned bits = 8u << width;
+        for (unsigned count : {0u, 1u, bits - 1, bits, bits + 1, 255u}) {
+            const auto operation = ops[kind][width];
+            h.test(operation, [&](auto &block) {
+                write_q(block, append(block, operation, {read_q(block), Value{uint8_t(count)}}));
+            }, [&](auto &state) {
+                // Build the result one bit at a time, independently of Wasm shifts.
+                for (unsigned index = 0; index < 128 / bits; ++index) {
+                    const auto input = lane(state, bits, index);
+                    uint64_t result = 0;
+                    for (unsigned bit = 0; bit < bits; ++bit) {
+                        bool set;
+                        if (kind == 0) set = bit >= count && ((input >> (bit - count)) & 1);
+                        else if (bit + count < bits) set = (input >> (bit + count)) & 1;
+                        else set = kind == 2 && ((input >> (bits - 1)) & 1);
+                        if (set) result |= uint64_t(1) << bit;
+                    }
+                    set_lane(state, bits, index, result);
+                }
+            });
+        }
+    }
+    std::printf("Vector immediate shifts: %u fixtures; %zu missing routes\n", h.cases, h.missing.size());
+    CHECK(h.missing.empty());
+}
+
 void ir_data_movement() {
     Harness h;
     const std::array<unsigned, 4> widths{8, 16, 32, 64};

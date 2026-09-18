@@ -5,7 +5,12 @@
 #include <mem/ptr.h>
 #include <dynarmic/frontend/A32/a32_types.h>
 #include <dynarmic/ir/opcodes.h>
+#include <dynarmic/common/fp/op.h>
+#include <dynarmic/common/fp/fpcr.h>
+#include <dynarmic/common/fp/fpsr.h>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
 
 namespace {
 unsigned checks = 0;
@@ -95,6 +100,10 @@ void equal_context(const CPUContext &a, const CPUContext &b) {
 #include "wasmjit_byte_reverse_tests.inc"
 #include "wasmjit_f64_tests.inc"
 #include "fp64_helper_tests.inc"
+#include "wasmjit_recip_tests.inc"
+#include "wasmjit_tofixed_tests.inc"
+#include "wasmjit_vectormul_tests.inc"
+#include "wasmjit_fpsqrt_tests.inc"
 #include "wasmjit_exclusive_tests.inc"
 
 void tls_read(MemState &mem) {
@@ -1736,6 +1745,9 @@ int main() {
     CHECK(init(mem, true));
     CHECK(try_alloc_at(mem, code, page, "JIT backend tests") == code);
     CHECK(try_alloc_at(mem, data, 2 * page, "JIT checked memory") == data);
+    vector_tests::ir_vector_int_to_float();
+    vector_tests::ir_shift32_frontier();
+    vector_tests::ir_immediate_shifts();
     vector_tests::ir_data_movement();
     vector_tests::region_slot_reuse();
     vector_tests::guest_data_movement(mem);
@@ -1762,6 +1774,10 @@ int main() {
     f64_tests::guest_float_to_int(mem);
     f64_tests::guest_tls_write(mem);
     fp64_helper_tests::run();
+    recip_tests::run();
+    tofixed_tests::run();
+    vectormul_tests::run();
+    fpsqrt_tests::run();
     helpers(mem);
     tls_read(mem);
     memory_barriers(mem);

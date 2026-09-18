@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "fp64.h"
 
+#include "dynarmic/common/fp/op.h"
+#include "dynarmic/common/fp/fpcr.h"
+#include "dynarmic/common/fp/fpsr.h"
+#include "dynarmic/common/fp/op/FPToFixed.h"
+#include "dynarmic/common/fp/rounding_mode.h"
+
 namespace vita3k::wasmjit {
 namespace {
 
@@ -170,10 +176,63 @@ uint64_t quotient_jam(uint64_t a, uint64_t b) noexcept {
     return quotient | uint64_t(remainder != 0);
 }
 
+// Binary32 lane helpers backed by the vendored Dynarmic implementation
+// (common/fp/op/FPRecipEstimate.cpp, FPRecipStepFused.cpp). The A32 decoder
+// emits fpcr_controlled=false for the vector RECPE/VRECPS instructions, which
+// means the STANDARD FPSCR value (FPCR: RN, FZ=0, DN=0; AHP irrelevant at
+// esize 32) and the FPSR cumulative flags in bits [7,4:0]. Exception enables
+// are rejected by the emitter before the helper can run, so FPProcessException
+// never hits its ASSERT_FALSE trap path. The u32 result and the newly raised
+// flag bits map one-to-one onto the FP64Result contract.
+FP64Result fp32_lane_estimate(uint32_t operation, uint32_t lane_a, uint32_t lane_b) noexcept {
+    const Dynarmic::FP::FPCR fpcr{0}; // standard FPSCR: RN, FZ=0, DN=0
+    Dynarmic::FP::FPSR fpsr{0};       // cumulative flags, freshly cleared
+    uint32_t result;
+    if (operation == 4) {
+        result = Dynarmic::FP::FPRecipEstimate<uint32_t>(lane_a, fpcr, fpsr);
+    } else {
+        result = Dynarmic::FP::FPRecipStepFused<uint32_t>(lane_a, lane_b, fpcr, fpsr);
+    }
+    return {result, fpsr.Value() & 0x9f};
+}
+
+// Binary32 lane float-to-int VCVT backed by the vendored Dynarmic
+// implementation (common/fp/op/FPToFixed.cpp). The A32 translator emits the
+// standard VCVT shape (fbits=0, TowardsZero, fpcr_controlled=false), so the
+// conversion always runs as FPToFixed(ibits=32, fbits=0, TowardsZero) under
+// the standard FPSCR value. The emitter rejects any other immediate shape
+// before the helper can run. The u32 result and the newly raised flag bits
+// map one-to-one onto the FP64Result contract.
+FP64Result fp32_lane_to_fixed(uint32_t operation, uint32_t lane) noexcept {
+    const Dynarmic::FP::FPCR fpcr{0}; // standard FPSCR: RN, FZ=0, DN=0
+    Dynarmic::FP::FPSR fpsr{0};       // cumulative flags, freshly cleared
+    const bool unsigned_ = operation == 7;
+    const uint64_t result = Dynarmic::FP::FPToFixed<uint32_t>(
+        32, lane, 0, unsigned_, fpcr, Dynarmic::FP::RoundingMode::TowardsZero, fpsr);
+    return {result & 0xffffffffu, fpsr.Value() & 0x9f};
+}
+
 } // namespace
 
+} // namespace vita3k::wasmjit
+
+// Dispatch boundary: keep the fp64_arithmetic entry point after the anonymous
+// namespace so the helpers above stay file-local.
+namespace vita3k::wasmjit {
+
 FP64Result fp64_arithmetic(uint32_t operation, uint64_t a, uint64_t b, uint32_t fpscr) noexcept {
-    if (operation > 3)
+    // Vector RECPE/VRECPS binary32 lane estimates (see fp64.h). The emitter
+    // packs the a lane into memory_value[0] and, for VRECPS, the b lane into
+    // memory_value[2]; the i64 arguments arrive as those packed words.
+    if (operation == 4)
+        return fp32_lane_estimate(4, uint32_t(a), uint32_t(b));
+    if (operation == 5)
+        return fp32_lane_estimate(5, uint32_t(a), uint32_t(b));
+    if (operation == 6)
+        return fp32_lane_to_fixed(6, uint32_t(a));
+    if (operation == 7)
+        return fp32_lane_to_fixed(7, uint32_t(a));
+    if (operation > 7)
         return {default_nan, ioc};
 
     uint32_t flags = 0;

@@ -57,6 +57,34 @@ const indirectModule = new WebAssembly.Module(Uint8Array.from([
 ]));
 let runs = 0;
 let regionRuns = 0;
+// Native fp64 helper contract (wasm_jit_cpu.cpp fp64_helper): operation
+// 0/1/2/3 = add/sub/mul/div on i64 pairs packed from memory_value[0..3];
+// result bits go back to memory_value[0..1] and the returned flags are ORed
+// into FPSCR by the generated code. Fixtures only exercise the operation
+// selection shape, so ordinary JS binary64 arithmetic suffices; x/0 raises
+// IOC with the default quiet NaN like the native helper.
+const fp64 = (stateOffset, operation) => {
+    const view = new DataView(memory.buffer);
+    const low = word => view.getUint32(stateOffset + 96 + 4 * word, true);
+    const a = low(0) + low(1) * 0x100000000, b = low(2) + low(3) * 0x100000000;
+    const box = new DataView(new Float64Array(1).buffer);
+    box.setBigUint64(0, BigInt(a), true);
+    const fa = box.getFloat64(0, true);
+    box.setBigUint64(0, BigInt(b), true);
+    const fb = box.getFloat64(0, true);
+    if (operation === 2 && fb === 0) {
+        view.setUint32(stateOffset + 96, 0, true);
+        view.setUint32(stateOffset + 100, 0x7ff80000, true);
+        return 1;
+    }
+    const result = operation === 0 ? fa + fb : operation === 1 ? fa - fb
+        : operation === 2 ? fa * fb : fa / fb;
+    box.setFloat64(0, result, true);
+    const bits = box.getBigUint64(0, true);
+    view.setUint32(stateOffset + 96, Number(bits & 0xffffffffn), true);
+    view.setUint32(stateOffset + 100, Number(bits >> 32n), true);
+    return 0;
+};
 for (const fixture of fixtures) {
     const isRegion = fixture.budget !== undefined;
     const bytes = readFileSync(join(directory, `${fixture.name}.wasm`));
@@ -65,10 +93,11 @@ for (const fixture of fixtures) {
     assert.deepEqual(WebAssembly.Module.imports(module), [
         {module: 'env', name: 'memory', kind: 'memory'},
         {module: 'env', name: 'mem_read', kind: 'function'},
-        {module: 'env', name: 'mem_write', kind: 'function'}]);
+        {module: 'env', name: 'mem_write', kind: 'function'},
+        {module: 'env', name: 'fp64', kind: 'function'}]);
     const exportName = isRegion ? 'run' : 'block';
     assert.deepEqual(WebAssembly.Module.exports(module), [{name: exportName, kind: 'function'}]);
-    const block = new WebAssembly.Instance(module, {env: {memory, mem_read, mem_write}}).exports[exportName];
+    const block = new WebAssembly.Instance(module, {env: {memory, mem_read, mem_write, fp64}}).exports[exportName];
     const variants = (fixture.variants ?? []).map(filename => {
         const raw = readFileSync(join(directory, filename));
         assert(WebAssembly.validate(raw), `${filename}: module must validate`);
@@ -76,7 +105,7 @@ for (const fixture of fixtures) {
         assert.deepEqual(WebAssembly.Module.imports(candidate), WebAssembly.Module.imports(module));
         assert.deepEqual(WebAssembly.Module.exports(candidate), WebAssembly.Module.exports(module));
         return {filename, run: new WebAssembly.Instance(candidate,
-            {env: {memory, mem_read, mem_write}}).exports.run};
+            {env: {memory, mem_read, mem_write, fp64}}).exports.run};
     });
     // Wasm export is an actual typed function, not a JS trampoline.
     let invoke;

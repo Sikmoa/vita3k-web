@@ -19,6 +19,22 @@ struct FP64Result {
 // Trap delivery is not implemented; other FPSCR bits are ignored.
 // Invalid operation selectors return the default NaN with IOC.
 // Integer-only, allocation-free, independent of host FP state and Dynarmic.
+// Operations 4 and 5 implement the ARM vector RECPE/VRECPS estimates for one
+// binary32 lane packed in the low 32 bits of `a` (and `b`): operation 4 =
+// vrecpe.f32(a); operation 5 = vrecps.f32(a, b) = 2.0 + (-a) * b fused. Both
+// always execute under the STANDARD FPSCR value (RN, FZ=0, DN=0), matching
+// the A32 translator's fpcr_controlled=false call sites, and only IDC/DZC/
+// OFC/UFC/IXC/IOC bits (mask 0x9f) are returned. Their results come from the
+// vendored Dynarmic FP implementation (common/fp), which is linked in, so
+// there is no second estimate algorithm to keep in sync.
+// Operations 6 and 7 implement the ARM vector float-to-int VCVT for one
+// binary32 lane packed in the low 32 bits of `a`: operation 6 = signed
+// (vcvt.s32.f32), operation 7 = unsigned (vcvt.u32.f32). The A32 translator
+// emits fbits=0, TowardsZero rounding and fpcr_controlled=false for these,
+// so both always execute as FPToFixed(ibits=32, fbits=0, TowardsZero) under
+// the standard FPSCR value via the vendored implementation; only the IOC/IXC
+// cumulative bits (mask 0x9f) are returned. The 32-bit integer result rides
+// in the low 32 bits of the returned value.
 FP64Result fp64_arithmetic(uint32_t operation, uint64_t a, uint64_t b, uint32_t fpscr) noexcept;
 
 } // namespace vita3k::wasmjit

@@ -1192,6 +1192,44 @@ private:
         }
         return ok;
     }
+    bool vector_immediate_shift(const Inst &inst, unsigned bits, bool left, bool arithmetic) {
+        const auto amount = inst.GetArg(1);
+        if (!amount.IsImmediate() || amount.GetType() != Type::U8) return false;
+        const unsigned count = amount.GetU8();
+        if (bits == 64) {
+            for (unsigned word = 0; word < 4; word += 2) {
+                if (count >= bits && !arithmetic) {
+                    constant64(code, 0);
+                } else {
+                    value_word(inst.GetArg(0), word); op(ExtendU);
+                    value_word(inst.GetArg(0), word + 1); op(ExtendU);
+                    constant64(code, 32); op(Shl64); op(Or64);
+                    constant64(code, std::min(count, 63u));
+                    op(left ? Shl64 : arithmetic ? ShrS64 : ShrU64);
+                }
+                store_i64_words(next_local + word);
+            }
+        } else {
+            for (unsigned word = 0; word < 4; ++word) {
+                for (unsigned offset = 0; offset < 32; offset += bits) {
+                    if (count >= bits && !arithmetic) {
+                        imm(0);
+                    } else {
+                        vector_element_word(inst.GetArg(0), bits, (word * 32 + offset) / bits);
+                        if (arithmetic && bits < 32) {
+                            imm(32 - bits); op(Shl); imm(32 - bits); op(ShrS);
+                        }
+                        imm(std::min(count, bits - 1));
+                        op(left ? Shl : arithmetic ? ShrS : ShrU);
+                        if (bits < 32) mask((1u << bits) - 1);
+                    }
+                    if (offset) { imm(offset); op(Shl); op(Or); }
+                }
+                set(next_local + word);
+            }
+        }
+        return ok;
+    }
     bool vector_broadcast(const Inst &inst, unsigned bits, bool element = false) {
         unsigned index = 0;
         if (element && !vector_index(inst, bits, index)) return false;
@@ -2338,6 +2376,208 @@ private:
             get(next_local); op(0xbe); op(0xbb); // f32 bits -> f64.promote_f32
             op(0x62); imm(4); op(Shl); op(Or); store(offsetof(JitState, fpscr));
             return ok;
+        case Op::FPVectorFromSignedFixed32:
+        case Op::FPVectorFromUnsignedFixed32: {
+            // Per-lane i32 -> binary32. The A32 translator emits fbits=0,
+            // ToNearest_TieEven and fpcr_controlled=false (standard FPSCR);
+            // each rides the IR as an immediate. Wasm's f32.convert_i32_s/u
+            // is exactly that conversion and is independent of FPSCR, so only
+            // the architectural shape is accepted and anything else rejects
+            // the block. Like Dynarmic's native backends, no exception flags
+            // are raised: an i32 magnitude cannot overflow binary32 and, with
+            // fbits == 0, cannot underflow below the normal range either; the
+            // rounding-loss flags of the abstract standard-FPSCR result are
+            // discarded there, so bit-exact parity keeps them discarded here.
+            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0
+                || !inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU8() != 0
+                || !inst.GetArg(3).IsImmediate() || inst.GetArg(3).GetU1() != 0)
+                return false;
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(0), word);
+                op(kind == Op::FPVectorFromUnsignedFixed32 ? 0xb3 : 0xb2); // f32.convert_i32_u/s
+                op(0xbc); // i32.reinterpret_f32 keeps the result bits
+                set(next_local + word);
+            }
+            return ok;
+        }
+        case Op::FPVectorMul32:
+        case Op::FPVectorAdd32:
+        case Op::FPVectorSub32: {
+            // Four-lane binary32 add/sub/mul (vadd/vsub/vmul.f32). Only the
+            // standard-FPSCR form (fpcr_controlled=false) is emitted: RN is
+            // what Wasm f32 arithmetic implements, FZ=0 means no input
+            // flushing, DN=0 means NaNs propagate quieted. The IR op always
+            // spans the full U128 (D-form lanes read as zero from GetVector
+            // and their flags accumulate in the interpreter too), so all
+            // four lanes execute. Per-lane logic mirrors the verified scalar
+            // FP arithmetic lowering with FZ/DN/RMode pinned to standard:
+            // NaN priority, invalid combinations, the narrow result, then
+            // the wide f64 computation for the IXC/UFC/OFC cumulative
+            // flags (add/sub keep the scalar's reverse-sum lost-addend
+            // check). Locals: results in next_local[0..3], temporaries
+            // above (10 slots per inst).
+            if (!inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU1() != 0)
+                return false;
+            const bool multiply = kind == Op::FPVectorMul32;
+            const bool subtract = kind == Op::FPVectorSub32;
+            const uint8_t narrow_op = multiply ? 0x94 : subtract ? 0x93 : 0x92;
+            const uint8_t wide_op = multiply ? 0xa2 : subtract ? 0xa1 : 0xa0;
+            load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+            begin_if(); ret(ExitReason::Unsupported); end_if();
+            const auto la = next_local + 4, lb = next_local + 5;
+            const auto laa = next_local + 6, lab = next_local + 7;
+            const auto lnan = next_local + 8, lflags = next_local + 9;
+            imm(0); set(lflags);
+            const auto laccumulate = [&](uint32_t bits) {
+                get(lflags); imm(bits); op(Or); set(lflags);
+            };
+            const auto wide_combine = [&] {
+                get(la); op(0xbe); op(0xbb);
+                get(lb); op(0xbe); op(0xbb); op(wide_op); // exact in f64
+            };
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(0), word); set(la);
+                value_word(inst.GetArg(1), word); set(lb);
+                get(la); mask(0x7fffffff); set(laa);
+                get(lb); mask(0x7fffffff); set(lab);
+                imm(0); set(lnan);
+                // ARM NaN priority: first signaling operand, then first
+                // quiet operand. Reverse iteration lets the first win.
+                for (bool signaling : {false, true}) for (int i = 1; i >= 0; --i) {
+                    const auto s = i == 0 ? la : lb, sab = i == 0 ? laa : lab;
+                    get(sab); imm(0x7f800000); op(GtU);
+                    if (signaling) { get(s); mask(0x00400000); op(Eqz); op(And); }
+                    begin_if();
+                    get(s); imm(0x00400000); op(Or); set(lnan);
+                    if (signaling) laccumulate(1);
+                    end_if();
+                }
+                get(lnan); begin_if();
+                get(lnan); set(next_local + word); // DN=0: propagate quieted
+                op(Else);
+                if (multiply) {
+                    get(laa); op(Eqz); get(lab); imm(0x7f800000); op(Eq); op(And);
+                    get(lab); op(Eqz); get(laa); imm(0x7f800000); op(Eq); op(And); op(Or);
+                } else {
+                    // inf +/- inf with matching (add: differing, sub: same)
+                    // operand signs is invalid.
+                    get(laa); imm(0x7f800000); op(Eq);
+                    get(lab); imm(0x7f800000); op(Eq); op(And);
+                    get(la); get(lb); op(Xor); mask(0x80000000);
+                    if (subtract) op(Eqz);
+                    else { op(Eqz); op(Eqz); }
+                    op(And);
+                }
+                begin_if(); // invalid combination
+                laccumulate(1); imm(0x7fc00000); set(next_local + word);
+                op(Else);
+                get(la); op(0xbe); get(lb); op(0xbe); op(narrow_op);
+                op(0xbc); set(next_local + word);
+                // Infinite inputs that survive NaN/invalid selection produce
+                // exact infinities; only finite lanes need the wide check
+                // (and the reverse sums misfire on infinities: inf-inf=NaN).
+                get(laa); imm(0x7f800000); op(LtU);
+                get(lab); imm(0x7f800000); op(LtU); op(And);
+                // Both operands finite here, so the wide combination is exact.
+                // lnan is dead past NaN selection: reuse it for tininess.
+                wide_combine(); op(0x99); // f64.abs
+                imm(0x00800000); op(0xbe); op(0xbb); op(0x63); // < min-normal
+                wide_combine(); imm(0); op(0xbe); op(0xbb); op(0x62); // != 0
+                op(And); set(lnan);
+                wide_combine(); get(next_local + word); op(0xbe); op(0xbb); op(0x62);
+                if (!multiply) {
+                    // If the exponent gap exceeds binary64 precision, even the
+                    // wide result can lose a nonzero addend: reverse both sums.
+                    wide_combine(); get(la); op(0xbe); op(0xbb); op(0xa1);
+                    get(lb); op(0xbe); op(0xbb); if (subtract) op(0x9a);
+                    op(0x62); op(Or);
+                    wide_combine(); get(lb); op(0xbe); op(0xbb); op(subtract ? 0xa0 : 0xa1);
+                    get(la); op(0xbe); op(0xbb); op(0x62); op(Or);
+                }
+                op(And); begin_if();
+                laccumulate(0x10);
+                get(lnan); begin_if(); laccumulate(8); end_if();
+                get(next_local + word); mask(0x7fffffff); imm(0x7f800000); op(Eq);
+                begin_if(); laccumulate(4); end_if();
+                end_if();
+                end_if(); end_if();
+            }
+            get(0); load(offsetof(JitState, fpscr)); get(lflags); op(Or);
+            store(offsetof(JitState, fpscr));
+            return ok;
+        }
+        case Op::FPVectorRecipEstimate32:
+        case Op::FPVectorRecipStepFused32: {
+            // ARM vector reciprocal estimates (vrecpe.f32 / vrecps.f32), one
+            // helper call per lane. The A32 translator passes
+            // fpcr_controlled=false for both, so the estimate always runs
+            // under the standard FPSCR value; the native helper re-derives
+            // every result from the vendored Dynarmic FP implementation.
+            // Like FPAdd64 and friends, live exception enables must be clear.
+            load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+            begin_if(); ret(ExitReason::Unsupported); end_if();
+            // fp64.h contract for operations 4/5: the a lane rides in the
+            // low 32 bits of memory_value[0] and the b lane in memory_value[2]
+            // (the two i64 operand words the scalar ops pack). The b lane
+            // is republished per lane: the helper overwrites memory_value[0]
+            // with the result bits on every call, and lanes generally differ.
+            const bool fused = kind == Op::FPVectorRecipStepFused32;
+            for (unsigned word = 0; word < 4; ++word) {
+                if (fused) {
+                    get(0); value_word(inst.GetArg(1), word);
+                    store(offsetof(JitState, memory_value) + 8);
+                }
+                get(0); value_word(inst.GetArg(0), word);
+                store(offsetof(JitState, memory_value));
+                get(0);
+                imm(kind == Op::FPVectorRecipEstimate32 ? 4 : 5);
+                load(offsetof(JitState, fpscr));
+                op(Call); uleb(code, 2); set(next_local + word);
+                // OR the returned cumulative-flag bits into FPSCR.
+                get(0); load(offsetof(JitState, fpscr));
+                get(next_local + word); imm(0x000000ffu); op(And);
+                op(Or); store(offsetof(JitState, fpscr));
+                // Collect the result lane from the helper's scratch words.
+                load(offsetof(JitState, memory_value)); set(next_local + word);
+            }
+            return ok;
+        }
+        case Op::FPVectorToSignedFixed32:
+        case Op::FPVectorToUnsignedFixed32: {
+            // ARM vector float-to-int VCVT (vcvt.s32/u32.f32), one helper
+            // call per lane. The A32 translator emits fbits=0,
+            // TowardsZero rounding and fpcr_controlled=false for these, so
+            // the conversion always runs under the standard FPSCR value;
+            // the native helper re-derives every result from the vendored
+            // Dynarmic FPToFixed implementation. Any other immediate shape
+            // rejects the block, as does any live exception enable.
+            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0
+                || !inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU8() != 3
+                || !inst.GetArg(3).IsImmediate() || inst.GetArg(3).GetU1() != 0)
+                return false;
+            load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+            begin_if(); ret(ExitReason::Unsupported); end_if();
+            // fp64.h contract for operations 6/7: the lane rides in the low
+            // 32 bits of memory_value[0] (the first i64 operand word the
+            // scalar ops pack). The helper overwrites memory_value[0] with
+            // the result bits on every call, so the lane is republished
+            // per lane exactly like the reciprocal estimates.
+            for (unsigned word = 0; word < 4; ++word) {
+                get(0); value_word(inst.GetArg(0), word);
+                store(offsetof(JitState, memory_value));
+                get(0);
+                imm(kind == Op::FPVectorToSignedFixed32 ? 6 : 7);
+                load(offsetof(JitState, fpscr));
+                op(Call); uleb(code, 2); set(next_local + word);
+                // OR the returned cumulative-flag bits into FPSCR.
+                get(0); load(offsetof(JitState, fpscr));
+                get(next_local + word); imm(0x000000ffu); op(And);
+                op(Or); store(offsetof(JitState, fpscr));
+                // Collect the result lane from the helper's scratch words.
+                load(offsetof(JitState, memory_value)); set(next_local + word);
+            }
+            return ok;
+        }
         case Op::FPAdd64:
         case Op::FPSub64:
         case Op::FPMul64:
@@ -2475,6 +2715,62 @@ private:
             if (start.FPSCR().FTZ()) end_if();
             end_if(); end_if(); end_if(); end_if();
             get(0); load(offsetof(JitState, fpscr)); get(flags); op(Or); store(offsetof(JitState, fpscr));
+            return ok;
+        }
+        case Op::FPSqrt32: {
+            // Scalar binary32 square root (vsqrts). Wasm f32.sqrt is RN-exact,
+            // so only RN locations emit; FTZ/DN follow the location FPSCR
+            // exactly like the scalar arithmetic above, and live exception
+            // enables must be clear. Negative nonzero inputs raise IOC with
+            // the default NaN; inexact results raise IXC (plus UFC when the
+            // result is tiny — overflow is impossible for a square root).
+            // Exactness via the f64 square: w*w holds exactly for a 24-bit w.
+            if (start.FPSCR().Value() & 0x00c00000u) return false;
+            load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+            begin_if(); ret(ExitReason::Unsupported); end_if();
+            const auto sa = next_local + 1, saa = next_local + 2;
+            const auto sflags = next_local + 3, snan = next_local + 4;
+            imm(0); set(sflags);
+            arg(0); set(sa);
+            get(sa); mask(0x7fffffff); set(saa);
+            if (start.FPSCR().FTZ()) {
+                get(saa); imm(0x00800000); op(LtU);
+                get(saa); op(Eqz); op(Eqz); op(And); begin_if();
+                get(sflags); imm(0x80); op(Or); set(sflags);
+                get(sa); mask(0x80000000); set(sa);
+                imm(0); set(saa); end_if();
+            }
+            get(saa); imm(0x7f800000); op(GtU); begin_if();
+            get(sa); imm(0x00400000); op(Or); set(snan);
+            get(sa); mask(0x00400000); op(Eqz); begin_if();
+            get(sflags); imm(1); op(Or); set(sflags); end_if();
+            if (start.FPSCR().DN()) imm(0x7fc00000);
+            else get(snan);
+            set(next_local);
+            op(Else);
+            get(sa); mask(0x80000000); begin_if(); // negative input
+            get(saa); op(Eqz); begin_if();
+            get(sa); set(next_local); // sqrt(-0) = -0, exact
+            op(Else);
+            get(sflags); imm(1); op(Or); set(sflags);
+            imm(0x7fc00000); set(next_local); end_if();
+            op(Else);
+            get(sa); op(0xbe); op(0x91); // f32.sqrt
+            op(0xbc); set(next_local);
+            // Inexact iff the exact f64 square of the result misses the input.
+            get(next_local); op(0xbe); op(0xbb);
+            get(next_local); op(0xbe); op(0xbb); op(0xa2); // w*w exact
+            get(sa); op(0xbe); op(0xbb); op(0x62); // f64.ne
+            begin_if();
+            get(sflags); imm(0x10); op(Or); set(sflags);
+            get(next_local); mask(0x7fffffff); imm(0x00800000); op(LtU);
+            get(next_local); mask(0x7fffffff); op(Eqz); op(Eqz); op(And);
+            begin_if();
+            get(sflags); imm(8); op(Or); set(sflags); end_if();
+            end_if();
+            end_if(); end_if();
+            get(0); load(offsetof(JitState, fpscr)); get(sflags); op(Or);
+            store(offsetof(JitState, fpscr));
             return ok;
         }
         case Op::FPNeg32: arg(0); imm(0x80000000); op(Xor); break;
@@ -2820,6 +3116,18 @@ private:
             return inst.GetArg(0).IsImmediate() && inst.GetArg(0).GetType() == Type::U64;
         case Op::A32SetCheckBit:
             value_word(inst.GetArg(0)); set(check_bit_local); check_bit_written = true; return ok;
+        case Op::VectorLogicalShiftLeft8: return vector_immediate_shift(inst, 8, true, false);
+        case Op::VectorLogicalShiftLeft16: return vector_immediate_shift(inst, 16, true, false);
+        case Op::VectorLogicalShiftLeft32: return vector_immediate_shift(inst, 32, true, false);
+        case Op::VectorLogicalShiftLeft64: return vector_immediate_shift(inst, 64, true, false);
+        case Op::VectorLogicalShiftRight8: return vector_immediate_shift(inst, 8, false, false);
+        case Op::VectorLogicalShiftRight16: return vector_immediate_shift(inst, 16, false, false);
+        case Op::VectorLogicalShiftRight32: return vector_immediate_shift(inst, 32, false, false);
+        case Op::VectorLogicalShiftRight64: return vector_immediate_shift(inst, 64, false, false);
+        case Op::VectorArithmeticShiftRight8: return vector_immediate_shift(inst, 8, false, true);
+        case Op::VectorArithmeticShiftRight16: return vector_immediate_shift(inst, 16, false, true);
+        case Op::VectorArithmeticShiftRight32: return vector_immediate_shift(inst, 32, false, true);
+        case Op::VectorArithmeticShiftRight64: return vector_immediate_shift(inst, 64, false, true);
         case Op::VectorEqual8: return vector_integer_select(inst, 8, VectorLaneOp::Equal, false);
         case Op::VectorEqual16: return vector_integer_select(inst, 16, VectorLaneOp::Equal, false);
         case Op::VectorEqual32: return vector_integer_select(inst, 32, VectorLaneOp::Equal, false);

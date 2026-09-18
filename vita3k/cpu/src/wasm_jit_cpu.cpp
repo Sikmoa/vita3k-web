@@ -918,6 +918,22 @@ struct WasmJitCPU::Impl {
                 char message[96];
                 std::snprintf(message, sizeof(message), "guest memory %s fault at %08x (pc %08x)",
                     state.fault_write ? "write" : "read", state.fault_address, state.fault_pc);
+                if (std::getenv("VITA3K_WASMJIT_FAULT_TRACE")) {
+                    std::fprintf(stderr, "WasmJitCPU fault trace: %s\n", message);
+                    for (unsigned r = 0; r < 15; ++r)
+                        std::fprintf(stderr, "  r%-2u=%08x%s", r, state.regs[r], (r % 4 == 3) ? "\n" : "  ");
+                    std::fprintf(stderr, "r15=%08x cpsr=%08x\n", state.regs[15], state.cpsr);
+                    std::fprintf(stderr, "fpu:");
+                    for (unsigned w = 0; w < 8; ++w)
+                        std::fprintf(stderr, " %08x", state.fpu[w]);
+                    std::fprintf(stderr, "\n");
+                    if (state.fault_pc >= 0x81000000 && state.fault_pc < 0x812D96CCu) {
+                        const uint32_t word = *reinterpret_cast<const uint32_t *>(
+                            mem_guest_to_host(*parent->mem, state.fault_pc & ~1u));
+                        std::fprintf(stderr, "faulting instruction word @%08x = %08x\n", state.fault_pc, word);
+                    }
+                    std::fflush(stderr);
+                }
                 return fail(message);
             }
             case ExitReason::Miss:
@@ -1070,6 +1086,14 @@ struct WasmJitCPU::Impl {
                 char message[96];
                 std::snprintf(message, sizeof(message), "guest memory %s fault at %08x",
                     write ? "write" : "read", address);
+                if (std::getenv("VITA3K_WASMJIT_FAULT_TRACE")) {
+                    // Rollback overwrote registers; print the pre-rollback snapshot.
+                    std::fprintf(stderr, "WasmJitCPU fault trace: %s (pc %08x)\n", message, before.regs[15]);
+                    for (unsigned r = 0; r < 15; ++r)
+                        std::fprintf(stderr, "  r%-2u=%08x%s", r, before.regs[r], (r % 4 == 3) ? "\n" : "  ");
+                    std::fprintf(stderr, "r15=%08x cpsr=%08x\n", before.regs[15], before.cpsr);
+                    std::fflush(stderr);
+                }
                 return fail(message);
             }
             if (!state.executed || state.executed > found->second.instruction_limit)
