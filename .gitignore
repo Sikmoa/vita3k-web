@@ -50,3 +50,7 @@ fastlane/screenshots
 fastlane/test_output
 fastlane/readme.md
 .github/copilot-instructions.md
+
+# Python bytecode from browser helper scripts
+__pycache__/
+*.pyc
