@@ -21,6 +21,8 @@ set(_hle_exports
     sceGxmTextureInitLinear sceGxmSetFragmentTexture sceGxmTextureSetData
     sceGxmTextureSetMinFilter sceGxmTextureSetMagFilter
     sceGxmTextureSetUAddrMode sceGxmTextureSetVAddrMode
+    # Notification buffer for guest side channel checks.
+    sceGxmGetNotificationRegion
     sceKernelExitProcess
     sceKernelAllocMemBlock sceKernelFreeMemBlock sceKernelGetMemBlockBase
     sceKernelCreateLwMutex sceKernelDeleteLwMutex sceKernelLockLwMutex
@@ -99,9 +101,67 @@ set(_hle_exports
     sceNetInit sceNetTerm
     # Offline control initialization only; upstream stub parity, no connection.
     sceNetCtlInit sceNetCtlTerm
-    # Keep sceKernelWaitSema/CB, DelayThread/CB/200, WaitThreadEnd/CB,
-    # WaitEventFlag/CB and WaitLwCond/CB unselected: their production paths
-    # wait on host condition variables (or sleep) and cannot yield guest threads.
+    # NP state initialization only; no sign-in or remote service is supplied.
+    sceNpInit sceNpTerm
+    # Config-based upstream service state (STUBBED); default is signed out.
+    sceNpGetServiceState sceNpManagerGetNpId
+    sceNpRegisterServiceStateCallback sceNpUnregisterServiceStateCallback
+    sceNpCheckCallback
+    # Existing upstream UNIMPLEMENTED bodies: desktop stub parity, not commerce support.
+    sceNpCommerce2Init sceNpCommerce2Term
+    # Upstream NP Basic lifecycle/handler stubs only; no social service support.
+    sceNpBasicInit sceNpBasicTerm
+    sceNpBasicRegisterHandler sceNpBasicUnregisterHandler
+    # Upstream auth/signaling init stubs do not supply authentication or connections.
+    sceNpAuthInit sceNpAuthTerm sceNpSignalingInit sceNpSignalingTerm
+    # Production local trophy-state lifecycle (no online trophy service).
+    sceNpTrophyInit sceNpTrophyTerm
+    # Limbo trophy frontier (imports=30690 missing_nids=1 PC=8126bac0):
+    # upstream production context/handle lifecycle over the staged TRP files.
+    sceNpTrophyCreateContext sceNpTrophyDestroyContext
+    sceNpTrophyCreateHandle sceNpTrophyDestroyHandle sceNpTrophyAbortHandle
+    # Limbo trophy-state frontier (imports=40062 missing_nids=1 PC=8126c330):
+    # production read of the local TRP-backed context (unlock flags/count).
+    sceNpTrophyGetTrophyUnlockState
+    # Limbo trophy-setup-dialog frontier (imports=40013 missing_nids=1 PC=8126c330,
+    # reached after null-sink audio pacing): production SceCommonDialog bodies
+    # (already sourced). Init arms a host-tick deadline, GetStatus completes
+    # to FINISHED/OK once it passes, Term closes the dialog; offline-clean.
+    sceNpTrophySetupDialogInit sceNpTrophySetupDialogGetStatus sceNpTrophySetupDialogTerm
+    sceNpTrophySetupDialogGetResult
+    # Limbo event-flag frontier (imports=39403 missing_nids=1 PC=8126c3e0):
+    # production kernel eventflag objects; the wait path parks cooperatively
+    # on the fiber runtime (sync_primitives execution_host branch, same
+    # contract as the semaphore/mutex waits), set/cancel unlink and resume.
+    sceKernelCreateEventFlag sceKernelDeleteEventFlag
+    sceKernelSetEventFlag sceKernelClearEventFlag
+    sceKernelWaitEventFlag sceKernelPollEventFlag sceKernelCancelEventFlag
+    # Limbo eventflag-info frontier (imports=40059 missing_nids=1 PC=8126c330):
+    # production struct fill in the already-sourced SceThreadmgr; both the
+    # NID name and the underscore EXPORT name (display precedent).
+    sceKernelGetEventFlagInfo _sceKernelGetEventFlagInfo
+    # Limbo audio frontier (imports=39506 missing_nids=1 PC=8126bbd0):
+    # production SceAudio port registry against the browser null sink
+    # (hle_audio_null.cpp); output drains instantly, volumes tracked.
+    sceAudioOutOpenPort sceAudioOutReleasePort sceAudioOutOutput
+    sceAudioOutGetRestSample sceAudioOutSetVolume sceAudioOutSetConfig
+    # Limbo dialog/app frontiers (imports=39895 missing_nids=2): both are
+    # trivial production bodies (STATUS_NONE with no active dialog; constant
+    # 0 game-program query). SceCommonDialog.cpp is already sourced.
+    sceNetCheckDialogGetStatus sceAppMgrIsGameProgram
+    # Limbo RTC frontier (imports=39419 missing_nids=2 PC=8126bce0):
+    # sceRtcGetCurrentTick reads the host clock via base_tick, and
+    # sceRtcGetTickResolution is the VITA_CLOCKS_PER_SEC constant.
+    sceRtcGetCurrentTick sceRtcGetTickResolution
+    # Limbo RTC frontier (imports=40011 missing_nids=1 PC=8126c330):
+    # pure SceDateTime->time_t conversion in the already-sourced SceRtcUser.
+    sceRtcGetTime64_t
+    # Limbo sleep frontier: sceKernelDelayThread parks cooperatively until
+    # the deadline (SceThreadmgr execution_host branch, no host sleep).
+    sceKernelDelayThread sceKernelDelayThread200
+    # Keep DelayThreadCB, WaitThreadEnd/CB, WaitEventFlagCB and WaitLwCond/CB
+    # unselected: their production paths wait on host condition variables
+    # (or sleep) and cannot yield guest threads.
     # GetSystemTime and GetThreadRunStatus are UNIMPLEMENTED upstream. There
     # is no user sceKernelGetSystemTimeLow in nids.inc; do not invent one.
     # Immediate Limbo frontier (imports=3995 missing_nids=1 PC=8126af40):
@@ -209,14 +269,31 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceDisplay/SceDisplay.cpp"
     "${_HLE_ROOT}/modules/SceDriverUser/SceDisplayUser.cpp"
     "${_HLE_ROOT}/modules/SceDriverUser/SceFios2User.cpp"
+    # Limbo RTC frontier (imports=39419 missing_nids=2 PC=8126bce0):
+    # host-clock production bodies (rtc.cpp is chrono-only, no tz data).
+    "${_HLE_ROOT}/modules/SceRtc/SceRtc.cpp"
+    "${_HLE_ROOT}/modules/SceDriverUser/SceRtcUser.cpp"
+    "${_HLE_ROOT}/rtc/src/rtc.cpp"
     "${_HLE_ROOT}/modules/SceNet/SceNet.cpp"
     "${_HLE_ROOT}/modules/SceNetCtl/SceNetCtl.cpp"
+    "${_HLE_ROOT}/modules/SceNpManager/SceNpManager.cpp"
+    "${_HLE_ROOT}/modules/SceNpCommerce2/SceNpCommerce2.cpp"
+    "${_HLE_ROOT}/modules/SceNpBasic/SceNpBasic.cpp"
+    "${_HLE_ROOT}/modules/SceNpCommon/SceNpCommon.cpp"
+    "${_HLE_ROOT}/modules/SceNpSignaling/SceNpSignaling.cpp"
+    "${_HLE_ROOT}/modules/SceNpTrophy/SceNpTrophy.cpp"
     "${_HLE_ROOT}/modules/SceAppUtil/SceAppUtil.cpp"
     "${_HLE_ROOT}/modules/SceCommonDialog/SceCommonDialog.cpp"
     # No LIBRARY_INIT; startup_libraries.inc stays LIBRARY(SceSysmem).
     "${_HLE_ROOT}/modules/SceCtrl/SceCtrl.cpp"
     "${_HLE_ROOT}/modules/SceTouch/SceTouch.cpp"
     "${_HLE_ROOT}/modules/ScePower/ScePower.cpp"
+    # Audio port registry (null device sink is hle_audio_null.cpp, linked
+    # separately below; this adapter only registers the selected bridges).
+    "${_HLE_ROOT}/modules/SceAudio/SceAudio.cpp"
+    # Limbo app-manager frontier: sceAppMgrIsGameProgram is a constant-0
+    # production body (full TU needed for the adapter scan).
+    "${_HLE_ROOT}/modules/SceAppMgr/SceAppMgr.cpp"
     # sceTouchPeek needs touch_get; touch_get's vblank wait needs wait_vblank.
     # Both TUs are Emscripten-aware (browser cooperative vblank, no host
     # threads) and define no EXPORTs, so they only contribute link symbols.
@@ -277,11 +354,21 @@ add_library(vita3k_web_runtime_hle STATIC
     ${_hle_adapters}
     "${_HLE_ROOT}/kernel/src/sync_primitives.cpp"
     "${_HLE_BROWSER_ROOT}/src/hle_io.cpp"
+    # Null audio sink (no device in the web runtime); production SceAudio
+    # bodies (a _hle_module_sources adapter) run unchanged against it.
+    "${_HLE_BROWSER_ROOT}/src/hle_audio_null.cpp"
     "${_HLE_ROOT}/io/src/device.cpp"
     "${_HLE_ROOT}/io/src/filesystem.cpp"
     "${_HLE_ROOT}/io/src/state_functions.cpp"
     "${_HLE_ROOT}/util/src/string_utils.cpp"
     "${_HLE_ROOT}/util/src/net_utils.cpp"
+    "${_HLE_ROOT}/np/src/init.cpp"
+    # Trophy context lifecycle for sceNpTrophyCreateContext and friends:
+    # upstream production bodies over the staged TRP files (pugixml parses
+    # the trophy config; TRP framing comes from trp_parser, no miniz link).
+    "${_HLE_ROOT}/np/src/trophy/context.cpp"
+    "${_HLE_ROOT}/np/src/trophy/trp_parser.cpp"
+    "${_HLE_EXT}/pugixml/src/pugixml.cpp"
     "${_HLE_ROOT}/emuenv/src/emuenv.cpp"
     "${_HLE_ROOT}/display/src/display.cpp"
     "${_HLE_ROOT}/motion/src/motion_input.cpp"
@@ -293,7 +380,8 @@ target_include_directories(vita3k_web_runtime_hle PUBLIC ${_hle_includes}
     "${_HLE_EXT}/yaml-cpp/include")
 target_include_directories(vita3k_web_runtime_hle PRIVATE
     "${_hle_generated}" "${_HLE_BROWSER_ROOT}/src" "${_HLE_EXT}/dlmalloc" "${_HLE_EXT}/printf"
-    "${_HLE_EXT}/stb" "${_HLE_EXT}/xxHash" "${_HLE_EXT}/vita-toolchain/src")
+    "${_HLE_EXT}/stb" "${_HLE_EXT}/xxHash" "${_HLE_EXT}/vita-toolchain/src"
+    "${_HLE_EXT}/pugixml/src")
 target_compile_definitions(vita3k_web_runtime_hle PRIVATE
     VITA3K_BROWSER_GXM=1
     ONLY_MSPACES=1

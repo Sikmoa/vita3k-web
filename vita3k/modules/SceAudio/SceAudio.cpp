@@ -23,7 +23,31 @@
 #include <util/lock_and_find.h>
 #include <util/tracy.h>
 
+#include <chrono>
+#include <cstdint>
+#include <map>
+
 TRACY_MODULE_NAME(SceAudio);
+
+namespace {
+// Browser null-sink pacing: the web port has no audio device, so the null
+// sink would drain instantly and let the guest audio thread submit thousands
+// of buffers per frame, starving the game's other threads of dispatch
+// quanta. Real hardware blocks sceAudioOutOutput when the driver buffer is
+// full, so games are written to tolerate Output pacing; emulate a 1-deep
+// device buffer on the wall clock: each Output may proceed once the previous
+// buffer's playback duration has elapsed. Keyed by port id; entries are
+// erased on port release (ids are reused).
+std::map<int, uint64_t> &audio_pace_next_us() {
+    static std::map<int, uint64_t> next;
+    return next;
+}
+uint64_t audio_wall_us() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch())
+        .count());
+}
+} // namespace
 
 enum SceAudioOutMode {
     SCE_AUDIO_OUT_MODE_MONO = 0,
@@ -207,6 +231,21 @@ EXPORT(int, sceAudioOutOutput, int port, const void *buf) {
     }
     // is it really useful to update the thread status?
     thread->update_status(ThreadStatus::wait);
+    if (emuenv.kernel.execution_host) {
+        // Pace to the wall clock (see audio_pace_next_us): park the fiber
+        // until the device buffer has room instead of submitting instantly.
+        const uint64_t buffer_us = static_cast<uint64_t>(prt->len_microseconds);
+        const uint64_t now = audio_wall_us();
+        auto &next = audio_pace_next_us()[port];
+        if (next == 0)
+            next = now + buffer_us;
+        if (now < next) {
+            const uint64_t wait = next - now;
+            emuenv.kernel.execution_host->wait_sync(*thread,
+                static_cast<uint32_t>(wait > UINT32_MAX ? UINT32_MAX : wait));
+        }
+        next = (audio_wall_us() > next ? audio_wall_us() : next) + buffer_us;
+    }
     emuenv.audio.audio_output(*prt, buf);
     thread->update_status(ThreadStatus::run);
 
@@ -243,6 +282,7 @@ EXPORT(int, sceAudioOutReleasePort, int port) {
     if (!emuenv.audio.out_ports.erase(port)) {
         return RET_ERROR(SCE_AUDIO_OUT_ERROR_INVALID_PORT);
     }
+    audio_pace_next_us().erase(port);
 
     return 0;
 }

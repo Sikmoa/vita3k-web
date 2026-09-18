@@ -29,6 +29,14 @@ bool unsupported_import(uint32_t nid) {
     const std::string_view n = name ? name : "";
     if (n.find("WaitSema") != n.npos && n.find("CB") == n.npos)
         return false;
+    // eventflag_wait parks on the fiber runtime (sync_primitives
+    // execution_host branch); the CB variant still runs host callbacks.
+    if (n.find("WaitEventFlag") != n.npos && n.find("CB") == n.npos)
+        return false;
+    // delay_thread parks until its deadline (SceThreadmgr execution_host
+    // branch); the CB variant still runs host callbacks first.
+    if (n.find("DelayThread") != n.npos && n.find("CB") == n.npos)
+        return false;
     return n.find("Wait") != n.npos || n.find("DelayThread") != n.npos
         || n.find("CheckCallback") != n.npos || n.find("CB") != n.npos
         || n.find("ReceiveMsgPipe") != n.npos || n.find("SendMsgPipe") != n.npos;

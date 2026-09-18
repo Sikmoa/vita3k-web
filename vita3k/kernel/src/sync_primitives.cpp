@@ -1583,7 +1583,16 @@ static int eventflag_waitorpoll(KernelState &kernel, const char *export_name, Sc
         const auto data_it = event->waiting_threads->push(data);
         thread_lock.unlock();
 
-        int err = handle_timeout(kernel, thread, thread_lock, event_lock, event->waiting_threads, data_it, export_name, timeout);
+        // Browser fiber runtime: park cooperatively instead of blocking the
+        // host thread (same contract as semaphore/mutex waits). The
+        // set/cancel paths unlink the queue entry and flip status to run,
+        // which both resumes the fiber (via update_status -> notify) and
+        // reports readiness back through handle_cooperative_wait.
+        int err;
+        if (kernel.execution_host)
+            err = handle_cooperative_wait(kernel, thread, thread_lock, event_lock, event->waiting_threads, timeout);
+        else
+            err = handle_timeout(kernel, thread, thread_lock, event_lock, event->waiting_threads, data_it, export_name, timeout);
         if (err < 0 && outBits) {
             // set it only if a timeout occurs
             // otherwise set in eventflag_set

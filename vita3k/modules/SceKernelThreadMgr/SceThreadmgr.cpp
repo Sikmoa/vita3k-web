@@ -1065,6 +1065,22 @@ static int delay_thread(KernelState &kernel, SceUID thread_id, SceUInt delay_us)
         return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
 
     const ThreadStatePtr thread = kernel.get_thread(thread_id);
+    if (kernel.execution_host) {
+        // Browser fiber runtime: park until the deadline instead of blocking
+        // the host thread. No queue is involved (nothing else can resume a
+        // delay early except deletion, which wait_sync reports as cancelled).
+        {
+            const std::lock_guard<std::mutex> lock(thread->mutex);
+            thread->update_status(ThreadStatus::wait);
+        }
+        kernel.execution_host->wait_sync(*thread, delay_us);
+        {
+            const std::lock_guard<std::mutex> lock(thread->mutex);
+            if (thread->status != ThreadStatus::run)
+                thread->update_status(ThreadStatus::run);
+        }
+        return SCE_KERNEL_OK;
+    }
     std::unique_lock<std::mutex> lock(thread->mutex);
     thread->update_status(ThreadStatus::wait);
     thread->status_cond.wait_for(lock, std::chrono::microseconds(delay_us),

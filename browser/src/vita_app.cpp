@@ -46,6 +46,9 @@
 #include <optional>
 #include <string>
 
+// Null audio sink (hle_audio_null.cpp): no device in the web runtime.
+void vita3k_web_install_null_audio(struct AudioState &audio);
+
 namespace {
 
 // Staged launch configuration. Plain POD + std::string; set from JS/bench
@@ -170,6 +173,7 @@ int vita3k_web_run_app() {
     env->io.savedata = config.title_id;
     auto &license = env->license.rif[config.title_id];
     license = SceNpDrmLicense{};
+    vita3k_web_install_null_audio(env->audio);
     if (config.has_klic) std::memcpy(license.key, config.klic, sizeof(license.key));
 
     ThreadStatePtr thread;
@@ -301,11 +305,31 @@ int vita3k_web_run_app() {
 #ifdef VITA3K_USE_WASM_JIT
         vita3k::web::GuestThreadRuntime::Progress progress;
         std::size_t dispatched = 0;
+        std::size_t dispatch_budget = 100000;
+        if (const char *budget_env = std::getenv("VITA3K_BENCH_DISPATCHES")) {
+            const unsigned long parsed = std::strtoul(budget_env, nullptr, 10);
+            if (parsed > 0) dispatch_budget = static_cast<std::size_t>(parsed);
+        }
+        std::size_t pc_sample_every = 0;
+        if (const char *sample_env = std::getenv("VITA3K_BENCH_PC_SAMPLE")) {
+            const unsigned long parsed = std::strtoul(sample_env, nullptr, 10);
+            if (parsed > 0) pc_sample_every = static_cast<std::size_t>(parsed);
+        }
+        std::size_t pc_sample_next = pc_sample_every;
         do {
             progress = runtime.resume(256);
             dispatched += progress.dispatches;
+            if (pc_sample_every && dispatched >= pc_sample_next) {
+                pc_sample_next = dispatched + pc_sample_every;
+                std::fprintf(stderr, "[vita3k-web] pc-sample dispatched=%zu threads=", dispatched);
+                for (const auto &[tid, t] : env->kernel.threads) {
+                    if (t && t->cpu)
+                        std::fprintf(stderr, " %d:%08x", tid, read_pc(*t->cpu));
+                }
+                std::fprintf(stderr, "\n");
+            }
         } while (!exited && env->missing_nids.empty() && !progress.failed
-            && !progress.idle && dispatched < 100000);
+            && !progress.idle && dispatched < dispatch_budget);
         std::printf("[vita3k-web] Guest scheduler: dispatches=%zu runnable=%zu waiting=%zu dormant=%zu failed=%zu idle=%d\n",
             dispatched, progress.runnable, progress.waiting, progress.dormant, progress.failed, progress.idle);
 #else
