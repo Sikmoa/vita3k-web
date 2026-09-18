@@ -279,11 +279,11 @@ bool validate_region_block(const Dynarmic::IR::Block &block,
 // next_pc published exactly as a single-region run would. A region reporting
 // more ticks than its slice returns DispatchOverrun (host fails, as it does
 // for the equivalent single-region overrun today).
-constexpr uint32_t kDispatchMapEntries = 2048;
+constexpr uint32_t kDispatchMapEntries = 8192;
 constexpr uint32_t kDispatchMapMask = kDispatchMapEntries - 1;
 constexpr uint32_t kDispatchMaxProbe = 64;
 constexpr uint32_t kDispatchEntryBytes = 16;
-constexpr uint32_t kDispatchTableLimit = 512;
+constexpr uint32_t kDispatchTableLimit = 4096;
 constexpr uint32_t kDispatchSliceTicks = 131072; // == REGION_CALL_TICKS
 // Hash must be bit-identical to dispatch_map_index() in wasm_jit_cpu.cpp.
 constexpr uint32_t kDispatchHashK = 0x9e3779b9u;

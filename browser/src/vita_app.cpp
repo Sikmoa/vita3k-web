@@ -39,13 +39,17 @@
 
 #include "vita_runtime.h"
 
+#include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 // Null audio sink (hle_audio_null.cpp): no device in the web runtime.
 void vita3k_web_install_null_audio(struct AudioState &audio);
@@ -213,8 +217,67 @@ static int run_app_impl() {
     bool exited = false;
     int exit_code = 0;
     unsigned imports = 0;
+    // Wall time charged to the HLE callback (import dispatch + module body).
+    // Subtracting it, the JIT phase counters and the wall clock separates
+    // "import handling" from "JIT compile" and "JIT dispatch".
+    double hle_ms = 0.0;
+    std::unordered_map<std::uint32_t, std::pair<unsigned, double>> hle_nids;
     const char *trace_option = std::getenv("VITA3K_TRACE_HLE");
     const bool trace_hle = trace_option && std::strcmp(trace_option, "1") == 0;
+#ifdef VITA3K_USE_WASM_JIT
+    // Guest-rate diagnosis. The retail rate is the product of JIT compilation
+    // (emit/install) and execution (run_js_calls), so report instructions over
+    // wall time along with the counters that explain a stall: compiled blocks
+    // and regions, cache hits, invalidations (self-modifying code) and the
+    // slow-path memory breakdown in the per-CPU profile.
+    const auto jit_started = std::chrono::steady_clock::now();
+    const auto jit_report = [&](const char *tag, bool verbose) {
+        std::uint64_t total = 0, hottest = 0;
+        for (const auto &[id, active] : env->kernel.threads) {
+            if (!active || !active->cpu || !active->cpu->cpu) continue;
+            const auto count = static_cast<WasmJitCPU &>(*active->cpu->cpu).instructions_executed();
+            total += count;
+            if (count > hottest) hottest = count;
+        }
+        const double seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - jit_started).count();
+        std::printf("[vita3k-web] jit[%s] elapsed=%.1fs insns=%llu rate_mips=%.2f imports=%u threads=%zu hle_ms=%.1f\n",
+            tag, seconds, static_cast<unsigned long long>(total),
+            seconds > 0.0 ? static_cast<double>(total) / seconds / 1e6 : 0.0,
+            imports, env->kernel.threads.size(), hle_ms);
+        if (!verbose) return;
+        // Which import owns the wall clock, and is it many cheap calls (spin) or
+        // few expensive ones (blocking/decompression)? Sorted by total ms.
+        std::vector<std::pair<std::uint32_t, std::pair<unsigned, double>>> ranked(
+            hle_nids.begin(), hle_nids.end());
+        std::sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) {
+            return a.second.second > b.second.second;
+        });
+        // Ascending on purpose: the log tail keeps the end of the block, so the
+        // largest consumer is the last line printed.
+        const std::size_t shown = ranked.size() < 8 ? ranked.size() : 8;
+        for (std::size_t i = shown; i > 0; --i) {
+            const auto &[nid, stats] = ranked[i - 1];
+            std::printf("[vita3k-web] jit hle NID=%08x %-28s calls=%u ms=%.1f avg_us=%.0f\n",
+                nid, import_name(nid), stats.first, stats.second,
+                stats.first ? stats.second * 1000.0 / stats.first : 0.0);
+        }
+        for (const auto &[id, active] : env->kernel.threads) {
+            if (!active || !active->cpu || !active->cpu->cpu) continue;
+            auto &jit = static_cast<WasmJitCPU &>(*active->cpu->cpu);
+            if (jit.instructions_executed() == 0) continue;
+            std::printf("[vita3k-web] jit thread=%d %s insns=%llu blocks=%llu regions=%llu hits=%llu invalidated=%llu\n",
+                id, active->name.c_str(),
+                static_cast<unsigned long long>(jit.instructions_executed()),
+                static_cast<unsigned long long>(jit.compiled_blocks()),
+                static_cast<unsigned long long>(jit.regions_formed()),
+                static_cast<unsigned long long>(jit.cache_hits()),
+                static_cast<unsigned long long>(jit.invalidated_blocks()));
+            if (jit.instructions_executed() == hottest)
+                std::printf("[vita3k-web] jit profile %d: %s\n", id, jit.get_profile().c_str());
+        }
+    };
+#endif
     struct Cleanup {
         EmuEnvState &env;
         ThreadStatePtr &thread;
@@ -243,10 +306,21 @@ static int run_app_impl() {
                         import_sequence, tid, nid, read_pc(cpu), import_name(nid));
                     std::fflush(stderr);
                 }
-                if (imports < 400 || imports % 500 == 0)
+                if (imports < 400 || imports % 500 == 0) {
                     std::printf("[vita3k-web] Vita import #%u: %s NID=%08x PC=%08x\n",
                         imports, import_name(nid), nid, read_pc(cpu));
+#ifdef VITA3K_USE_WASM_JIT
+                    jit_report("progress", true);
+#endif
+                }
+                const auto hle_started = std::chrono::steady_clock::now();
                 ::call_import(*env, cpu, nid, tid);
+                const double hle_cost = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - hle_started).count();
+                hle_ms += hle_cost;
+                auto &hle_slot = hle_nids[nid];
+                ++hle_slot.first;
+                hle_slot.second += hle_cost;
                 if (trace_hle) {
                     std::fprintf(stderr, "[vita3k-web] HLE return #%u tid=%d NID=%08x PC=%08x\n",
                         import_sequence, tid, nid, read_pc(cpu));
@@ -360,6 +434,9 @@ static int run_app_impl() {
             dispatched, progress.runnable, progress.waiting, progress.dormant, progress.failed, progress.idle);
 #else
         thread->run_loop(true);
+#endif
+#ifdef VITA3K_USE_WASM_JIT
+        jit_report("final", true);
 #endif
         std::printf("[vita3k-web] Vita result: process_exit=%d code=%d imports=%u missing_nids=%zu PC=%08x\n",
             exited, exit_code, imports, env->missing_nids.size(), read_pc(*thread->cpu));

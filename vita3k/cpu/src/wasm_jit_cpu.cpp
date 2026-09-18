@@ -51,7 +51,14 @@ constexpr size_t REGION_MAX_BLOCKS = 512;
 constexpr uint64_t REGION_MAX_TICKS = 32768;
 constexpr uint32_t REGION_BLOCK_INSTR_LIMIT = 64;
 constexpr size_t REGION_MAX_CODE_BYTES = REGION_BLOCK_INSTR_LIMIT * 4;
-constexpr size_t REGION_CACHE_LIMIT = 128;
+// Live-region budget for the (single-populated-cache) region cache. Every
+// eviction bumps the global dispatch-map epoch, so an undersized limit makes
+// a code-streaming title stale the whole map continuously and fall back to
+// host round-trips instead of Wasm-side chaining. A stream of ~17k distinct
+// regions through a 128-entry LRU showed emit+install at ~18% of wall time
+// and a ~57x gap versus the hot-loop bench; 1024 keeps the map load factor
+// (kDispatchMapEntries) low while staying below kDispatchTableLimit.
+constexpr size_t REGION_CACHE_LIMIT = 1024;
 constexpr uint32_t REGION_CALL_TICKS = 131072; // Bound latency of host stop checks.
 
 uint32_t counter_delta(uint32_t before, uint32_t after) noexcept {
@@ -489,7 +496,7 @@ EM_JS(void, vita3k_jit_release, (int slot), {
 // REGION_CACHE_LIMIT, far below the initial table size).
 EM_JS(void, vita3k_jit_table_ensure, (), {
     if (!Module['vita3kJitTable'])
-        Module['vita3kJitTable'] = new WebAssembly.Table({initial: 512, element: 'anyfunc'});
+        Module['vita3kJitTable'] = new WebAssembly.Table({initial: 4096, element: 'anyfunc'});
 });
 EM_JS(int, vita3k_jit_install_region_impl, (const uint8_t *bytes, unsigned length,
     MemoryFunction read_memory, MemoryFunction write_memory, MemoryFunction arithmetic), {
@@ -536,7 +543,7 @@ EM_JS(int, vita3k_jit_install_dispatch, (const uint8_t *bytes, unsigned length),
         const raw = Module['vita3kHostBytes'](bytes, length).slice();
         if (typeof process !== 'undefined' && process.env?.VITA3K_DUMP_JIT) require('fs').writeFileSync('/tmp/jit-dispatch.wasm', raw);
         if (!Module['vita3kJitTable'])
-            Module['vita3kJitTable'] = new WebAssembly.Table({initial: 512, element: 'anyfunc'});
+            Module['vita3kJitTable'] = new WebAssembly.Table({initial: 4096, element: 'anyfunc'});
         const module = new WebAssembly.Module(raw);
         const instance = new WebAssembly.Instance(module, {env: {
             memory: wasmMemory,
