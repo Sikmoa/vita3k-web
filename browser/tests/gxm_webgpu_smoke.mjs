@@ -319,6 +319,73 @@ try {
       depthStencil: { ...depthState('less', true), depthBias: 1 } }), 'unknown depth-stencil field rejected');
     renderer.destroyProgram(lessWrite); renderer.destroyProgram(lessNoWrite); renderer.destroyTarget(depthTarget);
 
+    // Vertex attribute formats. Real fragments prove the fetched values, not
+    // just that the layout was accepted: every vertex carries the same
+    // attribute payload, so the interpolated varying is constant, and a
+    // buffered full-target triangle rasterizes it across the whole 4x4 target.
+    const formatTarget = renderer.createTarget(4, 4);
+    const formatProgram = (stride, offset, format, inputType, attributeExpression) =>
+      renderer.createProgram({ stride, attributes: [{ shaderLocation: 0, offset, format }],
+        uniformSize: 0, bufferBindings: [],
+        vertexWGSL: `struct Out { @builtin(position) position: vec4f, @location(0) color: vec4f };
+          @vertex fn main(@builtin(vertex_index) i: u32, @location(0) v: ${inputType}) -> Out {
+            var corners = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+            var out: Out; out.position = vec4f(corners[i], 0.0, 1.0);
+            out.color = ${attributeExpression}; return out; }`,
+        fragmentWGSL: '@fragment fn main(@location(0) v: vec4f) -> @location(0) vec4f { return v; }' });
+    const formatPixel = async (formatProgramId, vertex) => at2(await renderer.submit(formatTarget,
+      [{ program: formatProgramId, indexFormat: 'uint16', indices,
+        vertices: new Uint8Array([...vertex, ...vertex, ...vertex]) }]), 1, 1);
+    const tight = await formatProgram(4, 0, 'unorm8x4', 'vec4f', 'v');
+    check((await formatPixel(tight, new Uint8Array([255, 128, 0, 64]))).join() === '255,128,0,64',
+      'unorm8x4 fetches normalized bytes');
+    // Limbo's observed shape: the attribute starts at offset 16 of a 20-byte
+    // stride and fills it exactly; the leading 16 bytes must not leak in.
+    const stridedVertex = new Uint8Array(20).fill(0x99);
+    stridedVertex.set([10, 200, 30, 40], 16);
+    const strided = await formatProgram(20, 16, 'unorm8x4', 'vec4f', 'v');
+    check((await formatPixel(strided, stridedVertex)).join() === '10,200,30,40',
+      'unorm8x4 reads only its own bytes inside a 20-byte stride');
+    // 16-bit normalized components at offset 4 of an 8-byte stride. 0x8080 and
+    // 0x4040 are exactly 128 and 64 in an 8-bit target.
+    const wide = await formatProgram(8, 4, 'unorm16x2', 'vec2f', 'vec4f(v, 0.0, 1.0)');
+    check((await formatPixel(wide, new Uint8Array([9,9,9,9, 0x80,0x80, 0x40,0x40]))).join() === '128,64,0,255',
+      'unorm16x2 fetches 16-bit normalized components');
+    // Half-float components land in an f32 shader input with no conversion.
+    const halves = await formatProgram(8, 0, 'float16x4', 'vec4f', 'v');
+    check(matches(await formatPixel(halves,
+      new Uint8Array([0,0x3c, 0,0x38, 0,0x34, 0,0x3a])), [255, 128, 64, 191], 1),
+      'float16x4 feeds a vec4<f32> input');
+    // Signed normalized bytes are only visible through a remap: 127 -> +1,
+    // 0 -> 0, -128 -> -1 mapped back into [0, 1].
+    const signed = await formatProgram(4, 0, 'snorm8x4', 'vec4f', 'v * vec4f(0.5) + vec4f(0.5)');
+    check(matches(await formatPixel(signed, new Uint8Array([127, 0, 128, 0])), [255, 128, 0, 128], 1),
+      'snorm8x4 decodes signed normalized bytes');
+    const formatHits = renderer.pipelineCacheStats().hits;
+    await formatProgram(20, 16, 'unorm8x4', 'vec4f', 'v');
+    check(renderer.pipelineCacheStats().hits === formatHits + 1, 'identical attribute layout reuses the pipeline');
+    // Every part of the layout that WebGPU cannot express exactly must reject
+    // instead of reinterpreting or truncating the guest bytes.
+    await rejects(() => formatProgram(4, 0, 'unorm8x1', 'vec4f', 'v'), 'no 1-component 8-bit vertex format');
+    await rejects(() => formatProgram(4, 0, 'unorm8x3', 'vec4f', 'v'), 'no 3-component 8-bit vertex format');
+    await rejects(() => formatProgram(6, 2, 'unorm8x4', 'vec4f', 'v'), 'unorm8x4 offset must be 4-aligned');
+    await rejects(() => formatProgram(4, 1, 'unorm8x2', 'vec4f', 'v'), 'unorm8x2 offset must be 2-aligned');
+    await rejects(() => formatProgram(4, 4, 'unorm16x2', 'vec2f', 'vec4f(v, 0.0, 1.0)'),
+      'attribute element must fit inside the stride');
+    // A format with fewer components than the shader input is legal: WebGPU
+    // fills the missing components with (0, 0, 0, 1) instead of reading the
+    // next attribute's bytes, which is why only x2/x4 8- and 16-bit formats
+    // are needed to represent a guest x2/x4 fetch exactly.
+    const filled = await formatProgram(8, 0, 'unorm16x2', 'vec4f', 'v');
+    check((await formatPixel(filled, new Uint8Array([0x80,0x80, 0x40,0x40, 0,0,0,0]))).join()
+      === '128,64,0,255', 'missing vertex components default to (0, 0, 0, 1)');
+    await rejects(() => renderer.createProgram({ stride: 16, uniformSize: 0, bufferBindings: [],
+      attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' },
+        { shaderLocation: 0, offset: 8, format: 'float32x2' }],
+      vertexWGSL: 'invalid', fragmentWGSL: 'invalid' }), 'duplicate shader location rejected');
+    for (const program of [tight, strided, wide, halves, signed]) renderer.destroyProgram(program);
+    renderer.destroyTarget(formatTarget);
+
     renderer.destroyProgram(program); renderer.destroyTarget(target);
     await rejects(() => renderer.submit(target, []), 'destroyed target rejected');
     renderer.dispose();
@@ -339,7 +406,7 @@ try {
     device.destroy();
     return { checks, backend: 'WebGPU', translatedGuestShader: false, pipelineCache: true };
   });
-  assert.equal(result.checks, 68);
+  assert.equal(result.checks, 81);
   console.log(JSON.stringify(result));
 } finally {
   clearTimeout(timeout);

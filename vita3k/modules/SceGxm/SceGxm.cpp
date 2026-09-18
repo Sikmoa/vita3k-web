@@ -905,6 +905,14 @@ static void display_entry_thread(EmuEnvState &emuenv) {
     }
 
     while (true) {
+#ifdef VITA3K_BROWSER_GXM
+        // The browser has no host thread parked on this queue: entries are
+        // drained inline by sceGxmDisplayQueueAddEntry, so never block on an
+        // empty queue here (top() below waits on a condition variable that
+        // only a concurrent producer could signal).
+        if (display_queue.size() == 0)
+            break;
+#endif
         auto display_callback = display_queue.top();
         if (!display_callback)
             break;
@@ -2271,9 +2279,21 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
 
     renderer::send_single_command(*emuenv.renderer, nullptr, renderer::CommandOpcode::NewFrame, false, frame, &emuenv.display, active_renderer_context);
 
+#ifdef VITA3K_BROWSER_GXM
+    // The browser execution host has no host thread for this queue, and the
+    // desktop wait below would deadlock the guest thread: nothing else could
+    // ever pop the entry. Every draw in this consumer is complete before its
+    // HLE call returns, so drain the queue inline instead. display_entry_thread
+    // runs the guest display callback on the display queue thread, whose
+    // sceDisplaySetFrameBuf is what presents the frame, and marks both sync
+    // objects done exactly like the desktop host thread (it returns as soon as
+    // the queue is empty; see the browser check in its loop).
+    display_entry_thread(emuenv);
+#else
     if (emuenv.gxm.params.displayQueueMaxPendingCount == 1)
         // double buffering, not handled by the queue configuration
         emuenv.gxm.display_queue.wait_empty();
+#endif
 
     return 0;
 }

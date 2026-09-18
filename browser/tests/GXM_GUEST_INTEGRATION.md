@@ -61,29 +61,38 @@ Host-only shader/renderer checks do not substitute for guest execution.
   attributes, other textures, instancing, non-default region clip, stencil
   state, the force-load/force-store depth modes and other commands are
   rejected, not silently ignored.
-- C2 (renderer side implemented, unverified) accepts `SignalSyncObject`,
+- C2 (implemented and verified against retail Limbo) accepts
+  `SignalSyncObject`,
   `WaitSyncObject` and `NewFrame`, and wakes `sceGxmNotificationWait` via
   `notification_ready` after `SignalNotification`/`SyncSurfaceData`. NewFrame
-  only records the predicted frame; pixels are NOT presented. See GXM_WEBGPU.md.
+  records the predicted frame; the pixels are presented by the display-queue
+  drain that `sceGxmDisplayQueueAddEntry` performs (GXM_WEBGPU.md
+  "Presentation").
 - C1 adds a bounded pipeline cache (reuse verified; eviction/device-loss tests
   outstanding) and ordered guest draw/fill/fence
   queue (GXM_WEBGPU.md). Each draw still translates GXP, uploads buffers and
   creates/reads back its target. Shader translation caching and persistent
   surface ownership remain to be implemented.
 - Production distribution of compiler, Naga and WASI shim assets and ordinary
-  worker integration still need packaging work; the historical test server is
-  not evidence of a complete app launcher.
+  worker integration still need packaging work. `browser/tests/limbo_serve.mjs`
+  now serves the runtime, the shader assets and a staged retail app to an
+  ordinary browser (`HOST=0.0.0.0 PORT=... node browser/tests/limbo_serve.mjs`),
+  and `browser/tests/limbo_watch.mjs` mirrors the presented frames into the
+  workspace headlessly; both are still development tools, not a shipped app.
 - `vita3k/renderer/src/sync.cpp` intentionally NOT linked (single-threaded, GPU-fenced
   bridge replaces its queue thread); `wishlist` / `subject_done` reimplemented locally.
 - `browser/web/gxm_context.js` is owned by main; the bridge uses the separate
   `gxm_hle_bridge.js` instead.
 - Full renderer completeness and Limbo gameplay are NOT verified. Textured GXP
   has separate host-driven browser tests. Bounded guest texture wiring is now
-  GPU-verified; presentation, vertex attribute formats,
-  display queue integration and retail-app scheduling remain unfinished. Blend
-  and depth-stencil state are implemented and GPU-verified at the renderer
-  level (see GXM_WEBGPU.md); no retail frame has been rendered in a browser
-  yet.
+  GPU-verified; the guest `SceGxmAttributeFormat` set U8N/S8N/U16N/S16N/F16/F32
+  is translated in JS (GXM5 packet); display-queue integration, retail-app
+  scheduling and presentation are implemented and verified against retail Limbo,
+  which presented its title/loading frames in a browser (GXM_WEBGPU.md
+  "Presentation"). Blend and depth-stencil state are implemented and
+  GPU-verified at the renderer level.
+  Still unverified: gameplay beyond the loading screen, stencil state, MSAA,
+  multi-stream vertex layouts, and every draw still reads back per draw.
   `rendererComplete=false` in the probe output remains intentional.
 
 ## Task #20 handoff to the HLE owner (Limbo SceGxm static rows)
@@ -97,15 +106,22 @@ All NIDs are from `vita3k/nids/include/nids/nids.inc`.
 Display-queue/sync notification (bridge now handles the commands/notify):
 
 - `sceGxmDisplayQueueAddEntry` 0xEC5C26B5 — emits `NewFrame` (accepted) plus
-  display-queue push. Still needs display-thread scheduling of the guest
-  callback (scheduler owner) and future pixel presentation.
+  the display-queue push. SELECTED and verified: `browser::gxm_initialize`
+  creates the display queue guest thread, the entry drains the queue inline
+  under `VITA3K_BROWSER_GXM`, the guest display callback runs on that thread and
+  its `sceDisplaySetFrameBuf` import is the presentation trigger. Retail Limbo
+  presents real frames (GXM_WEBGPU.md "Presentation").
 - `sceGxmSyncObjectCreate` 0x6A6013E1 / `sceGxmSyncObjectDestroy` 0x889AE88C —
   backend-agnostic `renderer::create/destroy` already linked via
   `renderer/src/creation.cpp`.
 - `sceGxmGetNotificationRegion` 0x8BDE825A — returns the region allocated in
   `gxm_initialize`; no renderer involvement.
 - `sceGxmNotificationWait` 0x9F448E79 — now woken by the bridge notify; pure
-  HLE wait on `notification_ready` otherwise.
+  HLE wait on `notification_ready` otherwise. Limbo calls it on the render
+  thread and the fiber runtime answers it immediately (logged as an unsupported
+  wait, non-fatal). Also non-fatal and logged the same way:
+  `sceDisplayWaitSetFrameBuf` 0x9423560C and `sceDisplayWaitSetFrameBufMulti`
+  0x7D9864A8.
 - `sceGxmMapMemory` 0xC61E34FC / `sceGxmUnmapMemory` 0x828C68E8 — HLE-side
   region tracking only (`features.enable_memory_mapping` is false, so no
   renderer `MemoryMap` command is ever sent and preflight is unaffected).

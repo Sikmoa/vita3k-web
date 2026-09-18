@@ -25,6 +25,7 @@
 #include <cpu/impl/wasm_jit_cpu.h>
 #include "guest_thread_runtime.h"
 #endif
+#include <display/state.h>
 #include <emuenv/state.h>
 #include <io/functions.h>
 #include <io/state.h>
@@ -64,6 +65,24 @@ struct AppLaunchConfig {
 AppLaunchConfig &launch_config() {
     static AppLaunchConfig config;
     return config;
+}
+
+// Guest dispatch budget for the browser run loop. The desktop-shaped default
+// is the bench harness budget; the browser harness raises it so a retail app
+// can reach its first presented frame instead of stopping mid-load. The
+// VITA3K_BENCH_DISPATCHES environment variable still wins when set (the Node
+// bench path), because it is the declared override for that harness.
+std::size_t &dispatch_budget_slot() {
+    static std::size_t budget = 100000;
+    return budget;
+}
+
+std::size_t dispatch_budget() {
+    if (const char *env = std::getenv("VITA3K_BENCH_DISPATCHES")) {
+        const unsigned long parsed = std::strtoul(env, nullptr, 10);
+        if (parsed > 0) return static_cast<std::size_t>(parsed);
+    }
+    return dispatch_budget_slot();
 }
 
 // Desktop preload order (interface.cpp load_app_impl, minus taihen/patches):
@@ -144,6 +163,13 @@ void vita3k_web_set_app_paths(const char *vita_fs, const char *title_id, const c
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE
+void vita3k_web_set_dispatch_budget(std::uint32_t budget) {
+    if (!budget) return;
+    dispatch_budget_slot() = budget;
+    std::printf("[vita3k-web] guest dispatch budget: %u\n", budget);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE
 void vita3k_web_set_license_key(const std::uint8_t *key16) {
     auto &config = launch_config();
     if (!key16) {
@@ -157,8 +183,9 @@ void vita3k_web_set_license_key(const std::uint8_t *key16) {
     std::puts("[vita3k-web] license klic staged");
 }
 
-extern "C" EMSCRIPTEN_KEEPALIVE
-int vita3k_web_run_app() {
+// Implementation shared by the exported entry point below, which reports its
+// result through the host exit hook.
+static int run_app_impl() {
     const auto &config = launch_config();
     if (config.title_id.empty()) {
         std::fprintf(stderr, "[vita3k-web] run_app: no title staged (call vita3k_web_set_app_paths first)\n");
@@ -180,6 +207,9 @@ int vita3k_web_run_app() {
 #ifdef VITA3K_USE_WASM_JIT
     vita3k::web::GuestThreadRuntime runtime;
 #endif
+    // Same vblank headroom as run_vita: without it the guest spends real time
+    // in frame pacing instead of executing.
+    env->display.fast_vblank = vita3k_web_fast_vblank_enabled();
     bool exited = false;
     int exit_code = 0;
     unsigned imports = 0;
@@ -305,11 +335,7 @@ int vita3k_web_run_app() {
 #ifdef VITA3K_USE_WASM_JIT
         vita3k::web::GuestThreadRuntime::Progress progress;
         std::size_t dispatched = 0;
-        std::size_t dispatch_budget = 100000;
-        if (const char *budget_env = std::getenv("VITA3K_BENCH_DISPATCHES")) {
-            const unsigned long parsed = std::strtoul(budget_env, nullptr, 10);
-            if (parsed > 0) dispatch_budget = static_cast<std::size_t>(parsed);
-        }
+        const std::size_t budget = dispatch_budget();
         std::size_t pc_sample_every = 0;
         if (const char *sample_env = std::getenv("VITA3K_BENCH_PC_SAMPLE")) {
             const unsigned long parsed = std::strtoul(sample_env, nullptr, 10);
@@ -329,7 +355,7 @@ int vita3k_web_run_app() {
                 std::fprintf(stderr, "\n");
             }
         } while (!exited && env->missing_nids.empty() && !progress.failed
-            && !progress.idle && dispatched < dispatch_budget);
+            && !progress.idle && dispatched < budget);
         std::printf("[vita3k-web] Guest scheduler: dispatches=%zu runnable=%zu waiting=%zu dormant=%zu failed=%zu idle=%d\n",
             dispatched, progress.runnable, progress.waiting, progress.dormant, progress.failed, progress.idle);
 #else
@@ -344,4 +370,16 @@ int vita3k_web_run_app() {
         std::fprintf(stderr, "[vita3k-web] Vita app runtime error: %s\n", error.what());
         return -9;
     }
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE
+int vita3k_web_run_app() {
+    // The retail path suspends inside its run loop (ASYNCIFY), so the JS call
+    // site does not receive this return value: report the outcome through the
+    // same host hook the homebrew path uses (vita3kWebOnExit -> worker.js
+    // 'vita-exit'). Without it the host waits out its whole deadline after the
+    // guest has already stopped, and the real exit code is invisible.
+    const int code = run_app_impl();
+    vita3k_web_notify_exit(code);
+    return code;
 }

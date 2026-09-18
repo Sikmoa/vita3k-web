@@ -54,3 +54,6 @@ fastlane/readme.md
 # Python bytecode from browser helper scripts
 __pycache__/
 *.pyc
+
+# Local scratch for the retail-app probes (staged content, logs, frames).
+.limbo_work/

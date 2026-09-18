@@ -70,6 +70,8 @@ static bool vita3k_web_fast_vblank = false;
 extern "C" EMSCRIPTEN_KEEPALIVE
 void vita3k_web_set_fast_vblank(int enabled) { vita3k_web_fast_vblank = enabled != 0; }
 
+bool vita3k_web_fast_vblank_enabled() { return vita3k_web_fast_vblank; }
+
 static void trace_cpu(CPUState &cpu, uint32_t nid) {
     if (!vita3k_web_trace_cpu) return;
     const auto context = save_context(cpu);
@@ -98,7 +100,7 @@ static int run_vita(const uint8_t *bytes, uint32_t size) {
         std::printf("[vita3k-web] guest window: [0x%llx,0x%llx); runtime allocation below 4 GiB\n",
             static_cast<unsigned long long>(vita3k::memory::guest_window_base),
             static_cast<unsigned long long>(vita3k::memory::guest_window_end));
-    env->display.fast_vblank = vita3k_web_fast_vblank;
+    env->display.fast_vblank = vita3k_web_fast_vblank_enabled();
     ThreadStatePtr thread;
     bool exited = false;
     int exit_code = 0;

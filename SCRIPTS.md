@@ -138,6 +138,38 @@ Open <http://localhost:8080/display.html?backend=jit> for the JIT and
 SharedArrayBuffer). The Worker's console prints the JIT profile line ending in
 `fast_reads=... fast_writes=...` — its presence proves the fast-path build.
 
+## Retail app (Limbo) in a browser
+
+```sh
+env EM_CACHE=/home/user/.vscratch/emcache cmake --build build/web64 --target vita3k_web_jit -j$(nproc)
+HOST=0.0.0.0 PORT=8099 node browser/tests/limbo_serve.mjs
+```
+
+Open the printed URL (`HOST=0.0.0.0` lists the machine's addresses; add
+`?auto=1` to start on load). The page stages `.limbo_work/stage`
+(`LIMBO_STAGE`, `LIMBO_TITLE`, `LIMBO_APP`), boots the retail app through the
+same Worker messages the headless probe uses, and draws every presented frame
+to a canvas next to a live guest log. Query parameters: `?memory=w64|w32|auto`
+(auto probes Memory64 and falls back), `?backend=jit|interp`. Requires WebGPU;
+the wasm32 fallback is a separate target (`vita3k_web`) and only presents frames
+when it was built from the same tree as the wasm64 module.
+
+Headless equivalent that mirrors frames into the workspace as they arrive (use
+it when the page's port is not reachable from this machine):
+
+```sh
+PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index.mjs \
+  LIMBO_DEADLINE_MS=300000 node browser/tests/limbo_watch.mjs      # -> .limbo_work/live/
+```
+
+`latest.png` is rewritten on every poll and each new generation is also kept as
+`frame_NNNNN.png`; `status.json` carries the current status, frame count and the
+guest log. The headless browser uses SwiftShader (`--use-angle=swiftshader`,
+`--enable-unsafe-webgpu`); set `LIMBO_GPU=1` on a machine with a real GPU.
+
+`browser/tests/limbo_app_chromium.mjs` is the assertion probe (exit 0 requires
+at least one presented frame; `LIMBO_DEADLINE_MS` bounds the run).
+
 ## Debugging generated Wasm
 
 ```sh

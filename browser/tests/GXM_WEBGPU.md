@@ -9,9 +9,14 @@ consumer itself accepts WGSL; it is not the shader translator.
 
 ## Existing supported boundary
 
-- RGBA8 offscreen targets and indexed triangle lists (uint16/uint32).
-- One interleaved vertex stream; float scalar/vectors and unorm8x4 in the
-  consumer. The native guest packet currently permits F32 attributes only.
+- RGBA8 offscreen targets and indexed triangles: triangle lists (uint16/uint32)
+  and triangle fans. WebGPU has no fan topology, so the native bridge expands a
+  fan to the equivalent triangle list (same index buffer, centre = the first
+  guest index); cull mode is restricted to NONE, so the expansion cannot change
+  which faces are drawn.
+- One interleaved vertex stream. The guest attribute format travels in the
+  packet and is translated in JS: U8N/S8N/U16N/S16N with 2 or 4 components,
+  F16 with 2 or 4, and F32 with 1 to 4.
 - Explicit WGSL, or WGSL translated from guest GXP by the guest bridge.
 - Group-0 uniform/read-only-storage bindings with explicit sizes/visibility;
   the original single uniform-buffer API remains available.
@@ -29,7 +34,10 @@ U/V addressing are accepted. Texels and sampler state are snapshotted before
 await, uploaded per draw, and texture resources are destroyed after readback.
 Texture layout participates in the pipeline key; texels and sampler values do
 not. Missing data, wrong sizes and unsupported sampler/texture fields reject.
-**Guest SceGxm unit-zero LINEAR ABGR8 texture state is wired and verified.**
+**Guest SceGxm unit-zero LINEAR texture state is wired and verified**: ABGR8
+(`0x0c000000`, byte-identical to RGBA8) and 16-bit swizzled U8U8 GRRR
+(`0x07002000`, RGB = the low byte replicated, A = the high byte), the format the
+retail Limbo frame's sprite draws use.
 The Memory64 JIT guest probe performs six textured GXP draws, including padded
 rows, filtering/wrapping, pixel mutation without rebinding and data-address
 replacement. See `GXM_GUEST_INTEGRATION.md` for the exact bounded descriptor
@@ -63,17 +71,51 @@ pipeline submitted to a target without a depth attachment (or the reverse), a
 format mismatch, and an out-of-range clear value all reject.
 
 Still unsupported: MSAA, multiple
-vertex streams, non-default vertex attribute formats (only F32 is accepted),
+vertex streams, vertex attribute formats outside the JS table above,
 non-default region-clip/scissor, additional target formats, stencil state or
-stencil writeback, and resident framebuffer resolve/presentation. The guest fixture
+stencil writeback. Two-sided depth state is approximated with the front face
+(see C2); each remaining unsupported state rejects rather than rendering
+implicitly. The guest fixture
 verifies only the bounded texture path, not these remaining features. Each draw still
 reads back; this is not a performance result or a completed retail renderer.
 
+## Presentation (verified)
+
+The display queue is how a frame reaches the screen, and it is now wired end to
+end. `browser::gxm_initialize` creates the same `SceGxmDisplayQueue` guest
+thread the desktop backend creates (null entry, standard priority; a dormant
+thread parks in `run_loop` without executing the null entry), but no host
+`std::thread`. `sceGxmDisplayQueueAddEntry` therefore drains the queue inline
+under `VITA3K_BROWSER_GXM` by calling the production `display_entry_thread`,
+whose loop gains one browser-only check that stops on an empty queue instead of
+blocking on a condition variable no other thread can signal. The desktop
+`wait_empty()` for `displayQueueMaxPendingCount == 1` is skipped for the same
+reason: the entry has already been drained by the time the call returns.
+
+Draining runs the guest display callback through
+`ThreadState::run_guest_function` on the display queue thread. The browser
+execution host implements this cooperatively (`guest_thread_runtime.cpp`): the
+calling fiber parks and the scheduler dispatches the display thread, exactly
+like the desktop host thread. The callback's `sceDisplaySetFrameBuf`
+(`0x7A410B64`) / `_sceDisplaySetFrameBuf` (`0xF51523CB`) is the presentation
+trigger: `browser/src/vita_app.cpp` calls `vita3k_web_present_frame` after that
+import, and `vita_display_bridge.cpp` tightens the real `sce_frame` rows and
+posts them through the host hook. `NewFrame` still records the predicted frame
+for renderer state; it is not the presentation path.
+
+Verified with retail Limbo: the title screen presents real content
+(`framesPresented: 3` in a 240 s probe, first frame 960x544, saved as
+`.limbo_work/limbo_frame_000001_960x544.png`). The frame arrives early in the
+run; the probe then waits out its deadline because the app keeps loading, not
+because presentation is slow.
+
 ## C2 — display-queue/sync commands, viewport state, state-driven render info
 
-Status: implemented, NOT yet run (parent verifies serially). Renderer-side
-slice only; the HLE allowlist additions it unblocks are listed for the HLE
-owner in `GXM_GUEST_INTEGRATION.md` and are not selected here.
+Status: implemented and verified end-to-end against retail Limbo, which
+presented its first frames (verification and mechanism in the Presentation
+section above). The HLE allowlist additions it unblocked are selected in
+`browser/runtime_hle.cmake` (`sceGxmPadHeartbeat`, `sceGxmDisplayQueueAddEntry`);
+the remaining inventory is in `GXM_GUEST_INTEGRATION.md`.
 
 Native (`browser/src/gxm_webgpu_bridge.cpp`):
 
@@ -81,8 +123,9 @@ Native (`browser/src/gxm_webgpu_bridge.cpp`):
   `subject_done`), `WaitSyncObject` (BeginScene fragment wait via `wishlist`;
   steady state is already signaled, genuine backpressure blocks with desktop
   semantics instead of skipping), and `NewFrame` (display-queue entry records
-  the predicted frame into display state and sets `should_display`; pixels are
-  NOT presented). All other new opcodes (notably `MidSceneFlush`,
+  the predicted frame into display state and sets `should_display`; the pixels
+  themselves are presented by the display-queue drain, see above). All other
+  new opcodes (notably `MidSceneFlush`,
   `TransferCopy/Downscale`, `MemoryMap/Unmap`) still reject in preflight.
 - `SignalNotification` and `SyncSurfaceData` now publish under
   `notification_mutex` and `notify_all`, mirroring `sync.cpp`
@@ -102,19 +145,23 @@ Native (`browser/src/gxm_webgpu_bridge.cpp`):
   Indexed/default vertex/fragment uniform buffers need no change: they already
   flow through `set_uniform_buffer` into the packed draw payload.
 
-Packet GXM4 (`0x47584d34`, replaces GXM3; native and JS deploy together): fixed
+Packet GXM5 (`0x47584d35`, replaces GXM4; native and JS deploy together): fixed
 words as before, then blend enabled u32 plus seven guest blend words (colorMask,
 colorFunc, alphaFunc, colorSrc, colorDst, alphaSrc, alphaDst), then depth
 enabled u32 plus, when enabled, four words (guest depth format, guest depth
 func, guest depth write mode, load mode) and one f32 clear value, then the
 texture count/header, viewport flat u32 and six f32 bits
-(xOffset,yOffset,zOffset,xScale,yScale,zScale), then render info, attributes,
-payloads and texture bytes. Blend and depth words are guest enum values, so the
+(xOffset,yOffset,zOffset,xScale,yScale,zScale), then render info, four words per
+attribute (shader location, offset, component count, guest
+`SceGxmAttributeFormat`), the six payloads and packed texture bytes. GXM5 adds
+that attribute-format word so the guest vertex format is translated in JS next
+to every other guest enum; attributes were previously assumed F32. Blend and
+depth words are guest enum values, so the
 single GXM -> WebGPU translation lives in the JS decoder next to the sampler
 and texture-format translation; the guest blend descriptor is retained on the
 WebGPU fragment program at creation time (`browser/src/gxm_webgpu_program.h`)
-because the guest pointer is not kept. GXM2 and GXM3 now fail loudly in the
-decoder, and the transparent blend block replaces the previous native
+because the guest pointer is not kept. GXM2, GXM3 and GXM4 now fail loudly in
+the decoder, and the transparent blend block replaces the previous native
 all-or-nothing rejection that made `sceGxmShaderPatcherCreateFragmentProgram`
 return `SCE_GXM_ERROR_DRIVER` for every non-default descriptor.
 

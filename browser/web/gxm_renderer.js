@@ -12,8 +12,16 @@
 // descriptor is translated by the caller (gxm_hle_bridge.js); this consumer
 // accepts WebGPU values and rejects anything it cannot express.
 
-const formats = Object.freeze({ float32: [4, 4], float32x2: [8, 4],
-  float32x3: [12, 4], float32x4: [16, 4], unorm8x4: [4, 1] });
+// Vertex formats: [byte size, minimum attribute offset alignment]. WebGPU
+// requires the offset to be a multiple of min(4, byte size of the format), so
+// only the two-component 8-bit formats align to 2; every wider format aligns
+// to 4 (which is also what a Metal-backed implementation demands).
+const formats = Object.freeze({
+  float32: [4, 4], float32x2: [8, 4], float32x3: [12, 4], float32x4: [16, 4],
+  unorm8x2: [2, 2], unorm8x4: [4, 4], snorm8x2: [2, 2], snorm8x4: [4, 4],
+  unorm16x2: [4, 4], unorm16x4: [8, 4], snorm16x2: [4, 4], snorm16x4: [8, 4],
+  float16x2: [4, 4], float16x4: [8, 4],
+});
 const align = (value, alignment) => Math.ceil(value / alignment) * alignment;
 function integer(value, min, max, name) {
   if (!Number.isSafeInteger(value) || value < min || value > max)

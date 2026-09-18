@@ -224,6 +224,19 @@ set(_hle_exports
     sceGxmProgramParameterGetArraySize sceGxmProgramParameterGetCategory
     sceGxmProgramParameterGetComponentCount sceGxmProgramParameterGetContainerIndex
     sceGxmProgramParameterGetName sceGxmProgramParameterGetType
+    # Per-frame heartbeat (imports=45276 missing_nids=1 RenderThread PC=8126c330):
+    # Limbo calls it right after the first frame's scene is submitted. The
+    # upstream body only null-checks its two pointers and returns 0, so
+    # selecting it is production parity, not a new stub. A missing NID kills
+    # the calling thread, which is what ended the run before any present.
+    sceGxmPadHeartbeat
+    # Display queue (imports=45189 missing_nids=1 RenderThread PC=8126c330):
+    # the frame presentation entry point. Production body; under
+    # VITA3K_BROWSER_GXM it drains the queue inline (guest display callback on
+    # the SceGxmDisplayQueue thread, whose sceDisplaySetFrameBuf presents) since
+    # the browser execution host has no display host thread. Limbo does not
+    # import sceGxmDisplayQueueFinish.
+    sceGxmDisplayQueueAddEntry
 )
 
 # Take NID values from the one authoritative database, never a second resolver.

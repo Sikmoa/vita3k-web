@@ -31,13 +31,22 @@ target_link_options(vita3k_guest_thread_runtime INTERFACE -fexceptions -sASYNCIF
 # so the shim must be linked here too.
 add_executable(vita3k_web_jit
     src/main.cpp src/vita_runtime.cpp src/vita_display_bridge.cpp
-    src/memory.cpp src/interpreter.cpp src/guest.cpp src/vita_self_decrypt.cpp)
+    src/memory.cpp src/interpreter.cpp src/guest.cpp src/vita_self_decrypt.cpp
+    src/vita_app.cpp)
 target_compile_definitions(vita3k_web_jit PRIVATE VITA3K_WEB=1 VITA3K_USE_WASM_JIT=1)
-target_link_libraries(vita3k_web_jit PRIVATE vita3k_web_runtime_hle vita3k_wasm_jit)
+target_link_libraries(vita3k_web_jit PRIVATE vita3k_web_runtime_hle vita3k_wasm_jit
+    vita3k_guest_thread_runtime)
+# The retail-app entry points are exported for the Worker, and the FS runtime is
+# exported so staged content can be uploaded into MEMFS before vita3k_web_run_app
+# (the browser build has no NODERAWFS). FORCE_FILESYSTEM keeps the FS library in
+# the link even when only the harness (not the guest) touches it.
 target_link_options(vita3k_web_jit PRIVATE
     -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=Vita3KWebJit
     -sENVIRONMENT=web,worker -sNO_EXIT_RUNTIME=1 -sASYNCIFY=1
-    ${VITA3K_WEB_INITIAL_MEMORY_LINK_OPTION} "-sEXPORTED_FUNCTIONS=['_main','_malloc','_free']")
+    -sFORCE_FILESYSTEM=1
+    ${VITA3K_WEB_INITIAL_MEMORY_LINK_OPTION}
+    "-sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_vita3k_web_set_app_paths','_vita3k_web_set_license_key','_vita3k_web_set_dispatch_budget','_vita3k_web_run_app']"
+    "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','cwrap']")
 add_custom_command(TARGET vita3k_web_jit POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dist"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

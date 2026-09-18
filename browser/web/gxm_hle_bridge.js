@@ -103,6 +103,42 @@ export function gxmDepthStencilState(format, depthCompare, depthWriteMode, loadM
     depthWriteEnabled: depthWriteMode === 0, clearValue };
 }
 
+// Guest SceGxmAttributeFormat (plus component count) to a WebGPU vertex format.
+// Pure and exported so the packet contract test covers the whole table without
+// a device. Only shapes a WebGPU vertex format represents exactly are listed:
+// the guest formats the shader reads as floats (normalized, F16 and F32). The
+// integer formats U8/S8/U16/S16 need a scaled or integer vertex input WebGPU
+// has no vertex format for, and UNTYPED needs an integer shader input the
+// translator does not declare; all three reject. WebGPU has no 1- or
+// 3-component 8/16-bit vertex format either, so those component counts are
+// absent here and reject rather than silently widening the fetch.
+const vertexFormats = {
+  4: { 2: 'unorm8x2', 4: 'unorm8x4' }, // U8N
+  5: { 2: 'snorm8x2', 4: 'snorm8x4' }, // S8N
+  6: { 2: 'unorm16x2', 4: 'unorm16x4' }, // U16N
+  7: { 2: 'snorm16x2', 4: 'snorm16x4' }, // S16N
+  8: { 2: 'float16x2', 4: 'float16x4' }, // F16
+  9: { 1: 'float32', 2: 'float32x2', 3: 'float32x3', 4: 'float32x4' }, // F32
+};
+export function gxmVertexFormat(format, components) {
+  if (!Number.isInteger(format) || !Number.isInteger(components))
+    throw new TypeError('vertex attribute format and component count must be integers');
+  const spec = vertexFormats[format];
+  const name = spec ? spec[components] : undefined;
+  if (!name) throw new Error(`unsupported vertex attribute format ${format}x${components}`);
+  return name;
+}
+
+// Guest texture formats the C++ producer accepts, always delivered as
+// rgba8unorm pixels: LINEAR U8U8U8U8_ABGR passes through byte-for-byte and
+// LINEAR U8U8_GRRR is expanded with the SWIZZLE2_GRRR component mapping
+// (RGB = first byte, alpha = second). Anything else rejects before the device.
+const guestTextureFormats = new Set([0x0c000000, 0x07002000]);
+export function gxmFragmentTextureFormat(format) {
+  if (!guestTextureFormats.has(format)) throw new Error(`unsupported fragment texture format ${format}`);
+  return 'rgba8unorm';
+}
+
 // Versioned host-owned packet, not a guest struct containing native pointers.
 // Copy every input before awaiting the compiler or device.
 export async function drawGuestSurface(packet, initialPixels, width, height) {
@@ -110,7 +146,7 @@ export async function drawGuestSurface(packet, initialPixels, width, height) {
   return enqueueGuestWork(() => drawOwnedSurface(packet, initialPixels, width, height));
 }
 // Pure decoder exported for lightweight packet contract tests (no GPU/compiler).
-// Only GXM3 is accepted: never silently interpret an old native producer.
+// Only GXM5 is accepted: never silently interpret an older native producer.
 export function decodeGuestDrawPacket(packet) {
   const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
   let cursor = 0;
@@ -133,7 +169,7 @@ export function decodeGuestDrawPacket(packet) {
     if (!Number.isSafeInteger(n) || n < 0 || cursor + n > packet.length) throw new Error('truncated GXM draw packet');
     const data = packet.slice(cursor, cursor + n); cursor += n; return data;
   };
-  if (word() !== 0x47584d34) throw new Error('unknown GXM draw packet version');
+  if (word() !== 0x47584d35) throw new Error('unknown GXM draw packet version');
   const stride = word(), indexSize = word();
   const lengths = Array.from({ length: 6 }, word);
   const attributeCount = word();
@@ -156,14 +192,13 @@ export function decodeGuestDrawPacket(packet) {
     const width = word(), height = word(), format = word();
     const min = word(), mag = word(), u = word(), v = word();
     textureLength = word();
-    // GXM LINEAR ABGR8 is little-endian RGBA bytes, already depadded by C++.
     // Packet sampler codes are the production enums, not WebGPU constants.
-    if (!width || !height || width > 4096 || height > 4096 || format !== 0x0c000000
+    if (!width || !height || width > 4096 || height > 4096
         || textureLength !== width * height * 4 || textureLength > 16 * 1024 * 1024
         || min > 1 || mag > 1 || u > 2 || v > 2)
       throw new Error('unsupported fragment texture packet');
     const filters = ['nearest', 'linear'], addresses = ['repeat', 'mirror-repeat', 'clamp-to-edge'];
-    fragmentTexture = { width, height, format: 'rgba8unorm', sampler: {
+    fragmentTexture = { width, height, format: gxmFragmentTextureFormat(format), sampler: {
       minFilter: filters[min], magFilter: filters[mag], addressModeU: addresses[u], addressModeV: addresses[v],
     } };
   }
@@ -173,9 +208,8 @@ export function decodeGuestDrawPacket(packet) {
     zOffset: float(), xScale: float(), yScale: float(), zScale: float() };
   const info = take(48);
   const attributes = Array.from({ length: attributeCount }, () => {
-    const shaderLocation = word(), offset = word(), components = word();
-    if (components < 1 || components > 4) throw new Error('unsupported attribute components');
-    return { shaderLocation, offset, format: components === 1 ? 'float32' : `float32x${components}` };
+    const shaderLocation = word(), offset = word(), components = word(), guestFormat = word();
+    return { shaderLocation, offset, format: gxmVertexFormat(guestFormat, components) };
   });
   const [indices, vertices, vertexGXP, fragmentGXP, vertexUniforms, fragmentUniforms] = lengths.map(take);
   if (fragmentTexture) fragmentTexture.pixels = take(textureLength);
@@ -230,7 +264,12 @@ async function drawOwnedSurface(packet, initialPixels, width, height) {
       indexFormat: indexSize === 2 ? 'uint16' : 'uint32', buffers,
       viewport: viewportRect,
       ...(fragmentTexture ? { fragmentTexture } : {}) }], { initialPixels,
-      ...(depth ? { depth } : {}) })).pixels;
+      // submit() validates the per-pass depth attachment against a strict
+      // { format, stencil, clearValue } shape; the per-pipeline depth state
+      // (compare/write) already flowed through createProgram above, so drop
+      // the decoder-side extras here.
+      ...(depth ? { depth: { format: depth.format, stencil: depth.stencil,
+        clearValue: depth.clearValue } } : {}) })).pixels;
   } finally {
     // submit has settled (including GPU readback) before either resource can
     // be released. Retain only the bounded device-local pipeline cache.

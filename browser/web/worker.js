@@ -141,6 +141,70 @@ self.onmessage = async ({ data }) => {
     }
     break;
   }
+  case 'stage-files': {
+    // MEMFS staging for the retail-app path. The browser build has no
+    // NODERAWFS, so content is uploaded into the Emscripten filesystem before
+    // vita3k_web_run_app resolves guest device paths under `<root>`. Every
+    // entry is fetched and sized by this side; the caller only names the
+    // logical paths and their URLs.
+    try {
+      const fs = module?.FS;
+      if (!fs) throw new Error('filesystem runtime is not exported by this module');
+      const root = typeof data.root === 'string' && data.root.startsWith('/') ? data.root : '/vita';
+      let files = 0, bytes = 0;
+      for (const entry of data.files || []) {
+        const path = String(entry?.path ?? '');
+        if (!path || path.startsWith('/') || path.split('/').includes('..'))
+          throw new RangeError(`unsafe staged path: ${path}`);
+        const response = await fetch(entry.url, { credentials: 'same-origin' });
+        if (!response.ok) throw new Error(`staged fetch failed (${response.status}): ${path}`);
+        const payload = new Uint8Array(await response.arrayBuffer());
+        if (Number.isSafeInteger(entry.size) && entry.size >= 0 && payload.byteLength !== entry.size)
+          throw new Error(`staged size mismatch for ${path}: ${payload.byteLength} != ${entry.size}`);
+        const target = `${root}/${path}`;
+        const directory = target.slice(0, target.lastIndexOf('/'));
+        if (directory) fs.mkdirTree(directory);
+        fs.writeFile(target, payload);
+        files += 1; bytes += payload.byteLength;
+      }
+      post({ type: 'staged', root, files, bytes });
+    } catch (error) {
+      post({ type: 'error', message: `stage-files failed: ${error}` });
+    }
+    break;
+  }
+  case 'run-app': {
+    // Retail-app launch (vita_app.cpp): the guest sees <vitaFs>/ux0/... and
+    // the module owns module loading, license setup and the main thread.
+    try {
+      if (!module?._vita3k_web_set_app_paths || !module?._vita3k_web_run_app)
+        throw new Error('retail-app entry points are not exported by this module');
+      // Pointers are i64 under Memory64: exported parameter wrappers only
+      // accept BigInt there, so route every address through the host-pointer
+      // helper (which returns BigInt for Memory64 and a Number otherwise).
+      const hostPointer = (value) => typeof module['vita3kHostPointer'] === 'function'
+        ? module['vita3kHostPointer'](value) : value;
+      module._vita3k_web_set_trace?.(data.trace ? 1 : 0);
+      module._vita3k_web_set_fast_vblank?.(data.fastVblank ? 1 : 0);
+      if (Number.isSafeInteger(data.dispatches) && data.dispatches > 0)
+        module._vita3k_web_set_dispatch_budget?.(data.dispatches);
+      module.ccall('vita3k_web_set_app_paths', null, ['string', 'string', 'string'],
+        [data.vitaFs || '/vita', data.title, data.app || data.title]);
+      if (data.licenseKey instanceof Uint8Array) {
+        if (data.licenseKey.byteLength !== 16) throw new RangeError('license key must be 16 bytes');
+        const allocation = module._malloc(16);
+        module.HEAPU8.set(data.licenseKey, allocation);
+        module._vita3k_web_set_license_key(hostPointer(allocation));
+        module._free(hostPointer(allocation));
+      } else {
+        module._vita3k_web_set_license_key(hostPointer(0));
+      }
+      module._vita3k_web_run_app();
+    } catch (error) {
+      post({ type: 'vita-exit', exitCode: -1, ok: false, message: String(error.stack || error) });
+    }
+    break;
+  }
   case 'shutdown':
     if (module?._vita3k_web_shutdown) module._vita3k_web_shutdown();
     transition('stopped');
