@@ -6,13 +6,13 @@
 // implementation, so the differential oracle here IS that same library
 // called directly: the fixtures therefore prove the wiring (lane packing,
 // helper dispatch, FPSCR flag OR-in, register writeback) rather than
-// re-deriving the algorithm. The LUT sweep additionally checks the
-// estimate table against its closed-form definition, which is the only
-// place a transcription error could hide.
+// re-deriving the algorithm. Hand-pinned special cases independently check
+// input flushing, default NaNs, underflow and newly raised flags, so using
+// the same library for the differential cannot hide a wrong control value.
 //
-// The helper executes under the standard FPSCR value (RN, FZ=0, DN=0) per
-// the A32 translator's fpcr_controlled=false call sites, so every fixture
-// blocks with FPSCR.RMode != 00 and asserts that rejection.
+// The helper executes under ASIMDStandardValue() (RN, FZ=1, DN=1) per the
+// A32 translator's fpcr_controlled=false call sites. Mode fixtures prove
+// live RMode/FZ/DN cannot perturb results, including matching region keys.
 namespace recip_tests {
 namespace A32 = Dynarmic::A32;
 namespace IR = Dynarmic::IR;
@@ -20,9 +20,9 @@ using Op = IR::Opcode;
 using Value = IR::Value;
 using Reason = vita3k::wasmjit::ExitReason;
 
-IR::Block blank(uint32_t pc = code) {
-    const A32::LocationDescriptor here{pc, A32::PSR{0x10}, A32::FPSCR{0}};
-    const A32::LocationDescriptor next{pc + 4, A32::PSR{0x10}, A32::FPSCR{0}};
+IR::Block blank(uint32_t pc = code, uint32_t fpscr = 0) {
+    const A32::LocationDescriptor here{pc, A32::PSR{0x10}, A32::FPSCR{fpscr}};
+    const A32::LocationDescriptor next{pc + 4, A32::PSR{0x10}, A32::FPSCR{fpscr}};
     IR::Block block{here};
     block.SetEndLocation(next);
     block.SetTerminal(IR::Term::LinkBlock{next});
@@ -80,9 +80,78 @@ void run(const IR::Block &block, const JitState &initial, const JitState *expect
     }
 }
 
-// Direct helper differential: every bit pattern, one lane at a time, against
-// the same Dynarmic entry points the helper calls. This proves the FP64Result
-// packing (bits + newly-raised flags only), not the algorithm.
+// Independent standard-FPSCR expectations: in particular, denormals are
+// zeros BEFORE estimating (IDC+DZC, not overflow), and DN discards NaN signs
+// and payloads. Check both the helper and the emitted block/region wiring.
+void hand_cases() {
+    struct Case { uint32_t operation, a, b, result, flags; };
+    const Case cases[] = {
+        {4, 0x00000000u, 0, 0x7f800000u, 0x02u}, // +0 -> +inf, DZC
+        {4, 0x80000000u, 0, 0xff800000u, 0x02u}, // -0 -> -inf, DZC
+        {4, 0x00000001u, 0, 0x7f800000u, 0x82u}, // FZ: +denormal -> +0, IDC+DZC
+        {4, 0x80000001u, 0, 0xff800000u, 0x82u}, // FZ preserves the input sign
+        {4, 0x007fffffu, 0, 0x7f800000u, 0x82u}, // largest denormal also flushes
+        {4, 0x807fffffu, 0, 0xff800000u, 0x82u},
+        {4, 0x7f800000u, 0, 0x00000000u, 0x00u}, // +inf -> +0, no UFC/DZC
+        {4, 0xff800000u, 0, 0x80000000u, 0x00u}, // -inf -> -0
+        {4, 0x7fc12345u, 0, 0x7fc00000u, 0x00u}, // DN qNaN, no IOC
+        {4, 0xffc12345u, 0, 0x7fc00000u, 0x00u}, // default NaN is positive
+        {4, 0x7f812345u, 0, 0x7fc00000u, 0x01u}, // DN sNaN still raises IOC
+        {4, 0xff812345u, 0, 0x7fc00000u, 0x01u},
+        {4, 0x3f800000u, 0, 0x3f7f8000u, 0x00u}, // RECPE(1): 511/512, no IXC
+        {4, 0x00800000u, 0, 0x7e7f8000u, 0x00u}, // min-normal is NOT flushed
+        {4, 0x7e800000u, 0, 0x00000000u, 0x08u}, // tiny estimate flushes, UFC only
+        {4, 0xff7fffffu, 0, 0x80000000u, 0x08u}, // negative tiny estimate -> -0
+        {5, 0x3f800000u, 0x3f800000u, 0x3f800000u, 0x00u}, // 2 - 1*1 = 1
+        {5, 0x3f800000u, 0x40000000u, 0x00000000u, 0x00u}, // exact cancellation is +0 (RN)
+        {5, 0x00000000u, 0x7f800000u, 0x40000000u, 0x00u}, // special 0*inf -> 2, no IOC
+        {5, 0x80000001u, 0x7f800000u, 0x40000000u, 0x80u}, // flushed 0*inf -> 2, IDC only
+        {5, 0xff800000u, 0x007fffffu, 0x40000000u, 0x80u}, // either operand flushes
+        {5, 0x00000001u, 0x3f800000u, 0x40000000u, 0x80u},
+        {5, 0xffc12345u, 0x3f800000u, 0x7fc00000u, 0x00u}, // DN also covers negated a
+        {5, 0x3f800000u, 0xff812345u, 0x7fc00000u, 0x01u}, // signaling b -> IOC
+        {5, 0x7fc12345u, 0x00000001u, 0x7fc00000u, 0x80u}, // unpack BOTH before NaNs
+        {5, 0x80000001u, 0x7f812345u, 0x7fc00000u, 0x81u}, // IDC survives IOC
+        {5, 0x7f800000u, 0x3f800000u, 0xff800000u, 0x00u}, // infinite result, no OFC/IXC
+        {5, 0x7f7fffffu, 0x40000000u, 0xff800000u, 0x14u}, // finite overflow, OFC+IXC
+        {5, 0x00800000u, 0x00800000u, 0x40000000u, 0x10u}, // tiny PRODUCT, normal fused result: IXC, not UFC
+        {5, 0x3f800001u, 0x3ffffffeu, 0x29000000u, 0x00u}, // exact fused residual 2^-45
+    };
+    for (const auto &item : cases) {
+        for (uint32_t mode = 0; mode < 16; ++mode) {
+            const auto result = vita3k::wasmjit::fp64_arithmetic(
+                item.operation, item.a, item.b, (mode << 22) | 0xa8000004u);
+            if (result.bits != item.result || result.flags != item.flags)
+                std::fprintf(stderr, "recip hand op=%u mode=%x a=%08x b=%08x got=%08x/%02x want=%08x/%02x\n",
+                    item.operation, mode, item.a, item.b, uint32_t(result.bits), result.flags, item.result, item.flags);
+            CHECK(result.bits == item.result);
+            CHECK(result.flags == item.flags); // never return preexisting flags/mode bits
+        }
+        for (uint32_t scr : {0u, 0x03c00000u}) {
+            auto block = blank(code, scr);
+            const auto a = read_q(block);
+            const auto result = item.operation == 4
+                ? append(block, Op::FPVectorRecipEstimate32, {a, Value{false}})
+                : append(block, Op::FPVectorRecipStepFused32, {a, read_q(block, 2), Value{false}});
+            write_q(block, result, 1);
+            auto state = base_state();
+            state.fpscr = scr | 0xa8000004u; // preserve NZCV/QC and a preexisting OFC
+            for (unsigned lane = 0; lane < 4; ++lane) {
+                state.fpu[lane] = item.a;
+                state.fpu[8 + lane] = item.b;
+            }
+            auto expected = state;
+            for (unsigned lane = 0; lane < 4; ++lane) expected.fpu[4 + lane] = item.result;
+            expected.fpscr |= item.flags;
+            run(block, state, &expected); // matching non-RN region keys must execute too
+        }
+    }
+    std::puts("recip hand cases: standard FZ/DN, fused results, flags and mode independence passed");
+}
+
+// Direct helper differential: sampled bit patterns, one lane at a time,
+// against the same Dynarmic entry points the helper calls. This proves the
+// FP64Result packing (bits + newly-raised flags only), not the algorithm.
 void helper_differential() {
     using vita3k::wasmjit::fp64_arithmetic;
     uint32_t rng = 0x9e3779b9;
@@ -93,7 +162,7 @@ void helper_differential() {
         const uint32_t lane_b = iteration < 8 ? uint32_t(0x00800000 * iteration) : rng;
         for (uint32_t operation : {4u, 5u}) {
             const auto result = fp64_arithmetic(operation, lane_a, lane_b, 0);
-            Dynarmic::FP::FPCR fpcr{0};
+            const auto fpcr = Dynarmic::FP::FPCR{0}.ASIMDStandardValue();
             Dynarmic::FP::FPSR fpsr{0};
             const uint32_t oracle = operation == 4
                 ? Dynarmic::FP::FPRecipEstimate<uint32_t>(lane_a, fpcr, fpsr)
@@ -147,7 +216,7 @@ void ir_lanes() {
         JitState expected = state;
         uint32_t fpscr = 0;
         for (unsigned lane = 0; lane < 4; ++lane) {
-            Dynarmic::FP::FPCR fpcr{0};
+            const auto fpcr = Dynarmic::FP::FPCR{0}.ASIMDStandardValue();
             Dynarmic::FP::FPSR fpsr{0};
             const uint32_t a = state.fpu[lane], b = state.fpu[8 + lane];
             expected.fpu[4 + lane] = Dynarmic::FP::FPRecipEstimate<uint32_t>(a, fpcr, fpsr);
@@ -159,6 +228,31 @@ void ir_lanes() {
         run(block, state, &expected);
     }
     std::printf("recip ir lanes: %zu cases x 2 ops x (block+region) passed\n", cases.size());
+}
+
+// Only an immediate fpcr_controlled=false is supported. A runtime U1
+// (even one whose live value would be false) must not bypass the shape guard.
+void immediate_guards() {
+    for (Op op : {Op::FPVectorRecipEstimate32, Op::FPVectorRecipStepFused32}) {
+        for (unsigned shape : {0u, 1u, 2u}) {
+            auto block = blank();
+            const auto controlled = shape == 2 ? append(block, Op::A32GetCFlag) : Value{shape == 1};
+            const auto a = read_q(block);
+            const auto result = op == Op::FPVectorRecipEstimate32
+                ? append(block, op, {a, controlled})
+                : append(block, op, {a, read_q(block, 2), controlled});
+            write_q(block, result, 1);
+            const A32::LocationDescriptor at{block.Location()};
+            for (bool region : {false, true}) {
+                const auto bytes = region
+                    ? vita3k::wasmjit::emit_region({&block}, {{at.PC(), PSR_DISPATCH_MASK,
+                        at.CPSR().Value() & PSR_DISPATCH_MASK, 1}})
+                    : vita3k::wasmjit::emit_block(block);
+                CHECK(bytes.empty() == (shape != 0));
+            }
+        }
+    }
+    std::puts("recip immediate guards: controlled=true and non-immediate U1 reject in block/region modes");
 }
 
 // The estimate runs under the standard FPSCR value regardless of the live
@@ -178,7 +272,7 @@ void scr_guards() {
         // Oracle: the standard-FPSCR estimate, identical for every live FPSCR.
         JitState expected = state;
         for (unsigned lane = 0; lane < 4; ++lane) {
-            Dynarmic::FP::FPCR fpcr{0};
+            const auto fpcr = Dynarmic::FP::FPCR{0}.ASIMDStandardValue();
             Dynarmic::FP::FPSR fpsr{0};
             expected.fpu[4 + lane] = Dynarmic::FP::FPRecipEstimate<uint32_t>(state.fpu[lane], fpcr, fpsr);
             CHECK(fpsr.Value() == 0); // normal inputs raise no cumulative flags
@@ -197,10 +291,10 @@ void scr_guards() {
         }
         // Region mode Misses cleanly: FPSCR mode bits are part of the
         // block's translation key, so the dispatch leaf refuses entry with
-        // zero architectural writes and the host re-dispatches. This is the
-        // correct product behavior (real guest code runs these PCs under
-        // the standard FPSCR); the block-mode half above proves the emitter
-        // itself ignores the mode bits per fpcr_controlled=false.
+        // zero architectural writes and the host re-dispatches with the
+        // matching key. The hand cases above also execute matching non-RN
+        // regions; the block-mode half here proves the emitter itself
+        // ignores the mode bits per fpcr_controlled=false.
         {
             const A32::LocationDescriptor at{block.Location()};
             const auto bytes = vita3k::wasmjit::emit_region({&block}, {{at.PC(), PSR_DISPATCH_MASK,
@@ -273,7 +367,7 @@ void limbo_sequence() {
     JitState expected = state;
     uint32_t fpscr = 0;
     for (unsigned lane = 0; lane < 4; ++lane) {
-        Dynarmic::FP::FPCR fpcr{0};
+        const auto fpcr = Dynarmic::FP::FPCR{0}.ASIMDStandardValue();
         Dynarmic::FP::FPSR fpsr{0};
         const uint32_t raw = state.fpu[lane];
         // VCVT fbits=0: plain i32 -> f32 via exact double widening.
@@ -293,8 +387,10 @@ void limbo_sequence() {
 }
 
 inline void run() {
+    hand_cases();
     helper_differential();
     ir_lanes();
+    immediate_guards();
     scr_guards();
     limbo_sequence();
 }

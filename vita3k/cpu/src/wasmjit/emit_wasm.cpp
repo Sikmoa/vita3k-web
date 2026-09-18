@@ -97,7 +97,7 @@ enum Wasm : uint8_t {
     CallIndirect = 0x11, Select = 0x1b,
     Get = 0x20, Set = 0x21, Load = 0x28, Load64 = 0x29, Load8U = 0x2d, Load16U = 0x2f,
     Store = 0x36, Store8 = 0x3a, Store16 = 0x3b, Const = 0x41,
-    Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtU = 0x49, GtS = 0x4a, GtU = 0x4b, LeU = 0x4d, GeU = 0x4e, Eqz64 = 0x50,
+    Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtU = 0x49, GtS = 0x4a, GtU = 0x4b, LeU = 0x4d, GeU = 0x4f, Eqz64 = 0x50,
     Clz = 0x67, Add = 0x6a, Sub = 0x6b, Mul = 0x6c, And = 0x71, Or = 0x72, Xor = 0x73,
     Shl = 0x74, ShrS = 0x75, ShrU = 0x76, RotR = 0x78,
     Add64 = 0x7c, Sub64 = 0x7d, Mul64 = 0x7e, Or64 = 0x84, Shl64 = 0x86, ShrU64 = 0x88, ShrS64 = 0x87, Wrap = 0xa7, ExtendU = 0xad,
@@ -2358,6 +2358,60 @@ private:
             get(next_local + 3); op(Select);
             break;
         }
+        case Op::FPVectorEqual32:
+        case Op::FPVectorGreater32:
+        case Op::FPVectorGreaterEqual32: {
+            // A32 VCEQ/VCGT/VCGE.f32 use StandardFPSCRValue: RN, FZ=DN=1,
+            // regardless of the live mode bits. LT/LE are GT/GE with swapped
+            // operands in the frontend. Compare integer bit-pattern keys so
+            // Wasm cannot quiet an sNaN before we account for its exception.
+            // Ordered GT/GE signal IOC for ANY NaN; EQ only for an sNaN.
+            if (!inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetType() != Type::U1
+                || inst.GetArg(2).GetU1())
+                return false;
+            load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+            begin_if(); ret(ExitReason::Unsupported); end_if();
+            const auto a = next_local + 4, b = next_local + 5;
+            const auto nan = next_local + 6, flags = next_local + 7;
+            imm(0); set(flags);
+            for (unsigned word = 0; word < 4; ++word) {
+                imm(0); set(nan);
+                for (unsigned i = 0; i < 2; ++i) {
+                    const auto slot = a + i;
+                    value_word(inst.GetArg(i), word); set(slot);
+                    get(slot); mask(0x7fffffff); imm(0x7f800000); op(GtU);
+                    begin_if();
+                    imm(1); set(nan);
+                    get(flags);
+                    if (kind == Op::FPVectorEqual32) { get(slot); mask(0x00400000); op(Eqz); }
+                    else imm(1);
+                    op(Or); set(flags);
+                    end_if();
+                    // FZ is unconditionally on. Unpack BOTH operands even
+                    // for unordered lanes: a NaN must not suppress IDC.
+                    get(slot); mask(0x7fffffff); imm(0x00800000); op(LtU);
+                    get(slot); mask(0x7fffffff); op(Eqz); op(Eqz); op(And);
+                    begin_if();
+                    get(flags); imm(0x80); op(Or); set(flags);
+                    get(slot); mask(0x80000000); set(slot);
+                    end_if();
+                    // +/-0 compare equal. Negatives sort by complemented
+                    // bits; nonnegatives by bits with the sign bit toggled.
+                    get(slot); mask(0x7fffffff); op(Eqz);
+                    begin_if(); imm(0); set(slot); end_if();
+                    get(slot); imm(0xffffffff); imm(0x80000000);
+                    get(slot); imm(31); op(ShrU); op(Select); op(Xor); set(slot);
+                }
+                imm(0);
+                get(a); get(b);
+                op(kind == Op::FPVectorEqual32 ? Eq : kind == Op::FPVectorGreater32 ? GtU : GeU);
+                get(nan); op(Eqz); op(And);
+                op(Sub); set(next_local + word); // 0 - predicate = all ones/zero
+            }
+            get(0); load(offsetof(JitState, fpscr)); get(flags); op(Or);
+            store(offsetof(JitState, fpscr));
+            return ok;
+        }
         case Op::FPFixedS32ToSingle:
         case Op::FPFixedU32ToSingle:
             // The IR carries an explicit rounding mode (scalar integer VCVT
@@ -2403,19 +2457,13 @@ private:
         case Op::FPVectorMul32:
         case Op::FPVectorAdd32:
         case Op::FPVectorSub32: {
-            // Four-lane binary32 add/sub/mul (vadd/vsub/vmul.f32). Only the
-            // standard-FPSCR form (fpcr_controlled=false) is emitted: RN is
-            // what Wasm f32 arithmetic implements, FZ=0 means no input
-            // flushing, DN=0 means NaNs propagate quieted. The IR op always
-            // spans the full U128 (D-form lanes read as zero from GetVector
-            // and their flags accumulate in the interpreter too), so all
-            // four lanes execute. Per-lane logic mirrors the verified scalar
-            // FP arithmetic lowering with FZ/DN/RMode pinned to standard:
-            // NaN priority, invalid combinations, the narrow result, then
-            // the wide f64 computation for the IXC/UFC/OFC cumulative
-            // flags (add/sub keep the scalar's reverse-sum lost-addend
-            // check). Locals: results in next_local[0..3], temporaries
-            // above (10 slots per inst).
+            // Four-lane binary32 add/sub/mul (vadd/vsub/vmul.f32). A32's
+            // standard FPSCR (fpcr_controlled=false) means RN, FZ=DN=1:
+            // denormals flush to signed zero, and NaNs become the default
+            // NaN. The full U128 executes (D-form upper lanes read as zero).
+            // As in scalar FP, f64 detects inexactness and pre-rounding
+            // tininess; reverse sums catch lost addends in add/sub. A tiny
+            // nonzero result is flushed with UFC but without IXC.
             if (!inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU1() != 0)
                 return false;
             const bool multiply = kind == Op::FPVectorMul32;
@@ -2433,27 +2481,30 @@ private:
             };
             const auto wide_combine = [&] {
                 get(la); op(0xbe); op(0xbb);
-                get(lb); op(0xbe); op(0xbb); op(wide_op); // exact in f64
+                get(lb); op(0xbe); op(0xbb); op(wide_op);
             };
             for (unsigned word = 0; word < 4; ++word) {
-                value_word(inst.GetArg(0), word); set(la);
-                value_word(inst.GetArg(1), word); set(lb);
-                get(la); mask(0x7fffffff); set(laa);
-                get(lb); mask(0x7fffffff); set(lab);
                 imm(0); set(lnan);
-                // ARM NaN priority: first signaling operand, then first
-                // quiet operand. Reverse iteration lets the first win.
-                for (bool signaling : {false, true}) for (int i = 1; i >= 0; --i) {
-                    const auto s = i == 0 ? la : lb, sab = i == 0 ? laa : lab;
-                    get(sab); imm(0x7f800000); op(GtU);
-                    if (signaling) { get(s); mask(0x00400000); op(Eqz); op(And); }
+                for (unsigned i = 0; i < 2; ++i) {
+                    const auto s = la + i, sab = laa + i;
+                    value_word(inst.GetArg(i), word); set(s);
+                    get(s); mask(0x7fffffff); set(sab);
+                    get(sab); imm(0x00800000); op(LtU);
+                    get(sab); op(Eqz); op(Eqz); op(And);
                     begin_if();
-                    get(s); imm(0x00400000); op(Or); set(lnan);
-                    if (signaling) laccumulate(1);
+                    laccumulate(0x80);
+                    get(s); mask(0x80000000); set(s);
+                    imm(0); set(sab);
+                    end_if();
+                    get(sab); imm(0x7f800000); op(GtU);
+                    begin_if();
+                    imm(1); set(lnan);
+                    get(s); mask(0x00400000); op(Eqz);
+                    begin_if(); laccumulate(1); end_if();
                     end_if();
                 }
                 get(lnan); begin_if();
-                get(lnan); set(next_local + word); // DN=0: propagate quieted
+                imm(0x7fc00000); set(next_local + word); // standard DN=1
                 op(Else);
                 if (multiply) {
                     get(laa); op(Eqz); get(lab); imm(0x7f800000); op(Eq); op(And);
@@ -2468,22 +2519,22 @@ private:
                     else { op(Eqz); op(Eqz); }
                     op(And);
                 }
-                begin_if(); // invalid combination
+                begin_if();
                 laccumulate(1); imm(0x7fc00000); set(next_local + word);
                 op(Else);
                 get(la); op(0xbe); get(lb); op(0xbe); op(narrow_op);
                 op(0xbc); set(next_local + word);
-                // Infinite inputs that survive NaN/invalid selection produce
-                // exact infinities; only finite lanes need the wide check
-                // (and the reverse sums misfire on infinities: inf-inf=NaN).
+                // Surviving infinite inputs produce exact infinities. Avoid
+                // their reverse sums (inf-inf=NaN) and spurious IXC/OFC.
                 get(laa); imm(0x7f800000); op(LtU);
-                get(lab); imm(0x7f800000); op(LtU); op(And);
-                // Both operands finite here, so the wide combination is exact.
-                // lnan is dead past NaN selection: reuse it for tininess.
+                get(lab); imm(0x7f800000); op(LtU); op(And); begin_if();
                 wide_combine(); op(0x99); // f64.abs
                 imm(0x00800000); op(0xbe); op(0xbb); op(0x63); // < min-normal
                 wide_combine(); imm(0); op(0xbe); op(0xbb); op(0x62); // != 0
-                op(And); set(lnan);
+                op(And); begin_if();
+                laccumulate(8); // FZ flush: no additional IXC, even if exact
+                get(next_local + word); mask(0x80000000); set(next_local + word);
+                op(Else);
                 wide_combine(); get(next_local + word); op(0xbe); op(0xbb); op(0x62);
                 if (!multiply) {
                     // If the exponent gap exceeds binary64 precision, even the
@@ -2494,12 +2545,11 @@ private:
                     wide_combine(); get(lb); op(0xbe); op(0xbb); op(subtract ? 0xa0 : 0xa1);
                     get(la); op(0xbe); op(0xbb); op(0x62); op(Or);
                 }
-                op(And); begin_if();
+                begin_if();
                 laccumulate(0x10);
-                get(lnan); begin_if(); laccumulate(8); end_if();
                 get(next_local + word); mask(0x7fffffff); imm(0x7f800000); op(Eq);
                 begin_if(); laccumulate(4); end_if();
-                end_if();
+                end_if(); end_if(); end_if();
                 end_if(); end_if();
             }
             get(0); load(offsetof(JitState, fpscr)); get(lflags); op(Or);
@@ -2514,6 +2564,10 @@ private:
             // under the standard FPSCR value; the native helper re-derives
             // every result from the vendored Dynarmic FP implementation.
             // Like FPAdd64 and friends, live exception enables must be clear.
+            const bool fused = kind == Op::FPVectorRecipStepFused32;
+            const auto control = inst.GetArg(fused ? 2 : 1);
+            if (!control.IsImmediate() || control.GetType() != Type::U1 || control.GetU1())
+                return false;
             load(offsetof(JitState, fpscr)); mask(0x00009f00u);
             begin_if(); ret(ExitReason::Unsupported); end_if();
             // fp64.h contract for operations 4/5: the a lane rides in the
@@ -2521,7 +2575,6 @@ private:
             // (the two i64 operand words the scalar ops pack). The b lane
             // is republished per lane: the helper overwrites memory_value[0]
             // with the result bits on every call, and lanes generally differ.
-            const bool fused = kind == Op::FPVectorRecipStepFused32;
             for (unsigned word = 0; word < 4; ++word) {
                 if (fused) {
                     get(0); value_word(inst.GetArg(1), word);

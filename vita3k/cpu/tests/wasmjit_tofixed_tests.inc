@@ -6,16 +6,16 @@
 // implementation, so the differential oracle here IS that same library
 // called directly: the fixtures prove the wiring (immediate-shape gating,
 // lane packing, helper dispatch, FPSCR flag OR-in, register writeback)
-// rather than re-deriving the conversion. No LUT or closed form exists to
-// cross-check against (unlike RECPE), so the edge-class sweep leans on the
-// algorithm's specified boundary behaviors: NaN/inf/overflow saturate with
-// IOC, negative inputs to the unsigned conversion trap to zero with IOC,
-// exact integers raise nothing, and any discarded fraction raises IXC.
+// rather than re-deriving the conversion. Independent hand-pinned cases
+// check zero-with-IOC for NaNs/negative unsigned inputs, saturation with IOC
+// for overflow, and IXC for discarded fractions. FZ input flushing happens
+// first: either sign of subnormal becomes zero with IDC only, even unsigned.
 //
 // The helper executes the standard VCVT shape only (fbits=0, TowardsZero
-// rounding, fpcr_controlled=false) per the A32 translator's call sites, so
-// every other immediate shape must reject the block, and every fixture runs
-// with FPSCR.RMode != 00 to prove the mode bits cannot perturb the result.
+// rounding, fpcr_controlled=false) under ASIMDStandardValue() (FZ=1, DN=1;
+// explicit rounding overrides RN). Every other immediate shape must reject.
+// Mode fixtures vary live RMode/FZ/DN and match region keys to prove these
+// bits cannot perturb the standard-FPSCR conversion.
 #include <dynarmic/common/fp/op/FPToFixed.h>
 #include <dynarmic/common/fp/rounding_mode.h>
 namespace tofixed_tests {
@@ -25,9 +25,9 @@ using Op = IR::Opcode;
 using Value = IR::Value;
 using Reason = vita3k::wasmjit::ExitReason;
 
-IR::Block blank(uint32_t pc = code) {
-    const A32::LocationDescriptor here{pc, A32::PSR{0x10}, A32::FPSCR{0}};
-    const A32::LocationDescriptor next{pc + 4, A32::PSR{0x10}, A32::FPSCR{0}};
+IR::Block blank(uint32_t pc = code, uint32_t fpscr = 0) {
+    const A32::LocationDescriptor here{pc, A32::PSR{0x10}, A32::FPSCR{fpscr}};
+    const A32::LocationDescriptor next{pc + 4, A32::PSR{0x10}, A32::FPSCR{fpscr}};
     IR::Block block{here};
     block.SetEndLocation(next);
     block.SetTerminal(IR::Term::LinkBlock{next});
@@ -86,7 +86,7 @@ void run(const IR::Block &block, const JitState &initial, const JitState *expect
 }
 
 uint32_t oracle_tofixed(uint32_t lane, bool unsigned_, uint32_t &flags) {
-    Dynarmic::FP::FPCR fpcr{0};
+    const auto fpcr = Dynarmic::FP::FPCR{0}.ASIMDStandardValue();
     Dynarmic::FP::FPSR fpsr{0};
     const uint64_t result = Dynarmic::FP::FPToFixed<uint32_t>(
         32, lane, 0, unsigned_, fpcr, Dynarmic::FP::RoundingMode::TowardsZero, fpsr);
@@ -94,11 +94,75 @@ uint32_t oracle_tofixed(uint32_t lane, bool unsigned_, uint32_t &flags) {
     return uint32_t(result & 0xffffffffu);
 }
 
-// Direct helper differential: every bit pattern, one lane at a time, against
-// the same Dynarmic entry point the helper calls. Edge classes are pinned
-// first (NaN payloads, infinities, signed zeros, overflow boundaries at
-// 2^31/2^32, INT_MIN, fractions) so the saturate-with-IOC and truncate-with-
-// IXC paths are covered even if the PRNG never lands on them.
+// These expectations do not call the vendored oracle. In particular, FZ
+// must replace the old denormal IXC/unsigned IOC outcomes with IDC only.
+void hand_cases() {
+    struct Case { uint32_t lane, signed_result, signed_flags, unsigned_result, unsigned_flags; };
+    const Case cases[] = {
+        {0x00000000u, 0, 0x00u, 0, 0x00u}, // signed zeros convert exactly
+        {0x80000000u, 0, 0x00u, 0, 0x00u},
+        {0x00000001u, 0, 0x80u, 0, 0x80u}, // min subnormal: IDC, no IXC/UFC
+        {0x80000001u, 0, 0x80u, 0, 0x80u}, // negative subnormal: no unsigned IOC
+        {0x007fffffu, 0, 0x80u, 0, 0x80u}, // max subnormal still flushes
+        {0x807fffffu, 0, 0x80u, 0, 0x80u},
+        {0x00800000u, 0, 0x10u, 0, 0x10u}, // min normal does NOT flush: IXC
+        {0x80800000u, 0, 0x10u, 0, 0x01u}, // negative normal is unsigned invalid
+        {0x7fc12345u, 0, 0x01u, 0, 0x01u}, // qNaN -> integer zero + IOC
+        {0xffc12345u, 0, 0x01u, 0, 0x01u}, // NaN sign/payload cannot survive conversion
+        {0x7f812345u, 0, 0x01u, 0, 0x01u}, // sNaN -> integer zero + IOC
+        {0xff812345u, 0, 0x01u, 0, 0x01u},
+        {0x7f800000u, 0x7fffffffu, 0x01u, 0xffffffffu, 0x01u}, // +inf saturates
+        {0xff800000u, 0x80000000u, 0x01u, 0, 0x01u}, // -inf saturates
+        {0x3f800000u, 1, 0x00u, 1, 0x00u}, // +1 exact
+        {0xbf800000u, 0xffffffffu, 0x00u, 0, 0x01u}, // -1 exact signed, unsigned IOC
+        {0x3f7fffffu, 0, 0x10u, 0, 0x10u}, // truncate, never round to 1
+        {0xbf7fffffu, 0, 0x10u, 0, 0x01u},
+        {0x3fc00000u, 1, 0x10u, 1, 0x10u}, // 1.5 -> 1 + IXC, regardless of RMode
+        {0xbfc00000u, 0xffffffffu, 0x10u, 0, 0x01u}, // -1.5 -> -1, unsigned IOC only
+        {0x4effffffu, 0x7fffff80u, 0x00u, 0x7fffff80u, 0x00u}, // last f32 below 2^31
+        {0x4f000000u, 0x7fffffffu, 0x01u, 0x80000000u, 0x00u}, // +2^31 fits unsigned
+        {0xcf000000u, 0x80000000u, 0x00u, 0, 0x01u}, // INT_MIN fits signed
+        {0xcf000001u, 0x80000000u, 0x01u, 0, 0x01u}, // below INT_MIN saturates
+        {0x4f7fffffu, 0x7fffffffu, 0x01u, 0xffffff00u, 0x00u}, // last f32 below 2^32
+        {0x4f800000u, 0x7fffffffu, 0x01u, 0xffffffffu, 0x01u}, // 2^32 overflows both
+        {0x7f7fffffu, 0x7fffffffu, 0x01u, 0xffffffffu, 0x01u}, // no OFC/IXC on saturation
+        {0xff7fffffu, 0x80000000u, 0x01u, 0, 0x01u},
+    };
+    for (const auto &item : cases) {
+        for (uint32_t operation : {6u, 7u}) {
+            const bool unsigned_ = operation == 7;
+            const uint32_t bits = unsigned_ ? item.unsigned_result : item.signed_result;
+            const uint32_t flags = unsigned_ ? item.unsigned_flags : item.signed_flags;
+            for (uint32_t mode = 0; mode < 16; ++mode) {
+                const auto result = vita3k::wasmjit::fp64_arithmetic(
+                    operation, item.lane, 0, (mode << 22) | 0xa8000004u);
+                if (result.bits != bits || result.flags != flags)
+                    std::fprintf(stderr, "tofixed hand op=%u mode=%x lane=%08x got=%08x/%02x want=%08x/%02x\n",
+                        operation, mode, item.lane, uint32_t(result.bits), result.flags, bits, flags);
+                CHECK(result.bits == bits);
+                CHECK(result.flags == flags); // return only newly raised flags
+            }
+            for (uint32_t scr : {0u, 0x03c00000u}) {
+                auto block = blank(code, scr);
+                write_q(block, append(block, unsigned_ ? Op::FPVectorToUnsignedFixed32 : Op::FPVectorToSignedFixed32,
+                    {read_q(block), Value{uint8_t(0)}, Value{uint8_t(3)}, Value{false}}), 1);
+                auto state = base_state();
+                state.fpscr = scr | 0xa8000004u; // retain NZCV/QC and preexisting OFC
+                for (unsigned lane = 0; lane < 4; ++lane) state.fpu[lane] = item.lane;
+                auto expected = state;
+                for (unsigned lane = 0; lane < 4; ++lane) expected.fpu[4 + lane] = bits;
+                expected.fpscr |= flags;
+                run(block, state, &expected); // both matching-key modes must execute
+            }
+        }
+    }
+    std::puts("tofixed hand cases: FZ/IDC, NaNs, saturation, truncation and mode independence passed");
+}
+
+// Direct helper differential: sampled bit patterns, one lane at a time,
+// against the same Dynarmic entry point the helper calls. Seed the sweep
+// with NaN payloads, infinities, signed zeros, overflow boundaries at
+// 2^31/2^32, INT_MIN and fractions alongside the independent cases above.
 void helper_differential() {
     using vita3k::wasmjit::fp64_arithmetic;
     const uint32_t edges[] = {
@@ -108,7 +172,7 @@ void helper_differential() {
         0x3f800000u, 0xbf800000u, // +/-1
         0x3f7fffffu, 0xbf7fffffu, // just below 1 (IXC, truncate to 0)
         0x3fc00000u, 0xbfc00000u, // +/-1.5 (IXC)
-        0x4f000000u, 0xcf000000u, // +/-2^31 (signed edge, unsigned overflow)
+        0x4f000000u, 0xcf000000u, // +/-2^31 (signed boundary; +2^31 fits unsigned)
         0x4f000001u, 0xcf000001u,
         0x4f800000u, // 2^32 (both overflow)
         0xcf800000u, // -2^32
@@ -340,7 +404,7 @@ void limbo_shape() {
     JitState state = base_state();
     state.fpu[0] = 0x3b800000u; // 1/16384: Wwise-style fractional gain
     state.fpu[1] = 0x447a0000u; // 1000.0
-    state.fpu[2] = 0x4f000000u; // 2^31: unsigned overflow, saturates with IOC
+    state.fpu[2] = 0x4f000000u; // 2^31: exactly representable unsigned, no IOC
     state.fpu[3] = 0xbf800000u; // -1.0: unsigned invalid, zero with IOC
     JitState expected = state;
     uint32_t fpscr = 0;
@@ -355,6 +419,7 @@ void limbo_shape() {
 }
 
 inline void run() {
+    hand_cases();
     helper_differential();
     ir_lanes();
     immediate_guards();

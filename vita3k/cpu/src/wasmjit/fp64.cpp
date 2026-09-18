@@ -179,14 +179,14 @@ uint64_t quotient_jam(uint64_t a, uint64_t b) noexcept {
 // Binary32 lane helpers backed by the vendored Dynarmic implementation
 // (common/fp/op/FPRecipEstimate.cpp, FPRecipStepFused.cpp). The A32 decoder
 // emits fpcr_controlled=false for the vector RECPE/VRECPS instructions, which
-// means the STANDARD FPSCR value (FPCR: RN, FZ=0, DN=0; AHP irrelevant at
-// esize 32) and the FPSR cumulative flags in bits [7,4:0]. Exception enables
+// means the STANDARD FPSCR value (FPCR: RN, FZ=1, DN=1; AHP/FZ16 irrelevant
+// at esize 32) and the FPSR cumulative flags in bits [7,4:0]. Exception enables
 // are rejected by the emitter before the helper can run, so FPProcessException
 // never hits its ASSERT_FALSE trap path. The u32 result and the newly raised
 // flag bits map one-to-one onto the FP64Result contract.
 FP64Result fp32_lane_estimate(uint32_t operation, uint32_t lane_a, uint32_t lane_b) noexcept {
-    const Dynarmic::FP::FPCR fpcr{0}; // standard FPSCR: RN, FZ=0, DN=0
-    Dynarmic::FP::FPSR fpsr{0};       // cumulative flags, freshly cleared
+    const auto fpcr = Dynarmic::FP::FPCR{0}.ASIMDStandardValue(); // RN, FZ=1, DN=1
+    Dynarmic::FP::FPSR fpsr{0}; // cumulative flags, freshly cleared
     uint32_t result;
     if (operation == 4) {
         result = Dynarmic::FP::FPRecipEstimate<uint32_t>(lane_a, fpcr, fpsr);
@@ -200,12 +200,13 @@ FP64Result fp32_lane_estimate(uint32_t operation, uint32_t lane_a, uint32_t lane
 // implementation (common/fp/op/FPToFixed.cpp). The A32 translator emits the
 // standard VCVT shape (fbits=0, TowardsZero, fpcr_controlled=false), so the
 // conversion always runs as FPToFixed(ibits=32, fbits=0, TowardsZero) under
-// the standard FPSCR value. The emitter rejects any other immediate shape
-// before the helper can run. The u32 result and the newly raised flag bits
-// map one-to-one onto the FP64Result contract.
+// the standard FPSCR value (FZ=1, DN=1, with explicit TowardsZero rounding).
+// Flushed subnormal inputs return zero with IDC, not IOC/IXC. The emitter
+// rejects any other immediate shape before the helper can run. The u32
+// result and the newly raised flag bits map onto the FP64Result contract.
 FP64Result fp32_lane_to_fixed(uint32_t operation, uint32_t lane) noexcept {
-    const Dynarmic::FP::FPCR fpcr{0}; // standard FPSCR: RN, FZ=0, DN=0
-    Dynarmic::FP::FPSR fpsr{0};       // cumulative flags, freshly cleared
+    const auto fpcr = Dynarmic::FP::FPCR{0}.ASIMDStandardValue(); // RN, FZ=1, DN=1
+    Dynarmic::FP::FPSR fpsr{0}; // cumulative flags, freshly cleared
     const bool unsigned_ = operation == 7;
     const uint64_t result = Dynarmic::FP::FPToFixed<uint32_t>(
         32, lane, 0, unsigned_, fpcr, Dynarmic::FP::RoundingMode::TowardsZero, fpsr);

@@ -97,6 +97,7 @@ void equal_context(const CPUContext &a, const CPUContext &b) {
 #include "wasmjit_vector_tests.inc"
 #include "wasmjit_vector_integer_tests.inc"
 #include "wasmjit_vector_compare_tests.inc"
+#include "wasmjit_vectorfp_compare_tests.inc"
 #include "wasmjit_byte_reverse_tests.inc"
 #include "wasmjit_f64_tests.inc"
 #include "fp64_helper_tests.inc"
@@ -1757,6 +1758,7 @@ int main() {
     vector_integer_tests::guest_arithmetic(mem);
     vector_compare_tests::ir_comparisons();
     vector_compare_tests::guest_comparisons(mem);
+    vectorfp_compare_tests::run(mem);
     byte_reverse_tests::ir_reversal();
     byte_reverse_tests::guest_reversal(mem);
     exclusive_tests::guest_exclusive(mem);
