@@ -114,7 +114,7 @@ try {
     check(explicit.pixels.every((v,i) => v === [255,0,0,255][i%4])
       && renderer.pipelineCacheStats().misses === 4, 'binding size and visibility miss cache');
     renderer.destroyProgram(explicitProgram);
-    await rejects(() => renderer.createProgram({ ...definition, blend: {} }), 'unsupported pipeline state is not silently defaulted');
+    await rejects(() => renderer.createProgram({ ...definition, cullMode: 'back' }), 'unsupported pipeline state is not silently defaulted');
     vertices.fill(0);
     const black = await renderer.submit(target, [draw]);
     check(black.pixels.every((v,i) => v === [0,0,0,255][i%4]), 'vertex changes affect coverage');
@@ -186,6 +186,139 @@ try {
     await rejects(() => renderer.submit(vpTarget, [{ ...tri, viewport: { x: NaN, y: 0, width: 32, height: 32 } }]),
       'non-finite viewport rejected');
     renderer.destroyProgram(vpProgram); renderer.destroyTarget(vpTarget);
+
+    // Fixed-function blend state. Real fragments and real blending: expected
+    // values come from the guest factors, checked with a one-step unorm
+    // tolerance because the blend unit's rounding mode is unspecified.
+    const overlay = new Float32Array([-1,-1, 3,-1, -1,3]);
+    const blendTarget = renderer.createTarget(4, 4);
+    const opaqueGreen = new Uint8Array(4 * 4 * 4);
+    for (let i = 0; i < opaqueGreen.length; i += 4) opaqueGreen.set([0, 255, 0, 255], i);
+    const srcAlphaBlend = { color: { operation: 'add', srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+      alpha: { operation: 'add', srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' } };
+    const blendProgram = await renderer.createProgram({ ...definition, writeMask: 0xf, blend: srcAlphaBlend });
+    const blendDraw = { program: blendProgram, vertices: overlay, indices,
+      uniforms: new Float32Array([1,0,0,0.25]), indexFormat: 'uint16' };
+    const blent = await renderer.submit(blendTarget, [blendDraw], { initialPixels: opaqueGreen });
+    const at2 = (image, x, y) => image.pixels.slice((y * 4 + x) * 4, (y * 4 + x) * 4 + 4);
+    const matches = (actual, expected, tolerance) => expected.every((v, i) => Math.abs(actual[i] - v) <= tolerance);
+    // 0.25 * red + 0.75 * green, alpha 0.25 * 0.25 + 1 * 0.75.
+    check(matches(at2(blent, 1, 1), [64, 191, 0, 207], 1), `src-alpha blend writes blended pixels: ${at2(blent, 1, 1)}`);
+    const blendHits = renderer.pipelineCacheStats().hits;
+    const blendReuse = await renderer.createProgram({ ...definition, writeMask: 0xf, blend: srcAlphaBlend });
+    check(renderer.pipelineCacheStats().hits === blendHits + 1, 'identical blend state reuses the pipeline');
+    const missesBefore = renderer.pipelineCacheStats().misses;
+    await renderer.createProgram({ ...definition, writeMask: 0xf, blend: { ...srcAlphaBlend,
+      color: { operation: 'max', srcFactor: 'one', dstFactor: 'one' } } });
+    check(renderer.pipelineCacheStats().misses === missesBefore + 1, 'blend state participates in the pipeline key');
+    const maxProgram = await renderer.createProgram({ ...definition, writeMask: 0xf,
+      blend: { color: { operation: 'max', srcFactor: 'one', dstFactor: 'one' },
+        alpha: { operation: 'max', srcFactor: 'one', dstFactor: 'one' } } });
+    const maxed = await renderer.submit(blendTarget, [{ ...blendDraw, program: maxProgram,
+      uniforms: new Float32Array([1,0,0,1]) }], { initialPixels: opaqueGreen });
+    check(at2(maxed, 1, 1).join() === '255,255,0,255', 'max blend keeps the larger source channel');
+    renderer.destroyProgram(maxProgram); renderer.destroyProgram(blendReuse);
+    // The guest color mask is the pipeline write mask, and it applies with
+    // blending disabled as well.
+    const noneProgram = await renderer.createProgram({ ...definition, writeMask: 0 });
+    const unmasked = await renderer.submit(blendTarget, [{ ...blendDraw, program: noneProgram,
+      indexFormat: 'uint16' }], { initialPixels: opaqueGreen });
+    check(at2(unmasked, 1, 1).join() === '0,255,0,255', 'empty write mask leaves the destination untouched');
+    renderer.destroyProgram(noneProgram);
+    const blueOnlyProgram = await renderer.createProgram({ ...definition, writeMask: 0x4 });
+    const masked = await renderer.submit(blendTarget, [{ ...blendDraw, program: blueOnlyProgram,
+      uniforms: new Float32Array([0,0,1,1]) }], { initialPixels: opaqueGreen });
+    check(at2(masked, 1, 1).join() === '0,255,255,255', 'write mask leaves unselected channels at their destination value');
+    renderer.destroyProgram(blueOnlyProgram);
+    const replaced = await renderer.submit(blendTarget, [{ ...blendDraw, program,
+      uniforms: new Float32Array([0,0,1,1]) }], { initialPixels: opaqueGreen });
+    check(at2(replaced, 1, 1).join() === '0,0,255,255', 'no blend state replaces the destination');
+    await rejects(() => renderer.createProgram({ ...definition, blend: { color: srcAlphaBlend.color } }),
+      'blend descriptor needs both components');
+    await rejects(() => renderer.createProgram({ ...definition, blend: { ...srcAlphaBlend,
+      color: { operation: 'multiply', srcFactor: 'one', dstFactor: 'one' } } }), 'unsupported blend operation rejected');
+    await rejects(() => renderer.createProgram({ ...definition, blend: { ...srcAlphaBlend,
+      color: { operation: 'add', srcFactor: 'one', dstFactor: 'src-alpha-saturate' } } }),
+      'saturate factor is invalid as a destination factor');
+    await rejects(() => renderer.createProgram({ ...definition, writeMask: 0x10 }), 'write mask out of range rejected');
+    renderer.destroyProgram(blendProgram); renderer.destroyTarget(blendTarget);
+
+    // Depth-stencil state. Depth is clear-on-load and never read back, so all
+    // checks stay inside one submission (one render pass, one attachment).
+    const depthDefinition = { ...definition, stride: 12,
+      attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }],
+      vertexWGSL: '@vertex fn main(@location(0) p: vec3f) -> @builtin(position) vec4f { return vec4f(p, 1); }' };
+    const depthState = (depthCompare, depthWriteEnabled) => ({ format: 'depth24plus-stencil8',
+      depthCompare, depthWriteEnabled });
+    const lessWrite = await renderer.createProgram({ ...depthDefinition,
+      depthStencil: depthState('less-equal', true) });
+    const lessNoWrite = await renderer.createProgram({ ...depthDefinition,
+      depthStencil: depthState('less-equal', false) });
+    const greaterWrite = await renderer.createProgram({ ...depthDefinition,
+      depthStencil: depthState('greater', true) });
+    const depthTarget = renderer.createTarget(4, 4, { depthFormat: 'depth24plus-stencil8' });
+    const depthAttachment = { format: 'depth24plus-stencil8', stencil: true, clearValue: 1 };
+    // WebGPU clip space keeps z in [0, 1] (unlike OpenGL's [-1, 1]), so the
+    // vertex z is the depth written by the pipeline: 0.25 near, 0.5 mid,
+    // 0.75 far, and a negative z would be clipped away entirely.
+    const quad = (program, z, color) => ({
+      program, vertices: new Float32Array([-1,-1,z, 3,-1,z, -1,3,z]), indices,
+      uniforms: new Float32Array(color), indexFormat: 'uint16' });
+    const farRed = quad(lessWrite, 0.75, [1,0,0,1]);
+    const nearGreen = quad(lessWrite, 0.25, [0,1,0,1]);
+    const midBlue = quad(lessWrite, 0.5, [0,0,1,1]);
+    const farOnly = await renderer.submit(depthTarget, [farRed], { depth: depthAttachment });
+    check(at2(farOnly, 1, 1).join() === '255,0,0,255', 'farther quad passes against a cleared depth buffer');
+    const nearWins = await renderer.submit(depthTarget, [farRed, nearGreen], { depth: depthAttachment });
+    check(at2(nearWins, 1, 1).join() === '0,255,0,255', 'nearer quad overwrites the farther one');
+    const farRejected = await renderer.submit(depthTarget, [nearGreen, farRed], { depth: depthAttachment });
+    check(at2(farRejected, 1, 1).join() === '0,255,0,255', 'farther quad fails the depth test');
+    // left-to-right through the pass: far writes 0.75, near passes without
+    // writing, mid compares against 0.75 and wins. If the middle draw had
+    // written depth, mid would be rejected (0.5 <= 0.25 is false).
+    const noWrite = await renderer.submit(depthTarget, [farRed, quad(lessNoWrite, 0.25, [0,1,0,1]),
+      midBlue], { depth: depthAttachment });
+    check(at2(noWrite, 1, 1).join() === '0,0,255,255', 'depthWriteEnabled false keeps the earlier depth value');
+    const writeControl = await renderer.submit(depthTarget, [farRed, nearGreen, midBlue], { depth: depthAttachment });
+    check(at2(writeControl, 1, 1).join() === '0,255,0,255', 'depthWriteEnabled true rejects the later mid quad');
+    // greater + clear 0: 0.5 passes, then 0.25 fails against it.
+    const greaterTarget = renderer.createTarget(4, 4, { depthFormat: 'depth24plus-stencil8' });
+    const greater = await renderer.submit(greaterTarget, [quad(greaterWrite, 0.5, [0,0,1,1]),
+      quad(greaterWrite, 0.25, [0,1,0,1])], { depth: { ...depthAttachment, clearValue: 0 } });
+    check(at2(greater, 1, 1).join() === '0,0,255,255', 'greater compare rejects the nearer subsequent quad');
+    const greaterControl = await renderer.submit(greaterTarget, [quad(greaterWrite, 0.25, [0,1,0,1])],
+      { depth: { ...depthAttachment, clearValue: 0 } });
+    check(at2(greaterControl, 1, 1).join() === '0,255,0,255', 'greater compare accepts a depth above the clear value');
+    renderer.destroyProgram(greaterWrite); renderer.destroyTarget(greaterTarget);
+    // The exact D16 representation is a first-class target format.
+    const unormTarget = renderer.createTarget(4, 4, { depthFormat: 'depth16unorm' });
+    const unormProgram = await renderer.createProgram({ ...depthDefinition,
+      depthStencil: { format: 'depth16unorm', depthCompare: 'less-equal', depthWriteEnabled: true } });
+    const unorm = await renderer.submit(unormTarget, [quad(unormProgram, 0.75, [1,0,0,1]),
+      quad(unormProgram, 0.25, [0,1,0,1])], { depth: { format: 'depth16unorm', stencil: false, clearValue: 1 } });
+    check(at2(unorm, 1, 1).join() === '0,255,0,255', 'depth16unorm target tests and writes depth');
+    const depthHits = renderer.pipelineCacheStats().hits;
+    const depthReuse = await renderer.createProgram({ ...depthDefinition,
+      depthStencil: depthState('less-equal', true) });
+    check(renderer.pipelineCacheStats().hits === depthHits + 1, 'identical depth state reuses the pipeline');
+    renderer.destroyProgram(depthReuse); renderer.destroyProgram(unormProgram);
+    renderer.destroyTarget(unormTarget);
+    await rejects(() => renderer.submit(target, [quad(lessWrite, 0.25, [0,1,0,1])], { depth: depthAttachment }),
+      'depth pipeline cannot use a target without a depth attachment');
+    await rejects(() => renderer.submit(depthTarget, [farRed], {}), 'depth target needs explicit depth state');
+    await rejects(() => renderer.submit(depthTarget, [farRed],
+      { depth: { ...depthAttachment, format: 'depth32float' } }), 'depth attachment format must match the target');
+    await rejects(() => renderer.submit(depthTarget, [farRed],
+      { depth: { ...depthAttachment, clearValue: 2 } }), 'depth clear value out of range rejected');
+    await rejects(() => renderer.createProgram({ ...depthDefinition,
+      depthStencil: depthState('less-or-equal', true) }), 'unsupported depth compare rejected');
+    await rejects(() => renderer.createProgram({ ...depthDefinition,
+      depthStencil: { format: 'depth16unorm', depthCompare: 'less', depthWriteEnabled: 'yes' } }),
+      'non-boolean depth write flag rejected');
+    await rejects(() => renderer.createProgram({ ...depthDefinition,
+      depthStencil: { ...depthState('less', true), depthBias: 1 } }), 'unknown depth-stencil field rejected');
+    renderer.destroyProgram(lessWrite); renderer.destroyProgram(lessNoWrite); renderer.destroyTarget(depthTarget);
+
     renderer.destroyProgram(program); renderer.destroyTarget(target);
     await rejects(() => renderer.submit(target, []), 'destroyed target rejected');
     renderer.dispose();
@@ -206,7 +339,7 @@ try {
     device.destroy();
     return { checks, backend: 'WebGPU', translatedGuestShader: false, pipelineCache: true };
   });
-  assert.equal(result.checks, 41);
+  assert.equal(result.checks, 68);
   console.log(JSON.stringify(result));
 } finally {
   clearTimeout(timeout);

@@ -34,6 +34,12 @@
 #include <util/log.h>
 #include <util/tracy.h>
 
+#ifdef VITA3K_BROWSER_GXM
+// Browser-owned fragment program state: the WebGPU consumer needs the guest
+// blend descriptor at draw time, and the guest pointer is not retained here.
+#include <gxm_webgpu_program.h>
+#endif
+
 namespace renderer {
 
 static void layout_ssbo_offset_from_uniform_buffer_sizes(UniformBufferSizes &sizes, UniformBufferSizes &offsets, std::size_t &total_hold) {
@@ -185,19 +191,22 @@ COMMAND(handle_memory_unmap) {
 bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProgram &program, const SceGxmBlendInfo *blend, GXPPtrMap &gxp_ptr_map) {
     switch (state.current_backend) {
 #ifdef VITA3K_BROWSER_GXM
-    case Backend::WebGPU:
-        // The initial browser draw path has no blend pipeline state yet.
-        // Reject it here rather than silently drawing with replacement blending.
-        if (blend && (blend->colorMask != SCE_GXM_COLOR_MASK_ALL
-                || blend->colorFunc != SCE_GXM_BLEND_FUNC_NONE
-                || blend->alphaFunc != SCE_GXM_BLEND_FUNC_NONE)) {
+    case Backend::WebGPU: {
+        // The guest descriptor is retained verbatim in guest units and packed
+        // into every draw that binds this program; only shapes no WebGPU
+        // pipeline can express are rejected, at creation time, exactly like the
+        // previous all-or-nothing rejection.
+        auto program = std::make_unique<browser::WebGPUFragmentProgram>();
+        program->blend = browser::webgpu_blend_state_from_guest(blend);
+        if (!browser::webgpu_blend_state_supported(program->blend)) {
             LOG_ERROR("WebGPU GXM unsupported fragment blend state: colorMask={:#x} colorFunc={} alphaFunc={} colorSrc={} colorDst={} alphaSrc={} alphaDst={}",
-                unsigned(blend->colorMask), unsigned(blend->colorFunc), unsigned(blend->alphaFunc),
-                unsigned(blend->colorSrc), unsigned(blend->colorDst), unsigned(blend->alphaSrc), unsigned(blend->alphaDst));
+                program->blend.color_mask, program->blend.color_func, program->blend.alpha_func,
+                program->blend.color_src, program->blend.color_dst, program->blend.alpha_src, program->blend.alpha_dst);
             return false;
         }
-        fp = std::make_unique<FragmentProgram>();
+        fp = std::move(program);
         break;
+    }
 #else
     case Backend::OpenGL:
         gl::create(fp, dynamic_cast<gl::GLState &>(state), program, blend);

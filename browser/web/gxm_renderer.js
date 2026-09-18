@@ -2,10 +2,15 @@
 // NOT a GXP translator or a replacement for SceGxm's validation/state machine.
 // Input: translated WGSL + snapshotted vertex/index/uniform data. Output: tightly
 // packed RGBA8 after GPU completion, suitable for the existing display bridge.
-// Supported initially: one interleaved stream, triangle-list, RGBA8, no depth,
-// blending or MSAA. Per-draw viewports map NDC to a target sub-rect (depth is
-// always [0, 1]); omitted viewports cover the full target. Optional fragment unit zero: linear RGBA8, one mip,
-// explicit sampler, group 3 bindings 0/1. No guest texture state is inferred.
+// Supported initially: one interleaved stream, triangle-list, RGBA8, no MSAA.
+// Per-draw viewports map NDC to a target sub-rect (depth is always [0, 1]);
+// omitted viewports cover the full target. Optional fragment unit zero: linear
+// RGBA8, one mip, explicit sampler, group 3 bindings 0/1. No guest texture
+// state is inferred. Optional fixed-function state: per-target write mask and
+// color/alpha blending, and a per-target depth-stencil attachment with the
+// depth compare/write mode from the GXM record state. The guest depth-stencil
+// descriptor is translated by the caller (gxm_hle_bridge.js); this consumer
+// accepts WebGPU values and rejects anything it cannot express.
 
 const formats = Object.freeze({ float32: [4, 4], float32x2: [8, 4],
   float32x3: [12, 4], float32x4: [16, 4], unorm8x4: [4, 1] });
@@ -57,7 +62,11 @@ export function createGXMRenderer(device) {
   }
 
   return Object.freeze({
-    createTarget(width, height) {
+    // depthFormat adds a depth-stencil attachment. Only formats WebGPU renders
+    // directly are accepted; there is no depth readback, so the guest's depth
+    // memory is never written (the native producer rejects the force-store
+    // state that would require it).
+    createTarget(width, height, { depthFormat } = {}) {
       available();
       integer(width, 1, device.limits.maxTextureDimension2D, 'width');
       integer(height, 1, device.limits.maxTextureDimension2D, 'height');
@@ -65,8 +74,15 @@ export function createGXMRenderer(device) {
         throw new RangeError('render target readback exceeds maxBufferSize');
       const texture = device.createTexture({ size: [width, height], format: 'rgba8unorm',
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST });
+      let depthTexture;
+      if (depthFormat !== undefined) {
+        if (!['depth16unorm', 'depth32float', 'depth24plus-stencil8'].includes(depthFormat))
+          throw new Error(`unsupported depth format: ${depthFormat}`);
+        depthTexture = device.createTexture({ size: [width, height], format: depthFormat,
+          usage: GPUTextureUsage.RENDER_ATTACHMENT });
+      }
       const id = nextId++;
-      targets.set(id, { width, height, texture });
+      targets.set(id, { width, height, texture, depthTexture, depthFormat });
       return id;
     },
 
@@ -74,11 +90,42 @@ export function createGXMRenderer(device) {
     // explicit test WGSL and deliberately does not claim guest shader execution.
     async createProgram({ vertexWGSL, fragmentWGSL, stride, attributes, uniformSize = 0,
       vertexEntryPoint = 'main', fragmentEntryPoint = 'main', bufferBindings,
-      fragmentTexture = false, ...unsupportedState }) {
+      fragmentTexture = false, writeMask = 0xf, blend, depthStencil, ...unsupportedState }) {
       available();
       if (typeof fragmentTexture !== 'boolean') throw new TypeError('fragmentTexture must be boolean');
       if (Object.keys(unsupportedState).length)
         throw new Error(`unsupported pipeline state: ${Object.keys(unsupportedState).join(', ')}`);
+      integer(writeMask, 0, 0xf, 'color write mask');
+      const blendOperations = ['add', 'subtract', 'reverse-subtract', 'min', 'max'];
+      const blendFactors = ['zero', 'one', 'src', 'one-minus-src', 'src-alpha', 'one-minus-src-alpha',
+        'dst', 'one-minus-dst', 'dst-alpha', 'one-minus-dst-alpha', 'src-alpha-saturate'];
+      // WebGPU accepts src-alpha-saturate as the color source factor only.
+      const blendComponent = (component, name, color) => {
+        if (!component || typeof component !== 'object') throw new TypeError(`${name} blend component required`);
+        const { operation, srcFactor, dstFactor, ...extra } = component;
+        if (Object.keys(extra).length) throw new Error(`unsupported ${name} blend state`);
+        if (!blendOperations.includes(operation) || !blendFactors.includes(srcFactor)
+            || !blendFactors.includes(dstFactor) || (!color && srcFactor === 'src-alpha-saturate'))
+          throw new Error(`unsupported ${name} blend state`);
+        return { operation, srcFactor, dstFactor };
+      };
+      let fragmentBlend;
+      if (blend !== undefined) {
+        if (!blend || typeof blend !== 'object' || Object.keys(blend).some(key => !['color', 'alpha'].includes(key)))
+          throw new TypeError('unsupported blend descriptor');
+        fragmentBlend = { color: blendComponent(blend.color, 'color', true),
+          alpha: blendComponent(blend.alpha, 'alpha', false) };
+      }
+      let pipelineDepth;
+      if (depthStencil !== undefined) {
+        if (!depthStencil || typeof depthStencil !== 'object') throw new TypeError('depth-stencil state required');
+        const { format, depthCompare, depthWriteEnabled, ...extraDepth } = depthStencil;
+        if (Object.keys(extraDepth).length || !['depth16unorm', 'depth32float', 'depth24plus-stencil8'].includes(format)
+            || !['never', 'less', 'equal', 'less-equal', 'greater', 'not-equal', 'greater-equal', 'always'].includes(depthCompare)
+            || typeof depthWriteEnabled !== 'boolean')
+          throw new Error('unsupported depth-stencil state');
+        pipelineDepth = { format, depthWriteEnabled, depthCompare };
+      }
       if (typeof vertexWGSL !== 'string' || typeof fragmentWGSL !== 'string'
           || typeof vertexEntryPoint !== 'string' || typeof fragmentEntryPoint !== 'string')
         throw new TypeError('shader sources and entry points must be strings');
@@ -124,11 +171,11 @@ export function createGXMRenderer(device) {
       bindingLayout.sort((a, b) => a.binding - b.binding);
       const key = JSON.stringify([vertexWGSL, fragmentWGSL, vertexEntryPoint, fragmentEntryPoint,
         stride, layout, bindingLayout, fragmentTexture, 'rgba8unorm', 'triangle-list', 'none',
-        'no-depth-stencil', 'no-blend', 1]);
+        'no-depth-bias', pipelineDepth ?? 'no-depth-stencil', fragmentBlend ?? 'no-blend', writeMask, 1]);
       const publish = pipeline => {
         const id = nextId++;
         programs.set(id, { pipeline, stride, uniformSize, bindingLayout, fragmentTexture,
-          explicitBindings: bufferBindings !== undefined });
+          explicitBindings: bufferBindings !== undefined, depthStencil: pipelineDepth, writeMask });
         return id;
       };
       if (pipelines.has(key)) {
@@ -164,10 +211,15 @@ export function createGXMRenderer(device) {
               { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
             ] }));
         }
+        // Depth and blend state are fixed pipeline state: both are part of the
+        // key above and both are materialized here. A program with depth state
+        // can only be submitted to a target created with the same format.
         pipeline = await device.createRenderPipelineAsync({ layout: device.createPipelineLayout({ bindGroupLayouts }),
           vertex: { module: vertex, entryPoint: vertexEntryPoint, buffers: [{ arrayStride: stride, attributes: layout }] },
-          fragment: { module: fragment, entryPoint: fragmentEntryPoint, targets: [{ format: 'rgba8unorm' }] },
+          fragment: { module: fragment, entryPoint: fragmentEntryPoint,
+            targets: [{ format: 'rgba8unorm', writeMask, ...(fragmentBlend ? { blend: fragmentBlend } : {}) }] },
           primitive: { topology: 'triangle-list', cullMode: 'none' },
+          ...(pipelineDepth ? { depthStencil: pipelineDepth } : {}),
         });
       } catch (error) { failure = error; }
       finally {
@@ -189,7 +241,7 @@ export function createGXMRenderer(device) {
     // the first await: Wasm may grow memory or overwrite its buffers afterwards.
     // The producer must await this Promise before signaling GXM sync objects,
     // running a display-queue callback, or releasing/reusing the target.
-    async submit(targetId, draws, { clearColor = [0, 0, 0, 1], initialPixels } = {}) {
+    async submit(targetId, draws, { clearColor = [0, 0, 0, 1], initialPixels, depth } = {}) {
       available();
       const target = lookup(targets, targetId, 'target');
       if (!Array.isArray(clearColor) || clearColor.length !== 4
@@ -198,8 +250,30 @@ export function createGXMRenderer(device) {
       const initial = initialPixels === undefined ? null : bytes(initialPixels);
       if (initial && initial.length !== target.width * target.height * 4)
         throw new RangeError('initial surface size mismatch');
+      // The depth attachment is per render pass, so its state is validated once
+      // here; the load op is always clear (the native producer rejects the
+      // force-load/force-store states that would need guest depth contents).
+      let depthAttachment = null;
+      if (depth === undefined) {
+        if (target.depthFormat !== undefined)
+          throw new Error('depth-stencil target submitted without depth state');
+      } else {
+        if (!depth || typeof depth !== 'object' || target.depthFormat === undefined)
+          throw new TypeError('depth state requires a depth-stencil render target');
+        const { format, stencil, clearValue, ...extraDepth } = depth;
+        if (Object.keys(extraDepth).length || format !== target.depthFormat
+            || typeof stencil !== 'boolean' || stencil !== (target.depthFormat === 'depth24plus-stencil8')
+            || typeof clearValue !== 'number' || !Number.isFinite(clearValue) || clearValue < 0 || clearValue > 1)
+          throw new Error('unsupported depth attachment state');
+        depthAttachment = { format, stencil, clearValue };
+      }
       const snapshots = draws.map(draw => {
         const program = lookup(programs, draw.program, 'program');
+        // A pipeline with depth state must be submitted to a target created
+        // with the same depth format, and a pass with a depth attachment must
+        // use a pipeline that names it; otherwise depth would be ignored.
+        if ((program.depthStencil?.format ?? null) !== (target.depthFormat ?? null))
+          throw new Error('depth-stencil state does not match render target');
         const vertices = bytes(draw.vertices), indices = bytes(draw.indices);
         const indexSize = draw.indexFormat === 'uint16' ? 2 : draw.indexFormat === 'uint32' ? 4 : 0;
         if (!indexSize) throw new Error('unsupported index format');
@@ -287,7 +361,12 @@ export function createGXMRenderer(device) {
           { bytesPerRow: target.width * 4 }, [target.width, target.height]);
         const encoder = device.createCommandEncoder();
         const pass = encoder.beginRenderPass({ colorAttachments: [{ view: target.texture.createView(),
-          loadOp: initial ? 'load' : 'clear', storeOp: 'store', clearValue: clearColor }] });
+          loadOp: initial ? 'load' : 'clear', storeOp: 'store', clearValue: clearColor }],
+          ...(depthAttachment ? { depthStencilAttachment: {
+            view: target.depthTexture.createView(), depthLoadOp: 'clear',
+            depthClearValue: depthAttachment.clearValue, depthStoreOp: 'discard',
+            ...(depthAttachment.stencil ? { stencilLoadOp: 'clear', stencilStoreOp: 'discard',
+              stencilClearValue: 0 } : {}) } } : {}) });
         for (const draw of snapshots) {
           pass.setPipeline(draw.program.pipeline);
           // Explicit every draw: identical to the default full-target viewport
@@ -345,7 +424,9 @@ export function createGXMRenderer(device) {
     },
     destroyTarget(id) {
       available();
-      lookup(targets, id, 'target').texture.destroy();
+      const target = lookup(targets, id, 'target');
+      target.texture.destroy();
+      target.depthTexture?.destroy();
       targets.delete(id);
     },
     destroyProgram(id) {
@@ -359,7 +440,10 @@ export function createGXMRenderer(device) {
     },
     dispose() {
       if (busy) throw new Error('renderer operation in flight; await completion');
-      for (const target of targets.values()) target.texture.destroy();
+      for (const target of targets.values()) {
+        target.texture.destroy();
+        target.depthTexture?.destroy();
+      }
       targets.clear(); programs.clear(); pipelines.clear(); disposed = true;
     },
   });

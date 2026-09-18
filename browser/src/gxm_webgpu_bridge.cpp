@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Browser-only consumer of the production renderer command ABI. No GL/Vulkan.
 #include "gxm_webgpu_bridge.h"
+#include "gxm_webgpu_program.h"
 #include <display/state.h>
 #include <emuenv/state.h>
 #include <gxm/functions.h>
@@ -13,6 +14,7 @@
 #include <stdexcept>
 #include <array>
 #include <vector>
+#include <cmath>
 #include <cstring>
 #include <exception>
 
@@ -83,6 +85,10 @@ struct WebContext final : renderer::Context {
     std::array<std::vector<uint8_t>, 2> uniforms;
     bool has_fragment_texture = false;
     SceGxmTexture fragment_texture{}; // Command-owned descriptor, not a guest pointer.
+    // Depth-stencil attachment presence. The descriptor itself stays in
+    // record.depth_stencil_surface; a null or disabled guest surface clears it
+    // exactly like scene.cpp handle_set_context.
+    bool has_depth = false;
 };
 
 struct WebState final : renderer::State {
@@ -285,6 +291,47 @@ static void require_guest(MemState &mem, Address address, size_t size) {
         unsupported("invalid guest draw range");
 }
 
+// Guest depth bytes per sample, mirroring vulkan surface_cache.
+static uint32_t depth_bytes_per_sample(SceGxmDepthStencilFormat format) {
+    switch (format) {
+    case SCE_GXM_DEPTH_STENCIL_FORMAT_S8:
+        return 1;
+    case SCE_GXM_DEPTH_STENCIL_FORMAT_D16:
+        return 2;
+    default:
+        return 4;
+    }
+}
+
+// Depth formats the WebGPU consumer represents exactly:
+//   D16   -> depth16unorm           (16-bit unorm guest depth)
+//   DF32  -> depth32float           (32-bit float guest depth)
+//   S8D24 -> depth24plus-stencil8   (24-bit unorm depth, 8-bit stencil)
+// S8, DF32M, DF32_S8 and DF32M_S8 have no matching WebGPU format; accepting
+// them would silently reinterpret guest depth values. All of them reject here,
+// before any packet is built.
+static bool supported_depth_format(SceGxmDepthStencilFormat format) {
+    switch (format) {
+    case SCE_GXM_DEPTH_STENCIL_FORMAT_D16:
+    case SCE_GXM_DEPTH_STENCIL_FORMAT_DF32:
+    case SCE_GXM_DEPTH_STENCIL_FORMAT_S8D24:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The only stencil state the consumer can honour: always pass, keep on every
+// outcome, full masks and zero reference. Anything else would need a stencil
+// stage (and stencil writes back into guest memory) that does not exist yet.
+static bool stencil_state_default(const GxmStencilStateOp &op, const GxmStencilStateValues &values) {
+    return op.func == SCE_GXM_STENCIL_FUNC_ALWAYS
+        && op.stencil_fail == SCE_GXM_STENCIL_OP_KEEP
+        && op.depth_fail == SCE_GXM_STENCIL_OP_KEEP
+        && op.depth_pass == SCE_GXM_STENCIL_OP_KEEP
+        && values.compare_mask == 0xff && values.write_mask == 0xff && values.ref == 0;
+}
+
 // Match gxm/src/textures.cpp and SceGxm's accessors, not a tightly packed
 // interpretation of the guest descriptor. LINEAR_STRIDED has different packed
 // control fields and is deliberately NOT accepted here.
@@ -437,11 +484,22 @@ static int consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem) {
     if (ctx.record.front_polygon_mode != SCE_GXM_POLYGON_MODE_TRIANGLE_FILL
         || ctx.record.back_polygon_mode != SCE_GXM_POLYGON_MODE_TRIANGLE_FILL)
         unsupported("polygon mode not implemented");
-    if (ctx.record.front_depth_func != SCE_GXM_DEPTH_FUNC_LESS_EQUAL
-        || ctx.record.back_depth_func != SCE_GXM_DEPTH_FUNC_LESS_EQUAL
-        || ctx.record.front_depth_write_mode != SCE_GXM_DEPTH_WRITE_ENABLED
-        || ctx.record.back_depth_write_mode != SCE_GXM_DEPTH_WRITE_ENABLED)
-        unsupported("depth test state not implemented");
+    if (ctx.record.front_depth_func != ctx.record.back_depth_func
+        || ctx.record.front_depth_write_mode != ctx.record.back_depth_write_mode)
+        unsupported("two-sided depth state not implemented");
+    if (ctx.record.front_depth_func > SCE_GXM_DEPTH_FUNC_ALWAYS)
+        unsupported("depth function not implemented");
+    // Without a depth attachment the recorded depth state is not representable:
+    // WebGPU would silently test against nothing. Only the inert default
+    // (the same state the pre-attachment consumer required) is accepted.
+    if (!ctx.has_depth && (ctx.record.front_depth_func != SCE_GXM_DEPTH_FUNC_LESS_EQUAL
+            || ctx.record.front_depth_write_mode != SCE_GXM_DEPTH_WRITE_ENABLED))
+        unsupported("depth test state without depth surface");
+    // No stencil stage exists, so only the inert GXM default is accepted. The
+    // S8D24 attachment is cleared/discarded, never written back to guest memory.
+    if (ctx.has_depth && !(stencil_state_default(ctx.record.front_stencil_state_op, ctx.record.front_stencil_state_values)
+            && stencil_state_default(ctx.record.back_stencil_state_op, ctx.record.back_stencil_state_values)))
+        unsupported("stencil state not implemented");
     const auto *vp = ctx.record.vertex_program.get(mem);
     const auto *fp = ctx.record.fragment_program.get(mem);
     if (!vp->renderer_data || !fp->renderer_data || fp->is_maskupdate
@@ -487,8 +545,20 @@ static int consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem) {
         const auto info = vp->renderer_data->attribute_infos.find(a.regIndex);
         if (a.streamIndex != 0 || a.format != SCE_GXM_ATTRIBUTE_FORMAT_F32
             || !a.componentCount || a.componentCount > 4 || a.offset + a.componentCount * 4 > stride
-            || info == vp->renderer_data->attribute_infos.end() || info->second.is_integer)
+            || info == vp->renderer_data->attribute_infos.end() || info->second.is_integer) {
+            // Name the exact attribute: the consumer can only express a single
+            // F32 stream, so the rejected shape must be visible without a
+            // debugger (regIndex, format, layout, and the program metadata).
+            printf("[gxm-reject] vertex attribute regIndex=%u stream=%u format=%u components=%u offset=%u stride=%zu metadata=%s\n",
+                unsigned(a.regIndex), unsigned(a.streamIndex), unsigned(a.format),
+                unsigned(a.componentCount), a.offset, stride,
+                info == vp->renderer_data->attribute_infos.end() ? "missing" : "present");
+            if (info != vp->renderer_data->attribute_infos.end())
+                printf("[gxm-reject] vertex attribute metadata location=%u type=%u componentCount=%u integer=%d signed=%d regformat=%d\n",
+                    info->second.location, unsigned(info->second.gxm_type), unsigned(info->second.component_count),
+                    info->second.is_integer, info->second.is_signed, info->second.regformat);
             unsupported("vertex attribute format");
+        }
         attributes.push_back({info->second.location, a.offset, a.componentCount});
     }
     const auto shader = [&](Ptr<const SceGxmProgram> ptr) {
@@ -512,18 +582,44 @@ static int consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem) {
         packet.insert(packet.end(), bytes, bytes + size);
     };
     const auto word = [&](uint32_t value) { append(&value, 4); };
-    // GXM3 fixed words: magic, stride, indexSize, six payload lengths,
-    // attribute count, texture count (0/1), optional eight texture words,
-    // viewport flat u32, viewport xOffset,yOffset,zOffset,xScale,yScale,zScale
-    // f32 bits. Then render info (48 bytes), attributes, the six payloads,
-    // and packed texture bytes. The vertex shader consumes only flip/flag/
-    // screen/z from render info; x/y mapping is the WebGPU viewport, computed
-    // in JS from these exact GXM floats. GXM2 is no longer accepted: native
-    // and JS deploy together, old packets must fail loudly. All words are
-    // little-endian wasm u32.
-    word(0x47584d33); word(stride); word(index_size);
+    // The bound fragment program carries the guest blend descriptor retained at
+    // program creation (gxm_webgpu_program.h); the packet ships it in guest
+    // units so the JS decoder owns the single GXM -> WebGPU translation, like
+    // the texture sampler/format fields.
+    const auto *const webgpu_fp = static_cast<const browser::WebGPUFragmentProgram *>(fp->renderer_data.get());
+    const auto &blend = webgpu_fp->blend;
+    const bool blend_enabled = blend.color_func != SCE_GXM_BLEND_FUNC_NONE
+        || blend.alpha_func != SCE_GXM_BLEND_FUNC_NONE;
+    // GXM4 fixed words: magic, stride, indexSize, six payload lengths,
+    // attribute count, blend enabled u32, seven guest blend words (colorMask,
+    // colorFunc, alphaFunc, colorSrc, colorDst, alphaSrc, alphaDst), depth
+    // enabled u32, optional five depth words (format, compare, write mode,
+    // load mode 0=clear, clear value f32), texture count (0/1), optional eight
+    // texture words, viewport flat u32, viewport
+    // xOffset,yOffset,zOffset,xScale,yScale,zScale f32 bits. Then render info
+    // (48 bytes), attributes, the six payloads, and packed texture bytes. The
+    // vertex shader consumes only flip/flag/screen/z from render info; x/y
+    // mapping is the WebGPU viewport, computed in JS from these exact GXM
+    // floats. GXM3 is no longer accepted: native and JS deploy together, old
+    // packets must fail loudly. All words are little-endian wasm u32.
+    word(0x47584d34); word(stride); word(index_size);
     for (auto size : {index_bytes, stream.size, size_t(vs->size), size_t(fs->size), ctx.uniforms[0].size(), ctx.uniforms[1].size()}) word(size);
     word(attributes.size());
+    word(blend_enabled ? 1u : 0u);
+    word(blend.color_mask); word(blend.color_func); word(blend.alpha_func);
+    word(blend.color_src); word(blend.color_dst); word(blend.alpha_src); word(blend.alpha_dst);
+    word(ctx.has_depth ? 1u : 0u);
+    if (ctx.has_depth) {
+        const auto &depth = ctx.record.depth_stencil_surface;
+        word(static_cast<uint32_t>(depth.get_format()));
+        word(static_cast<uint32_t>(ctx.record.front_depth_func));
+        word(static_cast<uint32_t>(ctx.record.front_depth_write_mode));
+        // Load mode is always clear: force_load was rejected when the surface
+        // was recorded, so the draw starts from background_depth.
+        word(0);
+        const float clear_depth = depth.background_depth;
+        append(&clear_depth, sizeof(clear_depth));
+    }
     word(textured ? 1 : 0);
     if (textured) {
         const auto &t = ctx.fragment_texture;
@@ -582,7 +678,7 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
             auto *target = helper.pop<RenderTarget *>();
             const auto *color = helper.pop<SceGxmColorSurface *>();
             const auto *depth = helper.pop<SceGxmDepthStencilSurface *>();
-            if (!target || !color || depth || color->disabled || color->downscale || color->gamma
+            if (!target || !color || color->disabled || color->downscale || color->gamma
                 || color->colorFormat != SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR
                 || color->surfaceType != SCE_GXM_COLOR_SURFACE_LINEAR
                 || !color->width || !color->height || color->width > 4096 || color->height > 4096
@@ -594,12 +690,51 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
                         unsigned(color->colorFormat), unsigned(color->surfaceType), color->width, color->height,
                         color->strideInPixels, bool(color->disabled), unsigned(color->downscale), unsigned(color->gamma));
                 }
-                unsupported("color/depth surface format");
+                unsupported("color surface format");
             }
             require_guest(static_cast<WebState &>(state).mem, color->data.address(),
                 (uint64_t(color->height) - 1) * color->strideInPixels * 4 + uint64_t(color->width) * 4);
             web.record.color_surface = *color; web.has_surface = true;
             ctx->current_render_target = target;
+            // Depth-stencil attachment, mirroring scene.cpp handle_set_context:
+            // a null or disabled guest surface clears the recorded addresses.
+            // The attachment always matches the color surface dimensions, which
+            // is what a single GXM render target guarantees.
+            web.has_depth = false;
+            web.record.depth_stencil_surface = SceGxmDepthStencilSurface{};
+            if (depth && !depth->disabled()) {
+                const auto format = depth->get_format();
+                const uint32_t bytes = depth_bytes_per_sample(format);
+                // Validation bound, not a layout model: the guest depth memory is
+                // never read or written (force_load/force_store are rejected
+                // below), so LINEAR and TILED differ only in a buffer the
+                // consumer does not touch. A tiled allocation is never smaller
+                // than this row-major estimate, so the check cannot false-reject.
+                const uint64_t footprint = uint64_t(depth->get_stride()) * bytes * color->height;
+                const Address data = depth->depth_data.address();
+                if (!supported_depth_format(format) || !depth->depth_data
+                    || depth->get_stride() < color->width || !std::isfinite(depth->background_depth)
+                    || depth->background_depth < 0.0f || depth->background_depth > 1.0f
+                    || !footprint || footprint > 64 * 1024 * 1024
+                    || !is_valid_addr_range(static_cast<WebState &>(state).mem, data, uint64_t(data) + footprint)) {
+                    printf("[gxm-reject] depth tiling=%s format=%08x strideSamples=%u depth=%d stencil=%d forceLoad=%d forceStore=%d background=%g footprint=%llu\n",
+                        depth->get_type() == SCE_GXM_DEPTH_STENCIL_SURFACE_TILED ? "tiled" : "linear",
+                        unsigned(format), depth->get_stride(),
+                        depth->depth_data.address() != 0, depth->stencil_data.address() != 0,
+                        bool(depth->force_load), bool(depth->force_store), double(depth->background_depth),
+                        static_cast<unsigned long long>(footprint));
+                    unsupported("depth surface format/layout");
+                }
+                // force_load means the previous depth-stencil contents must be
+                // preserved; force_store means they must be written back to
+                // guest memory. The consumer has a per-draw attachment and no
+                // depth readback, so both reject instead of losing contents.
+                if (depth->force_load || depth->force_store)
+                    unsupported(depth->force_load ? "depth force load (guest depth contents)"
+                                                 : "depth force store (guest depth writeback)");
+                web.record.depth_stencil_surface = *depth;
+                web.has_depth = true;
+            }
             break;
         }
         case CommandOpcode::SetState:

@@ -52,6 +52,57 @@ export function gxmViewportRect(viewport, width, height) {
   return { x, y, width: w, height: h };
 }
 
+// Guest blend descriptor (GXM units) to WebGPU pipeline state. Pure and
+// exported so the packet contract test covers every value without a device.
+// GXM has no per-channel "blend disabled": NONE is translated as 'add' by this
+// consumer and by the desktop backends (translate_blend_func), and blending is
+// enabled when either channel asks for it. Only the inert all-NONE descriptor
+// leaves `blend` undefined, which still applies the guest color mask through
+// the pipeline write mask.
+const blendFuncs = ['add', 'add', 'subtract', 'reverse-subtract', 'min', 'max']; // [NONE, ADD, ...]
+const blendFactors = { 0: 'zero', 1: 'one', 2: 'src', 3: 'one-minus-src', 4: 'src-alpha',
+  5: 'one-minus-src-alpha', 6: 'dst', 7: 'one-minus-dst', 8: 'dst-alpha', 9: 'one-minus-dst-alpha',
+  10: 'src-alpha-saturate' }; // 11 DST_ALPHA_SATURATE has no WebGPU equivalent.
+export function gxmBlendState(colorMask, colorFunc, alphaFunc, colorSrc, colorDst, alphaSrc, alphaDst) {
+  // GXM color mask bits: A=1, R=2, G=4, B=8. WebGPU write mask: R=1, G=2, B=4, A=8.
+  if (!Number.isInteger(colorMask) || colorMask & ~0xf) throw new Error('unsupported blend color mask');
+  const writeMask = (colorMask & 2 ? 1 : 0) | (colorMask & 4 ? 2 : 0)
+    | (colorMask & 8 ? 4 : 0) | (colorMask & 1 ? 8 : 0);
+  const operations = [colorFunc, alphaFunc].map(value => blendFuncs[value]);
+  if (operations.some(value => value === undefined)) throw new Error('unsupported blend function');
+  const factors = [colorSrc, colorDst, alphaSrc, alphaDst].map(value => blendFactors[value]);
+  if (factors.some(value => value === undefined)) throw new Error('unsupported blend factor');
+  const [src, dst, alphaSrcFactor, alphaDstFactor] = factors;
+  // WebGPU accepts src-alpha-saturate only as the color source factor.
+  if ([dst, alphaSrcFactor, alphaDstFactor].includes('src-alpha-saturate'))
+    throw new Error('unsupported blend factor position');
+  if (colorFunc === 0 && alphaFunc === 0) return { writeMask };
+  return { writeMask, blend: { color: { operation: operations[0], srcFactor: src, dstFactor: dst },
+    alpha: { operation: operations[1], srcFactor: alphaSrcFactor, dstFactor: alphaDstFactor } } };
+}
+// Guest depth-stencil descriptor (GXM units) to a WebGPU depth attachment and
+// pipeline state. Every accepted format is an exact representation of the
+// guest layout; approximations reject. Depth load mode 0 is the only accepted
+// value: the native producer rejects force_load/force_store, so the attachment
+// is always cleared to the guest background depth and never read back.
+const depthFormats = { 0x02444000: { format: 'depth16unorm', stencil: false },
+  0x00044000: { format: 'depth32float', stencil: false },
+  0x01266000: { format: 'depth24plus-stencil8', stencil: true } };
+const depthFuncs = { 0x0000000: 'never', 0x0400000: 'less', 0x0800000: 'equal', 0x0c00000: 'less-equal',
+  0x1000000: 'greater', 0x1400000: 'not-equal', 0x1800000: 'greater-equal', 0x1c00000: 'always' };
+export function gxmDepthStencilState(format, depthCompare, depthWriteMode, loadMode, clearValue) {
+  const spec = depthFormats[format];
+  if (!spec) throw new Error('unsupported depth format');
+  const compare = depthFuncs[depthCompare];
+  if (!compare) throw new Error('unsupported depth compare function');
+  if (depthWriteMode !== 0 && depthWriteMode !== 0x00100000) throw new Error('unsupported depth write mode');
+  if (loadMode !== 0) throw new Error('unsupported depth load mode');
+  if (typeof clearValue !== 'number' || !Number.isFinite(clearValue) || clearValue < 0 || clearValue > 1)
+    throw new RangeError('depth clear value must be a normalized finite number');
+  return { format: spec.format, stencil: spec.stencil, depthCompare: compare,
+    depthWriteEnabled: depthWriteMode === 0, clearValue };
+}
+
 // Versioned host-owned packet, not a guest struct containing native pointers.
 // Copy every input before awaiting the compiler or device.
 export async function drawGuestSurface(packet, initialPixels, width, height) {
@@ -67,23 +118,37 @@ export function decodeGuestDrawPacket(packet) {
     if (cursor + 4 > packet.length) throw new Error('truncated GXM draw packet');
     const n = view.getUint32(cursor, true); cursor += 4; return n;
   };
-  const float = () => {
+  const float = (what = 'GXM viewport float') => {
     if (cursor + 4 > packet.length) throw new Error('truncated GXM draw packet');
     const n = view.getFloat32(cursor, true); cursor += 4;
-    if (!Number.isFinite(n)) throw new Error('non-finite GXM viewport float');
+    if (!Number.isFinite(n)) throw new Error(`non-finite ${what}`);
     return n;
+  };
+  const flag = what => {
+    const value = word();
+    if (value !== 0 && value !== 1) throw new Error(`unsupported ${what}`);
+    return value === 1;
   };
   const take = n => {
     if (!Number.isSafeInteger(n) || n < 0 || cursor + n > packet.length) throw new Error('truncated GXM draw packet');
     const data = packet.slice(cursor, cursor + n); cursor += n; return data;
   };
-  if (word() !== 0x47584d33) throw new Error('unknown GXM draw packet version');
+  if (word() !== 0x47584d34) throw new Error('unknown GXM draw packet version');
   const stride = word(), indexSize = word();
   const lengths = Array.from({ length: 6 }, word);
   const attributeCount = word();
   if (![2,4].includes(indexSize) || !attributeCount || attributeCount > 16
       || stride < 4 || stride % 4 || lengths.some(n => n > 16 * 1024 * 1024))
     throw new Error('unsupported draw layout');
+  const blendEnabled = flag('blend enable flag');
+  const blendWords = Array.from({ length: 7 }, word);
+  const { writeMask, blend } = gxmBlendState(...blendWords);
+  if (blendEnabled !== (blend !== undefined)) throw new Error('blend flag/state mismatch');
+  let depth;
+  if (flag('depth enable flag')) {
+    const [format, compare, writeMode, loadMode] = Array.from({ length: 4 }, word);
+    depth = gxmDepthStencilState(format, compare, writeMode, loadMode, float('GXM depth clear value'));
+  }
   const textureCount = word();
   if (textureCount > 1) throw new Error('unsupported fragment texture count');
   let fragmentTexture, textureLength = 0;
@@ -116,11 +181,11 @@ export function decodeGuestDrawPacket(packet) {
   if (fragmentTexture) fragmentTexture.pixels = take(textureLength);
   if (cursor !== packet.length) throw new Error('trailing GXM draw packet bytes');
   return { stride, indexSize, viewport, info, attributes, indices, vertices, vertexGXP, fragmentGXP,
-    vertexUniforms, fragmentUniforms, fragmentTexture };
+    vertexUniforms, fragmentUniforms, fragmentTexture, writeMask, blend, depth };
 }
 async function drawOwnedSurface(packet, initialPixels, width, height) {
   const { stride, indexSize, viewport, info, attributes, indices, vertices, vertexGXP, fragmentGXP,
-    vertexUniforms, fragmentUniforms, fragmentTexture } = decodeGuestDrawPacket(packet);
+    vertexUniforms, fragmentUniforms, fragmentTexture, writeMask, blend, depth } = decodeGuestDrawPacket(packet);
   // Viewport rect is computed before any await from owned decode output, so
   // later device work cannot observe mutated state.
   const viewportRect = gxmViewportRect(viewport, width, height);
@@ -152,14 +217,20 @@ async function drawOwnedSurface(packet, initialPixels, width, height) {
       bufferBindings.push({ binding, size: data.length, type: 'read-only-storage', visibility });
     }
     program = await renderer.createProgram({ stride, attributes, bufferBindings,
-      fragmentTexture: fragmentTexture !== undefined,
+      fragmentTexture: fragmentTexture !== undefined, writeMask,
+      ...(blend ? { blend } : {}),
+      ...(depth ? { depthStencil: { format: depth.format, depthCompare: depth.depthCompare,
+        depthWriteEnabled: depth.depthWriteEnabled } } : {}),
       vertexWGSL: vertex.wgsl, fragmentWGSL: fragment.wgsl,
       vertexEntryPoint: 'main_vs', fragmentEntryPoint: 'main_fs' });
-    target = renderer.createTarget(width, height);
+    // The depth attachment is the same size as the color attachment (one GXM
+    // render target); it is per draw and never read back to guest memory.
+    target = renderer.createTarget(width, height, depth ? { depthFormat: depth.format } : undefined);
     return (await renderer.submit(target, [{ program, vertices, indices,
       indexFormat: indexSize === 2 ? 'uint16' : 'uint32', buffers,
       viewport: viewportRect,
-      ...(fragmentTexture ? { fragmentTexture } : {}) }], { initialPixels })).pixels;
+      ...(fragmentTexture ? { fragmentTexture } : {}) }], { initialPixels,
+      ...(depth ? { depth } : {}) })).pixels;
   } finally {
     // submit has settled (including GPU readback) before either resource can
     // be released. Retain only the bounded device-local pipeline cache.

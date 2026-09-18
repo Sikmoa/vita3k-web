@@ -37,7 +37,7 @@ passed: exit 42, 113 imports, zero missing NIDs, and nine readbacks on the
 Memory64 WASM JIT in Chromium/SwiftShader. This is the extended fixture's result,
 not the old color-only result.
 
-Regression baseline: `gxm_webgpu_smoke.mjs` (18 checks),
+Regression baseline: `gxm_webgpu_smoke.mjs` (68 checks),
 `gxp_webgpu_smoke.mjs` (8 checks), `gxp_translation_smoke.mjs` (22 checks),
 and `gxm_guest_probe_chromium.mjs` all pass in Chromium/SwiftShader.
 Host-only shader/renderer checks do not substitute for guest execution.
@@ -52,9 +52,14 @@ Host-only shader/renderer checks do not substitute for guest execution.
   (forwarded to the WebGPU viewport; draws without recorded viewport state
   reject), default region clip, and metadata-packed vertex/fragment uniform
   buffers (indexed and default, both stages: same `set_uniform_buffer` path).
-  It preserves the initial guest surface between draws. The bounded GXM3
-  texture path below is guest GPU-verified. Unsupported depth, blending,
-  other textures, instancing, non-default region clip and other commands are
+  It preserves the initial guest surface between draws. It also materializes the
+  guest fragment blend descriptor (write mask, color/alpha operation and
+  factors) and a depth-stencil attachment whose format is an exact WebGPU
+  representation of the guest depth format, with the guest depth
+  compare/write mode, cleared to the guest background depth. The bounded GXM4
+  texture path below is guest GPU-verified. Unsupported F32-only vertex
+  attributes, other textures, instancing, non-default region clip, stencil
+  state, the force-load/force-store depth modes and other commands are
   rejected, not silently ignored.
 - C2 (renderer side implemented, unverified) accepts `SignalSyncObject`,
   `WaitSyncObject` and `NewFrame`, and wakes `sceGxmNotificationWait` via
@@ -74,8 +79,11 @@ Host-only shader/renderer checks do not substitute for guest execution.
   `gxm_hle_bridge.js` instead.
 - Full renderer completeness and Limbo gameplay are NOT verified. Textured GXP
   has separate host-driven browser tests. Bounded guest texture wiring is now
-  GPU-verified; depth, blending, display queue integration
-  and retail-app scheduling remain unfinished.
+  GPU-verified; presentation, vertex attribute formats,
+  display queue integration and retail-app scheduling remain unfinished. Blend
+  and depth-stencil state are implemented and GPU-verified at the renderer
+  level (see GXM_WEBGPU.md); no retail frame has been rendered in a browser
+  yet.
   `rendererComplete=false` in the probe output remains intentional.
 
 ## Task #20 handoff to the HLE owner (Limbo SceGxm static rows)
@@ -189,13 +197,13 @@ its sync is display-queue plus notification waits.
   across draws/program changes; untextured programs omit the payload even if
   a descriptor remains bound. Nonzero fragment or any vertex texture usage
   is rejected from `ShaderProgram::textures_used` before upload.
-- GXM2 (`0x47584d32`) replaces GXM1, including untextured draws. Following the
-  old ten u32 words comes count 0/1; if 1, eight u32s are width, height, GXM
-  format, min, mag, U, V, packed byte length. Then old render-info, attributes,
-  six payloads, followed by packed texture bytes. GXM3 (`0x47584d33`, Task
-  #20, unverified) inserts viewport flat u32 plus six f32 bits
-  (xOffset,yOffset,zOffset,xScale,yScale,zScale) after the texture header and
-  before render info; GXM2 no longer decodes. No guest/native pointers
+- GXM4 (`0x47584d34`) replaces GXM3. After the old fixed words (magic, stride,
+  index size, six payload lengths, attribute count) come a blend enabled u32 and
+  seven guest blend words, then a depth enabled u32 and, when enabled, the guest
+  depth format, depth func, depth write mode, load mode and an f32 clear value,
+  then the texture count/header, viewport flat u32 plus six f32 bits
+  (xOffset,yOffset,zOffset,xScale,yScale,zScale), render info, attributes, six
+  payloads and packed texture bytes. GXM2/GXM3 no longer decode. No guest/native pointers
   or row padding cross into JS. JS checks version/count/size/enums/viewport
   finiteness/truncation and trailing bytes before compilation. C++ and JS
   snapshots happen before suspension; texture validation/readback failures

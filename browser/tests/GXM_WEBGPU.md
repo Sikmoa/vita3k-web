@@ -40,9 +40,32 @@ cover the full target. Viewport rects are dynamic draw state, never pipeline
 key material. Negative/non-finite rects reject; outside-viewport texels keep
 their initial values.
 
-Depth/stencil, blending, MSAA, multiple
-vertex streams, non-default region-clip/scissor, additional target formats and
-resident framebuffer resolve/presentation remain unsupported. The guest fixture
+`createProgram` additionally accepts the guest fixed-function fragment state as
+WebGPU values: `writeMask` (the translated guest color mask) and `blend` with a
+color and an alpha component (`operation`, `srcFactor`, `dstFactor`). Both are
+pipeline key material. A descriptor missing a component, an unknown operation
+or factor, a saturate factor outside the color source slot, or a write mask
+outside 0..15 rejects. `dst-alpha-saturate` is not a WebGPU factor at all and
+is rejected earlier, at program creation on the native side.
+
+`createTarget(width, height, { depthFormat })` adds a depth-stencil attachment
+(`depth16unorm`, `depth32float`, or `depth24plus-stencil8`), and
+`createProgram({ depthStencil: { format, depthCompare, depthWriteEnabled } })`
+adds the matching pipeline state. `submit(..., { depth })` supplies the pass
+attachment: it is always clear-on-load with the guest background depth and
+`storeOp: 'discard'`, because the native producer rejects the guest
+force-load/force-store states that would need guest depth contents. The
+attachment is therefore per draw, and depth continuity across the draws of one
+scene is only promised when the guest asks for it with force-load (which
+rejects instead of rendering with silently lost contents); the desktop GL
+backend clears per draw the same way. A depth
+pipeline submitted to a target without a depth attachment (or the reverse), a
+format mismatch, and an out-of-range clear value all reject.
+
+Still unsupported: MSAA, multiple
+vertex streams, non-default vertex attribute formats (only F32 is accepted),
+non-default region-clip/scissor, additional target formats, stencil state or
+stencil writeback, and resident framebuffer resolve/presentation. The guest fixture
 verifies only the bounded texture path, not these remaining features. Each draw still
 reads back; this is not a performance result or a completed retail renderer.
 
@@ -79,10 +102,21 @@ Native (`browser/src/gxm_webgpu_bridge.cpp`):
   Indexed/default vertex/fragment uniform buffers need no change: they already
   flow through `set_uniform_buffer` into the packed draw payload.
 
-Packet GXM3 (`0x47584d33`, replaces GXM2; native and JS deploy together):
-fixed words as before, then viewport flat u32 and six f32 bits
+Packet GXM4 (`0x47584d34`, replaces GXM3; native and JS deploy together): fixed
+words as before, then blend enabled u32 plus seven guest blend words (colorMask,
+colorFunc, alphaFunc, colorSrc, colorDst, alphaSrc, alphaDst), then depth
+enabled u32 plus, when enabled, four words (guest depth format, guest depth
+func, guest depth write mode, load mode) and one f32 clear value, then the
+texture count/header, viewport flat u32 and six f32 bits
 (xOffset,yOffset,zOffset,xScale,yScale,zScale), then render info, attributes,
-payloads and texture bytes. GXM2 now fails loudly in the decoder.
+payloads and texture bytes. Blend and depth words are guest enum values, so the
+single GXM -> WebGPU translation lives in the JS decoder next to the sampler
+and texture-format translation; the guest blend descriptor is retained on the
+WebGPU fragment program at creation time (`browser/src/gxm_webgpu_program.h`)
+because the guest pointer is not kept. GXM2 and GXM3 now fail loudly in the
+decoder, and the transparent blend block replaces the previous native
+all-or-nothing rejection that made `sceGxmShaderPatcherCreateFragmentProgram`
+return `SCE_GXM_ERROR_DRIVER` for every non-default descriptor.
 
 JS (`gxm_hle_bridge.js`): `decodeGuestDrawPacket` validates the viewport
 words (flat must be 0/1, floats finite) and exports pure `gxmViewportRect`,
@@ -152,11 +186,27 @@ PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index
 ```
 
 Verified result (exit 0):
-`{"checks":41,"backend":"WebGPU","translatedGuestShader":false,"pipelineCache":true}`.
+`{"checks":68,"backend":"WebGPU","translatedGuestShader":false,"pipelineCache":true}`.
 The eight added texture assertions cover quadrant pixels with snapshot ownership,
 texel changes on later draws, pipeline reuse, missing/partial texture rejection,
 unsupported samplers, rejection of ignored textures, and resource-layout cache keys.
 These use test WGSL, not a guest texturing fixture.
+
+The 27 blend/depth assertions use real blended and depth-tested fragments, not
+mocks: src-alpha ADD over an opaque destination at quarter alpha (with a
+one-step unorm tolerance, since the blend unit's rounding mode is unspecified),
+`max` blending, the write mask with blending both disabled and enabled, blend
+state sharing and differentiating the pipeline key, four malformed blend
+descriptors; then far/near ordering, near-first rejection of the farther quad,
+depth-write-disabled keeping the earlier depth value (with the write-enabled
+control), `greater` compare against a zero clear value (with its control),
+`depth16unorm`, depth-state pipeline reuse, and six rejected depth
+configurations. The guest packet contract test (`gxm_hle_packet_test.mjs`)
+covers the decode side without a device: all six blend operations, all eleven
+translatable factors with the saturate factor's position rule, the color-mask
+bit remap, all three depth formats, all eight compare functions, both write
+modes, and the rejections for old packet versions, unknown formats, load mode,
+non-finite/out-of-range clear values and inconsistent enable flags.
 No game assets or shader compiler are needed. Unavailable WebGPU is a failure
 to verify, never a successful skip.
 
