@@ -122,7 +122,17 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
             // Persistent top-level frame: dormant/suspended states park instead
             // of losing lifecycle/callback state. Only deletion returns it.
             r.thread->run_loop();
+        } catch (const std::exception &error) {
+            // Keep the fail-closed outcome, but do not hide renderer/HLE
+            // rejection reasons behind an otherwise unexplained failed=1.
+            std::fprintf(stderr, "[guest-runtime] thread %.63s (%d) PC=%08x failed: %.512s\n",
+                r.thread->name.c_str(), r.thread->id, read_pc(*r.thread->cpu), error.what());
+            r.faulted = true;
+            r.thread->returned_value = 0xDEADDEAD;
+            r.thread->update_status(ThreadStatus::dormant);
         } catch (...) {
+            std::fprintf(stderr, "[guest-runtime] thread %.63s (%d) PC=%08x failed: unknown exception\n",
+                r.thread->name.c_str(), r.thread->id, read_pc(*r.thread->cpu));
             r.faulted = true;
             r.thread->returned_value = 0xDEADDEAD;
             r.thread->update_status(ThreadStatus::dormant);

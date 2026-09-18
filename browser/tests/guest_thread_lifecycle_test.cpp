@@ -9,6 +9,7 @@
 #include <modules/module_parent.h>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include "guest_thread_semaphore_fixture.h"
 
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
@@ -349,6 +350,34 @@ int main() {
             std::printf("%s edge case %u passed\n", light ? "LwMutex" : "Mutex", scenario);
         }
     }
+    // A throwing HLE import must be diagnosed at the fiber boundary, counted
+    // once, and reaped without executing guest writeback or acknowledging it
+    // as success. Exercise standard and non-standard C++ exceptions alike.
+    for (bool unknown : {false, true}) {
+        env->kernel.call_import = [unknown](CPUState &, uint32_t nid, SceUID) {
+            REQUIRE(nid == 0x0c7b834b);
+            if (unknown) throw 7;
+            throw std::runtime_error("intentional HLE exception fixture");
+        };
+        REQUIRE(runtime.attach(*env));
+        const Address result = data + 0x204;
+        *Ptr<uint32_t>(result).get(env->mem) = 0xcccccccc;
+        guest_thread_fixture::build_waiter(env->mem, code, 0, 0, result);
+        auto faulting = env->kernel.create_thread(env->mem, "exception fixture", Ptr<const void>(code),
+            SCE_KERNEL_DEFAULT_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT,
+            SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
+        REQUIRE(faulting && faulting->start(0, Ptr<void>{}, false) == 0);
+        const auto failed = runtime.resume(64);
+        REQUIRE(failed.failed == 1 && failed.idle && failed.runnable == 0);
+        REQUIRE(!env->kernel.threads.contains(faulting->id));
+        REQUIRE(faulting->returned_value == 0xDEADDEAD);
+        REQUIRE(*Ptr<uint32_t>(result).get(env->mem) == 0xcccccccc);
+        REQUIRE(get_current_cpu_state() == nullptr);
+        REQUIRE(runtime.resume(64).failed == 1); // not double-counted after reap
+        REQUIRE(runtime.shutdown());
+        REQUIRE(env->kernel.threads.empty() && !env->kernel.execution_host);
+    }
+    std::puts("Guest thread exceptions: diagnostics, failure accounting and clean teardown passed");
     // Do not retain the last scenario's observer references after their scope.
     env->kernel.call_import = {};
 }

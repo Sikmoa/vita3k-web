@@ -586,8 +586,16 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
                 || color->colorFormat != SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR
                 || color->surfaceType != SCE_GXM_COLOR_SURFACE_LINEAR
                 || !color->width || !color->height || color->width > 4096 || color->height > 4096
-                || color->strideInPixels < color->width || color->strideInPixels > UINT32_MAX / 4)
+                || color->strideInPixels < color->width || color->strideInPixels > UINT32_MAX / 4) {
+                printf("[gxm-reject] surface target=%d color=%d depth=%d\n",
+                    target != nullptr, color != nullptr, depth != nullptr);
+                if (color) {
+                    printf("[gxm-reject] color format=%08x type=%u width=%u height=%u stride=%u disabled=%d downscale=%u gamma=%u\n",
+                        unsigned(color->colorFormat), unsigned(color->surfaceType), color->width, color->height,
+                        color->strideInPixels, bool(color->disabled), unsigned(color->downscale), unsigned(color->gamma));
+                }
                 unsupported("color/depth surface format");
+            }
             require_guest(static_cast<WebState &>(state).mem, color->data.address(),
                 (uint64_t(color->height) - 1) * color->strideInPixels * 4 + uint64_t(color->width) * 4);
             web.record.color_surface = *color; web.has_surface = true;

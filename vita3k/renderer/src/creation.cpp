@@ -190,8 +190,12 @@ bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProg
         // Reject it here rather than silently drawing with replacement blending.
         if (blend && (blend->colorMask != SCE_GXM_COLOR_MASK_ALL
                 || blend->colorFunc != SCE_GXM_BLEND_FUNC_NONE
-                || blend->alphaFunc != SCE_GXM_BLEND_FUNC_NONE))
+                || blend->alphaFunc != SCE_GXM_BLEND_FUNC_NONE)) {
+            LOG_ERROR("WebGPU GXM unsupported fragment blend state: colorMask={:#x} colorFunc={} alphaFunc={} colorSrc={} colorDst={} alphaSrc={} alphaDst={}",
+                unsigned(blend->colorMask), unsigned(blend->colorFunc), unsigned(blend->alphaFunc),
+                unsigned(blend->colorSrc), unsigned(blend->colorDst), unsigned(blend->alphaSrc), unsigned(blend->alphaDst));
             return false;
+        }
         fp = std::make_unique<FragmentProgram>();
         break;
 #else

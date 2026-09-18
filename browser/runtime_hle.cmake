@@ -136,6 +136,10 @@ set(_hle_exports
     sceKernelCreateEventFlag sceKernelDeleteEventFlag
     sceKernelSetEventFlag sceKernelClearEventFlag
     sceKernelWaitEventFlag sceKernelPollEventFlag sceKernelCancelEventFlag
+    # Limbo AK::IOThread teardown after the FP vector comparison frontier:
+    # upstream UNIMPLEMENTED/no-op body, desktop parity only. This does not
+    # implement per-open event-flag handle ownership or close semantics.
+    sceKernelCloseEventFlag
     # Limbo eventflag-info frontier (imports=40059 missing_nids=1 PC=8126c330):
     # production struct fill in the already-sourced SceThreadmgr; both the
     # NID name and the underscore EXPORT name (display precedent).
