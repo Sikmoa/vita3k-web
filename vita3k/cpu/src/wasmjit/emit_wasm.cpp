@@ -2650,6 +2650,23 @@ private:
             }
             return ok;
         }
+        case Op::FPVectorAbs16:
+        case Op::FPVectorAbs32:
+        case Op::FPVectorAbs64: {
+            // VABS.f16/f32/f64: per-lane sign clear. Exact in every FPSCR
+            // mode and raising nothing (an SNaN keeps its payload, sign
+            // cleared), so no FPSCR guard or flag accumulation. The D-form
+            // upper U128 lanes pass through to SetVector, which stores only
+            // its architectural footprint.
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(0), word);
+                if (kind == Op::FPVectorAbs16) mask(0x7fff7fff);
+                else if (kind == Op::FPVectorAbs32) mask(0x7fffffff);
+                else if (word & 1) mask(0x7fffffff);
+                set(next_local + word);
+            }
+            return ok;
+        }
         case Op::FPVectorMul32:
         case Op::FPVectorAdd32:
         case Op::FPVectorSub32: {

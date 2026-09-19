@@ -100,6 +100,7 @@ void equal_context(const CPUContext &a, const CPUContext &b) {
 #include "wasmjit_vectorfp_compare_tests.inc"
 #include "wasmjit_byte_reverse_tests.inc"
 #include "wasmjit_packed_saturate_tests.inc"
+#include "wasmjit_fpvector_abs_tests.inc"
 #include "wasmjit_f64_tests.inc"
 #include "fp64_helper_tests.inc"
 #include "wasmjit_recip_tests.inc"
@@ -1770,6 +1771,8 @@ int main() {
     byte_reverse_tests::guest_reversal(mem);
     packed_saturate_tests::ir_saturation();
     packed_saturate_tests::guest_saturation(mem);
+    fpvector_abs_tests::ir_abs();
+    fpvector_abs_tests::guest_abs(mem);
     exclusive_tests::guest_exclusive(mem);
     f64_tests::integer_to_double();
     f64_tests::float_to_int32();
