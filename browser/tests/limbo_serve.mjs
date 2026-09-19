@@ -7,7 +7,8 @@
 //   node browser/tests/limbo_serve.mjs                  # http://127.0.0.1:8080/
 //   PORT=9000 LIMBO_MEMORY=w32 node browser/tests/limbo_serve.mjs
 //
-// Query parameters: ?backend=jit|interp  ?memory=auto|w64|w32  ?auto=1 (start
+// Query parameters: ?backend=jit|interp  ?memory=auto|w64|w32
+// ?inlineMutex=0 disables the inline-mutex optimization for A/B testing; ?auto=1 (start
 // immediately). Requires a WebGPU browser **on a secure origin**: WebGPU is
 // exposed only to secure contexts, so a page served over plain HTTP from a
 // non-loopback address has no navigator.gpu and the first draw fails. Serve it
@@ -203,7 +204,7 @@ async function run() {
   if (webgpuBlocked) log('warning: ' + webgpuBlocked);
   runButton.disabled = true; stopButton.disabled = false;
   ensureAudio();
-  worker = new Worker(\`./worker.js?backend=\${backend}&memory=\${memory}\`, { type: 'module' });
+  worker = new Worker(\`./worker.js?backend=\${backend}&memory=\${memory}&inlineMutex=\${params.get('inlineMutex') === '0' ? '0' : '1'}\`, { type: 'module' });
   worker.onerror = (event) => { log('worker error: ' + event.message); status.textContent = 'worker error'; };
   worker.onmessage = async ({ data }) => {
     if (!data || typeof data !== 'object') return;
@@ -211,7 +212,7 @@ async function run() {
       case 'lifecycle': log('lifecycle: ' + data.state); break;
       case 'ready':
         status.textContent = 'staging content…';
-        log(\`ready (backend=\${data.diagnostics?.backend} memory=\${data.diagnostics?.memoryModel})\`);
+        log(\`ready (backend=\${data.diagnostics?.backend} memory=\${data.diagnostics?.memoryModel} inlineMutex=\${data.diagnostics?.inlineMutex})\`);
         try {
           const files = await (await fetch('/manifest.json')).json();
           worker.postMessage({ type: 'stage-files', root: '/vita',

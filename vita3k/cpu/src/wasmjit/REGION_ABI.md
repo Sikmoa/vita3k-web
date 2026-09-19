@@ -1,5 +1,20 @@
 # M14c region JIT ABI (parent-owned spec, v1.2)
 
+## Current verified additions
+
+The sections below retain historical design/source-only review records; their
+old layout sizes and validation disclaimers are not the current status.
+`emit_wasm.h` is authoritative for the live layout. The current wasm32
+`JitState` is 456 bytes; Memory64 uses wider host-address fields and emitted
+`offsetof` accesses. Both ABIs pass the full backend and cooperative-runtime
+suites (Node for wasm32, Chromium for Memory64).
+
+See [INLINE_MUTEX.md](INLINE_MUTEX.md) for the generated lock/unlock fast paths,
+12-byte import-stub dependencies, host/kernel dirty-list commit boundary, and
+measured retail comparison. The optimization does not change the region
+function signature or remove scheduler slice bounds. Build/test recipes are
+in [SCRIPTS.md](../../../../SCRIPTS.md).
+
 ## Memory64 addendum (source implementation, unvalidated)
 
 The historical sections below describe the wasm32 reference ABI and its

@@ -22,7 +22,7 @@
 //   LIMBO_FRAME_EVERY       save every Nth generation (default 30; never 1)
 //   LIMBO_MAX_FRAMES        maximum saved frames (default 8)
 //   LIMBO_DEADLINE_MS       overall guest deadline (default 600000)
-//   LIMBO_DISPATCHES        guest dispatch budget hint for the runtime
+//   LIMBO_INLINE_MUTEX      0 disables inline lock/unlock for a matched baseline
 //   PLAYWRIGHT_CHROMIUM_EXECUTABLE  headless Chromium executable path
 import { createServer } from 'node:http';
 import { readFile, writeFile, readdir } from 'node:fs/promises';
@@ -39,6 +39,7 @@ const frameOut = process.env.LIMBO_FRAME_OUT || '.limbo_work/limbo_frame';
 const frameEvery = Number(process.env.LIMBO_FRAME_EVERY || 30);
 const maxFrames = Number(process.env.LIMBO_MAX_FRAMES || 8);
 const deadlineMs = Number(process.env.LIMBO_DEADLINE_MS || 600000);
+const inlineMutex = process.env.LIMBO_INLINE_MUTEX !== '0';
 
 if (frameEvery === 1)
   throw new Error('LIMBO_FRAME_EVERY=1 saves no files (generations start at 1); use 2 or more');
@@ -162,10 +163,11 @@ try {
   page.on('pageerror', (error) => pageErrors.push(String(error)));
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
 
-  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs }) => {
-    const worker = new Worker('./worker.js?backend=jit&memory=w64', { type: 'module' });
+  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex }) => {
+    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}`, { type: 'module' });
     const state = { logs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
-      backend: null, memory: null, workerErrors: [], ready: false, timedOut: false };
+      backend: null, memory: null, workerErrors: [], ready: false, timedOut: false,
+      gxmDraws: 0, latestProgress: null, profiles: {}, jitThreads: {}, runStartedAt: null };
     const hex = (bytes) => Array.from(bytes.slice(0, 64), (v) => v.toString(16).padStart(2, '0')).join(' ');
     const result = await new Promise((resolveRun, rejectRun) => {
       // A deadline is a diagnostic outcome, not a failure: the host needs the
@@ -177,11 +179,19 @@ try {
       worker.onmessage = ({ data }) => {
         if (!data || typeof data !== 'object') return;
         switch (data.type) {
-        case 'log':
-          state.logs.push(data.message);
+        case 'log': {
+          const message = String(data.message);
+          state.logs.push(message);
           state.logCount += 1;
+          if (message.includes('GXM WebGPU GXP indexed draw readback completed')) ++state.gxmDraws;
+          if (message.includes('jit[progress]')) state.latestProgress = message;
+          const profile = message.match(/jit profile (\d+):/);
+          if (profile) state.profiles[profile[1]] = message;
+          const thread = message.match(/jit thread=(\d+) /);
+          if (thread) state.jitThreads[thread[1]] = message;
           if (state.logs.length > 4000) state.logs.splice(0, state.logs.length - 4000);
           break;
+        }
         case 'ready':
           state.ready = true;
           state.backend = data.diagnostics.backend;
@@ -193,14 +203,16 @@ try {
           break;
         case 'staged':
           state.staged = { files: data.files, bytes: data.bytes, root: data.root };
+          state.runStartedAt = performance.now();
           worker.postMessage({ type: 'run-app', vitaFs: data.root, title, app,
             fastVblank: true });
           break;
         case 'vita-frame': {
           const pixels = new Uint8Array(data.data);
-          // performance.now() is worker-relative but monotonic across the run,
-          // so the first record's `at` is the present latency after run-app.
+          // Retain page-relative time for compatibility and report the actual
+          // elapsed time since run-app separately (excludes staging).
           const record = { generation: data.generation, width: data.width, height: data.height,
+            sinceRunMs: Math.round(performance.now() - state.runStartedAt),
             at: Math.round(performance.now()), byteLength: pixels.byteLength, head: hex(pixels),
             checksum: [...pixels].reduce((h, v) => ((h * 33) ^ v) >>> 0, 5381) };
           if (data.generation % frameEvery === 1 && state.saved.length < maxFrames) {
@@ -225,7 +237,7 @@ try {
       };
     });
     return result;
-  }, { title, app, frameEvery, maxFrames, deadlineMs });
+  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex });
 
   const saved = [];
   for (const frame of outcome.saved) {
@@ -235,10 +247,13 @@ try {
     saved.push(path);
   }
 
-  const logText = outcome.logs.join('\n');
   const diagnostics = {
     backend: outcome.backend,
     memory: outcome.memory,
+    inlineMutex,
+    latestProgress: outcome.latestProgress,
+    jitThreads: outcome.jitThreads,
+    profiles: outcome.profiles,
     timedOut: outcome.timedOut,
     staged: outcome.staged,
     manifestFiles: staged.length,
@@ -250,7 +265,7 @@ try {
     workerErrors: outcome.workerErrors,
     pageErrors,
     logCount: outcome.logCount,
-    gxmDraws: (logText.match(/GXM WebGPU GXP indexed draw readback completed/g) || []).length,
+    gxmDraws: outcome.gxmDraws,
     gxmDrawFails: outcome.logs.filter((line) => line.includes('GXM WebGPU draw failed')).slice(-3),
     gxmRejects: outcome.logs.filter((line) => line.includes('[gxm-reject]')).slice(-6),
     moduleLoads: outcome.logs.filter((line) => line.includes('load_module')).slice(-12),

@@ -97,7 +97,7 @@ enum Wasm : uint8_t {
     CallIndirect = 0x11, Select = 0x1b,
     Get = 0x20, Set = 0x21, Load = 0x28, Load64 = 0x29, Load8U = 0x2d, Load16U = 0x2f,
     Store = 0x36, Store8 = 0x3a, Store16 = 0x3b, Const = 0x41,
-    Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtU = 0x49, GtS = 0x4a, GtU = 0x4b, LeU = 0x4d, GeU = 0x4f, Eqz64 = 0x50,
+    Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtS = 0x48, LtU = 0x49, GtS = 0x4a, GtU = 0x4b, LeU = 0x4d, GeU = 0x4f, Eqz64 = 0x50,
     Clz = 0x67, Add = 0x6a, Sub = 0x6b, Mul = 0x6c, And = 0x71, Or = 0x72, Xor = 0x73,
     Shl = 0x74, ShrS = 0x75, ShrU = 0x76, RotR = 0x78,
     Add64 = 0x7c, Sub64 = 0x7d, Mul64 = 0x7e, Or64 = 0x84, Shl64 = 0x86, ShrU64 = 0x88, ShrS64 = 0x87, Wrap = 0xa7, ExtendU = 0xad,
@@ -484,8 +484,8 @@ uint32_t entry_ticks(const RegionBlockMeta &meta) {
 
 class Emitter {
 public:
-    explicit Emitter(const Dynarmic::IR::Block &block)
-        : block(block), start(block.Location()), finish(block.EndLocation()) {}
+    explicit Emitter(const Dynarmic::IR::Block &block, uint32_t hot_nid = 0)
+        : block(block), start(block.Location()), finish(block.EndLocation()), hot_nid(hot_nid) {}
 
     // Region layout (REGION_ABI.md): run(state=0, budget=1) with locals
     // 2=executed_call, 3=pc, 4=CheckBit, 5=i64 scratch, 6=dispatch index,
@@ -498,6 +498,7 @@ public:
         : block(block), start(block.Location()), finish(block.EndLocation())
         , state(options)
         , region(true), body_index(index), members(&members), metadata(&metadata) {
+        hot_nid = metadata[index].hot_nid;
         check_bit_local = 4;
         scratch_local = 5;
         page_table_local = 8;
@@ -615,6 +616,7 @@ private:
             std::fprintf(stderr, "WasmJit emit reject: %s\n", why);
     }
     bool svc = false;
+    uint32_t hot_nid = 0, svc_inline_success_local = 0;
     bool pc_written = false;
     bool has_bx = false;
     bool check_bit_written = false;
@@ -723,6 +725,141 @@ private:
     // address (its low word is the instruction's own PC). Write helpers
     // consume memory_value, so the value must be published BEFORE the call.
     uint64_t pending_fault_location = 0;
+
+    // HLE intrinsics run entirely in generated Wasm. Every failure jumps out
+    // of this probe block WITHOUT changing registers, guest memory, or mutex
+    // ownership, then takes the normal SVC terminal. All commit addresses
+    // have been validated before the first write. No helper call can suspend
+    // between the probe and commit: this is cooperative, NOT a parallel CAS.
+    void inline_mutex() {
+        const auto success = next_local;
+        const auto address = next_local + 1, page = next_local + 2;
+        const auto backing = next_local + 3, slot_offset = next_local + 4;
+        const auto count = next_local + 5, next_count = next_local + 6;
+        const auto owner = next_local + 7, tid = next_local + 8, request = next_local + 9;
+        svc_inline_success_local = success;
+        imm(0); set(success);
+        const auto increment = [&](uint32_t offset) {
+            get(0); load(offset); imm(1); op(Add); store(offset);
+        };
+        const auto reg = [&](uint32_t r) {
+            if (region) get(reg_base + r);
+            else load(offsetof(JitState, regs) + r * 4);
+        };
+        const auto entry_address = [&] {
+            b_load_host(code, offsetof(JitState, mutex_table));
+            get(slot_offset); address_add_i32(code);
+        };
+        const auto entry_load = [&](uint32_t offset) {
+            entry_address(); op(Load); memarg(code, 2, offset);
+        };
+        const auto entry_store = [&](uint32_t offset, const auto &value) {
+            entry_address(); value(); op(Store); memarg(code, 2, offset);
+        };
+        const auto work_load = [&](uint32_t offset) {
+            guest_effective_address(address, backing); op(Load); memarg(code, 2, offset);
+        };
+
+        op(Block); op(0x40); ++extra_labels;
+        const auto probe_labels = extra_labels;
+        const auto decline_if = [&] {
+            op(BrIf); uleb(code, extra_labels - probe_labels);
+        };
+        b_load_host(code, offsetof(JitState, mutex_table)); op(host_eqz); decline_if();
+        memory_disabled(); decline_if();
+        reg(0); set(address);
+        reg(1); set(request);
+        load(offsetof(JitState, guest_thread_id)); set(tid);
+        get(tid); op(Eqz); decline_if();
+        get(tid); imm(kInlineMutexNoOwner); op(Eq); decline_if();
+        get(request); imm(0); op(GtS); op(Eqz); decline_if();
+
+        // Workarea owner/count/attr/uid are within [r0,r0+20). Out-of-range,
+        // cross-page, unaligned, readonly, or cached-code storage stays HLE.
+        get(address); imm(3); op(And); decline_if();
+        get(address); imm(12); op(ShrU); set(page);
+        get(page); op(Eqz); decline_if();
+        get(address); mask(0xfff); imm(4096 - 20); op(GtU); decline_if();
+        memory_base(page_perms_local, offsetof(JitState, page_perms_base));
+        get(page); address_add_i32(code);
+        op(Load8U); memarg(code, 0, 0); mask(3); imm(3); op(Ne); decline_if();
+        if (!memory64) {
+            memory_base(page_table_local, offsetof(JitState, page_table_base));
+            get(page); imm(2); op(Shl); op(Add);
+            op(Load); memarg(code, 2, 0); set(backing);
+            get(backing); op(Eqz); decline_if();
+        }
+        memory_base(code_pages_local, offsetof(JitState, code_pages_base));
+        get(page); imm(2); op(Shl); address_add_i32(code);
+        op(Load); memarg(code, 2, 0); decline_if();
+
+        // Host-owned, fixed-size direct-mapped registry. Collisions, stale
+        // guest UIDs, and guest-written mirror words must not alias a mutex.
+        get(address); imm(5); op(ShrU);
+        get(address); imm(15); op(ShrU); op(Xor);
+        mask(kInlineMutexEntries - 1); imm(5); op(Shl);
+        imm(offsetof(InlineMutexTable, entries)); op(Add); set(slot_offset);
+        entry_load(offsetof(InlineMutexEntry, enabled)); imm(1); op(Ne); decline_if();
+        entry_load(offsetof(InlineMutexEntry, workarea)); get(address); op(Ne); decline_if();
+        entry_load(offsetof(InlineMutexEntry, uid)); work_load(16); op(Ne); decline_if();
+        entry_load(offsetof(InlineMutexEntry, attr)); work_load(12); op(Ne); decline_if();
+        entry_load(offsetof(InlineMutexEntry, count)); set(count);
+        get(count); work_load(8); op(Ne); decline_if();
+        get(count); imm(INT32_MAX); op(GtU); decline_if();
+        entry_load(offsetof(InlineMutexEntry, owner)); set(owner);
+        get(owner); work_load(0); op(Ne); decline_if();
+        if (hot_nid == kInlineMutexLockNid) {
+            get(count); op(Eqz); begin_if();
+            get(owner); imm(kInlineMutexNoOwner); op(Ne); decline_if();
+            op(Else);
+            get(owner); get(tid); op(Ne); decline_if();
+            entry_load(offsetof(InlineMutexEntry, attr)); mask(kInlineMutexRecursive);
+            op(Eqz); decline_if();
+            // Overflow and invalid counts remain owned by the ordinary HLE.
+            get(count); imm(INT32_MAX); get(request); op(Sub); op(GtU); decline_if();
+            end_if();
+            get(count); get(request); op(Add); set(next_count);
+            get(tid); set(owner);
+        } else {
+            get(owner); get(tid); op(Ne); decline_if();
+            get(request); get(count); op(GtU); decline_if();
+            get(count); get(request); op(Sub); set(next_count);
+            get(next_count); op(Eqz); begin_if();
+            imm(kInlineMutexNoOwner); set(owner);
+            end_if();
+        }
+
+        // Commit: no further fallible operations, traps, host calls or yields.
+        // Link each changed slot once; the host drains ONLY this short list
+        // before exposing state to HLE, another fiber, or thread retirement.
+        entry_load(offsetof(InlineMutexEntry, dirty)); op(Eqz); begin_if();
+        entry_store(offsetof(InlineMutexEntry, next_dirty), [&] {
+            b_load_host(code, offsetof(JitState, mutex_table));
+            op(Load); memarg(code, 2, offsetof(InlineMutexTable, dirty_head));
+        });
+        b_load_host(code, offsetof(JitState, mutex_table));
+        get(slot_offset); imm(offsetof(InlineMutexTable, entries)); op(Sub);
+        imm(5); op(ShrU); imm(1); op(Add);
+        op(Store); memarg(code, 2, offsetof(InlineMutexTable, dirty_head));
+        entry_store(offsetof(InlineMutexEntry, dirty), [&] { imm(1); });
+        end_if();
+        entry_store(offsetof(InlineMutexEntry, count), [&] { get(next_count); });
+        entry_store(offsetof(InlineMutexEntry, owner), [&] { get(owner); });
+        guest_effective_address(address, backing); get(next_count);
+        op(Store); memarg(code, 2, 8);
+        guest_effective_address(address, backing); get(owner);
+        op(Store); memarg(code, 2, 0);
+        store_constant(offsetof(JitState, exclusive_size), 0);
+        if (region) { imm(0); set(reg_base); }
+        else store_constant(offsetof(JitState, regs), 0);
+        increment(hot_nid == kInlineMutexLockNid ? offsetof(JitState, mutex_fast_take)
+                                               : offsetof(JitState, mutex_fast_release));
+        imm(1); set(success);
+        op(End); --extra_labels;
+        get(success); op(Eqz); begin_if();
+        increment(offsetof(JitState, mutex_fast_fallback));
+        end_if();
+    }
 
     // M15 inline memory fast path (REGION_ABI.md "Inline memory fast path").
     // 1/2/4-byte accesses lower INLINE when provably equivalent to the checked
@@ -1143,6 +1280,47 @@ private:
         get(source); imm(24); op(ShrU); op(Or);
         set(result);
     }
+    // ARM QADD/QSUB family (UQADD8/UQADD16/UQSUB8/UQSUB16 and signed QADD8/
+    // QSUB8/QADD16/QSUB16): per-lane saturating arithmetic, no GE flags.
+    // Dynarmic lowers each to one U32->U32 IR op; lower it here lane by lane
+    // in plain i32 Wasm. Every partial sum/difference fits in i32, so the
+    // clamp is exact; lanes are reassembled only after their final shift.
+    // Uses reserved per-instruction SSA words +4..+8, like inline_mutex.
+    bool packed_saturating(const Inst &inst, unsigned lane_bits, bool is_signed, bool is_add) {
+        const uint32_t a = next_local + 4, b = next_local + 5;
+        const uint32_t acc = next_local + 6, lane = next_local + 7, tmp = next_local + 8;
+        const uint32_t lanes = 32 / lane_bits;
+        const uint32_t lane_mask = lane_bits == 32 ? 0xffffffffu : ((1u << lane_bits) - 1);
+        const uint32_t max = is_signed ? (lane_mask >> 1) : lane_mask;
+        const uint32_t min = is_signed ? static_cast<uint32_t>(0 - int32_t(max) - 1) : 0;
+        value(inst.GetArg(0)); set(a);
+        value(inst.GetArg(1)); set(b);
+        imm(0); set(acc);
+        for (uint32_t i = 0; i < lanes; ++i) {
+            const uint32_t shift = i * lane_bits;
+            get(a); imm(shift); op(ShrU); mask(lane_mask);
+            if (is_signed) { imm(32 - lane_bits); op(Shl); imm(32 - lane_bits); op(ShrS); }
+            get(b); imm(shift); op(ShrU); mask(lane_mask);
+            if (is_signed) { imm(32 - lane_bits); op(Shl); imm(32 - lane_bits); op(ShrS); }
+            is_add ? op(Add) : op(Sub);
+            set(tmp);
+            if (!is_signed && is_add) {
+                // sum <= 2*max: clamp up only.
+                imm(max); get(tmp); get(tmp); imm(max); op(GtU); op(Select); set(lane);
+            } else if (!is_signed) {
+                // diff wrapped: a < b (borrow) saturates to zero.
+                imm(0); get(tmp); get(a); imm(shift); op(ShrU); mask(lane_mask);
+                get(b); imm(shift); op(ShrU); mask(lane_mask); op(LtU); op(Select); set(lane);
+            } else {
+                // Signed sum/difference fits in i32: clamp both sides.
+                imm(max); get(tmp); get(tmp); imm(max); op(GtS); op(Select); set(lane);
+                imm(min); get(lane); get(lane); imm(min); op(LtS); op(Select); set(lane);
+            }
+            get(acc); get(lane); mask(lane_mask); imm(shift); op(Shl); op(Or); set(acc);
+        }
+        get(acc); set(next_local);
+        return ok;
+    }
     enum class VectorLaneOp { Equal, Greater, Minimum, Maximum, Absolute, AbsoluteDifference };
     bool vector_integer_select(const Inst &inst, unsigned bits, VectorLaneOp operation, bool is_signed) {
         // A32 integer comparisons/min/max/abs use 8/16/32-bit lanes. Signed
@@ -1414,6 +1592,11 @@ private:
             || boost::get<Term::FastDispatchHint>(&term)) {
             if (!pc_written)
                 reject("single terminal a");
+            if (svc && hot_nid) {
+                get(svc_inline_success_local); begin_if();
+                ret(ExitReason::Continue);
+                end_if();
+            }
             ret(svc ? ExitReason::Svc : ExitReason::Continue);
         } else if (const auto *halt = boost::get<Term::CheckHalt>(&term)) {
             // No halt field/import: only accept a check whose two outcomes
@@ -1925,6 +2108,19 @@ private:
             if (!pc_written)
                 reject("region terminal a");
             add_ticks(ticks);
+            if (svc && hot_nid) {
+                get(svc_inline_success_local); begin_if();
+                // Keep the real stub return instruction (including ARM/Thumb
+                // interworking) and its normal tick/budget accounting.
+                if (const auto idx = member_index(finish); idx != kNoMember) {
+                    location_member(finish);
+                    light_redispatch(idx);
+                } else {
+                    set_next_pc_runtime();
+                    ret(ExitReason::Miss);
+                }
+                end_if();
+            }
             set_next_pc_runtime();
             // Non-SVC re-dispatch terminals return to the host with next_pc;
             // Continue(0) is a single-block-only concept (REGION_ABI.md).
@@ -3071,6 +3267,14 @@ private:
         case Op::IsZero32: arg(0); op(Eqz); break;
         case Op::CountLeadingZeros32: arg(0); op(Clz); break;
         case Op::Mul32: arg(0); arg(1); op(Mul); break;
+        case Op::PackedSaturatedAddU8: return packed_saturating(inst, 8, false, true);
+        case Op::PackedSaturatedSubU8: return packed_saturating(inst, 8, false, false);
+        case Op::PackedSaturatedAddS8: return packed_saturating(inst, 8, true, true);
+        case Op::PackedSaturatedSubS8: return packed_saturating(inst, 8, true, false);
+        case Op::PackedSaturatedAddU16: return packed_saturating(inst, 16, false, true);
+        case Op::PackedSaturatedSubU16: return packed_saturating(inst, 16, false, false);
+        case Op::PackedSaturatedAddS16: return packed_saturating(inst, 16, true, true);
+        case Op::PackedSaturatedSubS16: return packed_saturating(inst, 16, true, false);
         case Op::ByteReverseWord:
             value_word(inst.GetArg(0)); set(next_local + 4);
             byte_reverse_word_from_local(next_local + 4, next_local);
@@ -3380,6 +3584,13 @@ private:
         }
         case Op::A32CallSupervisor:
             if (!pc_written) return false;
+            if (hot_nid) {
+                if (!is_inline_mutex_nid(hot_nid) || start.TFlag() || start.EFlag()
+                    || finish.PC() != start.PC() + 4 || block.CycleCount() != 1
+                    || !inst.GetArg(0).IsImmediate() || inst.GetArg(0).GetU32() != 0)
+                    return false;
+                inline_mutex();
+            }
             get(0); arg(0); store(offsetof(JitState, svc));
             svc = true;
             return ok;
@@ -3393,8 +3604,8 @@ private:
 };
 } // namespace
 
-std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block) {
-    Emitter emitter(block);
+std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block, uint32_t hot_nid) {
+    Emitter emitter(block, hot_nid);
     auto bytes = emitter.run();
     if (bytes.empty() && std::getenv("VITA3K_WASMJIT_REJECT_TRACE"))
         std::fprintf(stderr, "WasmJit emit_block rejected: %s\n", emitter.rejection.c_str());
@@ -3455,6 +3666,15 @@ std::vector<uint8_t> emit_region(
                 used_regs[index] = true;
                 written_regs[index] |= kind == Op::A32SetRegister;
             }
+        }
+    }
+
+    // Intrinsics access argument/result registers without Get/SetRegister
+    // IR nodes. Include them in the invocation-wide register cache contract.
+    for (const auto &m : meta) {
+        if (m.hot_nid) {
+            used_regs[0] = used_regs[1] = true;
+            written_regs[0] = true;
         }
     }
 

@@ -68,6 +68,9 @@ try {
         locateFile: (file) => new URL(`${base}${file}`, self.location.href).href,
         print: (message) => post({ type: 'log', message }),
         printErr: (message) => post({ type: 'log', message }),
+        // Matched diagnostic baseline; the native option also disables the
+        // kernel table/bookkeeping, not just generated probes.
+        VITA3K_JIT_INLINE_MUTEX: workerParams.get('inlineMutex') === '0' ? '0' : '1',
       });
       break;
     } catch (error) {
@@ -78,7 +81,7 @@ try {
   }
   transition('ready');
   post({ type: 'ready', diagnostics: { module: moduleName, backend: jit ? 'jit' : 'interpreter',
-    memoryRequested: memoryParam, memoryFallback,
+    memoryRequested: memoryParam, memoryFallback, inlineMutex: jit && workerParams.get('inlineMutex') !== '0',
     memoryModel: module['vita3kMemoryModel'], hostPointerBits: module['vita3kHostPointerBits'], wasm: true, worker: true } });
 } catch (error) {
   lifecycle = 'error';

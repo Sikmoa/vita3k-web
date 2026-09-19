@@ -1,28 +1,54 @@
 # SCRIPTS.md — Wasm JIT build, test & benchmark commands
 
-Working directory: repository root. Emscripten build tree: `build/web`
-(configured with the browser/JIT test targets ON; see `browser/runtime_wasmjit.cmake`).
+Working directory: repository root. Configured Emscripten trees are `build/web`
+(wasm32) and `build/web64` (Memory64); see `browser/runtime_wasmjit.cmake`.
+The `EM_CACHE` paths below are specific to this development host: its system
+cache supplies wasm32 libraries, while `.vscratch/emcache` supplies wasm64.
 
 ## Build & run the backend test (fast path, regions, SMC, memory matrix)
 
 ```sh
-cmake --build build/web --target vita3k_jit_backend_test_node -j 8
+env EM_CACHE=/usr/share/emscripten/cache cmake --build build/web --target vita3k_jit_backend_test_node -j2
 node build/web/browser/vita3k_jit_backend_test_node.js
 ```
 
 Compiles `vita3k/cpu/tests/wasmjit_backend_test.cpp` (which includes the backend
 `wasm_jit_cpu.cpp` so it can call the checked helpers directly) to a Node
 executable and runs it in Node's Wasm engine. Expected last line:
-`WasmJit backend: 9157 checks passed (real memory, no interpreter)`
-(8-mode direct-emitter matrix: P/K/PK flags x fast-bases guard shape;
+`WasmJit backend: <N> checks passed (real memory, no interpreter)` (currently
+over 13 million checks; the count grows with coverage). Includes the direct-
+emitter P/K/PK x fast-bases matrix and inline lock/unlock tests;
 also run with `VITA3K_WASMJIT_PROMOTE_FLAGS=0` to cover the reference
 process default, and with `VITA3K_WASMJIT_SLOW_REASONS=1` to cover the
-diagnostic slow-reason shape).
+diagnostic slow-reason shape.
+
+### Memory64 backend and cooperative-runtime suites (Chromium)
+
+The local Node 22 cannot instantiate these Memory64 executables. Use the
+classic-executable Chromium runner instead of treating that as a test failure:
+
+```sh
+env EM_CACHE=/home/user/.vscratch/emcache cmake --build build/web64 \
+  --target vita3k_jit_backend_test_node vita3k_guest_thread_tests -j2
+export PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index.mjs
+node browser/tests/wasm_executable_chromium.mjs vita3k_jit_backend_test_node 'WasmJit backend:'
+node browser/tests/wasm_executable_chromium.mjs vita3k_guest_thread_tests \
+  'Guest thread exceptions: diagnostics, failure accounting and clean teardown passed'
+```
+
+The runner checks aborts, page errors, exit status and the supplied success
+marker. `WASM_TEST_DIST` overrides `build/web64/browser`. For wasm32, build the
+same two targets in `build/web` with the system cache and run their `.js` files
+in Node. The runtime suite includes real mutex park/wake, cancellation,
+timeouts, deletion/reuse, multiple dirty-owner commits and exception teardown.
+The inline-mutex regression suites intentionally require acceleration enabled;
+use the retail ablation below for a disabled-path performance comparison.
 
 ## Emitter fixture suite (real Dynarmic IR → Wasm modules, run in Node)
 
 ```sh
 c++ -std=c++20 -O1 -Wall -Wextra -Werror \
+  -Ivita3k/cpu/include -Ivita3k/mem/include \
   -Iexternal/dynarmic/src \
   -Iexternal/dynarmic/externals/mcl/include \
   -Iexternal/fmt/include -Iexternal/boost \
@@ -141,8 +167,8 @@ SharedArrayBuffer). The Worker's console prints the JIT profile line ending in
 ## Retail app (Limbo) in a browser
 
 ```sh
-env EM_CACHE=/home/user/.vscratch/emcache cmake --build build/web64 --target vita3k_web_jit -j$(nproc)
-HOST=0.0.0.0 PORT=8099 node browser/tests/limbo_serve.mjs
+env EM_CACHE=/home/user/.vscratch/emcache cmake --build build/web64 --target vita3k_web_jit -j2
+HOST=0.0.0.0 PORT=5173 node browser/tests/limbo_serve.mjs
 ```
 
 Open the printed URL (`HOST=0.0.0.0` lists the machine's addresses; add
@@ -150,7 +176,11 @@ Open the printed URL (`HOST=0.0.0.0` lists the machine's addresses; add
 (`LIMBO_STAGE`, `LIMBO_TITLE`, `LIMBO_APP`), boots the retail app through the
 same Worker messages the headless probe uses, and draws every presented frame
 to a canvas next to a live guest log. Query parameters: `?memory=w64|w32|auto`
-(auto probes Memory64 and falls back), `?backend=jit|interp`.
+(auto probes Memory64 and falls back), `?backend=jit|interp`, `?inlineMutex=0`
+(disables the default-on inline lock/unlock paths for comparison). Start a new
+Worker/reload to change the selection. After changing the page's inline HTML,
+restart the **Node dev server**: it constructs that HTML once at startup.
+Static worker/JS/Wasm assets are read from disk per request.
 
 **WebGPU needs a secure origin.** `navigator.gpu` is exposed only to secure
 contexts, so a page served over plain HTTP from a non-loopback address reaches
@@ -177,7 +207,27 @@ guest log. The headless browser uses SwiftShader (`--use-angle=swiftshader`,
 `--enable-unsafe-webgpu`); set `LIMBO_GPU=1` on a machine with a real GPU.
 
 `browser/tests/limbo_app_chromium.mjs` is the assertion probe (exit 0 requires
-at least one presented frame; `LIMBO_DEADLINE_MS` bounds the run).
+at least one presented frame; `LIMBO_DEADLINE_MS` bounds the observation window,
+not the emulated game). Inspect `exit`, `timedOut` and error arrays separately;
+one presented frame is not proof of a clean guest exit.
+
+For a sequential inline-mutex comparison using the same binary:
+
+```sh
+for enabled in 1 0; do
+  env PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index.mjs \
+    LIMBO_INLINE_MUTEX=$enabled LIMBO_DEADLINE_MS=180000 LIMBO_FRAME_EVERY=10 \
+    LIMBO_FRAME_OUT=.limbo_work/inline-$enabled \
+    node browser/tests/limbo_app_chromium.mjs > .limbo_work/inline-$enabled.log 2>&1
+done
+```
+
+The JSON retains full-run draw counts (not just a truncated log tail), the
+latest live progress/per-thread profiles and first-frame `sinceRunMs`, excluding
+staging time. Raw assets/images/logs stay in ignored `.limbo_work/`. See
+[`INLINE_MUTEX.md`](vita3k/cpu/src/wasmjit/INLINE_MUTEX.md) for the coherence
+contract, regression coverage and the initial measured comparison. Do not infer
+per-import nanoseconds or steady FPS from cumulative MIPS/frame counts.
 
 ## Debugging generated Wasm
 

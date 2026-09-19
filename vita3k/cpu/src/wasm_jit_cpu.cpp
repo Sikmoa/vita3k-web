@@ -62,6 +62,30 @@ constexpr size_t REGION_MAX_CODE_BYTES = REGION_BLOCK_INSTR_LIMIT * 4;
 constexpr size_t REGION_CACHE_LIMIT = 1024;
 constexpr uint32_t REGION_CALL_TICKS = 131072; // Bound latency of host stop checks.
 
+// Opt-out for matched A/B runs. C getenv does not read browser module
+// properties (nor Node process.env), so use the same channel as JIT options.
+EM_JS(int, vita3k_jit_inline_mutex_option, (), {
+    const v = Module['VITA3K_JIT_INLINE_MUTEX'] ??
+        (typeof process !== 'undefined' ? process.env?.VITA3K_JIT_INLINE_MUTEX : undefined);
+    return String(v) === '0' ? 0 : 1;
+});
+bool inline_mutex_enabled() noexcept {
+    static const bool enabled = vita3k_jit_inline_mutex_option() != 0;
+    return enabled;
+}
+// Only ARM little-endian stubs can match. Include return/NID in cache
+// validation below so patching only the literal cannot retain an intrinsic.
+uint32_t hot_stub_nid(const MemState &mem, uint32_t pc, uint32_t cpsr) noexcept {
+    if (!inline_mutex_enabled() || (cpsr & (0x20u | 0x200u)) || (pc & 3u))
+        return 0;
+    uint32_t words[3] = {};
+    if (!mem_fetch(mem, pc, words, sizeof(words)))
+        return 0;
+    if (words[0] != 0xEF000000u || words[1] != 0xE1A0F00Eu)
+        return 0;
+    return vita3k::wasmjit::is_inline_mutex_nid(words[2]) ? words[2] : 0;
+}
+
 uint32_t counter_delta(uint32_t before, uint32_t after) noexcept {
     return after - before; // A call cannot execute a full 2^32 ticks.
 }
@@ -70,7 +94,8 @@ struct RegionBlock {
     Address pc = 0;
     uint32_t psr_mask = 0, psr_value = 0; // dispatch validation bits
     uint32_t ticks = 0;                    // conservative tick cost
-    std::vector<uint8_t> original;         // guest bytes [pc, EndLocation.PC)
+    uint32_t hot_nid = 0;                  // inline mutex fast path (0 = none)
+    std::vector<uint8_t> original;         // decoded bytes; hot stubs also track return/NID
     std::vector<vita3k::wasmjit::StoreContinuation> store_continuations;
 };
 struct RegionPage {
@@ -196,6 +221,7 @@ bool form_region(MemState &mem, uint32_t entry_pc, uint32_t entry_cpsr,
                 if (!ticks || ticks > REGION_MAX_TICKS)
                     return false;
                 block.pc = pc;
+                block.hot_nid = hot_stub_nid(mem, pc, location.CPSR().Value());
                 block.psr_mask = PSR_DISPATCH_MASK;
                 block.psr_value = location.CPSR().Value() & PSR_DISPATCH_MASK;
                 block.ticks = static_cast<uint32_t>(ticks);
@@ -205,7 +231,7 @@ bool form_region(MemState &mem, uint32_t entry_pc, uint32_t entry_cpsr,
                 // soon as the next candidate is examined.
                 if (!vita3k::wasmjit::validate_region_block(translated, block.store_continuations))
                     return false;
-                block.original.resize(static_cast<size_t>(end - pc));
+                block.original.resize(block.hot_nid ? 12 : static_cast<size_t>(end - pc));
                 if (!mem_fetch(mem, pc, block.original.data(), block.original.size()))
                     return false;
                 ir.emplace(std::move(translated));
@@ -231,6 +257,11 @@ bool form_region(MemState &mem, uint32_t entry_pc, uint32_t entry_cpsr,
             continue;
         region.total_ticks += block.ticks;
         collect_targets(ir->GetTerminal(), stack);
+        if (block.hot_nid) {
+            // Successful intrinsics fall through to the real MOV PC,LR.
+            // Include it now: the fast arm can chain without a cold host miss.
+            stack.emplace_back(ir->EndLocation());
+        }
         if (ir->GetCondition() != Dynarmic::IR::Cond::AL
             && ir->HasConditionFailedLocation())
             stack.emplace_back(ir->ConditionFailedLocation());
@@ -625,6 +656,7 @@ struct WasmJitCPU::Impl {
     // Phase profiling: milliseconds and counts for the JIT cost centers.
     double emit_ms = 0, install_ms = 0, run_js_ms = 0;
     uint64_t js_calls = 0, misses = 0, svc_exits = 0, budget_exits = 0;
+    uint64_t mutex_fast_take = 0, mutex_fast_release = 0, mutex_fast_fallback = 0;
     // Region-mode profiling.
     uint64_t regions = 0, region_misses = 0, smc_exits = 0, dispatches = 0;
     // M16 pump counters: in-Wasm chained transfers (tx_wasm) vs dispatcher
@@ -654,6 +686,13 @@ struct WasmJitCPU::Impl {
                 || (parent->mem->sparse_host_memory && parent->mem->page_table != nullptr));
     }
     ~Impl() { clear(); }
+    void account_counters() {
+        account_fast_counters(state);
+        mutex_fast_take += state.mutex_fast_take;
+        mutex_fast_release += state.mutex_fast_release;
+        mutex_fast_fallback += state.mutex_fast_fallback;
+        state.mutex_fast_take = state.mutex_fast_release = state.mutex_fast_fallback = 0;
+    }
     void clear_regions() {
         for (auto &[key, entry] : region_cache) {
             if (entry.table_index >= 0) {
@@ -834,7 +873,7 @@ struct WasmJitCPU::Impl {
                     block_ptrs.push_back(&ir_blocks[i]);
                     meta.push_back({region->blocks[i].pc, region->blocks[i].psr_mask,
                         region->blocks[i].psr_value, region->blocks[i].ticks,
-                        region->blocks[i].store_continuations});
+                        region->blocks[i].store_continuations, region->blocks[i].hot_nid});
                 }
                 const auto bytes = vita3k::wasmjit::emit_region(block_ptrs, meta, region_options);
                 emit_ms += emscripten_get_now() - t0;
@@ -885,6 +924,7 @@ struct WasmJitCPU::Impl {
             state.stop_flag = stopped.load() ? 1u : 0u;
             state.exit_reason = 0;
             state.svc = 0;
+            state.guest_thread_id = static_cast<uint32_t>(parent->thread_id);
             // M16 pump: publish the entry mapping, then let the Wasm-side
             // dispatcher chain compiled-region transfers without host exits.
             // regs[15] is the transfer target after every Miss/Budget/Smc
@@ -908,7 +948,7 @@ struct WasmJitCPU::Impl {
                 map_base, dispatch_epoch_addr());
             run_js_ms += emscripten_get_now() - t2;
             ++js_calls;
-            account_fast_counters(state);
+            account_counters();
             dispatches += counter_delta(dispatches_before, state.dispatches);
             tx_wasm += counter_delta(tx_before, state.tx_wasm);
             const uint32_t delta = counter_delta(executed_before, state.executed);
@@ -1038,7 +1078,10 @@ struct WasmJitCPU::Impl {
                             state.regs[15], state.cpsr, translation_limit, state.fpscr);
                     }
                 }();
-                auto bytes = vita3k::wasmjit::emit_block(ir);
+                // Inline mutex fast path: flag hot-stub blocks (regs[15] is
+                // the block entry PC here, like block.pc in form_region).
+                const uint32_t single_hot_nid = hot_stub_nid(*parent->mem, state.regs[15], state.cpsr);
+                auto bytes = vita3k::wasmjit::emit_block(ir, single_hot_nid);
                 if (bytes.empty() && translation_limit > 1) {
                     // Memory IR is initially safe only in a single guest
                     // instruction: precise CPU rollback and SMC revalidation
@@ -1046,7 +1089,7 @@ struct WasmJitCPU::Impl {
                     translation_limit = 1;
                     ir = vita3k::wasmjit::translate_block(*parent->mem,
                         state.regs[15], state.cpsr, translation_limit, state.fpscr);
-                    bytes = vita3k::wasmjit::emit_block(ir);
+                    bytes = vita3k::wasmjit::emit_block(ir, single_hot_nid);
                 }
                 emit_ms += emscripten_get_now() - t0;
                 ++misses;
@@ -1059,7 +1102,7 @@ struct WasmJitCPU::Impl {
                 const uint64_t start = state.regs[15];
                 if (end <= start || end - start > 128)
                     return fail("unsupported translated code span");
-                Block block{state.regs[15], std::vector<uint8_t>(end - start), -1, translation_limit};
+                Block block{state.regs[15], std::vector<uint8_t>(single_hot_nid ? 12 : end - start), -1, translation_limit};
                 if (!mem_fetch(*parent->mem, block.pc, block.original.data(), block.original.size()))
                     return fail("guest code unavailable at compilation");
                 // Allocate cache entry before installing so allocation failure
@@ -1083,6 +1126,7 @@ struct WasmJitCPU::Impl {
             state.fault_address = 0;
             state.fault_write = 0;
             state.memory_cookie = reinterpret_cast<uintptr_t>(parent->mem);
+            state.guest_thread_id = static_cast<uint32_t>(parent->thread_id);
             // M15 fast-path bases, exactly as in region mode above.
             const auto *mem_state = parent->mem;
             state.page_table_base = mem_state->sparse_host_memory
@@ -1102,7 +1146,7 @@ struct WasmJitCPU::Impl {
             const uint32_t reason = vita3k_jit_call(found->second.table_index, state_offset);
             run_js_ms += emscripten_get_now() - t2;
             ++js_calls;
-            account_fast_counters(state);
+            account_counters();
             if (reason == static_cast<uint32_t>(vita3k::wasmjit::ExitReason::Fault)) {
                 const uint32_t address = state.fault_address, write = state.fault_write;
                 state = before;
@@ -1266,6 +1310,10 @@ void WasmJitCPU::clear_exclusive() {
 std::size_t WasmJitCPU::processor_id() const { return impl->core; }
 void WasmJitCPU::set_instruction_budget(uint64_t v) { impl->budget = v; }
 void WasmJitCPU::set_region_mode(bool v) { impl->region_mode = v; }
+bool WasmJitCPU::inline_mutex_fast_paths_enabled() { return inline_mutex_enabled(); }
+void WasmJitCPU::set_inline_mutex_table(vita3k::wasmjit::InlineMutexTable *table) {
+    impl->state.mutex_table = inline_mutex_enabled() ? reinterpret_cast<uintptr_t>(table) : 0;
+}
 const std::string &WasmJitCPU::get_last_error() const { return impl->error; }
 uint32_t WasmJitCPU::get_fault_address() const { return impl->state.fault_address; }
 bool WasmJitCPU::get_fault_write() const { return impl->state.fault_write != 0; }
@@ -1275,14 +1323,15 @@ uint64_t WasmJitCPU::regions_formed() const { return impl->regions; }
 uint64_t WasmJitCPU::cache_hits() const { return impl->hits; }
 uint64_t WasmJitCPU::invalidated_blocks() const { return impl->invalidated; }
 std::string WasmJitCPU::get_profile() const {
-    char buffer[640];
+    char buffer[896];
     std::snprintf(buffer, sizeof(buffer),
         "emit_ms=%.1f install_ms=%.1f run_js_ms=%.1f js_calls=%llu misses=%llu "
         "svc_exits=%llu blocks=%llu mem_reads=%llu mem_writes=%llu "
         "regions=%llu region_misses=%llu smc_exits=%llu budget_exits=%llu dispatches=%llu "
         "fast_reads=%llu fast_writes=%llu slow_unmapped=%llu slow_perms=%llu "
         "slow_cross=%llu slow_code=%llu slow_other=%llu "
-        "tx_wasm=%llu host_miss=%llu promote_flags=%u promote_accounting=%u",
+        "tx_wasm=%llu host_miss=%llu promote_flags=%u promote_accounting=%u "
+        "mutex_take=%llu mutex_release=%llu mutex_fallback=%llu",
         impl->emit_ms, impl->install_ms, impl->run_js_ms,
         (unsigned long long)impl->js_calls, (unsigned long long)impl->misses,
         (unsigned long long)impl->svc_exits, (unsigned long long)impl->compiled,
@@ -1295,6 +1344,8 @@ std::string WasmJitCPU::get_profile() const {
         (unsigned long long)g_mem_slow_cross_page, (unsigned long long)g_mem_slow_code_page,
         (unsigned long long)g_mem_slow_other,
         (unsigned long long)impl->tx_wasm, (unsigned long long)impl->host_miss,
-        unsigned(impl->region_options.promote_flags), unsigned(impl->region_options.promote_accounting));
+        unsigned(impl->region_options.promote_flags), unsigned(impl->region_options.promote_accounting),
+        (unsigned long long)impl->mutex_fast_take, (unsigned long long)impl->mutex_fast_release,
+        (unsigned long long)impl->mutex_fast_fallback);
     return buffer;
 }

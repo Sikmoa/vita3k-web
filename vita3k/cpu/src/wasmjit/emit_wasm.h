@@ -3,6 +3,7 @@
 #pragma once
 
 #include "block_metadata.h"
+#include <cpu/inline_mutex.h>
 #include <mem/memory_model.h>
 
 #include <cstddef>
@@ -84,6 +85,14 @@ struct JitState {
     uint32_t exclusive_value;    // +424 value that read observed (low word)
     uint32_t exclusive_value_hi; // +428 high word for a 64-bit exclusive read
     uint32_t exclusive_size;     // +432 reserved width in bytes; 0 = none
+    // Cooperative-only intrinsic ABI; table lifetime is owned by the runtime
+    // and it is drained before any kernel/HLE observer (cpu/inline_mutex.h).
+    // Null disables the probe. Tid is read at run time, never baked into code.
+    uint32_t guest_thread_id;    // +436
+    HostAddress mutex_table;     // +440 host pointer, not a guest address
+    uint32_t mutex_fast_take;    // +444 inline successes this call
+    uint32_t mutex_fast_release; // +448
+    uint32_t mutex_fast_fallback;// +452 declined probes this call
 };
 static_assert(std::is_standard_layout_v<JitState>);
 static_assert(sizeof(JitState::regs) == 16 * sizeof(uint32_t));
@@ -109,7 +118,12 @@ static_assert(offsetof(JitState, exclusive_address) == 420);
 static_assert(offsetof(JitState, exclusive_value) == 424);
 static_assert(offsetof(JitState, exclusive_value_hi) == 428);
 static_assert(offsetof(JitState, exclusive_size) == 432);
-static_assert(sizeof(JitState) == 436);
+static_assert(offsetof(JitState, guest_thread_id) == 436);
+static_assert(offsetof(JitState, mutex_table) == 440);
+static_assert(offsetof(JitState, mutex_fast_take) == 444);
+static_assert(offsetof(JitState, mutex_fast_release) == 448);
+static_assert(offsetof(JitState, mutex_fast_fallback) == 452);
+static_assert(sizeof(JitState) == 456);
 #else
 static_assert(sizeof(HostAddress) == sizeof(void *));
 static_assert(offsetof(JitState, memory_cookie) % alignof(HostAddress) == 0);
@@ -174,7 +188,17 @@ static_assert(offsetof(JitState, page_perms_base) % alignof(HostAddress) == 0);
 // Unknown operations fail closed, including FP arithmetic and unusable
 // exclusive memory reservations.
 // Limits: 4096 IR instructions, 4096 guest ticks, terminal depth 16 / 256 nodes.
-std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block);
+std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block, uint32_t hot_nid = 0);
+// HLE stub intrinsics. The caller proves the ARM [svc #0, mov pc,lr, nid]
+// shape and tracks ALL 12 bytes as code dependencies, including the NID.
+// Null JitState::mutex_table keeps ordinary SVC behavior.
+constexpr uint32_t kInlineMutexLockNid = 0x46E7BE7B;    // sceKernelLockLwMutex
+constexpr uint32_t kInlineMutexUnlockNid = 0x91FA6614;  // sceKernelUnlockLwMutex
+constexpr uint32_t kInlineMutexUnlock2Nid = 0x120AFC8C; // sceKernelUnlockLwMutex2
+constexpr bool is_inline_mutex_nid(uint32_t nid) {
+    return nid == kInlineMutexLockNid || nid == kInlineMutexUnlockNid
+        || nid == kInlineMutexUnlock2Nid;
+}
 
 // M14c region emission (REGION_ABI.md). One WebAssembly.Module per REGION:
 // many guest basic blocks with an in-module dispatch loop, so hot loops never
@@ -218,6 +242,9 @@ struct RegionBlockMeta {
     uint32_t psr_value;
     uint32_t ticks; // conservative: CycleCount + ConditionFailedCycleCount
     std::vector<StoreContinuation> store_continuations{};
+    // A validated HLE stub NID, or 0. Caller must track its return word and
+    // NID literal as code dependencies, not only the decoded SVC word.
+    uint32_t hot_nid = 0;
 };
 // Candidate, unvalidated state representation. Defaults preserve reference
 // emission. Options are resolved at emission time, never by guest code.

@@ -23,6 +23,10 @@
 #include <util/lock_and_find.h>
 #include <util/log.h>
 
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+
 static constexpr bool LOG_SYNC_PRIMITIVES = false;
 
 // ***********
@@ -598,6 +602,161 @@ SceInt32 timer_stop(KernelState &kernel, const char *export_name, SceUID thread_
 // * Mutex *
 // *********
 
+namespace {
+// Keep the guest workarea words used by the generated probe an explicit ABI.
+static_assert(sizeof(SceKernelLwMutexWork) == 32);
+static_assert(offsetof(SceKernelLwMutexWork, owner) == 0);
+static_assert(offsetof(SceKernelLwMutexWork, lockCount) == 8);
+static_assert(offsetof(SceKernelLwMutexWork, attr) == 12);
+static_assert(offsetof(SceKernelLwMutexWork, uid) == 16);
+static_assert(SCE_KERNEL_MUTEX_ATTR_RECURSIVE == vita3k::wasmjit::kInlineMutexRecursive);
+
+// These helpers are only used between generated phases, on the cooperative
+// host's single OS thread. Never overwrite dirty state to "recover": doing so
+// would let HLE/scheduling observe stale kernel owners after an inline update.
+[[noreturn]] void mutex_inline_corruption(const char *reason) noexcept {
+    std::fprintf(stderr, "[inline-mutex] invariant failure: %s\n", reason);
+    std::abort();
+}
+
+vita3k::wasmjit::InlineMutexEntry *find_inline_mutex_entry(KernelState &kernel, const Mutex &mutex) noexcept {
+    if (!kernel.execution_host || !kernel.inline_mutex_table || !mutex.workarea)
+        return nullptr;
+    auto &table = *kernel.inline_mutex_table;
+    if (table.dirty_head)
+        mutex_inline_corruption("HLE entered before committing generated updates");
+    auto &entry = table.entries[vita3k::wasmjit::inline_mutex_index(mutex.workarea.address())];
+    // A suspended old guard may outlive deletion and reuse of this slot. A
+    // refresh must neither resurrect that lifetime nor overwrite a collision.
+    if (entry.uid != static_cast<uint32_t>(mutex.uid) || entry.workarea != mutex.workarea.address())
+        return nullptr;
+    if (entry.dirty || entry.next_dirty)
+        mutex_inline_corruption("dirty slot at an HLE boundary");
+    return &entry;
+}
+
+void refresh_inline_mutex(KernelState &kernel, const Mutex &mutex) noexcept {
+    auto *entry = find_inline_mutex_entry(kernel, mutex);
+    if (!entry)
+        return;
+    entry->enabled = 0;
+    entry->owner = mutex.owner ? static_cast<uint32_t>(mutex.owner->id) : vita3k::wasmjit::kInlineMutexNoOwner;
+    entry->count = static_cast<uint32_t>(mutex.lock_count);
+    entry->attr = mutex.attr;
+    // Preserve unusual HLE counts/owners exactly, but never accelerate them.
+    entry->enabled = mutex.inline_access_depth == 0 && mutex.waiting_threads
+        && mutex.waiting_threads->empty() && mutex.lock_count >= 0
+        && ((mutex.lock_count == 0) == !mutex.owner)
+        && (!mutex.owner || mutex.owner->id > 0);
+}
+
+void register_inline_mutex(KernelState &kernel, const Mutex &mutex) noexcept {
+    if (!kernel.execution_host || !kernel.inline_mutex_table || !mutex.workarea || mutex.uid <= 0)
+        return;
+    auto &table = *kernel.inline_mutex_table;
+    if (table.dirty_head)
+        mutex_inline_corruption("mutex created before committing generated updates");
+    auto &entry = table.entries[vita3k::wasmjit::inline_mutex_index(mutex.workarea.address())];
+    if (entry.uid != 0)
+        return; // Never evict a live slot, even if its inline access is disabled.
+    if (entry.dirty || entry.next_dirty)
+        mutex_inline_corruption("dirty slot registered as a new mutex");
+    entry = {};
+    entry.workarea = mutex.workarea.address();
+    entry.uid = static_cast<uint32_t>(mutex.uid);
+    refresh_inline_mutex(kernel, mutex);
+}
+
+void clear_inline_mutex(KernelState &kernel, const Mutex &mutex) noexcept {
+    if (auto *entry = find_inline_mutex_entry(kernel, mutex))
+        *entry = {}; // Clear both lifetime tags and enabled before map erasure.
+}
+
+class InlineMutexAccessGuard {
+    KernelState &kernel;
+    Mutex &mutex;
+    const bool active;
+
+public:
+    // The caller holds mutex.mutex on entry and again at destruction. Only
+    // handle_cooperative_wait releases it meanwhile; this guard stays on the
+    // parked fiber, so a second HLE operation cannot prematurely re-enable it.
+    InlineMutexAccessGuard(KernelState &kernel, Mutex &mutex) noexcept
+        : kernel(kernel)
+        , mutex(mutex)
+        , active(kernel.execution_host && kernel.inline_mutex_table) {
+        if (!active)
+            return; // Desktop does not even change the access depth.
+        if (mutex.inline_access_depth == std::numeric_limits<unsigned>::max())
+            mutex_inline_corruption("HLE access depth overflow");
+        ++mutex.inline_access_depth;
+        if (auto *entry = find_inline_mutex_entry(kernel, mutex))
+            entry->enabled = 0;
+    }
+
+    ~InlineMutexAccessGuard() noexcept {
+        if (!active)
+            return;
+        if (mutex.inline_access_depth == 0)
+            mutex_inline_corruption("unbalanced HLE access depth");
+        --mutex.inline_access_depth;
+        refresh_inline_mutex(kernel, mutex);
+    }
+
+    InlineMutexAccessGuard(const InlineMutexAccessGuard &) = delete;
+    InlineMutexAccessGuard &operator=(const InlineMutexAccessGuard &) = delete;
+};
+} // namespace
+
+void mutex_inline_commit(KernelState &kernel, const ThreadStatePtr &running_thread) noexcept {
+    auto *table = kernel.inline_mutex_table.get();
+    if (!table || !table->dirty_head)
+        return;
+    if (!kernel.execution_host || !running_thread || running_thread->id <= 0)
+        mutex_inline_corruption("generated updates without a running cooperative thread");
+
+    // No allocation, locks, callbacks or stack switches: no observer may run
+    // until ALL dirty slots are committed. Work is proportional to distinct
+    // changed slots, not inline calls or table capacity. Clearing dirty also
+    // detects duplicate/cyclic links without a table-sized visited scan.
+    uint32_t remaining = vita3k::wasmjit::kInlineMutexEntries;
+    while (table->dirty_head) {
+        const uint32_t link = table->dirty_head;
+        if (remaining == 0 || link > vita3k::wasmjit::kInlineMutexEntries)
+            mutex_inline_corruption("invalid or cyclic dirty list");
+        --remaining;
+        auto &entry = table->entries[link - 1];
+        if (entry.dirty != 1 || entry.enabled != 1 || entry.uid == 0
+            || entry.uid > static_cast<uint32_t>(std::numeric_limits<SceUID>::max())
+            || !entry.workarea || vita3k::wasmjit::inline_mutex_index(entry.workarea) != link - 1
+            || entry.next_dirty > vita3k::wasmjit::kInlineMutexEntries)
+            mutex_inline_corruption("invalid dirty slot metadata");
+
+        const auto found = kernel.lwmutexes.find(static_cast<SceUID>(entry.uid));
+        if (found == kernel.lwmutexes.end() || !found->second)
+            mutex_inline_corruption("dirty slot refers to a deleted mutex");
+        auto &mutex = *found->second;
+        if (static_cast<uint32_t>(mutex.uid) != entry.uid || mutex.workarea.address() != entry.workarea
+            || mutex.attr != entry.attr || mutex.inline_access_depth != 0
+            || !mutex.waiting_threads || !mutex.waiting_threads->empty())
+            mutex_inline_corruption("dirty slot lifetime or HLE state mismatch");
+
+        const bool free = entry.owner == vita3k::wasmjit::kInlineMutexNoOwner;
+        if ((!free && entry.owner != static_cast<uint32_t>(running_thread->id))
+            || (entry.count == 0) != free
+            || entry.count > static_cast<uint32_t>(std::numeric_limits<int>::max())
+            || mutex.lock_count < 0 || ((mutex.lock_count == 0) != !mutex.owner)
+            || (mutex.owner && mutex.owner != running_thread))
+            mutex_inline_corruption("invalid inline owner or count");
+
+        mutex.lock_count = static_cast<int>(entry.count);
+        mutex.owner = free ? ThreadStatePtr{} : running_thread;
+        table->dirty_head = entry.next_dirty;
+        entry.dirty = 0;
+        entry.next_dirty = 0;
+    }
+}
+
 SceUID mutex_create(SceUID *uid_out, KernelState &kernel, MemState &mem, const char *export_name, const char *mutex_name, SceUID thread_id, SceUInt attr, int init_count, Ptr<SceKernelLwMutexWork> workarea, SyncWeight weight) {
     if ((strlen(mutex_name) > 31) && ((attr & 0x80) == 0x80)) {
         return RET_ERROR(SCE_KERNEL_ERROR_UID_NAME_TOO_LONG);
@@ -651,6 +810,13 @@ SceUID mutex_create(SceUID *uid_out, KernelState &kernel, MemState &mem, const c
         *uid_out = uid;
     }
 
+    if (weight == SyncWeight::Light && kernel.execution_host && kernel.inline_mutex_table) {
+        // The module normally aliases uid_out to workarea.uid. Also initialize
+        // it for direct kernel callers before publishing the slot's lifetime.
+        workarea.get(mem)->uid = uid;
+        register_inline_mutex(kernel, *mutex);
+    }
+
     return SCE_KERNEL_OK;
 }
 
@@ -683,6 +849,7 @@ inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char
     const ThreadStatePtr thread = kernel.get_thread(thread_id);
 
     std::unique_lock<std::mutex> mutex_lock(mutex->mutex);
+    const InlineMutexAccessGuard inline_access(kernel, *mutex);
 
     bool is_recursive = (mutex->attr & SCE_KERNEL_MUTEX_ATTR_RECURSIVE);
 
@@ -789,6 +956,7 @@ inline static int mutex_unlock_impl(KernelState &kernel, const char *export_name
     const ThreadStatePtr current_thread = kernel.get_thread(thread_id);
 
     const std::lock_guard<std::mutex> mutex_lock(mutex->mutex);
+    const InlineMutexAccessGuard inline_access(kernel, *mutex);
 
     if (current_thread == mutex->owner) {
         if (unlock_count > mutex->lock_count) {
@@ -876,6 +1044,8 @@ int mutex_delete(KernelState &kernel, const char *export_name, SceUID thread_id,
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
     if (mutex->waiting_threads->empty()) {
         const std::lock_guard<std::mutex> kernel_guard(kernel.mutex);
+        if (weight == SyncWeight::Light)
+            clear_inline_mutex(kernel, *mutex);
         mutexes->erase(mutexid);
     } else {
         // TODO:

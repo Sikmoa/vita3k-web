@@ -6,6 +6,8 @@
 #include <memory>
 #include <string>
 
+namespace vita3k::wasmjit { struct InlineMutexTable; }
+
 class WasmJitCPU final : public CPUInterface {
 public:
     WasmJitCPU(CPUState *state, std::size_t processor_id);
@@ -39,6 +41,10 @@ public:
     // Region modules (many blocks, in-Wasm dispatch) vs single-block modules.
     // Default: region mode (M14c production path).
     void set_region_mode(bool value);
+    // Cooperative runtime only: borrowed host table (nullptr disables).
+    // The caller must commit dirty entries before any HLE/scheduler observer.
+    static bool inline_mutex_fast_paths_enabled();
+    void set_inline_mutex_table(vita3k::wasmjit::InlineMutexTable *table);
     const std::string &get_last_error() const;
     // Valid after a generated memory-fault exit. CPU state is restored to the
     // faulting instruction's entry; earlier stores in that instruction may

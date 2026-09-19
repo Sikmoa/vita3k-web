@@ -6,6 +6,7 @@
 #include <cpu/impl/wasm_jit_cpu.h>
 #include <emuenv/state.h>
 #include <kernel/state.h>
+#include <kernel/sync_primitives.h>
 #include <kernel/thread/thread_state.h>
 #include <nids/functions.h>
 
@@ -146,6 +147,8 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
         }
         // A terminal exit is also a CPU switch. Retained external ThreadState
         // references may keep this CPU alive after its kernel record is erased.
+        // Drop the borrowed table before shutdown can release its host memory.
+        static_cast<WasmJitCPU &>(*r.thread->cpu->cpu).set_inline_mutex_table(nullptr);
         clear_exclusive(*r.thread->cpu);
         invalidate_jit_cache(*r.thread->cpu, 0, UINT32_MAX);
         if (self.last_dispatched == &r)
@@ -188,7 +191,19 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
         if (stopping_)
             return -1;
         auto &jit = static_cast<WasmJitCPU &>(*thread.cpu->cpu);
-        const int result = single_step ? jit.step() : jit.run_slice(slice);
+        int result;
+        {
+            // Generated regions cannot suspend or call HLE. Commit their final
+            // inline owners/counts before run_loop can import, checkpoint or
+            // retire a thread, including when JIT execution throws.
+            struct CommitInlineMutexes {
+                KernelState &kernel;
+                const ThreadStatePtr &thread;
+                ~CommitInlineMutexes() noexcept { mutex_inline_commit(kernel, thread); }
+            } commit{*kernel, active->thread};
+            jit.set_inline_mutex_table(kernel->inline_mutex_table.get());
+            result = single_step ? jit.step() : jit.run_slice(slice);
+        }
         if (result < 0 && !active->faulted) {
             active->faulted = true;
         }
@@ -359,7 +374,11 @@ bool GuestThreadRuntime::attach(KernelState &kernel, MemState &mem) {
     if (self.kernel || Impl::attached_owner || kernel.execution_host || !kernel.threads.empty()
         || !kernel.halt_instruction_pc || !kernel.call_import)
         return false;
-    // Prepare potentially allocating closures before publishing a borrowed host.
+    // Prepare potentially allocating state before publishing a borrowed host.
+    // Disable the table and HLE bookkeeping too for a matched baseline run.
+    // Existing lwmutexes (if any) stay unaccelerated: only mutex_create registers.
+    auto inline_mutex_table = WasmJitCPU::inline_mutex_fast_paths_enabled()
+        ? std::make_unique<vita3k::wasmjit::InlineMutexTable>() : nullptr;
     auto import = [&self](CPUState &cpu, uint32_t nid, SceUID tid) {
         if (unsupported_import(nid)) {
             std::fprintf(stderr, "[guest-runtime] unsupported wait/callback NID=%08x (%s)\n", nid, import_name(nid));
@@ -381,6 +400,7 @@ bool GuestThreadRuntime::attach(KernelState &kernel, MemState &mem) {
     self.mem = &mem;
     self.stopping_ = false;
     self.failures = 0;
+    kernel.inline_mutex_table = std::move(inline_mutex_table);
     kernel.execution_host = &self;
     Impl::attached_owner = &self;
     return true;
@@ -398,6 +418,8 @@ bool GuestThreadRuntime::shutdown(std::size_t budget) {
         return false;
     if (!self.scheduler.teardown())
         return false;
+    // All records and their parked HLE guards/fibers have now retired.
+    self.kernel->inline_mutex_table.reset();
     self.kernel->call_import = std::move(self.saved_import);
     self.kernel->run_module_entry = std::move(self.saved_module);
     self.kernel->execution_host = nullptr;

@@ -14,8 +14,10 @@
 
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
 #include "guest_mspace_tests.h"
+#include "inline_mutex_fixture.h"
 
 int main() {
+    test_inline_mutex_runtime();
     auto env = std::make_unique<EmuEnvState>();
     REQUIRE(init(env->mem, true));
     const Address code = alloc(env->mem, 4096, "thread fixture code");

@@ -128,6 +128,9 @@ struct Mutex : SyncPrimitive {
     ThreadStatePtr owner;
     WaitingThreadQueuePtr waiting_threads;
     Ptr<SceKernelLwMutexWork> workarea;
+    // Overlapping cooperative HLE operations, including parked continuations.
+    // Inline access is disabled until every operation has completed.
+    unsigned inline_access_depth = 0;
 };
 
 typedef std::shared_ptr<Mutex> MutexPtr;
@@ -222,6 +225,11 @@ SceInt32 timer_start(KernelState &kernel, const char *export_name, SceUID thread
 SceInt32 timer_stop(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID timer_handle);
 
 // Mutex
+// Single-host-thread boundary: commit generated updates before any kernel/HLE
+// observer runs. A broken dirty list/lifetime/owner is fatal, not a fallback to
+// stale kernel state. Only running_thread may have changed ownership inline.
+// Desktop (no table) is a no-op; callers must hold no kernel/primitive locks.
+void mutex_inline_commit(KernelState &kernel, const ThreadStatePtr &running_thread) noexcept;
 SceUID mutex_create(SceUID *uid_out, KernelState &kernel, MemState &mem, const char *export_name, const char *name, SceUID thread_id, SceUInt attr, int init_count, Ptr<SceKernelLwMutexWork> workarea, SyncWeight weight);
 SceUID mutex_find(KernelState &kernel, const char *export_name, const char *pName);
 int mutex_lock(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID mutexid, int lock_count, unsigned int *timeout, SyncWeight weight);

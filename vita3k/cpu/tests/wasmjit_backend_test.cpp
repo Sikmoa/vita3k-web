@@ -99,6 +99,7 @@ void equal_context(const CPUContext &a, const CPUContext &b) {
 #include "wasmjit_vector_compare_tests.inc"
 #include "wasmjit_vectorfp_compare_tests.inc"
 #include "wasmjit_byte_reverse_tests.inc"
+#include "wasmjit_packed_saturate_tests.inc"
 #include "wasmjit_f64_tests.inc"
 #include "fp64_helper_tests.inc"
 #include "wasmjit_recip_tests.inc"
@@ -106,6 +107,7 @@ void equal_context(const CPUContext &a, const CPUContext &b) {
 #include "wasmjit_vectormul_tests.inc"
 #include "wasmjit_fpsqrt_tests.inc"
 #include "wasmjit_exclusive_tests.inc"
+#include "wasmjit_inline_mutex_tests.inc"
 
 void tls_read(MemState &mem) {
     CPUState parent{};
@@ -1336,18 +1338,22 @@ void region_regressions(MemState &mem, vita3k::wasmjit::RegionStateOptions optio
 
     // LRU eviction releases compiled regions and their page references.
     std::vector<uint32_t> calls(REGION_CACHE_LIMIT + 1, 0xef000042);
-    CHECK(calls.size() * sizeof(uint32_t) <= page);
-    CHECK(mem_write(mem, code, calls.data(), calls.size() * sizeof(uint32_t)));
-    jit.invalidate_jit_cache(code, page);
+    const uint32_t cache_bytes = static_cast<uint32_t>(calls.size() * sizeof(uint32_t));
+    // The enlarged production cache no longer fits this fixture in one page.
+    const Address cache_code = alloc(mem, cache_bytes, "LRU eviction fixture");
+    CHECK(cache_code != 0);
+    CHECK(mem_write(mem, cache_code, calls.data(), cache_bytes));
     jit.set_cpsr(0x10);
     for (size_t i = 0; i < calls.size(); ++i) {
-        jit.set_pc(code + static_cast<uint32_t>(i * 4));
+        jit.set_pc(cache_code + static_cast<uint32_t>(i * 4));
         CHECK(jit.run() == 0 && parent.svc_called);
     }
     const auto formed = jit.regions_formed();
-    jit.set_pc(code);
+    jit.set_pc(cache_code);
     CHECK(jit.run() == 0 && parent.svc_called);
     CHECK(jit.regions_formed() == formed + 1);
+    jit.invalidate_jit_cache(cache_code, cache_bytes);
+    free(mem, cache_code);
 }
 void region_store_continuations(MemState &mem, vita3k::wasmjit::RegionStateOptions options) {
     using Reason = vita3k::wasmjit::ExitReason;
@@ -1610,7 +1616,7 @@ void dispatch_pump(MemState &mem, vita3k::wasmjit::RegionStateOptions options) {
         mark_code_pages(region, +1);
         slots.push_back(slot);
         const uint64_t key = Location(entry, Dynarmic::A32::PSR{cpsr}, Dynarmic::A32::FPSCR{0}).UniqueHash();
-        CHECK(dispatch_map_insert(key, static_cast<uint32_t>(slot)));
+        CHECK(dispatch_map_insert(0, key, static_cast<uint32_t>(slot)));
         kept.push_back(std::move(region));
         return ticks;
     };
@@ -1627,7 +1633,7 @@ void dispatch_pump(MemState &mem, vita3k::wasmjit::RegionStateOptions options) {
     const auto drun = [&](JitState &state, uint32_t remaining) {
         return static_cast<Reason>(vita3k_jit_run_dispatch(
             reinterpret_cast<uintptr_t>(&state),
-            remaining, dispatch_map_base(), dispatch_epoch_addr()));
+            remaining, dispatch_map_base(0), dispatch_epoch_addr()));
     };
     // A: LDR r1,[pc,#4]; BX r1; NOP; .word codeB (literal at code+12).
     CHECK(mem_write(mem, code, std::array<uint32_t, 4>{0xe59f1004, 0xe12fff31, 0xe1a00000, codeB}.data(), 16));
@@ -1689,9 +1695,9 @@ void dispatch_pump(MemState &mem, vita3k::wasmjit::RegionStateOptions options) {
     const uint64_t akey = Location(code, Dynarmic::A32::PSR{0x10}, Dynarmic::A32::FPSCR{0}).UniqueHash();
     const uint64_t bkey = Location(codeB, Dynarmic::A32::PSR{0x10}, Dynarmic::A32::FPSCR{0}).UniqueHash();
     const uint64_t ckey = Location(codeC, Dynarmic::A32::PSR{0x10}, Dynarmic::A32::FPSCR{0}).UniqueHash();
-    CHECK(dispatch_map_insert(akey, static_cast<uint32_t>(slots[0])));
-    CHECK(dispatch_map_insert(bkey, static_cast<uint32_t>(slots[1])));
-    CHECK(dispatch_map_insert(ckey, static_cast<uint32_t>(slots[2])));
+    CHECK(dispatch_map_insert(0, akey, static_cast<uint32_t>(slots[0])));
+    CHECK(dispatch_map_insert(0, bkey, static_cast<uint32_t>(slots[1])));
+    CHECK(dispatch_map_insert(0, ckey, static_cast<uint32_t>(slots[2])));
     state = fresh(code, 0x10);
     CHECK(drun(state, 100) == Reason::Svc);
     CHECK(state.regs[0] == 1 && state.tx_wasm == 1);
@@ -1726,12 +1732,12 @@ void dispatch_pump(MemState &mem, vita3k::wasmjit::RegionStateOptions options) {
     dispatch_bump_epoch();
     const uint64_t fkey = Location(codeF, Dynarmic::A32::PSR{0x10}, Dynarmic::A32::FPSCR{0}).UniqueHash();
     const uint64_t gkey = Location(codeG, Dynarmic::A32::PSR{0x10}, Dynarmic::A32::FPSCR{0}).UniqueHash();
-    CHECK(dispatch_map_insert(fkey, static_cast<uint32_t>(slots[slots.size() - 2])));
+    CHECK(dispatch_map_insert(0, fkey, static_cast<uint32_t>(slots[slots.size() - 2])));
     state = flags_input();
     CHECK(drun(state, 4) == Reason::Miss);
     CHECK(state.executed == 2 && state.next_pc == codeG && state.regs[15] == codeG);
     CHECK(state.cpsr == 0x680f00d0 && state.regs[2] == 0);
-    CHECK(dispatch_map_insert(gkey, static_cast<uint32_t>(slots.back())));
+    CHECK(dispatch_map_insert(0, gkey, static_cast<uint32_t>(slots.back())));
     CHECK(drun(state, 2) == Reason::Svc);
     CHECK(state.executed == 4 && state.regs[2] == 1 && state.cpsr == 0x680f00d0);
     for (int slot : slots)
@@ -1746,6 +1752,7 @@ int main() {
     CHECK(init(mem, true));
     CHECK(try_alloc_at(mem, code, page, "JIT backend tests") == code);
     CHECK(try_alloc_at(mem, data, 2 * page, "JIT checked memory") == data);
+    inline_mutex_tests::run(mem);
     vector_tests::ir_vector_int_to_float();
     vector_tests::ir_shift32_frontier();
     vector_tests::ir_immediate_shifts();
@@ -1761,6 +1768,8 @@ int main() {
     vectorfp_compare_tests::run(mem);
     byte_reverse_tests::ir_reversal();
     byte_reverse_tests::guest_reversal(mem);
+    packed_saturate_tests::ir_saturation();
+    packed_saturate_tests::guest_saturation(mem);
     exclusive_tests::guest_exclusive(mem);
     f64_tests::integer_to_double();
     f64_tests::float_to_int32();

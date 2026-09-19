@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cpu/common.h>
+#include <cpu/inline_mutex.h>
 #include <kernel/callback.h>
 #include <kernel/debugger.h>
 #include <kernel/object_store.h>
@@ -37,6 +38,7 @@
 #include <condition_variable>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -174,6 +176,13 @@ struct KernelState {
     CorenumAllocator corenum_allocator;
     CallImportFunc call_import;
     KernelExecutionHost *execution_host = nullptr; // borrowed; opt-in only
+
+    // HOST linear-memory inline-mutex table (vita3k::wasmjit::InlineMutexTable).
+    // Allocated by the cooperative runtime on attach; nullptr on desktop.
+    // Generated fast paths mutate entries + guest workareas only during a
+    // no-observer phase; run_cpu drains dirty slots into kernel Mutex objects
+    // before any HLE/scheduling/thread deletion can observe them.
+    std::unique_ptr<vita3k::wasmjit::InlineMutexTable> inline_mutex_table;
 
     // Optional single-host-thread module entry runner. Desktop leaves this
     // unset and uses create_thread/run_guest_function. The browser supplies
