@@ -12,7 +12,7 @@ Module['preRun'] = Module['preRun'] || [];
 Module['preRun'].push(() => {
   for (const name of ['VITA3K_TRACE_MODULE_IMPORTS', 'VITA3K_TRACE_HLE',
       'VITA3K_WASMJIT_FAULT_TRACE', 'VITA3K_WASMJIT_REJECT_TRACE',
-      'VITA3K_BENCH_DISPATCHES', 'VITA3K_BENCH_PC_SAMPLE']) {
+      'VITA3K_BENCH_PC_SAMPLE']) {
     const value = Module[name] ??
       (typeof process !== 'undefined' ? process.env?.[name] : undefined);
     if (typeof value === 'string') ENV[name] = value;

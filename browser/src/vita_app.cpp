@@ -71,24 +71,6 @@ AppLaunchConfig &launch_config() {
     return config;
 }
 
-// Guest dispatch budget for the browser run loop. The desktop-shaped default
-// is the bench harness budget; the browser harness raises it so a retail app
-// can reach its first presented frame instead of stopping mid-load. The
-// VITA3K_BENCH_DISPATCHES environment variable still wins when set (the Node
-// bench path), because it is the declared override for that harness.
-std::size_t &dispatch_budget_slot() {
-    static std::size_t budget = 100000;
-    return budget;
-}
-
-std::size_t dispatch_budget() {
-    if (const char *env = std::getenv("VITA3K_BENCH_DISPATCHES")) {
-        const unsigned long parsed = std::strtoul(env, nullptr, 10);
-        if (parsed > 0) return static_cast<std::size_t>(parsed);
-    }
-    return dispatch_budget_slot();
-}
-
 // Desktop preload order (interface.cpp load_app_impl, minus taihen/patches):
 // HLE-only modules (libnet, np_*, libime, ...) self-skip inside load_module,
 // so attempting them unconditionally matches desktop behavior.
@@ -164,13 +146,6 @@ void vita3k_web_set_app_paths(const char *vita_fs, const char *title_id, const c
     config.app_path = app_path && *app_path ? app_path : config.title_id;
     std::printf("[vita3k-web] app paths: vita_fs=%s title=%s app=%s\n",
         config.vita_fs.c_str(), config.title_id.c_str(), config.app_path.c_str());
-}
-
-extern "C" EMSCRIPTEN_KEEPALIVE
-void vita3k_web_set_dispatch_budget(std::uint32_t budget) {
-    if (!budget) return;
-    dispatch_budget_slot() = budget;
-    std::printf("[vita3k-web] guest dispatch budget: %u\n", budget);
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE
@@ -409,7 +384,6 @@ static int run_app_impl() {
 #ifdef VITA3K_USE_WASM_JIT
         vita3k::web::GuestThreadRuntime::Progress progress;
         std::size_t dispatched = 0;
-        const std::size_t budget = dispatch_budget();
         std::size_t pc_sample_every = 0;
         if (const char *sample_env = std::getenv("VITA3K_BENCH_PC_SAMPLE")) {
             const unsigned long parsed = std::strtoul(sample_env, nullptr, 10);
@@ -429,7 +403,7 @@ static int run_app_impl() {
                 std::fprintf(stderr, "\n");
             }
         } while (!exited && env->missing_nids.empty() && !progress.failed
-            && !progress.idle && dispatched < budget);
+            && !progress.idle);
         std::printf("[vita3k-web] Guest scheduler: dispatches=%zu runnable=%zu waiting=%zu dormant=%zu failed=%zu idle=%d\n",
             dispatched, progress.runnable, progress.waiting, progress.dormant, progress.failed, progress.idle);
 #else

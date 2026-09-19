@@ -45,7 +45,7 @@ target_link_options(vita3k_web_jit PRIVATE
     -sENVIRONMENT=web,worker -sNO_EXIT_RUNTIME=1 -sASYNCIFY=1
     -sFORCE_FILESYSTEM=1
     ${VITA3K_WEB_INITIAL_MEMORY_LINK_OPTION}
-    "-sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_vita3k_web_set_app_paths','_vita3k_web_set_license_key','_vita3k_web_set_dispatch_budget','_vita3k_web_run_app']"
+    "-sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_vita3k_web_set_app_paths','_vita3k_web_set_license_key','_vita3k_web_run_app']"
     "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','cwrap']")
 add_custom_command(TARGET vita3k_web_jit POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dist"

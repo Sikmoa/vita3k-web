@@ -162,7 +162,7 @@ try {
   page.on('pageerror', (error) => pageErrors.push(String(error)));
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
 
-  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, dispatches }) => {
+  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs }) => {
     const worker = new Worker('./worker.js?backend=jit&memory=w64', { type: 'module' });
     const state = { logs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
       backend: null, memory: null, workerErrors: [], ready: false, timedOut: false };
@@ -194,7 +194,7 @@ try {
         case 'staged':
           state.staged = { files: data.files, bytes: data.bytes, root: data.root };
           worker.postMessage({ type: 'run-app', vitaFs: data.root, title, app,
-            fastVblank: true, dispatches });
+            fastVblank: true });
           break;
         case 'vita-frame': {
           const pixels = new Uint8Array(data.data);
@@ -225,8 +225,7 @@ try {
       };
     });
     return result;
-  }, { title, app, frameEvery, maxFrames, deadlineMs,
-    dispatches: Number(process.env.LIMBO_DISPATCHES || 20000000) });
+  }, { title, app, frameEvery, maxFrames, deadlineMs });
 
   const saved = [];
   for (const frame of outcome.saved) {
