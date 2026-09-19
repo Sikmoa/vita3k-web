@@ -1,5 +1,6 @@
 // Opt-in M14 proof: Dynarmic frontend/IR -> generated Wasm regions.
 // No interpreter fallback. The display application's default backend is unchanged.
+#include <cpu/common.h>
 #include <cpu/impl/wasm_jit_cpu.h>
 
 #include <mem/functions.h>
@@ -326,18 +327,32 @@ void account_fast_counters(JitState &state) noexcept {
 
 // M16 Wasm-side dispatch map (see emit_wasm.h): open-addressed
 // location-hash -> table-slot cache in linear memory, read by generated
-// dispatcher code. Plain statics: on wasm32 their addresses ARE linear
-// offsets, exactly like the page-table bases the JIT already exposes.
-// Entry layout: {key_lo, key_hi, slot, epoch}; epoch 0 = never written.
-static uint32_t dispatch_map[vita3k::wasmjit::kDispatchMapEntries * 4] = {};
+// dispatcher code. Entry layout: {key_lo, key_hi, slot, epoch}; epoch 0 =
+// never written.
+//
+// One slice per core (MAX_CORE_COUNT cores exist; each guest thread owns one,
+// recycled through CorenumAllocator). A slice only ever holds that core's own
+// table slots, so switching cores no longer has to retire the outgoing core's
+// compiled state, and a core can never chain into another core's code. Slices
+// are allocated on first dispatch, so a run pays only for the cores it uses.
+static uint32_t *dispatch_map_slices[MAX_CORE_COUNT] = {};
 static uint32_t dispatch_epoch = 1;
 static uint64_t dispatch_global_version = 0;
 // Process-global eviction generation. Every dispatch_bump_epoch() (all region-
 // eviction paths funnel through it) advances this, so each CPU can tell whether
 // any map invalidation happened since its last pump entry without paying a
 // per-entry epoch bump (which would stale its own just-inserted entries).
-static uintptr_t dispatch_map_base() {
-    return reinterpret_cast<uintptr_t>(&dispatch_map[0]);
+static uint32_t *dispatch_map_slice(std::size_t core) noexcept {
+    if (core >= MAX_CORE_COUNT)
+        return nullptr;
+    uint32_t *&slice = dispatch_map_slices[core];
+    if (!slice)
+        slice = static_cast<uint32_t *>(
+            std::calloc(vita3k::wasmjit::kDispatchMapEntries * 4, sizeof(uint32_t)));
+    return slice;
+}
+static uintptr_t dispatch_map_base(std::size_t core) noexcept {
+    return reinterpret_cast<uintptr_t>(dispatch_map_slice(core));
 }
 static uintptr_t dispatch_epoch_addr() {
     return reinterpret_cast<uintptr_t>(&dispatch_epoch);
@@ -349,20 +364,25 @@ static void dispatch_bump_epoch() noexcept {
     ++dispatch_global_version;
     ++dispatch_epoch;
     if (dispatch_epoch == 0) { // Never use the never-written marker.
-        std::memset(dispatch_map, 0, sizeof(dispatch_map));
+        for (uint32_t *slice : dispatch_map_slices)
+            if (slice)
+                std::memset(slice, 0, vita3k::wasmjit::kDispatchMapEntries * 4 * sizeof(uint32_t));
         dispatch_epoch = 1;
     }
 }
 // Insert or refresh; bit-identical probing to the dispatcher emitter.
 // Returns false only if no reusable slot exists within the probe limit
 // (impossible at REGION_CACHE_LIMIT << map size; fails loudly if hit).
-static bool dispatch_map_insert(uint64_t key, uint32_t slot) noexcept {
+static bool dispatch_map_insert(std::size_t core, uint64_t key, uint32_t slot) noexcept {
     using namespace vita3k::wasmjit;
+    uint32_t *base = dispatch_map_slice(core);
+    if (!base)
+        return false;
     const uint32_t lo = static_cast<uint32_t>(key);
     const uint32_t hi = static_cast<uint32_t>(key >> 32);
     uint32_t idx = dispatch_map_index(lo, hi);
     for (uint32_t i = 0; i < kDispatchMaxProbe; ++i) {
-        uint32_t *e = &dispatch_map[(idx & kDispatchMapMask) * 4];
+        uint32_t *e = &base[(idx & kDispatchMapMask) * 4];
         if (e[3] == dispatch_epoch && e[0] == lo && e[1] == hi) {
             e[2] = slot; // refresh existing mapping
             return true;
@@ -371,7 +391,7 @@ static bool dispatch_map_insert(uint64_t key, uint32_t slot) noexcept {
     }
     idx = dispatch_map_index(lo, hi);
     for (uint32_t i = 0; i < kDispatchMaxProbe; ++i) {
-        uint32_t *e = &dispatch_map[(idx & kDispatchMapMask) * 4];
+        uint32_t *e = &base[(idx & kDispatchMapMask) * 4];
         if (e[3] != dispatch_epoch) { // empty or stale: overwrite
             e[0] = lo;
             e[1] = hi;
@@ -496,7 +516,7 @@ EM_JS(void, vita3k_jit_release, (int slot), {
 // REGION_CACHE_LIMIT, far below the initial table size).
 EM_JS(void, vita3k_jit_table_ensure, (), {
     if (!Module['vita3kJitTable'])
-        Module['vita3kJitTable'] = new WebAssembly.Table({initial: 4096, element: 'anyfunc'});
+        Module['vita3kJitTable'] = new WebAssembly.Table({initial: 8192, element: 'anyfunc'});
 });
 EM_JS(int, vita3k_jit_install_region_impl, (const uint8_t *bytes, unsigned length,
     MemoryFunction read_memory, MemoryFunction write_memory, MemoryFunction arithmetic), {
@@ -543,7 +563,7 @@ EM_JS(int, vita3k_jit_install_dispatch, (const uint8_t *bytes, unsigned length),
         const raw = Module['vita3kHostBytes'](bytes, length).slice();
         if (typeof process !== 'undefined' && process.env?.VITA3K_DUMP_JIT) require('fs').writeFileSync('/tmp/jit-dispatch.wasm', raw);
         if (!Module['vita3kJitTable'])
-            Module['vita3kJitTable'] = new WebAssembly.Table({initial: 4096, element: 'anyfunc'});
+            Module['vita3kJitTable'] = new WebAssembly.Table({initial: 8192, element: 'anyfunc'});
         const module = new WebAssembly.Module(raw);
         const instance = new WebAssembly.Instance(module, {env: {
             memory: wasmMemory,
@@ -873,8 +893,11 @@ struct WasmJitCPU::Impl {
             if (found->second.table_index < 0
                 || found->second.table_index >= static_cast<int>(vita3k::wasmjit::kDispatchTableLimit))
                 return fail("region slot outside dispatch table");
-            if (!dispatch_map_insert(key, static_cast<uint32_t>(found->second.table_index)))
+            if (!dispatch_map_insert(core, key, static_cast<uint32_t>(found->second.table_index)))
                 return fail("region map full");
+            const uintptr_t map_base = dispatch_map_base(core);
+            if (map_base == 0)
+                return fail("dispatch map allocation failed");
             const uintptr_t state_offset = reinterpret_cast<uintptr_t>(&state);
             const uint32_t granted = static_cast<uint32_t>(std::min<uint64_t>(remaining_budget, UINT32_MAX));
             const uint32_t executed_before = state.executed;
@@ -882,7 +905,7 @@ struct WasmJitCPU::Impl {
             const uint32_t tx_before = state.tx_wasm;
             const double t2 = emscripten_get_now();
             const uint32_t reason = vita3k_jit_run_dispatch(state_offset, granted,
-                dispatch_map_base(), dispatch_epoch_addr());
+                map_base, dispatch_epoch_addr());
             run_js_ms += emscripten_get_now() - t2;
             ++js_calls;
             account_fast_counters(state);

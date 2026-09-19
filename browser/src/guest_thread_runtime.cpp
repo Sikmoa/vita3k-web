@@ -108,8 +108,15 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
     void activate(Record &r) {
         // Called both on first entry AND on return from a suspended stack.
         // entry() alone misses A -> B -> A once both fibers have started.
-        if (last_dispatched && last_dispatched != &r)
-            invalidate_jit_cache(*last_dispatched->thread->cpu, 0, UINT32_MAX);
+        //
+        // No JIT invalidation here: the Wasm dispatch map is per-core, so a
+        // core's compiled regions stay resident while another core runs, and
+        // a core can never chain into another core's code. Region-cache hits
+        // are revalidated against the page table, so code changes are still
+        // caught per core. Retiring the outgoing core's whole cache on every
+        // switch made multithreaded titles re-emit their working set
+        // continuously (retail Limbo: 30k region formations on an audio
+        // thread for 8M executed instructions).
         last_dispatched = &r;
         active = &r;
     }
@@ -164,10 +171,8 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
             throw std::logic_error("guest continuation invoked outside its runtime fiber");
         auto *cpu = get_current_cpu_state();
         clear_exclusive(*r->thread->cpu);
-        // The JS dispatch map has no CPU owner in its key. Invalidation is
-        // DEFERRED to the next dispatch: re-running the same CPU (the hot
-        // polling path) keeps its compiled state, a different CPU triggers the
-        // outgoing caches' retirement in activate() before any guest code runs.
+        // The dispatch map is per-core, so a switch needs no invalidation:
+        // each core keeps its compiled state resident across suspensions.
         active = nullptr;
         set_current_cpu_state(root_cpu);
         const bool switched = parked ? scheduler.park() : scheduler.yield();

@@ -283,7 +283,11 @@ constexpr uint32_t kDispatchMapEntries = 8192;
 constexpr uint32_t kDispatchMapMask = kDispatchMapEntries - 1;
 constexpr uint32_t kDispatchMaxProbe = 64;
 constexpr uint32_t kDispatchEntryBytes = 16;
-constexpr uint32_t kDispatchTableLimit = 4096;
+// Highest region-table slot the host accepts. Slots are dense (the JS side
+// allocates via a free list and grows the table on demand), and each core's
+// region cache is LRU-bounded by REGION_CACHE_LIMIT, so this only has to
+// cover MAX_CORE_COUNT caches at once -- it is a sanity bound, not a budget.
+constexpr uint32_t kDispatchTableLimit = 153600;
 constexpr uint32_t kDispatchSliceTicks = 131072; // == REGION_CALL_TICKS
 // Hash must be bit-identical to dispatch_map_index() in wasm_jit_cpu.cpp.
 constexpr uint32_t kDispatchHashK = 0x9e3779b9u;
