@@ -19,6 +19,35 @@ export function configureGuestShaders(urls) {
   if (shaderPromise) throw new Error('guest shader compiler already initialized');
   shaderPromise = createGXPShaderAdapter(urls);
 }
+// GXP->WGSL translation cache. One translate() runs the GXP compiler wasm
+// plus a FRESH Naga wasm instantiation per call (~50-200 ms), and every draw
+// carries its full vertex+fragment GXP blobs, so uncached draws paid the
+// translation twice per draw (measured: ~2.1 s/frame of sceGxmEndScene).
+// Same GXP bytes + same textureFormats always give the same WGSL, so cache
+// by content hash with a byte-compare on hit (hash collisions only evict).
+// Promises (not results) are cached so concurrent draws share in-flight work
+// and failures never poison the cache.
+const translateCache = new Map();
+const TRANSLATE_CACHE_LIMIT = 256;
+function gxpCacheKey(bytes) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < bytes.length; i++) { h ^= bytes[i]; h = Math.imul(h, 0x01000193); }
+  return (h >>> 0) + ':' + bytes.length;
+}
+function translateCached(compiler, gxp, options) {
+  const key = gxpCacheKey(gxp);
+  const hit = translateCache.get(key);
+  if (hit && hit.bytes.length === gxp.length && hit.bytes.every((v, i) => v === gxp[i]))
+    return hit.promise;
+  const promise = compiler.translate(gxp, options);
+  if (translateCache.size >= TRANSLATE_CACHE_LIMIT) {
+    const oldest = translateCache.keys().next();
+    if (!oldest.done) translateCache.delete(oldest.value);
+  }
+  translateCache.set(key, { bytes: gxp.slice(), promise });
+  promise.catch(() => { if (translateCache.get(key)?.promise === promise) translateCache.delete(key); });
+  return promise;
+}
 
 // GXM viewport (pass-through floats) to a WebGPU viewport rect in top-left
 // device pixels. Mirrors vulkan sync_viewport_real with res_multiplier 1:
@@ -232,8 +261,10 @@ async function drawOwnedSurface(packet, initialPixels, width, height) {
   // Explicit format hints match the only accepted guest texture format. The
   // translator retains descriptor sets 2/3 and splits unit n into 2n / 2n+1.
   const textureFormats = new Uint32Array(32).fill(0x0c000000);
-  const vertex = await compiler.translate(vertexGXP, { textureFormats });
-  const fragment = await compiler.translate(fragmentGXP, { textureFormats });
+  const [vertex, fragment] = await Promise.all([
+    translateCached(compiler, vertexGXP, { textureFormats }),
+    translateCached(compiler, fragmentGXP, { textureFormats }),
+  ]);
   if (!guestRenderer) guestRenderer = createGXMRenderer(await initializeGuestDevice());
   const renderer = guestRenderer;
   let target, program;

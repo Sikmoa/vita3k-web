@@ -121,6 +121,43 @@ function webgpuProblem() {
 const webgpuBlocked = webgpuProblem();
 if (webgpuBlocked) { warningBox.textContent = webgpuBlocked; warningBox.style.display = 'block'; }
 let worker = null, frames = 0, firstFrameAt = 0, startedAt = 0;
+// Web Audio sink: guest PCM (int16 interleaved; 48 kHz stereo on the MAIN
+// port) arrives as transferred ArrayBuffers from the worker (see
+// browser/src/hle_audio_null.cpp). AudioBuffers are chained on the context
+// clock; when the unpaced guest submits ahead of realtime (bursts while
+// loading) the chain is resynced instead of scheduling seconds of latency.
+let audioCtx = null, audioNext = 0;
+function ensureAudio() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    audioCtx = new AC();
+    audioNext = 0;
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+function playAudioPCM(freq, channels, frameCount, buffer) {
+  if (!audioCtx || !buffer) return;
+  const pcm = new Int16Array(buffer);
+  if (frameCount <= 0 || channels < 1 || channels > 2 || pcm.length < frameCount * channels) return;
+  const audio = audioCtx.createBuffer(channels, frameCount, freq > 0 ? freq : 48000);
+  for (let ch = 0; ch < channels; ch++) {
+    const out = audio.getChannelData(ch);
+    if (channels === 1) {
+      for (let i = 0; i < frameCount; i++) out[i] = pcm[i] / 32768;
+    } else {
+      for (let i = 0; i < frameCount; i++) out[i] = pcm[i * 2 + ch] / 32768;
+    }
+  }
+  const src = audioCtx.createBufferSource();
+  src.buffer = audio;
+  src.connect(audioCtx.destination);
+  const now = audioCtx.currentTime;
+  if (audioNext < now) audioNext = now;
+  if (audioNext > now + 1.0) audioNext = now;
+  src.start(audioNext);
+  audioNext += audio.duration;
+}
 const log = (text) => {
   const lines = logBox.textContent.split('\\n');
   lines.push(text);
@@ -143,6 +180,7 @@ async function run() {
   status.textContent = 'loading module…';
   if (webgpuBlocked) log('warning: ' + webgpuBlocked);
   runButton.disabled = true; stopButton.disabled = false;
+  ensureAudio();
   worker = new Worker(\`./worker.js?backend=\${backend}&memory=\${memory}\`, { type: 'module' });
   worker.onerror = (event) => { log('worker error: ' + event.message); status.textContent = 'worker error'; };
   worker.onmessage = async ({ data }) => {
@@ -175,6 +213,9 @@ async function run() {
         showStats();
         break;
       }
+      case 'vita-audio':
+        playAudioPCM(data.freq, data.channels, data.frames, data.data);
+        break;
       case 'vita-exit':
         // Report first, then release the worker: stop() must not overwrite the
         // outcome the viewer is waiting to read.

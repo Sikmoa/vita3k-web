@@ -15,8 +15,9 @@ void vita3k_web_present_frame(EmuEnvState &emuenv);
 // mirrored into DisplayState by every launch path (run_vita and run_app).
 bool vita3k_web_fast_vblank_enabled();
 
-// Implemented in vita_runtime.cpp via EM_JS (C linkage, EMSCRIPTEN-only).
+// Implemented via EM_JS (C linkage, EMSCRIPTEN-only).
 extern "C" {
 void vita3k_web_post_frame_hook(int generation, int width, int height, const uint8_t *data_ptr);
+void vita3k_web_post_audio_hook(int freq, int channels, int frames, const uint8_t *data_ptr, int bytes);
 void vita3k_web_notify_exit(int code);
 }

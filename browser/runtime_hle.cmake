@@ -237,6 +237,14 @@ set(_hle_exports
     # the browser execution host has no display host thread. Limbo does not
     # import sceGxmDisplayQueueFinish.
     sceGxmDisplayQueueAddEntry
+    # Controller poll (imports=616715 missing_nids=1 PC=8126af30): the 600 s
+    # headless run presented 43 frames then stopped here — the game finished
+    # loading and polls the gamepad. Production body via ctrl_get: zeroes the
+    # buffers, returns no buttons without a host controller (browser has no
+    # SDL), and the non-peek path waits for the next vblank, which the
+    # presenting display queue advances. No input wired yet (keyboard/gamepad
+    # mapping is follow-up); the game will sit at its input screen, correctly.
+    sceCtrlReadBufferPositive
 )
 
 # Take NID values from the one authoritative database, never a second resolver.
@@ -303,6 +311,9 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceCommonDialog/SceCommonDialog.cpp"
     # No LIBRARY_INIT; startup_libraries.inc stays LIBRARY(SceSysmem).
     "${_HLE_ROOT}/modules/SceCtrl/SceCtrl.cpp"
+    # ctrl_get implementation behind the selected SceCtrl bridges (chrono +
+    # controller-state reads only; no host input device needed).
+    "${_HLE_ROOT}/ctrl/src/ctrl.cpp"
     "${_HLE_ROOT}/modules/SceTouch/SceTouch.cpp"
     "${_HLE_ROOT}/modules/ScePower/ScePower.cpp"
     # Audio port registry (null device sink is hle_audio_null.cpp, linked

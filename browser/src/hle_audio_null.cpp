@@ -10,7 +10,24 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <memory>
+#include <vector>
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+
+// Web Audio handoff (contract in browser/src/vita_runtime.h): forward one
+// int16-interleaved PCM buffer per Output call. The scratch copy is ordinary
+// Wasm heap, so JS can read it under both memory models; the guest buffer is
+// never passed to JS directly. The page must copy the view synchronously.
+EM_JS(void, vita3k_web_post_audio_hook, (int freq, int channels, int frames, const uint8_t *ptr, int bytes), {
+    if (typeof vita3kWebOnAudio === 'function')
+        vita3kWebOnAudio(freq, channels, frames, Module['vita3kHostBytes'](ptr, bytes));
+});
+#else
+static void vita3k_web_post_audio_hook(int, int, int, const uint8_t *, int) {}
+#endif
 
 struct NullAudioAdapter : AudioAdapter {
     explicit NullAudioAdapter(AudioState &audio_state)
@@ -25,14 +42,31 @@ struct NullAudioAdapter : AudioAdapter {
         return port;
     }
 
-    void audio_output(AudioOutPort & /*out_port*/, const void * /*buffer*/) override {
-        // Sink: consume immediately, never block the guest audio thread.
+    void audio_output(AudioOutPort &out_port, const void *buffer) override {
+        // Sink + Web Audio tap: copy the PCM out for the page, never block
+        // the guest audio thread. buffer holds out_port.len_bytes of int16
+        // interleaved samples (readable host memory, as the SDL backend
+        // consumes it); the channel count comes from the port mode the
+        // sceAudioOutOpenPort body sets before any Output call.
+        if (!buffer || out_port.len_bytes <= 0)
+            return;
+        const int channels = (out_port.mode == 1) ? 2 : 1; // SceAudioOutMode STEREO
+        const size_t bytes = static_cast<size_t>(out_port.len_bytes);
+        const size_t frames = bytes / (static_cast<size_t>(channels) * sizeof(int16_t));
+        if (frames == 0)
+            return;
+        if (pcm.size() != bytes)
+            pcm.resize(bytes);
+        std::memcpy(pcm.data(), buffer, bytes);
+        vita3k_web_post_audio_hook(out_port.freq, channels, static_cast<int>(frames), pcm.data(), static_cast<int>(bytes));
     }
 
     int get_rest_sample(AudioOutPort & /*out_port*/) override {
         // Nothing buffered: the sink drains instantly.
         return 0;
     }
+
+    std::vector<uint8_t> pcm; // PCM scratch for the synchronous JS copy-out
 };
 
 void vita3k_web_install_null_audio(AudioState &audio) {

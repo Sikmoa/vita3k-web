@@ -686,51 +686,16 @@ inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char
 
     bool is_recursive = (mutex->attr & SCE_KERNEL_MUTEX_ATTR_RECURSIVE);
 
-    // Already owned
-    if (mutex->lock_count > 0) {
-        // Owned by ourselves
-        if (mutex->owner == thread) {
-            if (is_recursive) {
-                mutex->lock_count += lock_count;
-                if (weight == SyncWeight::Light)
-                    mutex->workarea.get(mem)->lockCount += lock_count;
-
-                return SCE_KERNEL_OK;
-            }
-            if (weight == SyncWeight::Light)
-                return RET_ERROR(SCE_KERNEL_ERROR_LW_MUTEX_RECURSIVE);
-
-            return RET_ERROR(SCE_KERNEL_ERROR_MUTEX_RECURSIVE);
-        }
-        // Owned by someone else
-
-        // Don't sleep if only_try is set
-        if (only_try) {
-            if (weight == SyncWeight::Light)
-                return RET_ERROR(SCE_KERNEL_ERROR_LW_MUTEX_FAILED_TO_OWN);
-
-            return RET_ERROR(SCE_KERNEL_ERROR_MUTEX_FAILED_TO_OWN);
-        }
-
-        // Sleep thread!
-        std::unique_lock<std::mutex> thread_lock(thread->mutex);
-        thread->update_status(ThreadStatus::wait, ThreadStatus::run);
-
-        WaitingThreadData data;
-        data.thread = thread;
-        data.lock_count = lock_count;
-        data.priority = thread->priority;
-        bool was_canceled = false;
-        data.was_canceled = &was_canceled;
-
-        const auto data_it = mutex->waiting_threads->push(data);
-        thread_lock.unlock();
-
-        int res = kernel.execution_host
-            ? handle_cooperative_wait(kernel, thread, thread_lock, mutex_lock, mutex->waiting_threads, timeout)
-            : handle_timeout(kernel, thread, thread_lock, mutex_lock, mutex->waiting_threads, data_it, export_name, timeout);
-        if (kernel.execution_host && was_canceled)
-            res = SCE_KERNEL_ERROR_WAIT_CANCEL;
+    // Uncontended fast path: the mutex is free, so take ownership inline.
+    // No wait-queue entry, no thread-status transition and — on the
+    // cooperative (browser) runtime — no fiber park/wake round-trip through
+    // the scheduler. The workarea mirror update is plain guest-memory writes.
+    // A free mutex has no waiters at an HLE boundary (mutex_unlock always
+    // transfers ownership directly to the next waiter instead of freeing),
+    // so taking it here cannot disturb wake order.
+    if (mutex->lock_count == 0) {
+        mutex->lock_count += lock_count;
+        mutex->owner = thread;
 
         if (weight == SyncWeight::Light) {
             mutex->workarea.get(mem)->lockCount = mutex->lock_count;
@@ -739,13 +704,56 @@ inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char
             }
         }
 
-        return res;
+        return SCE_KERNEL_OK;
     }
-    // Not owned
-    // Take ownership!
 
-    mutex->lock_count += lock_count;
-    mutex->owner = thread;
+    // Owned by ourselves: recursive take (or a recursion error on a
+    // non-recursive mutex). Also completes inline, same as above.
+    if (mutex->owner == thread) {
+        if (is_recursive) {
+            mutex->lock_count += lock_count;
+            if (weight == SyncWeight::Light)
+                mutex->workarea.get(mem)->lockCount += lock_count;
+
+            return SCE_KERNEL_OK;
+        }
+        if (weight == SyncWeight::Light)
+            return RET_ERROR(SCE_KERNEL_ERROR_LW_MUTEX_RECURSIVE);
+
+        return RET_ERROR(SCE_KERNEL_ERROR_MUTEX_RECURSIVE);
+    }
+
+    // Contended slow path: held by another thread. Semantics unchanged:
+    // only_try fails without sleeping, otherwise the thread is queued
+    // (FIFO/priority order) and parked until mutex_unlock hands ownership
+    // to it directly. Wake order is owned entirely by this queue.
+    // Don't sleep if only_try is set
+    if (only_try) {
+        if (weight == SyncWeight::Light)
+            return RET_ERROR(SCE_KERNEL_ERROR_LW_MUTEX_FAILED_TO_OWN);
+
+        return RET_ERROR(SCE_KERNEL_ERROR_MUTEX_FAILED_TO_OWN);
+    }
+
+    // Sleep thread!
+    std::unique_lock<std::mutex> thread_lock(thread->mutex);
+    thread->update_status(ThreadStatus::wait, ThreadStatus::run);
+
+    WaitingThreadData data;
+    data.thread = thread;
+    data.lock_count = lock_count;
+    data.priority = thread->priority;
+    bool was_canceled = false;
+    data.was_canceled = &was_canceled;
+
+    const auto data_it = mutex->waiting_threads->push(data);
+    thread_lock.unlock();
+
+    int res = kernel.execution_host
+        ? handle_cooperative_wait(kernel, thread, thread_lock, mutex_lock, mutex->waiting_threads, timeout)
+        : handle_timeout(kernel, thread, thread_lock, mutex_lock, mutex->waiting_threads, data_it, export_name, timeout);
+    if (kernel.execution_host && was_canceled)
+        res = SCE_KERNEL_ERROR_WAIT_CANCEL;
 
     if (weight == SyncWeight::Light) {
         mutex->workarea.get(mem)->lockCount = mutex->lock_count;
@@ -754,7 +762,7 @@ inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char
         }
     }
 
-    return SCE_KERNEL_OK;
+    return res;
 }
 
 int mutex_lock(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID mutexid, int lock_count, unsigned int *timeout, SyncWeight weight) {

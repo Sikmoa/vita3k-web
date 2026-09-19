@@ -18,6 +18,13 @@ globalThis.vita3kWebOnFrame = (generation, width, height, view) => {
   const data = view.slice().buffer;
   post({ type: 'vita-frame', generation, width, height, pixelFormat: 'A8B8G8R8', data }, [data]);
 };
+// PCM tap (see browser/src/hle_audio_null.cpp): one copied buffer per
+// sceAudioOutOutput call. Transfer the copy; the Wasm scratch is reused by
+// the next call, so the page must not retain the view.
+globalThis.vita3kWebOnAudio = (freq, channels, frames, view) => {
+  const data = view.slice().buffer;
+  post({ type: 'vita-audio', freq, channels, frames, data }, [data]);
+};
 
 const transition = (state) => {
   lifecycle = state;
@@ -186,8 +193,6 @@ self.onmessage = async ({ data }) => {
         ? module['vita3kHostPointer'](value) : value;
       module._vita3k_web_set_trace?.(data.trace ? 1 : 0);
       module._vita3k_web_set_fast_vblank?.(data.fastVblank ? 1 : 0);
-      if (Number.isSafeInteger(data.dispatches) && data.dispatches > 0)
-        module._vita3k_web_set_dispatch_budget?.(data.dispatches);
       module.ccall('vita3k_web_set_app_paths', null, ['string', 'string', 'string'],
         [data.vitaFs || '/vita', data.title, data.app || data.title]);
       if (data.licenseKey instanceof Uint8Array) {

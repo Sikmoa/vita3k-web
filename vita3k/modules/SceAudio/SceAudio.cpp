@@ -231,6 +231,12 @@ EXPORT(int, sceAudioOutOutput, int port, const void *buf) {
     }
     // is it really useful to update the thread status?
     thread->update_status(ThreadStatus::wait);
+    // Wall-clock pace, shared by desktop and browser. The browser sink taps
+    // the PCM for Web Audio downstream (see hle_audio_null.cpp), but the
+    // park itself is load-bearing: without it the guest audio thread submits
+    // thousands of buffers per second and starves the loader on the
+    // single-threaded cooperative scheduler (observed: 644k calls, 0 frames).
+    // Paced submission also keeps guest audio in sync with what is heard.
     if (emuenv.kernel.execution_host) {
         // Pace to the wall clock (see audio_pace_next_us): park the fiber
         // until the device buffer has room instead of submitting instantly.
