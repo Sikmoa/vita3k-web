@@ -245,6 +245,13 @@ set(_hle_exports
     # presenting display queue advances. No input wired yet (keyboard/gamepad
     # mapping is follow-up); the game will sit at its input screen, correctly.
     sceCtrlReadBufferPositive
+    # App-state poll (imports=610599 missing_nids=1 PC=8126b640): the 513 s
+    # browser run rendered 43 frames then stopped here. Upstream
+    # _sceAppMgrGetAppState is a forwarder (CALL_EXPORT) to
+    # __sceAppMgrGetAppState, whose body memsets the struct to 0 and returns
+    # 0 — the game asks about system/app events and UI overlay, gets "none",
+    # and proceeds. Production parity, not a new stub.
+    _sceAppMgrGetAppState
 )
 
 # Take NID values from the one authoritative database, never a second resolver.
@@ -322,6 +329,8 @@ set(_hle_module_sources
     # Limbo app-manager frontier: sceAppMgrIsGameProgram is a constant-0
     # production body (full TU needed for the adapter scan).
     "${_HLE_ROOT}/modules/SceAppMgr/SceAppMgr.cpp"
+    # _sceAppMgrGetAppState forwarder (CALL_EXPORT to __sceAppMgrGetAppState).
+    "${_HLE_ROOT}/modules/SceDriverUser/SceAppMgrUser.cpp"
     # sceTouchPeek needs touch_get; touch_get's vblank wait needs wait_vblank.
     # Both TUs are Emscripten-aware (browser cooperative vblank, no host
     # threads) and define no EXPORTs, so they only contribute link symbols.
