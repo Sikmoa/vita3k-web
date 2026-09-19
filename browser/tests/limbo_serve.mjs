@@ -95,6 +95,7 @@ const page = `<!doctype html>
   <strong>Limbo ${title}</strong>
   <button id="run">Run</button>
   <button id="stop" disabled>Stop</button>
+  <button id="beep">Beep</button>
   <span id="status">idle</span>
   <span id="stats"></span>
 </header>
@@ -110,6 +111,7 @@ const screen = document.querySelector('#screen'), ctx = screen.getContext('2d');
 const status = document.querySelector('#status'), stats = document.querySelector('#stats');
 const logBox = document.querySelector('#log'), runButton = document.querySelector('#run');
 const stopButton = document.querySelector('#stop'), warningBox = document.querySelector('#warning');
+const beepButton = document.querySelector('#beep');
 // WebGPU is exposed only in a secure context; say so before the run instead of
 // letting the first draw fail with a device error.
 function webgpuProblem() {
@@ -127,6 +129,7 @@ let worker = null, frames = 0, firstFrameAt = 0, startedAt = 0;
 // clock; when the unpaced guest submits ahead of realtime (bursts while
 // loading) the chain is resynced instead of scheduling seconds of latency.
 let audioCtx = null, audioNext = 0;
+let audioChunks = 0, audioBytes = 0, audioLogged = false, audioFirstAt = 0;
 function ensureAudio() {
   if (!audioCtx) {
     const AC = window.AudioContext || window.webkitAudioContext;
@@ -140,6 +143,14 @@ function playAudioPCM(freq, channels, frameCount, buffer) {
   if (!audioCtx || !buffer) return;
   const pcm = new Int16Array(buffer);
   if (frameCount <= 0 || channels < 1 || channels > 2 || pcm.length < frameCount * channels) return;
+  audioChunks += 1; audioBytes += pcm.length * 2;
+  if (!audioLogged) {
+    audioLogged = true; audioFirstAt = (performance.now() - startedAt) / 1000;
+    const n = Math.min(pcm.length, frameCount * channels);
+    let peak = 0, nonzero = 0;
+    for (let i = 0; i < n; i++) { const v = Math.abs(pcm[i]); if (v > peak) peak = v; if (v > 100) nonzero++; }
+    log('audio: first chunk ch=' + channels + ' freq=' + freq + ' frames=' + frameCount + ' nonzero=' + nonzero + '/' + n + ' peak=' + peak + '/32768 ctx=' + audioCtx.state + ' at=' + audioFirstAt.toFixed(1) + 's');
+  }
   const audio = audioCtx.createBuffer(channels, frameCount, freq > 0 ? freq : 48000);
   for (let ch = 0; ch < channels; ch++) {
     const out = audio.getChannelData(ch);
@@ -165,18 +176,29 @@ const log = (text) => {
   logBox.scrollTop = logBox.scrollHeight;
 };
 const showStats = () => {
-  if (!frames) { stats.textContent = ''; return; }
   const elapsed = (performance.now() - startedAt) / 1000;
-  stats.textContent = \`frames=\${frames} elapsed=\${elapsed.toFixed(1)}s first=\${(firstFrameAt / 1000).toFixed(1)}s\`;
+  const audio = audioCtx ? ' audio=chunks=' + audioChunks + ' ' + (audioBytes / 1048576).toFixed(1) + 'MiB ctx=' + audioCtx.state : ' audio=off';
+  if (!frames) { stats.textContent = 'elapsed=' + elapsed.toFixed(1) + 's' + audio; return; }
+  stats.textContent = 'frames=' + frames + ' elapsed=' + elapsed.toFixed(1) + 's first=' + (firstFrameAt / 1000).toFixed(1) + 's' + audio;
 };
 function stop(keepsStatus) {
   worker?.terminate(); worker = null;
   runButton.disabled = false; stopButton.disabled = true;
   if (!keepsStatus) status.textContent = 'stopped';
 }
+beepButton.onclick = () => {
+  ensureAudio();
+  if (!audioCtx) { log('audio: no AudioContext in this browser'); return; }
+  log('audio: beep ctx=' + audioCtx.state);
+  const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+  osc.frequency.value = 660; gain.gain.value = 0.2;
+  osc.connect(gain); gain.connect(audioCtx.destination);
+  osc.start(); osc.stop(audioCtx.currentTime + 0.25);
+};
 async function run() {
   stop();
   frames = 0; firstFrameAt = 0; logBox.textContent = ''; startedAt = performance.now();
+  audioChunks = 0; audioBytes = 0; audioLogged = false; audioFirstAt = 0;
   status.textContent = 'loading module…';
   if (webgpuBlocked) log('warning: ' + webgpuBlocked);
   runButton.disabled = true; stopButton.disabled = false;
