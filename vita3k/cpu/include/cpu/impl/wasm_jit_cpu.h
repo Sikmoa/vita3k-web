@@ -58,6 +58,18 @@ public:
     uint64_t regions_formed() const;
     // One-line phase profile: emit/install/run ms, dispatch and helper counts.
     std::string get_profile() const;
+    // Step-2 dispatch telemetry for the alternating-vs-single-CPU measurement.
+    // Same values as the host_entries=... tail of get_profile(), in a form
+    // tests can difference without parsing. All counters are per-CPU except
+    // the process-global memory helper tallies (not included here).
+    struct PumpCounters {
+        uint64_t host_entries = 0, post_hle_entries = 0;
+        uint64_t version_syncs = 0, version_bumps = 0;
+        uint64_t entry_scanned = 0, entry_evicted = 0;
+        uint64_t select_checks = 0, select_stale = 0, capacity_evictions = 0;
+        uint64_t js_calls = 0, host_miss = 0, tx_wasm = 0;
+    };
+    PumpCounters pump_counters() const;
     uint64_t cache_hits() const;
     uint64_t invalidated_blocks() const;
 private:

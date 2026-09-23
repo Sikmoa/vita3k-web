@@ -689,7 +689,9 @@ per-call scratch, NOT saved across fault rollbacks.
 ## Instrumentation (already added by parent)
 
 Per-phase ms (emit/install/run), js_calls (region entries), misses, svc,
-fault, smc, stop, budget exits, dispatches, mem helper call counts.
+fault, smc, stop, budget exits, dispatches, mem helper call counts, plus the
+dispatch-ownership telemetry below (host/epoch/probe/HLE-boundary counters,
+also exposed to tests via `WasmJitCPU::pump_counters()`).
 
 ## M16 Wasm-side multi-region dispatch pump
 
@@ -743,3 +745,33 @@ total. `JitState.tx_wasm` counts chained transfers per call (host
 accumulates like `dispatches`); `host_miss` counts dispatcher Miss returns
 (~all resolve to compiled regions at the loop top; true compiles remain
 `region_misses`).
+
+## Dispatch telemetry (step 2: measure before fixing ownership)
+
+Per-CPU counters, appended to `get_profile()` (append-only; existing log
+parsers keep working) and exposed structurally via
+`WasmJitCPU::pump_counters()` for tests:
+
+| Counter | Meaning |
+| --- | --- |
+| `host_entries` | `execute_regions` host entries (region path only; single-block `execute()` excluded) |
+| `post_hle_entries` | Entries where `svc_exits` advanced since the previous entry, i.e. HLE ran between pumps (covers suspended-HLE returns; a boundary marker, not per-import attribution) |
+| `version_syncs` / `version_bumps` | Memory64 entry version comparisons vs ack bumps applied. Each ack bump advances the global version itself, so alternating same-core CPUs re-bump every switch even with zero evictions; the miss cost only materializes under eviction churn |
+| `entry_scanned` / `entry_evicted` | Memory64 whole-cache revalidation probes vs regions dropped by the entry scan |
+| `select_checks` / `select_stale` | Loop-top selected-region validations vs stale drops (both memory models) |
+| `capacity_evictions` | LRU victim removals (both models) |
+
+Sparse (wasm32) mode skips the entry version sync and whole-cache scan, so
+`version_*`/`entry_*` stay zero there by construction; `select_*`,
+`capacity_evictions`, `host_entries` and `post_hle_entries` fire in both models.
+
+Measured with `dispatch_ownership_probes` (two core-0 CPUs, one self-loop
+region, no evictions). wasm32 Node: `direct=0`, bumps `0/0`, miss `0/0`,
+`post_hle=1`. Memory64 Chromium 153: `direct=1`, single-CPU `single_bumps=1`
+over two slices, alternating `entries=5/3 bumps=3/3 miss=0/0`, `post_hle=1`.
+In words: every same-core switch re-bumps the epoch (ping-pong confirmed),
+but with no eviction churn there are zero host misses on either side, because
+each entry re-inserts its loop-top key before the pump runs. This is the
+baseline step 3 must preserve while giving each cache explicit ownership:
+the fix may not remove the load-bearing revalidation until the ownership
+transition exists, and must keep the no-churn case at zero additional misses.

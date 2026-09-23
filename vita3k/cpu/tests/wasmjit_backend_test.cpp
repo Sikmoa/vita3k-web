@@ -222,6 +222,101 @@ void cooperative_slices(MemState &mem) {
     }
 }
 
+// Step-2 dispatch-ownership measurement: alternating-vs-single-CPU on the
+// shared slice-0 map. Both CPUs use core 0, exactly like the cooperative
+// runtime. No evictions occur in the loop phases, so the signals are
+// version_syncs/version_bumps (ping-pong: every switch re-bumps, because
+// each ack bump advances the global version itself) vs host_miss (flat:
+// each entry re-inserts its loop-top key before the pump runs). The miss
+// cost only materializes under real eviction churn (step 3 premise).
+// Version-bump assertions apply to the Memory64 direct path only; sparse
+// mode skips the entry version sync, so it checks functional outcomes.
+void dispatch_ownership_probes(MemState &mem) {
+    const bool direct = mem.direct_host_memory;
+    constexpr uint32_t loop = code + 0x600, svc_probe = code + 0x700;
+    // Loop: ADD r0,r0,#1; B loop (2 ticks/iter). SVC probe: ADD; SVC #0.
+    CHECK(mem_write(mem, loop, std::array<uint32_t, 2>{0xe2800001, 0xeafffffd}.data(), 8));
+    CHECK(mem_write(mem, svc_probe, std::array<uint32_t, 2>{0xe2800001, 0xef000000}.data(), 8));
+    dispatch_bump_epoch(); // normalize: earlier tests' teardowns bumped the version
+    CPUState parent{}, child{};
+    parent.mem = child.mem = &mem;
+    WasmJitCPU a(&parent, 0), b(&child, 0);
+    const auto run_loop = [](WasmJitCPU &jit, CPUState &cpu, uint64_t slice) {
+        jit.set_cpsr(0x10);
+        jit.set_pc(loop);
+        jit.set_reg(0, 0);
+        cpu.svc_called = false;
+        CHECK(jit.run_slice(slice) == WasmJitCPU::slice_yield);
+        CHECK(jit.get_reg(0) == slice / 2);
+    };
+    // Single CPU, first slice: one entry, one ack bump (last_version starts
+    // at 0, never equal to the live global), no misses/evictions.
+    run_loop(a, parent, 200);
+    auto da = a.pump_counters();
+    CHECK(da.host_entries == 1 && da.host_miss == 0);
+    CHECK(da.js_calls >= 1);
+    CHECK(da.entry_evicted == 0 && da.select_stale == 0 && da.capacity_evictions == 0);
+    CHECK(da.post_hle_entries == 0);
+    if (direct) CHECK(da.version_syncs == 1 && da.version_bumps == 1);
+    // Single CPU, second slice: no new bump, still no misses.
+    run_loop(a, parent, 200);
+    const auto da2 = a.pump_counters();
+    CHECK(da2.host_entries == 2 && da2.host_miss == 0);
+    if (direct) CHECK(da2.version_syncs == 2 && da2.version_bumps == 1);
+    // Second CPU, same core: its first entry bumps once, then every further
+    // switch re-bumps on both sides (ping-pong), with zero host misses.
+    run_loop(b, child, 200);
+    const auto db1 = b.pump_counters();
+    CHECK(db1.host_entries == 1 && db1.host_miss == 0);
+    if (direct) CHECK(db1.version_syncs == 1 && db1.version_bumps == 1);
+    run_loop(a, parent, 200);
+    run_loop(b, child, 200);
+    da = a.pump_counters();
+    const auto db = b.pump_counters();
+    CHECK(da.host_entries == 3 && db.host_entries == 2);
+    CHECK(da.host_miss == 0 && db.host_miss == 0);
+    CHECK(da.entry_evicted == 0 && db.entry_evicted == 0);
+    if (direct) {
+        CHECK(da.version_bumps == 2 && db.version_bumps == 2);
+        CHECK(da.version_syncs == 3 && db.version_syncs == 2);
+    }
+    // Post-HLE boundary: an SVC exit followed by re-entry counts exactly one
+    // post-HLE entry (model-independent: svc_exits tally in both modes).
+    a.set_cpsr(0x10);
+    a.set_pc(svc_probe);
+    a.set_reg(0, 0);
+    parent.svc_called = false;
+    CHECK(a.run_slice(64) == 0 && parent.svc_called && a.get_reg(0) == 1);
+    const auto pre_hle = a.pump_counters().post_hle_entries;
+    a.set_cpsr(0x10);
+    a.set_pc(loop);
+    a.set_reg(0, 0);
+    parent.svc_called = false;
+    CHECK(a.run_slice(64) == WasmJitCPU::slice_yield);
+    CHECK(a.pump_counters().post_hle_entries == pre_hle + 1);
+    // Stale shared-slice safety: evict the loop on both CPUs (each
+    // invalidation bumps the epoch and nulls the freed slot). The next run
+    // re-inserts before the pump, so the nulled stale hint never resolves.
+    const auto regions_before = b.regions_formed();
+    const auto miss_before = b.pump_counters().host_miss;
+    a.invalidate_jit_cache(loop, 8);
+    b.invalidate_jit_cache(loop, 8);
+    run_loop(b, child, 200);
+    CHECK(b.regions_formed() > regions_before);
+    CHECK(b.pump_counters().host_miss == miss_before);
+    da = a.pump_counters();
+    const auto db_final = b.pump_counters();
+    std::printf("dispatch ownership probes: direct=%d single_bumps=%llu "
+        "alternating_entries=%llu/%llu alternating_bumps=%llu/%llu "
+        "miss=%llu/%llu post_hle=%llu\n",
+        direct ? 1 : 0,
+        (unsigned long long)da2.version_bumps,
+        (unsigned long long)da.host_entries, (unsigned long long)db_final.host_entries,
+        (unsigned long long)da.version_bumps, (unsigned long long)db_final.version_bumps,
+        (unsigned long long)da.host_miss, (unsigned long long)db_final.host_miss,
+        (unsigned long long)a.pump_counters().post_hle_entries);
+}
+
 void leading_zeros(MemState &mem) {
     CPUState parent{};
     parent.mem = &mem;
@@ -1796,6 +1891,7 @@ int main() {
     tls_read(mem);
     memory_barriers(mem);
     cooperative_slices(mem);
+    dispatch_ownership_probes(mem);
     leading_zeros(mem);
     multiply32(mem);
     unsigned_long_multiply(mem);

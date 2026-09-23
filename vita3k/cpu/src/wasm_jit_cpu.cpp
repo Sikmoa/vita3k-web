@@ -657,6 +657,22 @@ struct WasmJitCPU::Impl {
     double emit_ms = 0, install_ms = 0, run_js_ms = 0;
     uint64_t js_calls = 0, misses = 0, svc_exits = 0, budget_exits = 0;
     uint64_t mutex_fast_take = 0, mutex_fast_release = 0, mutex_fast_fallback = 0;
+    // Dispatch-ownership telemetry (step-2 measurement, no behavior change).
+    // host_entries: execute_regions host entries (region path only).
+    // post_hle_entries: entries where svc_exits advanced since the previous
+    //   entry, i.e. HLE ran between pumps (covers suspended-HLE returns).
+    // version_syncs/version_bumps: Memory64 entry version comparisons vs ack
+    //   bumps applied (each ack bump advances the global version, so
+    //   alternating same-core CPUs bump on every switch even with no
+    //   evictions; the miss cost only materializes under eviction churn).
+    // entry_scanned/entry_evicted: Memory64 whole-cache revalidation probes
+    //   vs regions dropped by the entry scan. select_checks/select_stale:
+    //   loop-top selected-region validations vs stale drops.
+    //   capacity_evictions: LRU victim removals.
+    uint64_t host_entries = 0, post_hle_entries = 0, last_svc_at_entry = 0;
+    uint64_t version_syncs = 0, version_bumps = 0;
+    uint64_t entry_scanned = 0, entry_evicted = 0;
+    uint64_t select_checks = 0, select_stale = 0, capacity_evictions = 0;
     // Region-mode profiling.
     uint64_t regions = 0, region_misses = 0, smc_exits = 0, dispatches = 0;
     // M16 pump counters: in-Wasm chained transfers (tx_wasm) vs dispatcher
@@ -760,6 +776,15 @@ struct WasmJitCPU::Impl {
     }
 
     int execute_regions(uint64_t remaining_budget) {
+        ++host_entries;
+        // HLE ran between this entry and the previous one (an SVC exit was
+        // serviced, possibly with fiber suspension). Single-block SVC exits
+        // share the same svc_exits tally, so this is a boundary marker, not
+        // a per-import attribution.
+        if (svc_exits != last_svc_at_entry) {
+            ++post_hle_entries;
+            last_svc_at_entry = svc_exits;
+        }
         if (parent->mem->direct_host_memory) {
             // The hint map/table are process-global. Discard hints from any
             // other cooperatively scheduled CPU before publishing this CPU's
@@ -769,7 +794,13 @@ struct WasmJitCPU::Impl {
             // entries, forcing one host miss per pump re-entry (measured 717
             // vs 71 on the display fixture). All eviction paths funnel through
             // dispatch_bump_epoch(), which advances the global version.
+            // NOTE: the ack bump below advances the global version itself, so
+            // two same-core CPUs alternating entries re-bump every switch
+            // (version_bumps tracks this ping-pong; host_miss stays flat
+            // until real eviction churn stales chained targets).
+            ++version_syncs;
             if (dispatch_global_version != last_dispatch_version) {
+                ++version_bumps;
                 dispatch_bump_epoch();
                 last_dispatch_version = dispatch_global_version;
             }
@@ -781,10 +812,12 @@ struct WasmJitCPU::Impl {
             // Thus M16 cannot chain to stale bytes or a freed/non-executable
             // region after a direct host write. No per-access host logging/hook.
             for (auto it = region_cache.begin(); it != region_cache.end();) {
+                ++entry_scanned;
                 if (region_unchanged(*it->second.region, *parent->mem)) {
                     ++it;
                     continue;
                 }
+                ++entry_evicted;
                 vita3k_jit_release_region(it->second.table_index);
                 mark_code_pages(*it->second.region, -1);
                 it = region_cache.erase(it);
@@ -829,18 +862,23 @@ struct WasmJitCPU::Impl {
                 Dynarmic::A32::PSR{state.cpsr}, Dynarmic::A32::FPSCR{state.fpscr}};
             const uint64_t key = loc.UniqueHash();
             auto found = region_cache.find(key);
-            if (found != region_cache.end() && !region_unchanged(*found->second.region, *parent->mem)) {
+            if (found != region_cache.end()) {
+                ++select_checks;
+                if (!region_unchanged(*found->second.region, *parent->mem)) {
                 // Guest code changed under us (Ptr/HLE write without tracking,
                 // or a store the smc bitmap missed). Drop and recompile.
+                ++select_stale;
                 vita3k_jit_release_region(found->second.table_index);
                 mark_code_pages(*found->second.region, -1);
                 region_cache.erase(found);
                 ++invalidated;
                 dispatch_bump_epoch();
                 found = region_cache.end();
+                }
             }
             if (found == region_cache.end()) {
                 if (region_cache.size() >= REGION_CACHE_LIMIT) {
+                    ++capacity_evictions;
                     const auto victim = std::min_element(region_cache.begin(), region_cache.end(),
                         [](const auto &a, const auto &b) {
                             return a.second.last_used < b.second.last_used;
@@ -1323,7 +1361,7 @@ uint64_t WasmJitCPU::regions_formed() const { return impl->regions; }
 uint64_t WasmJitCPU::cache_hits() const { return impl->hits; }
 uint64_t WasmJitCPU::invalidated_blocks() const { return impl->invalidated; }
 std::string WasmJitCPU::get_profile() const {
-    char buffer[896];
+    char buffer[1216];
     std::snprintf(buffer, sizeof(buffer),
         "emit_ms=%.1f install_ms=%.1f run_js_ms=%.1f js_calls=%llu misses=%llu "
         "svc_exits=%llu blocks=%llu mem_reads=%llu mem_writes=%llu "
@@ -1331,7 +1369,10 @@ std::string WasmJitCPU::get_profile() const {
         "fast_reads=%llu fast_writes=%llu slow_unmapped=%llu slow_perms=%llu "
         "slow_cross=%llu slow_code=%llu slow_other=%llu "
         "tx_wasm=%llu host_miss=%llu promote_flags=%u promote_accounting=%u "
-        "mutex_take=%llu mutex_release=%llu mutex_fallback=%llu",
+        "mutex_take=%llu mutex_release=%llu mutex_fallback=%llu "
+        "host_entries=%llu post_hle_entries=%llu version_syncs=%llu version_bumps=%llu "
+        "entry_scanned=%llu entry_evicted=%llu select_checks=%llu select_stale=%llu "
+        "capacity_evictions=%llu",
         impl->emit_ms, impl->install_ms, impl->run_js_ms,
         (unsigned long long)impl->js_calls, (unsigned long long)impl->misses,
         (unsigned long long)impl->svc_exits, (unsigned long long)impl->compiled,
@@ -1346,6 +1387,28 @@ std::string WasmJitCPU::get_profile() const {
         (unsigned long long)impl->tx_wasm, (unsigned long long)impl->host_miss,
         unsigned(impl->region_options.promote_flags), unsigned(impl->region_options.promote_accounting),
         (unsigned long long)impl->mutex_fast_take, (unsigned long long)impl->mutex_fast_release,
-        (unsigned long long)impl->mutex_fast_fallback);
+        (unsigned long long)impl->mutex_fast_fallback,
+        (unsigned long long)impl->host_entries, (unsigned long long)impl->post_hle_entries,
+        (unsigned long long)impl->version_syncs, (unsigned long long)impl->version_bumps,
+        (unsigned long long)impl->entry_scanned, (unsigned long long)impl->entry_evicted,
+        (unsigned long long)impl->select_checks, (unsigned long long)impl->select_stale,
+        (unsigned long long)impl->capacity_evictions);
     return buffer;
+}
+
+WasmJitCPU::PumpCounters WasmJitCPU::pump_counters() const {
+    PumpCounters out{};
+    out.host_entries = impl->host_entries;
+    out.post_hle_entries = impl->post_hle_entries;
+    out.version_syncs = impl->version_syncs;
+    out.version_bumps = impl->version_bumps;
+    out.entry_scanned = impl->entry_scanned;
+    out.entry_evicted = impl->entry_evicted;
+    out.select_checks = impl->select_checks;
+    out.select_stale = impl->select_stale;
+    out.capacity_evictions = impl->capacity_evictions;
+    out.js_calls = impl->js_calls;
+    out.host_miss = impl->host_miss;
+    out.tx_wasm = impl->tx_wasm;
+    return out;
 }
