@@ -130,7 +130,7 @@ let worker = null, frames = 0, firstFrameAt = 0, startedAt = 0;
 // clock; when the unpaced guest submits ahead of realtime (bursts while
 // loading) the chain is resynced instead of scheduling seconds of latency.
 let audioCtx = null, audioNext = 0;
-let audioChunks = 0, audioBytes = 0, audioLogged = false, audioFirstAt = 0;
+let audioChunks = 0, audioBytes = 0, audioLogged = false, audioFirstAt = 0, audioPeak = 0;
 function ensureAudio() {
   if (!audioCtx) {
     const AC = window.AudioContext || window.webkitAudioContext;
@@ -145,6 +145,13 @@ function playAudioPCM(freq, channels, frameCount, buffer) {
   const pcm = new Int16Array(buffer);
   if (frameCount <= 0 || channels < 1 || channels > 2 || pcm.length < frameCount * channels) return;
   audioChunks += 1; audioBytes += pcm.length * 2;
+  // Rolling peak over the whole run: separates "guest sends silence" (peak
+  // stays 0) from "page drops sound" (peak > 0 but nothing audible).
+  const m = Math.min(pcm.length, frameCount * channels);
+  let chunkPeak = 0;
+  for (let i = 0; i < m; i++) { const v = Math.abs(pcm[i]); if (v > chunkPeak) chunkPeak = v; }
+  if (chunkPeak > audioPeak) audioPeak = chunkPeak;
+  if (audioChunks % 100 === 0) log('audio: chunks=' + audioChunks + ' peak=' + audioPeak + '/32768 ctx=' + audioCtx.state);
   if (!audioLogged) {
     audioLogged = true; audioFirstAt = (performance.now() - startedAt) / 1000;
     const n = Math.min(pcm.length, frameCount * channels);
@@ -178,7 +185,7 @@ const log = (text) => {
 };
 const showStats = () => {
   const elapsed = (performance.now() - startedAt) / 1000;
-  const audio = audioCtx ? ' audio=chunks=' + audioChunks + ' ' + (audioBytes / 1048576).toFixed(1) + 'MiB ctx=' + audioCtx.state : ' audio=off';
+  const audio = audioCtx ? ' audio=chunks=' + audioChunks + ' ' + (audioBytes / 1048576).toFixed(1) + 'MiB peak=' + audioPeak + ' ctx=' + audioCtx.state : ' audio=off';
   if (!frames) { stats.textContent = 'elapsed=' + elapsed.toFixed(1) + 's' + audio; return; }
   stats.textContent = 'frames=' + frames + ' elapsed=' + elapsed.toFixed(1) + 's first=' + (firstFrameAt / 1000).toFixed(1) + 's' + audio;
 };

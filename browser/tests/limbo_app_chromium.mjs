@@ -167,7 +167,8 @@ try {
     const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}`, { type: 'module' });
     const state = { logs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
       backend: null, memory: null, workerErrors: [], ready: false, timedOut: false,
-      gxmDraws: 0, latestProgress: null, profiles: {}, jitThreads: {}, runStartedAt: null };
+      gxmDraws: 0, latestProgress: null, profiles: {}, jitThreads: {}, runStartedAt: null,
+      audio: { chunks: 0, bytes: 0, peak: 0, nonzero: 0, scanned: 0, freqs: {}, channels: {}, first: null } };
     const hex = (bytes) => Array.from(bytes.slice(0, 64), (v) => v.toString(16).padStart(2, '0')).join(' ');
     const result = await new Promise((resolveRun, rejectRun) => {
       // A deadline is a diagnostic outcome, not a failure: the host needs the
@@ -224,6 +225,27 @@ try {
           state.frames.push(record);
           break;
         }
+        case 'vita-audio': {
+          // PCM content audit: the page cannot prove audibility headless, but
+          // peak/nonzero over the run separates "guest sends silence" from
+          // "page drops sound". Transferable buffer; scan and release.
+          const pcm = new Int16Array(data.data);
+          const a = state.audio;
+          a.chunks += 1; a.bytes += pcm.length * 2;
+          a.freqs[data.freq] = (a.freqs[data.freq] || 0) + 1;
+          a.channels[data.channels] = (a.channels[data.channels] || 0) + 1;
+          let peak = 0, nonzero = 0;
+          for (let i = 0; i < pcm.length; i++) {
+            const v = Math.abs(pcm[i]);
+            if (v > peak) peak = v;
+            if (v > 100) ++nonzero;
+          }
+          if (peak > a.peak) a.peak = peak;
+          a.nonzero += nonzero; a.scanned += pcm.length;
+          if (!a.first) a.first = { freq: data.freq, channels: data.channels,
+            frames: data.frames, samples: pcm.length, peak, nonzero };
+          break;
+        }
         case 'vita-exit':
           state.exit = { exitCode: data.exitCode, ok: data.ok, message: data.message };
           finish(null, state);
@@ -266,6 +288,7 @@ try {
     pageErrors,
     logCount: outcome.logCount,
     gxmDraws: outcome.gxmDraws,
+    audio: outcome.audio,
     gxmDrawFails: outcome.logs.filter((line) => line.includes('GXM WebGPU draw failed')).slice(-3),
     gxmRejects: outcome.logs.filter((line) => line.includes('[gxm-reject]')).slice(-6),
     moduleLoads: outcome.logs.filter((line) => line.includes('load_module')).slice(-12),

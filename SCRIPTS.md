@@ -69,6 +69,26 @@ every module in Node. Expected: 378 reference + 1146 candidate modules,
 ~59k cases, "Wasm execution passed" (P/K/PK x fast-bases variants plus
 the shifts_imm immediate-count suite; counts grow with coverage).
 
+## Audio audibility probe (square-wave homebrew through the Worker path)
+
+```sh
+cmake -S browser/tests/vita_audio_fixture -B build/vita-audio-fixture \
+  -DVITASDK=/opt/vitasdk/vitasdk
+cmake --build build/vita-audio-fixture --target vita3k_vita_audio_fixture
+PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index.mjs \
+  node browser/tests/audio_fixture_chromium.mjs
+```
+
+Builds a genuine VitaSDK homebrew that outputs 40 full-scale 440 Hz stereo
+buffers through production `sceAudioOut` HLE, runs it through the wasm64
+Worker (`run-vita`), and asserts exit code 7 with 40 chunks at peak 16000.
+Expected last line: `AUDIO PATH AUDIBLE: 40 full-scale chunks through
+HLE->worker->page`. A passing probe with silent retail PCM means the game
+emits silence (e.g. still on a loading screen with no input), not that the
+page drops sound. The headless Limbo harness (`limbo_app_chromium.mjs`)
+reports aggregate PCM `audio` (chunks/bytes/peak/nonzero/freqs) for the same
+separation, and the dev page shows a rolling `peak=` in its stats line.
+
 ## Exit-42 homebrew fixture (end-to-end JIT, cold start)
 
 ```sh

@@ -61,6 +61,12 @@ void vita3k_web_free_input(uint8_t *pointer) {
 static uint64_t vita3k_web_bench_instructions = 0;
 static bool vita3k_web_trace_cpu = false;
 
+// Null audio sink (hle_audio_null.cpp): the homebrew launch path opens the
+// same production SceAudio ports as retail, so it needs the same sink.
+// Mirrors run_app_impl in vita_app.cpp; without it the first
+// sceAudioOutOpenPort dereferences a null adapter (null-function trap).
+void vita3k_web_install_null_audio(struct AudioState &audio);
+
 extern "C" EMSCRIPTEN_KEEPALIVE
 void vita3k_web_set_trace(int enabled) { vita3k_web_trace_cpu = enabled != 0; }
 
@@ -101,6 +107,7 @@ static int run_vita(const uint8_t *bytes, uint32_t size) {
             static_cast<unsigned long long>(vita3k::memory::guest_window_base),
             static_cast<unsigned long long>(vita3k::memory::guest_window_end));
     env->display.fast_vblank = vita3k_web_fast_vblank_enabled();
+    vita3k_web_install_null_audio(env->audio);
     ThreadStatePtr thread;
     bool exited = false;
     int exit_code = 0;
