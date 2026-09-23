@@ -65,9 +65,10 @@ node vita3k/cpu/tests/wasmjit_emitter_test.mjs /tmp/wasmjit-emitter-fixtures
 Step 1 builds the native fixture generator (no CMake target exists for it —
 recipe from `vita3k/cpu/tests/wasmjit_emitter_README.md`). Step 2 translates
 real ARM/Thumb and emits `.wasm` fixtures + expected-state JSON. Step 3 executes
-every module in Node. Expected: 378 reference + 1146 candidate modules,
+every module in Node. Expected: 432 reference + 1308 candidate modules,
 ~59k cases, "Wasm execution passed" (P/K/PK x fast-bases variants plus
-the shifts_imm immediate-count suite; counts grow with coverage).
+the shifts_imm immediate-count suite and the 27-case vitaslop conformance
+import; counts grow with coverage).
 
 ## Audio audibility probe (square-wave homebrew through the Worker path)
 
