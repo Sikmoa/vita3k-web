@@ -54,6 +54,15 @@ constexpr MemPerm most_restrictive_perm(MemPerm a, MemPerm b) {
 bool mem_read(const MemState &state, Address addr, void *destination, size_t size);
 bool mem_write(MemState &state, Address addr, const void *source, size_t size);
 bool mem_fetch(const MemState &state, Address addr, void *destination, size_t size);
+// Optional observer for successful mem_write() ranges. The Wasm region JIT
+// installs this so code written through mem_write bumps its per-page write
+// generations (see wasm_jit_cpu.cpp: g_code_page_versions). Null in builds
+// without that JIT, and deliberately NOT a virtual or an emuenv dependency:
+// the memory layer must not know about the CPU layer. HLE that resolves guest
+// pointers with Ptr<T>::get() and memcpy's still bypasses this, which is why
+// the hook exists for the funnel that is actually used by tests and the
+// loader rather than pretending to cover every possible writer.
+extern void (*g_mem_write_observer)(Address addr, size_t size);
 // Page-granular, outward-rounded guest permissions; default allocation is RWX.
 // Rejects invalid/unallocated ranges without changing permissions.
 bool mem_set_permissions(MemState &state, Address addr, size_t size, MemPerm perm);

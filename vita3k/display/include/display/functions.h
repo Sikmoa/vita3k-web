@@ -32,6 +32,13 @@ void start_sync_thread(EmuEnvState &emuenv);
 // native host vblank thread; single-threaded hosts (browser Worker) drive it
 // cooperatively from wait_vblank instead.
 void advance_vblank(EmuEnvState &emuenv);
+// Advance the emulated vblank clock on hosts that have no vblank thread of
+// their own (the browser Worker). Returns true when this call woke at least one
+// waiter, so a cooperative scheduler can count it as forward progress instead
+// of idling. The clock only moves while a thread is registered in
+// display.vblank_wait_infos, which is the behavior the previous self-driven
+// browser wait loop had, without the spinning.
+bool service_vblank(EmuEnvState &emuenv);
 void wait_vblank(EmuEnvState &emuenv, const ThreadStatePtr &wait_thread, const uint64_t target_vcount, const bool is_cb);
 // if the result is not nullptr, contain the predicted frame (pointer needs to be freed later)
 DisplayFrameInfo *predict_next_image(EmuEnvState &emuenv, Address sync_object);

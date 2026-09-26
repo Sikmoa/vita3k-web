@@ -377,9 +377,13 @@ bool mem_fetch(const MemState &state, Address addr, void *destination, size_t si
     return copy_from_guest(state, addr, destination, size, MemPerm::Execute);
 }
 
+void (*g_mem_write_observer)(Address addr, size_t size) = nullptr;
+
 bool mem_write(MemState &state, Address addr, const void *source, size_t size) {
     if ((!source && size) || !check_range(state, addr, size, MemPerm::WriteOnly))
         return false;
+    if (g_mem_write_observer)
+        g_mem_write_observer(addr, size);
     if (state.direct_host_memory) {
         if (size)
             std::memcpy(vita3k::memory::direct_pointer(addr), source, size);
@@ -400,8 +404,14 @@ bool mem_set_permissions(MemState &state, Address addr, size_t size, MemPerm per
     if (static_cast<uint8_t>(perm) > static_cast<uint8_t>(MemPerm::ReadWriteExecute)
         || !check_range(state, addr, size, MemPerm::None))
         return false;
-    if (size)
+    if (size) {
         protect_inner(state, addr, static_cast<uint32_t>(size), perm);
+        // A permission change can invalidate a cached region without changing
+        // a single byte (losing Execute makes the fetch fail), so it counts as
+        // a tracked write for the JIT's per-page generations.
+        if (g_mem_write_observer)
+            g_mem_write_observer(addr, size);
+    }
     return true;
 }
 

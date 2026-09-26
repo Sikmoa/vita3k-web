@@ -111,21 +111,22 @@ public:
     ~Suite() { manifest << "]\n"; }
 
     void add(const std::string &name, const IR::Block &block, const std::vector<Case> &cases,
-        std::optional<uint32_t> region_budget = std::nullopt, bool differential = false) {
+        std::optional<uint32_t> region_budget = std::nullopt, bool differential = false,
+        vita3k::wasmjit::RegionStateOptions base_options = {}) {
         const auto emit = [&](vita3k::wasmjit::RegionStateOptions options = {}) {
-            if (!region_budget) return emit_block(block);
+            if (!region_budget) return emit_block(block, 0, options);
             const A32::LocationDescriptor at(block.Location());
             return vita3k::wasmjit::emit_region({&block}, {{at.PC(),
                 A32::LocationDescriptor::CPSR_MODE_MASK,
                 at.CPSR().Value() & A32::LocationDescriptor::CPSR_MODE_MASK,
                 static_cast<uint32_t>(block.CycleCount() + block.ConditionFailedCycleCount())}}, options);
         };
-        const auto bytes = emit();
+        const auto bytes = emit(base_options);
         if (bytes.empty()) {
             std::cerr << "Unexpected rejection: " << name << '\n' << IR::DumpBlock(block);
             std::abort();
         }
-        CHECK(bytes == emit()); // deterministic, no IR mutation
+        CHECK(bytes == emit(base_options)); // deterministic, no IR mutation
         std::ofstream wasm(path / (name + ".wasm"), std::ios::binary);
         wasm.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
         CHECK(wasm.good());
@@ -138,7 +139,9 @@ public:
             bool first_variant = true;
             for (unsigned mode = 1; mode <= 3; ++mode) {
                 for (unsigned fast = 0; fast <= 1; ++fast) {
-                    vita3k::wasmjit::RegionStateOptions options{(mode & 1) != 0, (mode & 2) != 0};
+                    vita3k::wasmjit::RegionStateOptions options = base_options;
+                    options.promote_flags = (mode & 1) != 0;
+                    options.promote_accounting = (mode & 2) != 0;
                     options.assume_fast_bases = fast != 0;
                     const auto variant = emit(options);
                     CHECK(!variant.empty() && variant == emit(options));
@@ -863,8 +866,42 @@ void memory_bases(Suite &suite) {
                 cases.push_back(test);
             }
             suite.add(std::string(write ? "memory_bases_write" : "memory_bases_read")
-                    + std::to_string(width * 8), block, cases);
+                    + std::to_string(width * 8), block, cases, std::nullopt, false,
+                // The per-access counters are diagnostic and off by default;
+                // this suite exists to pin the COUNTED shape, so ask for it.
+                vita3k::wasmjit::RegionStateOptions{false, false, false, true});
         }
+    }
+}
+
+// Production shape: the fast path leaves the diagnostic per-access counters
+// alone (RegionStateOptions::count_fast_memory is off by default) while still
+// loading/storing exactly what the counted shape does. Region emission uses
+// the same default, so this golden pins the uncounted fast path itself rather
+// than only the counted one.
+void memory_counters_off(Suite &suite) {
+    for (const bool write : {false, true}) {
+        const uint32_t opcode = write ? 0xe5810000u : 0xe5910000u;
+        const auto block = translate({opcode}, false);
+        auto in = initial();
+        in.regs[0] = 0xe5b6c7d8;
+        in.regs[1] = 0x3000;
+        in.page_table_base = 0x8000;
+        in.page_perms_base = 0x9000;
+        in.code_pages_base = 0xa000;
+        // next() copies the input, so mem_fast_reads/mem_fast_writes keep their
+        // zero initial value: that is the expectation, not an omission.
+        auto out = next(in);
+        if (!write)
+            out.regs[0] = 0x11223344; // the page-table backing word
+        Case test{in, out};
+        test.pre = {{0, 0x03000000}, {12, 0}, {0x800c, 0xb000},
+            {0x9000, 0x03000000}, {0xa00c, 0}, {0x3000, 0x11223344}, {0xb000, 0x11223344}};
+        test.mem = {{0x3000, 0x11223344}, {0xb000, 0x11223344}};
+        if (write)
+            test.mem[0xb000] = 0xe5b6c7d8;
+        suite.add(write ? "memory_counters_off_write" : "memory_counters_off_read",
+            block, {test});
     }
 }
 
@@ -1587,6 +1624,7 @@ int main(int argc, char **argv) {
     most_significant_word(suite);
     shifts64(suite);
     memory_bases(suite);
+    memory_counters_off(suite);
     memory_address_faults(suite);
     region_it_faults(suite);
     size_t vitaslop_passed = 0, vitaslop_skipped = 0;

@@ -1369,17 +1369,21 @@ void region_regressions(MemState &mem, vita3k::wasmjit::RegionStateOptions optio
     }
     collect_code_pages(overlapping);
     CHECK(overlapping.validation_pages.size() == 2);
-    CHECK(region_unchanged(overlapping, mem));
+    // force=true: this block exercises the byte compare on overlapping page
+    // fragments by editing the stored reference and page permissions directly,
+    // so no content generation moves and the version filter would (correctly,
+    // in the real system) skip the comparison it is here to verify.
+    CHECK(region_unchanged(overlapping, mem, true));
     overlapping.blocks[1].original[0] ^= 1;
-    CHECK(!region_unchanged(overlapping, mem));
+    CHECK(!region_unchanged(overlapping, mem, true));
     overlapping.blocks[1].original[0] ^= 1;
     const uint8_t changed = overlapping.blocks[0].original[8] ^ 1;
     CHECK(mem_write(mem, data + page, &changed, 1));
-    CHECK(!region_unchanged(overlapping, mem));
+    CHECK(!region_unchanged(overlapping, mem, true));
     CHECK(mem_write(mem, data + page, &overlapping.blocks[0].original[8], 1));
-    CHECK(region_unchanged(overlapping, mem));
+    CHECK(region_unchanged(overlapping, mem, true));
     CHECK(mem_set_permissions(mem, data + page, page, MemPerm::ReadWrite));
-    CHECK(!region_unchanged(overlapping, mem));
+    CHECK(!region_unchanged(overlapping, mem, true));
     CHECK(mem_set_permissions(mem, data, 2 * page, MemPerm::ReadWrite));
 
     // Reference counts, cross-page writes, and full-width address rounding.

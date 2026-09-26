@@ -188,7 +188,7 @@ static_assert(offsetof(JitState, page_perms_base) % alignof(HostAddress) == 0);
 // Unknown operations fail closed, including FP arithmetic and unusable
 // exclusive memory reservations.
 // Limits: 4096 IR instructions, 4096 guest ticks, terminal depth 16 / 256 nodes.
-std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block, uint32_t hot_nid = 0);
+// (emit_block itself is declared below RegionStateOptions.)
 // HLE stub intrinsics. The caller proves the ARM [svc #0, mov pc,lr, nid]
 // shape and tracks ALL 12 bytes as code dependencies, including the NID.
 // Null JitState::mutex_table keeps ordinary SVC behavior.
@@ -259,18 +259,32 @@ struct RegionStateOptions {
     // predicate is run-stable. Never set without that proof: a zero base
     // would turn a guest address into an unprobed host-memory offset.
     bool assume_fast_bases = false;
+    // Count each successful fast-path access into JitState.mem_fast_reads /
+    // mem_fast_writes, which the host only accumulates into the profile. It is
+    // purely diagnostic, and it costs a load+add+store in linear memory on
+    // EVERY guest load and store, so production leaves it off: one measured
+    // retail run retired 5.5e9 counted reads and 6.1e9 counted writes, i.e.
+    // tens of billions of extra memory operations. Set the switch to recover
+    // the exact per-access counts.
+    bool count_fast_memory = false;
 };
 // Read once per process/module. Native: getenv; Emscripten: Module properties
 // (same names) override process.env. PROMOTE_FLAGS defaults ON (production);
 // set it to "0" for the reference representation. PROMOTE_ACCOUNTING
 // defaults OFF; the exact value "1" (or VITA3K_WASMJIT_PROMOTED_STATE=1 as
-// umbrella default) enables it. The two independent switches override the
-// umbrella whenever present.
+// umbrella default) enables it. COUNT_FAST_MEMORY defaults OFF; "1" restores
+// the diagnostic per-access memory counters. The two independent switches
+// override the umbrella whenever present.
 RegionStateOptions region_state_options();
 std::vector<uint8_t> emit_region(
     const std::vector<const Dynarmic::IR::Block *> &blocks,
     const std::vector<RegionBlockMeta> &meta,
     RegionStateOptions options = region_state_options());
+// Single-block module (the reference/test shape). Options default to the
+// reference policy; ask for count_fast_memory to get the diagnostic
+// per-access memory counters on this path too.
+std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block, uint32_t hot_nid = 0,
+    RegionStateOptions options = {});
 
 // Checks whether a block can be lowered into a region body without assembling
 // a complete module. Region formation uses this to avoid repeatedly building
@@ -292,9 +306,21 @@ bool validate_region_block(const Dynarmic::IR::Block &block,
 // Stale entries (epoch mismatch) are skipped on lookup and overwritten on
 // insert. The host bumps *epoch_addr on EVERY region eviction, so a stale
 // slot can never match; table slots are additionally nulled on release.
-// Map capacity is fixed (kDispatchMapEntries, power of two); the host keeps
-// live regions far below it (REGION_CACHE_LIMIT) and fails loudly if an
-// insert finds no reusable slot within kDispatchMaxProbe.
+// Map capacity is fixed (kDispatchMapEntries, power of two). It is sized for
+// the host's live-region cache (REGION_CACHE_LIMIT, default 1024 and
+// runtime-tunable) to keep the ~12.5% load factor the map was sized for:
+// 1024 live entries in an 8k map probes in ~1.1 steps on average, comfortably
+// inside kDispatchMaxProbe. The host still fails loudly if an insert ever
+// finds no reusable slot within the probe limit.
+//
+// This was briefly 32768 to support an experimental 4096-region cache, but
+// that cache measured as a net loss (revalidation is O(live regions) per host
+// entry, so a bigger cache costs more in sweeps than it saves in evictions),
+// and a 4x larger table is pure per-dispatch cache pressure: the M16 pump
+// probes this table ~140M times per Limbo run, and 512KiB/core at 32k entries
+// cost a reproducible ~3 MIPS versus 128KiB/core here (16.5 -> 13.5 with page
+// versioning off). Size it for the default, not for an abandoned experiment.
+constexpr uint32_t kDispatchMapEntries = 8192;
 //
 // mrun(state, remaining, map_base, epoch_addr) -> ExitReason runs the pump:
 // entry and every transfer resolve (pc, cpsr, fpscr) to the location hash
@@ -306,7 +332,6 @@ bool validate_region_block(const Dynarmic::IR::Block &block,
 // next_pc published exactly as a single-region run would. A region reporting
 // more ticks than its slice returns DispatchOverrun (host fails, as it does
 // for the equivalent single-region overrun today).
-constexpr uint32_t kDispatchMapEntries = 8192;
 constexpr uint32_t kDispatchMapMask = kDispatchMapEntries - 1;
 constexpr uint32_t kDispatchMaxProbe = 64;
 constexpr uint32_t kDispatchEntryBytes = 16;

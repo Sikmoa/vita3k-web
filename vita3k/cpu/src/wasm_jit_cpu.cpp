@@ -18,9 +18,11 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include "mem/functions.h"
 #include <limits>
 #include <map>
 #include <optional>
@@ -57,10 +59,51 @@ constexpr size_t REGION_MAX_CODE_BYTES = REGION_BLOCK_INSTR_LIMIT * 4;
 // a code-streaming title stale the whole map continuously and fall back to
 // host round-trips instead of Wasm-side chaining. A stream of ~17k distinct
 // regions through a 128-entry LRU showed emit+install at ~18% of wall time
-// and a ~57x gap versus the hot-loop bench; 1024 keeps the map load factor
-// (kDispatchMapEntries) low while staying below kDispatchTableLimit.
+// and a ~57x gap versus the hot-loop bench.
+//
+// MEASURED, do not raise this on its own. Interleaved A/B (n=3 each, one
+// binary, 180s runs, ABBAAB so machine drift cancels): raising the limit to
+// 4096 cuts the cost it targets hard - capacity_evictions 7869 -> 1636 (-79%),
+// regions formed 8893 -> 5732 (-36%), emit 14770 -> 9181ms (-38%), run_js
+// 74787 -> 44704ms (-40%) - but revalidation is O(live regions) per host
+// entry, so it grew 26785 -> 69900ms (+161%) and the net accounted total got
+// WORSE (115776 -> 123843ms). End to end the guest simply got less done:
+// frames 33 -> 20 and reported 6.1 -> 3.7 MIPS, at an unchanged 5.5
+// draws/frame, i.e. it was starved rather than finished sooner.
+// The 4096 numbers are kept here because they are the prize: execution plus
+// compilation is only ~54s instead of ~90s. Realizing it needs revalidation
+// to cost O(regions whose code actually changed) instead of O(cache), after
+// which this limit should be re-measured. Until then 1024 ships.
+// Runtime-tunable so one binary can A/B it (see region_cache_limit()); the
+// value is printed in the profile as cache_limit.
 constexpr size_t REGION_CACHE_LIMIT = 1024;
 constexpr uint32_t REGION_CALL_TICKS = 131072; // Bound latency of host stop checks.
+
+// Region-cache size knob. Read once per process from the Module property
+// VITA3K_WASMJIT_REGION_CACHE, else process.env, else REGION_CACHE_LIMIT.
+// Values below 64 are clamped: a tiny cache thrashes the dispatch map and the
+// value exists to A/B cache SIZE, not to re-test pathological limits.
+EM_JS(int, vita3k_jit_region_cache_option, (), {
+    const read = (name) => {
+        if (typeof Module !== 'undefined' && Module[name] !== undefined)
+            return String(Module[name]);
+        return (typeof process !== 'undefined' && process.env) ? process.env[name] : undefined;
+    };
+    const raw = read('VITA3K_WASMJIT_REGION_CACHE');
+    if (raw === undefined)
+        return 0;
+    const value = parseInt(String(raw), 10);
+    return Number.isFinite(value) ? value : 0;
+});
+size_t region_cache_limit() noexcept {
+    static const size_t limit = []() {
+        const int requested = vita3k_jit_region_cache_option();
+        if (requested <= 0)
+            return REGION_CACHE_LIMIT;
+        return std::max<size_t>(64, static_cast<size_t>(requested));
+    }();
+    return limit;
+}
 
 // Opt-out for matched A/B runs. C getenv does not read browser module
 // properties (nor Node process.env), so use the same channel as JIT options.
@@ -71,6 +114,20 @@ EM_JS(int, vita3k_jit_inline_mutex_option, (), {
 });
 bool inline_mutex_enabled() noexcept {
     static const bool enabled = vita3k_jit_inline_mutex_option() != 0;
+    return enabled;
+}
+// A/B switch for the whole-cache revalidation gate in execute_regions():
+// '1' restores the unconditional every-entry sweep (the "B1" measurement),
+// anything else keeps the post-HLE-only gate ("B2", the shipping default).
+// Read once per process so an interleaved A/B/A series cannot change modes
+// mid-run; start a fresh Worker/Node process per sample.
+EM_JS(int, vita3k_jit_revalidate_all_option, (), {
+    const v = Module['VITA3K_WASMJIT_REVALIDATE_ALL'] ??
+        (typeof process !== 'undefined' ? process.env?.VITA3K_WASMJIT_REVALIDATE_ALL : undefined);
+    return String(v) === '1' ? 1 : 0;
+});
+bool revalidate_all_enabled() noexcept {
+    static const bool enabled = vita3k_jit_revalidate_all_option() != 0;
     return enabled;
 }
 // Only ARM little-endian stubs can match. Include return/NID in cache
@@ -105,6 +162,10 @@ struct RegionPage {
     };
     uint32_t page = 0;
     uint32_t begin = 4096, end = 0;
+    // g_code_page_versions[page] as of the last successful validation of this
+    // page. Equal means nothing wrote the page since, so the bytes cannot
+    // differ and the mem_fetch + memcmp below is skipped entirely.
+    uint32_t version = 0;
     std::vector<Span> spans;
 };
 struct Region {
@@ -114,6 +175,110 @@ struct Region {
     std::vector<uint32_t> code_pages;     // Only pages actually containing code.
     std::vector<RegionPage> validation_pages; // Built once, reused on every entry.
 };
+
+// Wide reference counts: multiple CPUs and cached entries can share pages.
+std::array<uint32_t, 1 << 20> g_code_pages{};
+// Per-page write generation, and a global generation that changes whenever any
+// page a cached region could cover is written through a TRACKED path. These
+// exist only to make the region-cache sweep affordable:
+//
+//   - guest stores to a cached code page take the checked path, set smc_dirty,
+//     and the host answers with clear_regions_for_page(), which DROPS the
+//     affected regions rather than revalidating them;
+//   - invalidate_jit_cache() is the sanctioned host-side "this code changed"
+//     notification and bumps the covered pages here.
+//
+// So in steady state no tracked path writes compiled code, the global
+// generation does not move, and the sweep is skipped with a single integer
+// compare per host entry instead of re-fetching and re-comparing every
+// validation page of every cached region (that sweep measured 25-30s of a
+// 180s retail run at a 1024-entry cache and ~70s at 4096, while never finding
+// a single stale region: entry_evicted was 0 in every measured run).
+//
+// KNOWN LIMIT, unchanged by this: a host write through a raw pointer into a
+// compiled code page bypasses both tracked paths, because HLE resolves guest
+// pointers with Ptr<T>::get() -> mem_guest_to_host() and then memcpy's, which
+// is indistinguishable from a read at that layer. Audit behind this change:
+// across the 39 HLE sources the web build compiles there is no direct
+// guest-memory mutation except memcpy through Ptr::get() in 13 places, all
+// targeting thread/mutex info, GXM program/uniform data or file buffers - not
+// loaded code - and module loading completes before any region exists.
+std::array<uint32_t, 1 << 20> g_code_page_versions{};
+std::atomic<uint32_t> g_code_write_epoch{1};
+
+// Record that pages [first_page, last_page] may have changed through a tracked
+// path. Only pages that actually carry compiled code bump a generation, so
+// data writes (the overwhelming majority of host traffic) cost one counter test
+// and leave the sweep skipped.
+void note_code_page_write(uint32_t first_page, uint32_t last_page) noexcept {
+    // Callers compute the range from Address arithmetic, so a wrapped or
+    // inverted range is possible; clamp to the array and reject it rather than
+    // walking ~4e9 entries.
+    constexpr uint32_t kMaxPage = (1u << 20) - 1;
+    if (last_page < first_page || first_page > kMaxPage)
+        return;
+    if (last_page > kMaxPage)
+        last_page = kMaxPage;
+    bool any = false;
+    for (uint32_t page = first_page; page <= last_page; ++page) {
+        if (!g_code_pages[page])
+            continue;
+        ++g_code_page_versions[page];
+        any = true;
+    }
+    if (any)
+        g_code_write_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+void note_code_range_write(Address address, size_t size) noexcept {
+    if (!size)
+        return;
+    const uint64_t end = (uint64_t(address) + size + 4095) >> 12;
+    const uint32_t first = address >> 12;
+    if (!first || end > (1u << 20))
+        return;
+    note_code_page_write(first, static_cast<uint32_t>(end - 1));
+}
+
+// Install the mem_write observer at library load, before any CPU exists, so
+// every later code write through the memory funnel bumps the generations.
+// Without this the conformance/backend suite is wrong in a way that looks like
+// a JIT bug: it writes its own probe code with mem_write, and a region left
+// over from an earlier test in the same process would be trusted as fresh, so
+// the probe would execute stale bytes.
+//
+// Isolation switch: LIMBO's versioning build showed a reproducible +44% run_js
+// and +66% emit_ms regression versus the pre-versioning baseline even though
+// the revalidation saving was real. The observer (which fires on EVERY
+// mem_write and mem_set_permissions, then walks the page range) is the prime
+// suspect, so this toggle lets an A/B isolate it: explicitly '0' keeps the
+// observer installed (indirect call remains) but makes its body a no-op,
+// removing the page walk and the epoch/page-version bumps.
+// DEFAULT IS ON and it is load-bearing for correctness, not just optimization:
+// wasmjit_inline_mutex_tests.inc:202 patches a code page via mem_write and
+// line 207 requires jit.invalidated_blocks() to increase, which only happens
+// if the observer bumps the code write epoch. Turning it off breaks that test
+// (and the production code-page-write invalidation guarantee), so OFF is a
+// diagnostic state only, never a shipping default.
+EM_JS(int, vita3k_jit_write_observer_option, (), {
+    const v = Module['VITA3K_WASMJIT_WRITE_OBSERVER'] ??
+        (typeof process !== 'undefined' ? process.env?.VITA3K_WASMJIT_WRITE_OBSERVER : undefined);
+    return String(v) === '0' ? 0 : 1;
+});
+bool write_observer_enabled() noexcept {
+    static const bool enabled = vita3k_jit_write_observer_option() != 0;
+    return enabled;
+}
+namespace {
+struct InstallMemWriteObserver {
+    InstallMemWriteObserver() noexcept {
+        ::g_mem_write_observer = [](Address addr, size_t size) {
+            if (write_observer_enabled())
+                note_code_range_write(addr, size);
+        };
+    }
+} install_mem_write_observer;
+} // namespace
 
 void collect_code_pages(Region &region) {
     region.code_pages.clear();
@@ -142,6 +307,9 @@ void collect_code_pages(Region &region) {
     region.code_pages.reserve(pages.size());
     region.validation_pages.reserve(pages.size());
     for (auto &[number, page] : pages) {
+        // Snapshot the current generation so the first validation of this
+        // region can skip any page that has not been written since formation.
+        page.version = g_code_page_versions[number];
         region.code_pages.push_back(number);
         region.validation_pages.push_back(std::move(page));
     }
@@ -289,8 +457,6 @@ bool form_region(MemState &mem, uint32_t entry_pc, uint32_t entry_cpsr,
 }
 // --- end region formation -------------------------------------------------
 
-// Wide reference counts: multiple CPUs and cached entries can share pages.
-std::array<uint32_t, 1 << 20> g_code_pages{};
 void mark_code_pages(const Region &region, int delta) {
     for (const uint32_t page : region.code_pages) {
         if (delta > 0)
@@ -301,14 +467,27 @@ void mark_code_pages(const Region &region, int delta) {
 }
 
 // Region-entry validation (replaces per-block unchanged()): revalidate the
-// guest bytes of EVERY member block once per region entry. Between entries,
-// cached code pages are marked in g_code_pages, letting checked_memory_write flag
-// smc_dirty for an immediate Smc exit instead of waiting for this check.
-bool region_unchanged(const Region &region, MemState &mem) {
+// guest bytes of EVERY member block once per region entry, but only for pages
+// whose write generation moved since the last successful check. Between
+// entries, cached code pages are marked in g_code_pages, letting
+// checked_memory_write flag smc_dirty for an immediate Smc exit instead of
+// waiting for this check; a page whose version is unchanged here provably
+// cannot differ, so it is skipped without touching memory.
+// On success the observed versions are adopted, so a page that was rewritten
+// with identical bytes is not re-read on every later entry.
+// `force` ignores the generations and compares every page. It exists for the
+// backend suite, whose byte-compare test corrupts the stored reference buffer
+// directly (not through a guest write, so no generation moves) and for pages
+// whose executability changed without a content write; both are cases the
+// version filter would otherwise (correctly, in the real system) skip.
+bool region_unchanged(Region &region, MemState &mem, bool force = false) {
     // No per-entry allocations, page grouping or binary searches. Only the
     // fetched range is read, so the scratch page needs no zero-initialization.
     std::array<uint8_t, 4096> bytes;
-    for (const auto &page : region.validation_pages) {
+    for (auto &page : region.validation_pages) {
+        const uint32_t version = g_code_page_versions[page.page];
+        if (!force && page.version == version)
+            continue;
         if (!mem_fetch(mem, page.page * 4096 + page.begin,
                 bytes.data(), page.end - page.begin))
             return false;
@@ -319,6 +498,7 @@ bool region_unchanged(const Region &region, MemState &mem) {
                     bytes.begin() + (span.page_offset - page.begin)))
                 return false;
         }
+        page.version = version;
     }
     return true;
 }
@@ -481,6 +661,10 @@ EMSCRIPTEN_KEEPALIVE uint32_t checked_memory_write(JitState *state, uint32_t add
             else if (state->smc_page != page)
                 state->smc_page = std::numeric_limits<uint32_t>::max();
             state->smc_dirty = 1;
+            // Tracked write: bump the page generation too, so any OTHER
+            // cached region covering this page is revalidated on the next
+            // host entry even if this thread's region is dropped instead.
+            note_code_page_write(static_cast<uint32_t>(page), static_cast<uint32_t>(page));
         }
     }
     return 0;
@@ -672,6 +856,12 @@ struct WasmJitCPU::Impl {
     uint64_t host_entries = 0, post_hle_entries = 0, last_svc_at_entry = 0;
     uint64_t version_syncs = 0, version_bumps = 0;
     uint64_t entry_scanned = 0, entry_evicted = 0;
+    // Wall time spent in the whole-cache revalidation sweep above. Diagnostic
+    // only: it attributes the Memory64 entry cost that entry_scanned counts.
+    double revalidate_ms = 0;
+    // g_code_write_epoch as of this core's last whole-cache sweep. Zero forces
+    // the first sweep, so regions formed before tracking started are checked.
+    uint32_t swept_code_epoch = 0;
     uint64_t select_checks = 0, select_stale = 0, capacity_evictions = 0;
     // Region-mode profiling.
     uint64_t regions = 0, region_misses = 0, smc_exits = 0, dispatches = 0;
@@ -774,6 +964,93 @@ struct WasmJitCPU::Impl {
     int budget_exhausted() {
         return scheduler_slice ? WasmJitCPU::slice_yield : fail("instruction budget exhausted");
     }
+    // Shared region form/emit/install path for the lazy miss path in
+    // execute_regions() and for AOT-1 precompile_region(). Forms the closure,
+    // emits the Wasm module, installs it in the function table, and publishes
+    // the cache entry WITHOUT executing guest code. Failures report through
+    // fail()/reject() exactly as the lazy path does; the caller checks for
+    // region_cache.end(). Per-build measurements (module bytes, block/tick
+    // counts, emit/install time) are reported through `stats` when non-null.
+    struct RegionBuildStats {
+        size_t blocks = 0;
+        uint32_t ticks = 0;
+        size_t wasm_bytes = 0;
+        double emit_ms = 0;
+        double install_ms = 0;
+    };
+    std::map<uint64_t, RegionEntry>::iterator ensure_region(uint32_t pc, uint64_t key,
+        RegionBuildStats *stats) {
+        if (region_cache.size() >= region_cache_limit()) {
+            ++capacity_evictions;
+            const auto victim = std::min_element(region_cache.begin(), region_cache.end(),
+                [](const auto &a, const auto &b) {
+                    return a.second.last_used < b.second.last_used;
+                });
+            vita3k_jit_release_region(victim->second.table_index);
+            mark_code_pages(*victim->second.region, -1);
+            region_cache.erase(victim);
+            ++invalidated;
+                dispatch_bump_epoch();
+        }
+        const double t0 = emscripten_get_now();
+        ++region_misses;
+        auto region = std::make_shared<Region>();
+        std::vector<Dynarmic::IR::Block> ir_blocks;
+        if (!form_region(*parent->mem, pc, state.cpsr, state.fpscr, *region, ir_blocks)) {
+            // Report the actual failing instruction, not just the
+            // region failure (which hides the unsupported op).
+            try {
+                reject(vita3k::wasmjit::translate_block(*parent->mem,
+                    pc, state.cpsr, 1, state.fpscr));
+            } catch (const std::exception &error) {
+                fail(error.what());
+            }
+            return region_cache.end();
+        }
+        std::vector<const Dynarmic::IR::Block *> block_ptrs;
+        std::vector<vita3k::wasmjit::RegionBlockMeta> meta;
+        block_ptrs.reserve(region->blocks.size());
+        meta.reserve(region->blocks.size());
+        for (size_t i = 0; i < region->blocks.size(); ++i) {
+            block_ptrs.push_back(&ir_blocks[i]);
+            meta.push_back({region->blocks[i].pc, region->blocks[i].psr_mask,
+                region->blocks[i].psr_value, region->blocks[i].ticks,
+                region->blocks[i].store_continuations, region->blocks[i].hot_nid});
+        }
+        const auto bytes = vita3k::wasmjit::emit_region(block_ptrs, meta, region_options);
+        const double emit_done = emscripten_get_now() - t0;
+        emit_ms += emit_done;
+        if (stats)
+            stats->emit_ms = emit_done;
+        if (bytes.empty()) {
+            fail("region emission rejected (no fallback)");
+            return region_cache.end();
+        }
+        // Allocate the map node before installing the JS function.
+        auto found = region_cache.emplace(key,
+            RegionEntry{std::move(region), -1}).first;
+        const double t1 = emscripten_get_now();
+        const int slot = vita3k_jit_install_region(bytes.data(), bytes.size(),
+            checked_memory_read, checked_memory_write);
+        const double install_done = emscripten_get_now() - t1;
+        install_ms += install_done;
+        if (stats)
+            stats->install_ms = install_done;
+        if (slot < 0) {
+            region_cache.erase(found); // No pages were marked yet.
+            fail("browser rejected generated region Wasm");
+            return region_cache.end();
+        }
+        found->second.table_index = slot;
+        mark_code_pages(*found->second.region, +1);
+        ++regions;
+        if (stats) {
+            stats->blocks = found->second.region->blocks.size();
+            stats->ticks = found->second.region->total_ticks;
+            stats->wasm_bytes = bytes.size();
+        }
+        return found;
+    }
 
     int execute_regions(uint64_t remaining_budget) {
         ++host_entries;
@@ -781,11 +1058,34 @@ struct WasmJitCPU::Impl {
         // serviced, possibly with fiber suspension). Single-block SVC exits
         // share the same svc_exits tally, so this is a boundary marker, not
         // a per-import attribution.
-        if (svc_exits != last_svc_at_entry) {
+        const bool hle_ran = svc_exits != last_svc_at_entry;
+        if (hle_ran) {
             ++post_hle_entries;
             last_svc_at_entry = svc_exits;
         }
-        if (parent->mem->direct_host_memory) {
+        // The whole-cache revalidation below exists because host/HLE/loader Ptr
+        // writes are unchecked and can change any cached region. Guest writes
+        // cannot need it: a store into a code page already forces the checked
+        // path, sets smc_dirty, and the region loop above re-forms from the
+        // bytes on disk. So the ONLY entries that can need a revalidation are
+        // the ones where host code actually ran (an SVC/HLE exit was serviced
+        // since the previous entry). Budget/miss/stop/SMC entries carry no host
+        // write, and rescanning the entire cache for them is pure waste: a
+        // measured 180s retail run spent 42.0s of 176.6s wall clock in exactly
+        // this sweep, ~1021 region byte-compares on each of 69k host entries,
+        // while evictions from the sweep itself were zero. Skipping the
+        // no-host-write entries keeps the guarantee (any real host write still
+        // forces a full sweep before the next entry can chain into a region)
+        // and drops the count to the HLE-driven subset.
+        //
+        // VITA3K_WASMJIT_REVALIDATE_ALL=1 restores the unconditional sweep for
+        // matched A/B runs: a single earlier pair of runs suggested B2 was a
+        // net regression, but the LRU explanation offered for it was wrong
+        // (last_used has exactly one writer, the loop-top selected-region path
+        // at the `found->second.last_used = ++region_clock` line below;
+        // region_unchanged() only reads bytes), so the question is now purely
+        // empirical and needs interleaved samples rather than one pair.
+        if (parent->mem->direct_host_memory && (revalidate_all_enabled() || hle_ran)) {
             // The hint map/table are process-global. Discard hints from any
             // other cooperatively scheduled CPU before publishing this CPU's
             // revalidated region set; table slots themselves remain reusable.
@@ -810,19 +1110,38 @@ struct WasmJitCPU::Impl {
             // (including a suspended HLE return). No host mutator runs inside
             // this cooperative pump; generated code-page writes use smc_dirty.
             // Thus M16 cannot chain to stale bytes or a freed/non-executable
-            // region after a direct host write. No per-access host logging/hook.
-            for (auto it = region_cache.begin(); it != region_cache.end();) {
-                ++entry_scanned;
-                if (region_unchanged(*it->second.region, *parent->mem)) {
-                    ++it;
-                    continue;
-                }
-                ++entry_evicted;
-                vita3k_jit_release_region(it->second.table_index);
-                mark_code_pages(*it->second.region, -1);
-                it = region_cache.erase(it);
-                ++invalidated;
+            // region after a tracked host write. No per-access host logging/hook.
+            //
+            // Two-level filter, because the unconditional form was 14-16% of
+            // wall clock and had never once found anything (entry_evicted was
+            // 0 in every measured run):
+            //   1. g_code_write_epoch only moves when a TRACKED path writes a
+            //      page that currently carries compiled code (see
+            //      note_code_page_write). Guest code writes take the smc path
+            //      and drop the region outright; data writes are not code
+            //      writes. Unchanged epoch => the whole sweep is provably
+            //      redundant, so it costs one integer compare.
+            //   2. When it does move, region_unchanged() re-reads only the
+            //      pages whose own generation changed.
+            if (g_code_write_epoch.load(std::memory_order_relaxed) != swept_code_epoch) {
+                const auto revalidate_started = std::chrono::steady_clock::now();
+                for (auto it = region_cache.begin(); it != region_cache.end();) {
+                    ++entry_scanned;
+                    if (region_unchanged(*it->second.region, *parent->mem)) {
+                        ++it;
+                        continue;
+                    }
+                    ++entry_evicted;
+                    vita3k_jit_release_region(it->second.table_index);
+                    mark_code_pages(*it->second.region, -1);
+                    it = region_cache.erase(it);
+                    ++invalidated;
                 dispatch_bump_epoch();
+                }
+                swept_code_epoch = g_code_write_epoch.load(std::memory_order_relaxed);
+                revalidate_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - revalidate_started)
+                                     .count();
             }
         }
         uint64_t budget_progress_mark = state.executed;
@@ -872,65 +1191,15 @@ struct WasmJitCPU::Impl {
                 mark_code_pages(*found->second.region, -1);
                 region_cache.erase(found);
                 ++invalidated;
-                dispatch_bump_epoch();
+                    dispatch_bump_epoch();
                 found = region_cache.end();
                 }
             }
             if (found == region_cache.end()) {
-                if (region_cache.size() >= REGION_CACHE_LIMIT) {
-                    ++capacity_evictions;
-                    const auto victim = std::min_element(region_cache.begin(), region_cache.end(),
-                        [](const auto &a, const auto &b) {
-                            return a.second.last_used < b.second.last_used;
-                        });
-                    vita3k_jit_release_region(victim->second.table_index);
-                    mark_code_pages(*victim->second.region, -1);
-                    region_cache.erase(victim);
-                    ++invalidated;
-                    dispatch_bump_epoch();
-                }
-                const double t0 = emscripten_get_now();
-                ++region_misses;
-                auto region = std::make_shared<Region>();
-                std::vector<Dynarmic::IR::Block> ir_blocks;
-                if (!form_region(*parent->mem, pc, state.cpsr, state.fpscr, *region, ir_blocks)) {
-                    // Report the actual failing instruction, not just the
-                    // region failure (which hides the unsupported op).
-                    try {
-                        return reject(vita3k::wasmjit::translate_block(*parent->mem,
-                            pc, state.cpsr, 1, state.fpscr));
-                    } catch (const std::exception &error) {
-                        return fail(error.what());
-                    }
-                }
-                std::vector<const Dynarmic::IR::Block *> block_ptrs;
-                std::vector<vita3k::wasmjit::RegionBlockMeta> meta;
-                block_ptrs.reserve(region->blocks.size());
-                meta.reserve(region->blocks.size());
-                for (size_t i = 0; i < region->blocks.size(); ++i) {
-                    block_ptrs.push_back(&ir_blocks[i]);
-                    meta.push_back({region->blocks[i].pc, region->blocks[i].psr_mask,
-                        region->blocks[i].psr_value, region->blocks[i].ticks,
-                        region->blocks[i].store_continuations, region->blocks[i].hot_nid});
-                }
-                const auto bytes = vita3k::wasmjit::emit_region(block_ptrs, meta, region_options);
-                emit_ms += emscripten_get_now() - t0;
-                if (bytes.empty())
-                    return fail("region emission rejected (no fallback)");
-                // Allocate the map node before installing the JS function.
-                found = region_cache.emplace(key,
-                    RegionEntry{std::move(region), -1}).first;
-                const double t1 = emscripten_get_now();
-                const int slot = vita3k_jit_install_region(bytes.data(), bytes.size(),
-                    checked_memory_read, checked_memory_write);
-                install_ms += emscripten_get_now() - t1;
-                if (slot < 0) {
-                    region_cache.erase(found); // No pages were marked yet.
-                    return fail("browser rejected generated region Wasm");
-                }
-                found->second.table_index = slot;
-                mark_code_pages(*found->second.region, +1);
-                ++regions;
+                RegionBuildStats build{};
+                found = ensure_region(pc, key, &build);
+                if (found == region_cache.end())
+                    return -1; // ensure_region already reported via fail()/reject().
             }
             ++hits;
             found->second.last_used = ++region_clock;
@@ -1320,6 +1589,11 @@ void WasmJitCPU::invalidate_jit_cache(Address start, size_t length) {
     for (auto it = impl->region_cache.begin(); it != impl->region_cache.end();) {
         const Region &r = *it->second.region;
         if (first_page < r.page_end && r.page_begin < end_page) {
+            // Sanctioned host-side "this code changed" notification: bump the
+            // covered pages' generations so the version filter cannot let a
+            // stale region survive, even though these entries are dropped.
+            note_code_page_write(std::max<uint32_t>(r.page_begin, first_page),
+                std::min<uint32_t>(r.page_end, end_page) - 1);
             if (it->second.table_index >= 0) vita3k_jit_release_region(it->second.table_index);
             mark_code_pages(r, -1);
             it = impl->region_cache.erase(it);
@@ -1358,6 +1632,60 @@ bool WasmJitCPU::get_fault_write() const { return impl->state.fault_write != 0; 
 uint64_t WasmJitCPU::instructions_executed() const { return impl->executed; }
 uint64_t WasmJitCPU::compiled_blocks() const { return impl->compiled; }
 uint64_t WasmJitCPU::regions_formed() const { return impl->regions; }
+// AOT-1: install the entry closure before first execution. Mirrors the
+// execute_regions() entry setup (dispatch install + map publish) and shares
+// its ensure_region() form/emit/install path, but executes no guest code.
+WasmJitCPU::PrecompileResult WasmJitCPU::precompile_region() {
+    PrecompileResult out{};
+    out.entry_pc = impl->state.regs[15];
+    const auto loc = Dynarmic::A32::LocationDescriptor{impl->state.regs[15],
+        Dynarmic::A32::PSR{impl->state.cpsr}, Dynarmic::A32::FPSCR{impl->state.fpscr}};
+    const uint64_t key = loc.UniqueHash();
+    if (!impl->dispatch_installed) {
+        vita3k_jit_table_ensure();
+        const auto dbytes = vita3k::wasmjit::emit_dispatch();
+        if (dbytes.empty()) {
+            out.error = "dispatch emission rejected";
+            return out;
+        }
+        if (vita3k_jit_install_dispatch(dbytes.data(), dbytes.size()) < 0) {
+            out.error = "browser rejected dispatch Wasm";
+            return out;
+        }
+        impl->dispatch_installed = true;
+    }
+    const auto cached = impl->region_cache.find(key);
+    if (cached != impl->region_cache.end()) {
+        if (!dispatch_map_insert(impl->core, key,
+                static_cast<uint32_t>(cached->second.table_index))) {
+            out.error = "region map full";
+            return out;
+        }
+        out.ok = true;
+        out.cache_hit = true;
+        out.blocks = cached->second.region->blocks.size();
+        out.ticks = cached->second.region->total_ticks;
+        return out;
+    }
+    Impl::RegionBuildStats build{};
+    const auto found = impl->ensure_region(impl->state.regs[15], key, &build);
+    if (found == impl->region_cache.end()) {
+        out.error = impl->error; // ensure_region already reported loudly.
+        return out;
+    }
+    if (!dispatch_map_insert(impl->core, key,
+            static_cast<uint32_t>(found->second.table_index))) {
+        out.error = "region map full";
+        return out;
+    }
+    out.ok = true;
+    out.blocks = build.blocks;
+    out.ticks = build.ticks;
+    out.wasm_bytes = build.wasm_bytes;
+    out.emit_ms = build.emit_ms;
+    out.install_ms = build.install_ms;
+    return out;
+}
 uint64_t WasmJitCPU::cache_hits() const { return impl->hits; }
 uint64_t WasmJitCPU::invalidated_blocks() const { return impl->invalidated; }
 std::string WasmJitCPU::get_profile() const {
@@ -1372,7 +1700,7 @@ std::string WasmJitCPU::get_profile() const {
         "mutex_take=%llu mutex_release=%llu mutex_fallback=%llu "
         "host_entries=%llu post_hle_entries=%llu version_syncs=%llu version_bumps=%llu "
         "entry_scanned=%llu entry_evicted=%llu select_checks=%llu select_stale=%llu "
-        "capacity_evictions=%llu",
+        "capacity_evictions=%llu revalidate_ms=%.1f revalidate_all=%d cache_limit=%zu",
         impl->emit_ms, impl->install_ms, impl->run_js_ms,
         (unsigned long long)impl->js_calls, (unsigned long long)impl->misses,
         (unsigned long long)impl->svc_exits, (unsigned long long)impl->compiled,
@@ -1392,7 +1720,8 @@ std::string WasmJitCPU::get_profile() const {
         (unsigned long long)impl->version_syncs, (unsigned long long)impl->version_bumps,
         (unsigned long long)impl->entry_scanned, (unsigned long long)impl->entry_evicted,
         (unsigned long long)impl->select_checks, (unsigned long long)impl->select_stale,
-        (unsigned long long)impl->capacity_evictions);
+        (unsigned long long)impl->capacity_evictions, impl->revalidate_ms,
+        revalidate_all_enabled() ? 1 : 0, region_cache_limit());
     return buffer;
 }
 

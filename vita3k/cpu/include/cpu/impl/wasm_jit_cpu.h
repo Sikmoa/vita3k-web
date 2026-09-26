@@ -56,6 +56,27 @@ public:
     // Region-mode metric: successfully installed code regions (a region
     // batches many basic blocks into one WebAssembly.Module).
     uint64_t regions_formed() const;
+    // AOT-1: compile+install the region closure for the CURRENT pc/cpsr/fpscr
+    // through the standard form/emit/install/table path without executing
+    // guest code. Guest-address semantics are unchanged and the installed
+    // entry holds no host addresses, table slots, JS identities, allocator
+    // pointers, or cross-MemState data (the dispatch slot is resolved per
+    // entry at execution, exactly as on the lazy path). Dynamic fallback is
+    // retained: run()/run_slice() behave identically with or without a
+    // precompile call. Set the entry pc/cpsr/fpscr first; fails closed
+    // (ok=false) on unsupported IR, unmapped code, or rejected Wasm.
+    struct PrecompileResult {
+        bool ok = false;
+        bool cache_hit = false;
+        std::string error;
+        uint32_t entry_pc = 0;
+        size_t blocks = 0;
+        uint32_t ticks = 0;
+        size_t wasm_bytes = 0;
+        double emit_ms = 0;
+        double install_ms = 0;
+    };
+    PrecompileResult precompile_region();
     // One-line phase profile: emit/install/run ms, dispatch and helper counts.
     std::string get_profile() const;
     // Step-2 dispatch telemetry for the alternating-vs-single-CPU measurement.

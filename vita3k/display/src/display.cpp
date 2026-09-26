@@ -108,6 +108,38 @@ void start_sync_thread(EmuEnvState &emuenv) {
     emuenv.display.vblank_thread = std::make_unique<std::thread>(vblank_sync_thread, std::ref(emuenv));
 }
 
+// Browser clock driver, shared by the cooperative fiber runtime and the
+// legacy self-driven wait below. See display/functions.h for the contract.
+bool service_vblank(EmuEnvState &emuenv) {
+    DisplayState &display = emuenv.display;
+    if (display.vblank_wait_infos.empty())
+        return false;
+
+    const auto before = display.vblank_count.load();
+    if (display.fast_vblank) {
+        // Headroom mode: one vblank per service pass, no wall-clock gating.
+        // next_vblank_time tracks now so leaving fast mode (or concurrent
+        // readers) never sees a stale deadline.
+        advance_vblank(emuenv);
+        display.next_vblank_time = std::chrono::steady_clock::now();
+        return display.vblank_count.load() != before;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (display.next_vblank_time.time_since_epoch().count() == 0) {
+        // First wait: seed the cadence so the first vblank lands one full
+        // period from now, like arriving just after a vblank start on native.
+        display.next_vblank_time = now + std::chrono::microseconds(TARGET_MICRO_PER_FRAME);
+    }
+    // Advance by every fully elapsed period, mirroring the native vblank
+    // thread's steady wall-clock cadence (a slow guest sees its vcount jump by
+    // the number of missed vblanks, as on native).
+    while (now >= display.next_vblank_time) {
+        advance_vblank(emuenv);
+        display.next_vblank_time += std::chrono::microseconds(TARGET_MICRO_PER_FRAME);
+    }
+    return display.vblank_count.load() != before;
+}
+
 void wait_vblank(EmuEnvState &emuenv, const ThreadStatePtr &wait_thread, const uint64_t target_vcount, const bool is_cb) {
     DisplayState &display = emuenv.display;
 
@@ -130,48 +162,31 @@ void wait_vblank(EmuEnvState &emuenv, const ThreadStatePtr &wait_thread, const u
 
 #ifdef __EMSCRIPTEN__
         // Browser Worker path: there is no host vblank thread, so nothing would
-        // ever wake status_cond. The waiting thread drives the emulated vblank
-        // clock itself instead: advance_vblank performs the same per-vblank
-        // work vblank_sync_thread does natively (increment the vblank count,
-        // notify vblank callbacks, wake threads whose target vcount was
-        // reached) and emscripten_sleep yields to the browser event loop
-        // between ticks (built with ASYNCIFY). The clock advances whenever a
-        // full ~60fps period (TARGET_MICRO_PER_FRAME) has elapsed on the
-        // steady clock, so sceDisplayGetVcount keeps progressing monotonically
-        // at a realistic cadence; everything runs on the Worker's single thread
-        // so no host-thread data races are possible.
-        while (wait_thread->status != ThreadStatus::run && !display.abort.load()) {
-            if (display.fast_vblank) {
-                // Headroom mode: one vblank per wait, no wall-clock gating.
-                // Waiting threads whose target vcount is reached wake via
-                // the normal advance_vblank path below; others loop and
-                // advance again. next_vblank_time tracks now so leaving fast
-                // mode (or concurrent readers) never sees a stale deadline.
-                advance_vblank(emuenv);
-                display.next_vblank_time = std::chrono::steady_clock::now();
+        // ever wake status_cond. Two shapes, one clock service:
+        //
+        // * With a cooperative execution host (the fiber runtime the browser
+        //   app installs) the waiting fiber parks through wait_sync, exactly
+        //   like the kernel sync primitives do, and the runtime's service pass
+        //   calls service_vblank to advance the emulated clock and wake it.
+        //   Parking is what makes this usable: the Worker has one thread, so
+        //   every OTHER guest fiber keeps running while this one waits out its
+        //   vblank. The previous sleep loop instead froze the whole Worker for
+        //   up to a full frame per wait, which was over half the wall clock as
+        //   soon as a title paced itself with sceDisplayWaitSetFrameBuf.
+        // * Without one (a bare Emscripten build with no fiber runtime) the
+        //   waiting thread keeps driving the clock itself, yielding to the
+        //   browser event loop between ticks.
+        if (emuenv.kernel.execution_host) {
+            thread_lock.unlock();
+            emuenv.kernel.execution_host->wait_sync(*wait_thread, std::nullopt);
+            thread_lock.lock();
+        } else {
+            while (wait_thread->status != ThreadStatus::run && !display.abort.load()) {
+                service_vblank(emuenv);
                 thread_lock.unlock();
                 emscripten_sleep(1);
                 thread_lock.lock();
-                continue;
             }
-            const auto now = std::chrono::steady_clock::now();
-            if (display.next_vblank_time.time_since_epoch().count() == 0) {
-                // First cooperative wait: seed the cadence so the first vblank
-                // lands one full period from now, like arriving just after a
-                // vblank start on native.
-                display.next_vblank_time = now + std::chrono::microseconds(TARGET_MICRO_PER_FRAME);
-            }
-            // Advance by every fully elapsed period, mirroring the native
-            // vblank thread's steady wall-clock cadence (a slow guest sees its
-            // vcount jump by the number of missed vblanks, as on native).
-            while (now >= display.next_vblank_time) {
-                advance_vblank(emuenv);
-                display.next_vblank_time += std::chrono::microseconds(TARGET_MICRO_PER_FRAME);
-            }
-
-            thread_lock.unlock();
-            emscripten_sleep(1);
-            thread_lock.lock();
         }
 #else
         wait_thread->status_cond.wait(thread_lock, [&]() {

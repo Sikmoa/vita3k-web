@@ -85,3 +85,15 @@ target_link_libraries(vita3k_jit_backend_test_node PRIVATE vita3k_dynarmic_front
 target_link_options(vita3k_jit_backend_test_node PRIVATE
     ${VITA3K_WEB_GROWTH_LINK_OPTION} -sALLOW_TABLE_GROWTH=1 -Wl,--export-table
     -sSTACK_SIZE=1048576 "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=['$setWasmTableEntry','$getWasmTableEntry']")
+
+# AOT-1 experiment: same TU discipline as the backend test (includes
+# wasm_jit_cpu.cpp directly for form_region/translate_block/validate helpers),
+# plus the runtime core's InterpreterCPU for the reference comparison.
+add_executable(vita3k_jit_aot_cluster_test_node "${VITA_ROOT}/cpu/tests/wasmjit_aot_cluster_test.cpp"
+    "${VITA_ROOT}/cpu/src/wasmjit/emit_wasm.cpp"
+    "${VITA_ROOT}/cpu/src/wasmjit/fp64.cpp")
+target_include_directories(vita3k_jit_aot_cluster_test_node PRIVATE "${VITA_ROOT}/cpu/src")
+target_link_libraries(vita3k_jit_aot_cluster_test_node PRIVATE vita3k_dynarmic_frontend vita3k_web_runtime_core)
+target_link_options(vita3k_jit_aot_cluster_test_node PRIVATE
+    ${VITA3K_WEB_GROWTH_LINK_OPTION} -sALLOW_TABLE_GROWTH=1 -Wl,--export-table
+    -sSTACK_SIZE=1048576 "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=['$setWasmTableEntry','$getWasmTableEntry']")

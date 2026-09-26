@@ -54,6 +54,18 @@ set(_hle_exports
     # Synchronous file metadata and reads/seeks reuse production IO implementations.
     sceIoGetstat sceIoGetstatByFd sceIoRead sceIoLseek sceIoLseek32
     _sceDisplaySetFrameBuf sceDisplaySetFrameBuf sceDisplayWaitVblankStart
+    # Frame pacing frontier (retail Limbo, 180s headless run: 12 frames, 522,205ms
+    # of HLE thread-time, 0.07fps). The game calls sceDisplayWaitSetFrameBuf and
+    # sceDisplayWaitSetFrameBufMulti to pace itself; with only WaitVblankStart
+    # bridged they resolved to no import at all, the guest saw a failed display
+    # wait, and it quit (process_exit(0), missing_nids=1, NID 7d9864A8). All of
+    # these share display_wait -> wait_vblank, which registers the thread in
+    # display.vblank_wait_infos and drives the emulated vblank clock in the
+    # browser build, so they return instead of blocking a host thread. The CB
+    # variants stay unselected on purpose: they run host callbacks, which the
+    # single-threaded fiber runtime cannot do.
+    sceDisplayWaitSetFrameBuf sceDisplayWaitSetFrameBufMulti
+    sceDisplayWaitVblankStartMulti
     sceDisplayGetVcount sceDisplayGetRefreshRate
     sceKernelCreateLwCond
     sceFiosOverlayGetList02

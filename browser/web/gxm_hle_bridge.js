@@ -169,9 +169,10 @@ export function gxmFragmentTextureFormat(format) {
 }
 
 // Versioned host-owned packet, not a guest struct containing native pointers.
-// Copy every input before awaiting the compiler or device.
+// Ownership transfer: the native producer (web_gxm_draw) passes freshly
+// copied buffers (packet slice + de-padded surface), so no re-slice here;
+// decode takes its own payload copies and submit stages synchronously.
 export async function drawGuestSurface(packet, initialPixels, width, height) {
-  packet = new Uint8Array(packet).slice(); initialPixels = new Uint8Array(initialPixels).slice();
   return enqueueGuestWork(() => drawOwnedSurface(packet, initialPixels, width, height));
 }
 // Pure decoder exported for lightweight packet contract tests (no GPU/compiler).
@@ -246,6 +247,69 @@ export function decodeGuestDrawPacket(packet) {
   return { stride, indexSize, viewport, info, attributes, indices, vertices, vertexGXP, fragmentGXP,
     vertexUniforms, fragmentUniforms, fragmentTexture, writeMask, blend, depth };
 }
+// Resident target/program handles across draws (one-deep caches). The
+// per-draw readback still lands in guest memory before drawOwnedSurface
+// returns, so every guest observer (fragment-texture feedback reads in the
+// native producer, presentation re-reads at SetFrameBuf, sync signals)
+// observes exactly the pixels the create+destroy-per-draw path published:
+// only GPU object identity is reused, never pixel contents. No fence change:
+// the submit await remains the fence, and writebacks are never deferred.
+// A program hit requires the full pipeline descriptor to match AND both GXP
+// blobs to be byte-identical (hash short-circuits, compare decides), because
+// WGSL is a pure function of the GXP bytes plus the constant format hints.
+let cachedTarget, cachedProgram;
+// Shared read-only fragment render-info block (identity transform tail).
+// submit() stages it into a padded upload buffer synchronously, so sharing
+// one frozen instance across draws is safe.
+const fragmentRenderInfo = new Float32Array([0, 0, 0, 0, 1]);
+function acquireResidentTarget(renderer, width, height, depth) {
+  const depthFormat = depth ? depth.format : undefined;
+  if (cachedTarget && cachedTarget.width === width && cachedTarget.height === height
+      && cachedTarget.depthFormat === depthFormat)
+    return cachedTarget.id;
+  const id = renderer.createTarget(width, height,
+    depth ? { depthFormat: depth.format } : undefined);
+  if (cachedTarget !== undefined) {
+    try { renderer.destroyTarget(cachedTarget.id); }
+    catch (error) { disposeGuestRenderer(renderer); throw error; }
+  }
+  cachedTarget = { id, width, height, depthFormat };
+  return id;
+}
+function acquireResidentProgram(renderer, descriptor, key, vertexGXP, fragmentGXP) {
+  if (cachedProgram && cachedProgram.key === key
+      && cachedProgram.vertexGXP.length === vertexGXP.length
+      && cachedProgram.fragmentGXP.length === fragmentGXP.length
+      && cachedProgram.vertexGXP.every((v, i) => v === vertexGXP[i])
+      && cachedProgram.fragmentGXP.every((v, i) => v === fragmentGXP[i]))
+    return Promise.resolve(cachedProgram.id);
+  return renderer.createProgram(descriptor).then(id => {
+    if (cachedProgram !== undefined) {
+      try { renderer.destroyProgram(cachedProgram.id); }
+      catch (error) { disposeGuestRenderer(renderer); throw error; }
+    }
+    cachedProgram = { id, key, vertexGXP, fragmentGXP };
+    return id;
+  });
+}
+function disposeGuestRenderer(renderer) {
+  // Device loss makes normal destroy methods unavailable. dispose still
+  // releases resources and ensures a poisoned renderer is never reused.
+  try { renderer.dispose(); } catch {}
+  cachedTarget = undefined; cachedProgram = undefined;
+  if (guestRenderer === renderer) guestRenderer = undefined;
+}
+function releaseResidentHandles(renderer) {
+  // Mirror the old per-draw finally teardown on the failure path only: drop
+  // resident handles so a later draw rebuilds from scratch, then propagate
+  // (the guest queue poisons, so no later draw can ack past this failure).
+  const target = cachedTarget, program = cachedProgram;
+  cachedTarget = undefined; cachedProgram = undefined;
+  try {
+    if (target !== undefined) renderer.destroyTarget(target.id);
+    if (program !== undefined) renderer.destroyProgram(program.id);
+  } catch { disposeGuestRenderer(renderer); }
+}
 async function drawOwnedSurface(packet, initialPixels, width, height) {
   const { stride, indexSize, viewport, info, attributes, indices, vertices, vertexGXP, fragmentGXP,
     vertexUniforms, fragmentUniforms, fragmentTexture, writeMask, blend, depth } = decodeGuestDrawPacket(packet);
@@ -267,11 +331,10 @@ async function drawOwnedSurface(packet, initialPixels, width, height) {
   ]);
   if (!guestRenderer) guestRenderer = createGXMRenderer(await initializeGuestDevice());
   const renderer = guestRenderer;
-  let target, program;
   try {
     // Unused explicit bindings are legal. Nonempty SSBOs use the production
     // uniform packing, never a shader-name-dependent hardcoded matrix.
-    const buffers = { 0: info, 1: new Float32Array([0,0,0,0,1]) };
+    const buffers = { 0: info, 1: fragmentRenderInfo };
     const bufferBindings = [
       { binding: 0, size: 48, type: 'uniform', visibility: GPUShaderStage.VERTEX },
       { binding: 1, size: 20, type: 'uniform', visibility: GPUShaderStage.FRAGMENT },
@@ -281,16 +344,26 @@ async function drawOwnedSurface(packet, initialPixels, width, height) {
       buffers[binding] = data;
       bufferBindings.push({ binding, size: data.length, type: 'read-only-storage', visibility });
     }
-    program = await renderer.createProgram({ stride, attributes, bufferBindings,
-      fragmentTexture: fragmentTexture !== undefined, writeMask,
+    const textured = fragmentTexture !== undefined;
+    const depthStencil = depth ? { format: depth.format, depthCompare: depth.depthCompare,
+      depthWriteEnabled: depth.depthWriteEnabled } : undefined;
+    // Cache key covers every renderer pipeline-key field except the WGSL
+    // itself, which the GXP blobs below identify exactly (hash short-circuit
+    // plus byte-compare; a 32-bit hash alone could alias two programs).
+    const key = JSON.stringify([stride, attributes,
+      bufferBindings.map(b => [b.binding, b.size, b.type, b.visibility]),
+      textured, writeMask, blend ?? null, depthStencil ?? null])
+      + '|' + gxpCacheKey(vertexGXP) + '|' + gxpCacheKey(fragmentGXP);
+    const program = await acquireResidentProgram(renderer, { stride, attributes, bufferBindings,
+      fragmentTexture: textured, writeMask,
       ...(blend ? { blend } : {}),
-      ...(depth ? { depthStencil: { format: depth.format, depthCompare: depth.depthCompare,
-        depthWriteEnabled: depth.depthWriteEnabled } } : {}),
+      ...(depthStencil ? { depthStencil } : {}),
       vertexWGSL: vertex.wgsl, fragmentWGSL: fragment.wgsl,
-      vertexEntryPoint: 'main_vs', fragmentEntryPoint: 'main_fs' });
+      vertexEntryPoint: 'main_vs', fragmentEntryPoint: 'main_fs' },
+      key, vertexGXP, fragmentGXP);
     // The depth attachment is the same size as the color attachment (one GXM
     // render target); it is per draw and never read back to guest memory.
-    target = renderer.createTarget(width, height, depth ? { depthFormat: depth.format } : undefined);
+    const target = acquireResidentTarget(renderer, width, height, depth);
     return (await renderer.submit(target, [{ program, vertices, indices,
       indexFormat: indexSize === 2 ? 'uint16' : 'uint32', buffers,
       viewport: viewportRect,
@@ -301,18 +374,11 @@ async function drawOwnedSurface(packet, initialPixels, width, height) {
       // the decoder-side extras here.
       ...(depth ? { depth: { format: depth.format, stencil: depth.stencil,
         clearValue: depth.clearValue } } : {}) })).pixels;
-  } finally {
-    // submit has settled (including GPU readback) before either resource can
-    // be released. Retain only the bounded device-local pipeline cache.
-    try {
-      if (target !== undefined) renderer.destroyTarget(target);
-      if (program !== undefined) renderer.destroyProgram(program);
-    } catch (error) {
-      // Device loss makes normal destroy methods unavailable. dispose still
-      // releases resources and ensures a poisoned renderer is never reused.
-      renderer.dispose(); guestRenderer = undefined;
-      throw error;
-    }
+  } catch (error) {
+    // submit has settled (including GPU readback) before resident handles are
+    // released. Success keeps them for the next draw; failure drops them.
+    releaseResidentHandles(renderer);
+    throw error;
   }
 }
 let devicePromise;

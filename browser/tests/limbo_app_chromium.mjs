@@ -40,6 +40,16 @@ const frameEvery = Number(process.env.LIMBO_FRAME_EVERY || 30);
 const maxFrames = Number(process.env.LIMBO_MAX_FRAMES || 8);
 const deadlineMs = Number(process.env.LIMBO_DEADLINE_MS || 600000);
 const inlineMutex = process.env.LIMBO_INLINE_MUTEX !== '0';
+// A/B switch for the JIT whole-cache revalidation gate: LIMBO_REVALIDATE_ALL=1
+// restores the unconditional every-entry sweep; default keeps the post-HLE gate.
+const revalidateAll = process.env.LIMBO_REVALIDATE_ALL === '1';
+// A/B switch for the code-page write observer: default ON (load-bearing for
+// correctness). LIMBO_WRITE_OBSERVER=0 disables the page-walk/epoch bump and is
+// a diagnostic state used to isolate the versioning build's run_js/emit
+// regression; it is NOT a valid shipping config.
+const writeObserver = process.env.LIMBO_WRITE_OBSERVER !== '0';
+// Region-cache size A/B: unset keeps the built-in default, a number overrides.
+const regionCache = process.env.LIMBO_REGION_CACHE || '';
 
 if (frameEvery === 1)
   throw new Error('LIMBO_FRAME_EVERY=1 saves no files (generations start at 1); use 2 or more');
@@ -163,8 +173,8 @@ try {
   page.on('pageerror', (error) => pageErrors.push(String(error)));
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
 
-  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex }) => {
-    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}`, { type: 'module' });
+  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver }) => {
+    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&revalidateAll=${revalidateAll ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}`, { type: 'module' });
     const state = { logs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
       backend: null, memory: null, workerErrors: [], ready: false, timedOut: false,
       gxmDraws: 0, latestProgress: null, profiles: {}, jitThreads: {}, runStartedAt: null,
@@ -259,7 +269,7 @@ try {
       };
     });
     return result;
-  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex });
+  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver });
 
   const saved = [];
   for (const frame of outcome.saved) {
@@ -273,6 +283,9 @@ try {
     backend: outcome.backend,
     memory: outcome.memory,
     inlineMutex,
+    revalidateAll,
+    writeObserver,
+    regionCache: regionCache || '(default)',
     latestProgress: outcome.latestProgress,
     jitThreads: outcome.jitThreads,
     profiles: outcome.profiles,

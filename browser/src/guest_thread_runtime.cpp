@@ -4,6 +4,7 @@
 #include <cpu/disasm/functions.h>
 #include <cpu/functions.h>
 #include <cpu/impl/wasm_jit_cpu.h>
+#include <display/functions.h>
 #include <emuenv/state.h>
 #include <kernel/state.h>
 #include <kernel/sync_primitives.h>
@@ -38,6 +39,20 @@ bool unsupported_import(uint32_t nid) {
     // branch); the CB variant still runs host callbacks first.
     if (n.find("DelayThread") != n.npos && n.find("CB") == n.npos)
         return false;
+    // The display waits are the guest's frame pacing (sceDisplayWaitSetFrameBuf,
+    // ...Multi, sceDisplayWaitVblankStart, ...Multi). wait_vblank registers the
+    // thread in display.vblank_wait_infos and, in the browser build, drives the
+    // emulated vblank clock itself instead of waiting on a host vblank thread,
+    // so these return rather than deadlock. Rejecting them hands the guest
+    // ILLEGAL_CONTEXT and leaves it with no vsync at all: retail Limbo's main
+    // thread then executes ~1.7k instructions total and burns 400+ thread
+    // seconds in semaphore waits trying to pace itself some other way.
+    // sceGxmNotificationWait stays rejected: it blocks on a host
+    // condition_variable that only the notifier (same Worker thread) can
+    // signal, so allowing it would freeze every fiber. It needs a cooperative
+    // implementation first.
+    if (n.find("DisplayWait") != n.npos && n.find("CB") == n.npos)
+        return false;
     return n.find("Wait") != n.npos || n.find("DelayThread") != n.npos
         || n.find("CheckCallback") != n.npos || n.find("CB") != n.npos
         || n.find("ReceiveMsgPipe") != n.npos || n.find("SendMsgPipe") != n.npos;
@@ -61,6 +76,10 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
     uint64_t slice;
     KernelState *kernel = nullptr;
     MemState *mem = nullptr;
+    // Set only by the EmuEnvState attach overload: service() drives the
+    // emulated vblank clock through it so a fiber parked on a display wait can
+    // be woken. The (kernel, mem) overload has no display to service.
+    EmuEnvState *env = nullptr;
     std::map<SceUID, std::unique_ptr<Record>> records;
     Record *active = nullptr;
     Record *last_dispatched = nullptr; // deferred JIT-cache retirement owner
@@ -277,8 +296,12 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
         return result;
     }
 
-    void service() {
+    // Returns true when this pass woke at least one parked fiber: a deadline
+    // expiry, a join completion, or a vblank. pump() uses that to tell "the
+    // machine is idle" from "the only runnable thing left is a clock tick".
+    bool service() {
         const auto now = GuestThreadRuntime::now_us();
+        bool woke = false;
         for (auto it = records.begin(); it != records.end();) {
             auto &r = *it->second;
             const auto state = scheduler.status(r.task);
@@ -298,10 +321,22 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
             }
             if (r.deleting || (r.deadline && now >= *r.deadline)
                 || (r.joining && (r.joining->status == ThreadStatus::dormant
-                    || !kernel->threads.contains(r.joining->id))))
+                    || !kernel->threads.contains(r.joining->id)))) {
+                if (state && state->state == Scheduler::State::parked)
+                    woke = true;
                 scheduler.wake(r.task);
+            }
             ++it;
         }
+        // A thread parked in sceDisplayWaitSetFrameBuf has no deadline and
+        // nobody to join, so nothing above can wake it. Drive the emulated
+        // vblank clock here instead: it is the only thing that makes the next
+        // frame boundary happen, and without it the pump would see every fiber
+        // parked, call the machine idle, and the app would stop at the first
+        // frame wait.
+        if (env && service_vblank(*env))
+            woke = true;
+        return woke;
     }
 
     GuestThreadRuntime::Progress pump(std::size_t budget) {
@@ -317,8 +352,14 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
         service();
         while (p.dispatches < budget) {
             const auto count = scheduler.resume(1);
-            if (!count)
-                break;
+            if (!count) {
+                // Every fiber is parked. service() can still wake one (an
+                // expired deadline, or the next vblank), so try once more
+                // before reporting the machine idle.
+                if (!service())
+                    break;
+                continue;
+            }
             p.dispatches += count;
             service();
         }
@@ -368,9 +409,15 @@ uint64_t GuestThreadRuntime::now_us() noexcept {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 bool GuestThreadRuntime::attached() const noexcept { return impl_->kernel != nullptr; }
-bool GuestThreadRuntime::attach(EmuEnvState &env) { return attach(env.kernel, env.mem); }
+bool GuestThreadRuntime::attach(EmuEnvState &env) {
+    if (!attach(env.kernel, env.mem))
+        return false;
+    impl_->env = &env;
+    return true;
+}
 bool GuestThreadRuntime::attach(KernelState &kernel, MemState &mem) {
     auto &self = *impl_;
+    self.env = nullptr;
     if (self.kernel || Impl::attached_owner || kernel.execution_host || !kernel.threads.empty()
         || !kernel.halt_instruction_pc || !kernel.call_import)
         return false;
@@ -425,6 +472,7 @@ bool GuestThreadRuntime::shutdown(std::size_t budget) {
     self.kernel->execution_host = nullptr;
     self.kernel = nullptr;
     self.mem = nullptr;
+    self.env = nullptr;
     Impl::attached_owner = nullptr;
     return true;
 }

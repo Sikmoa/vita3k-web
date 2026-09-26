@@ -24,7 +24,8 @@ EM_JS(uint32_t, vita3k_promoted_state_options, (), {
         return value === undefined ? def : value === '1';
     };
     return (enabled('VITA3K_WASMJIT_PROMOTE_FLAGS', true) ? 1 : 0)
-        | (enabled('VITA3K_WASMJIT_PROMOTE_ACCOUNTING', both) ? 2 : 0);
+        | (enabled('VITA3K_WASMJIT_PROMOTE_ACCOUNTING', both) ? 2 : 0)
+        | (enabled('VITA3K_WASMJIT_COUNT_FAST_MEMORY', false) ? 4 : 0);
 });
 // Bench-only opt-in is read from the JS side (Node process.env), the same
 // channel as the existing VITA3K_DUMP_JIT hook in wasm_jit_cpu.cpp: C-level
@@ -245,6 +246,7 @@ public:
     // guard (T3): the host proved all bases nonzero for this module's
     // lifetime. Single-block emission always keeps the guard.
     bool skip_fast_guard() const { return options.assume_fast_bases; }
+    bool count_fast_memory() const { return options.count_fast_memory; }
     void load_region_state(Bytes &c) const {
         reload_flags(c);
         if (options.promote_accounting) {
@@ -404,7 +406,7 @@ RegionStateOptions region_state_options() {
     static const RegionStateOptions options = [] {
 #ifdef __EMSCRIPTEN__
         const uint32_t flags = vita3k_promoted_state_options();
-        return RegionStateOptions{(flags & 1) != 0, (flags & 2) != 0};
+        return RegionStateOptions{(flags & 1) != 0, (flags & 2) != 0, false, (flags & 4) != 0};
 #else
         const char *both = std::getenv("VITA3K_WASMJIT_PROMOTED_STATE");
         const bool fallback = both && std::strcmp(both, "1") == 0;
@@ -414,7 +416,8 @@ RegionStateOptions region_state_options() {
         };
         // Production default (R2): promoted flags ON unless explicitly "0".
         return RegionStateOptions{enabled("VITA3K_WASMJIT_PROMOTE_FLAGS", true),
-            enabled("VITA3K_WASMJIT_PROMOTE_ACCOUNTING", fallback)};
+            enabled("VITA3K_WASMJIT_PROMOTE_ACCOUNTING", fallback), false,
+            enabled("VITA3K_WASMJIT_COUNT_FAST_MEMORY", false)};
 #endif
     }();
     return options;
@@ -484,8 +487,12 @@ uint32_t entry_ticks(const RegionBlockMeta &meta) {
 
 class Emitter {
 public:
-    explicit Emitter(const Dynarmic::IR::Block &block, uint32_t hot_nid = 0)
-        : block(block), start(block.Location()), finish(block.EndLocation()), hot_nid(hot_nid) {}
+    // Options default to the reference policy; the diagnostic per-access
+    // memory counters must be requested explicitly (see count_fast_memory).
+    explicit Emitter(const Dynarmic::IR::Block &block, uint32_t hot_nid = 0,
+        RegionStateOptions options = {})
+        : block(block), start(block.Location()), finish(block.EndLocation()), state(options)
+        , hot_nid(hot_nid) {}
 
     // Region layout (REGION_ABI.md): run(state=0, budget=1) with locals
     // 2=executed_call, 3=pc, 4=CheckBit, 5=i64 scratch, 6=dispatch index,
@@ -592,7 +599,7 @@ private:
     const Dynarmic::IR::Block &block;
     Location start, finish;
     Bytes code;
-    RegionState state; // single-block emission always uses the reference policy
+    RegionState state; // reference policy unless the caller supplies options
     std::unordered_map<const Inst *, uint32_t> locals;
     // Single-block layout: 1=CheckBit, 2=i64 scratch, 3..17=registers,
     // SSA from 18. Architectural registers must never alias SSA temporaries.
@@ -1000,8 +1007,10 @@ private:
             if (bytes == 1) { op(Store8); uleb(code, 0); uleb(code, 0); }
             else if (bytes == 2) { op(Store16); uleb(code, 1); uleb(code, 0); }
             else { op(Store); uleb(code, 2); uleb(code, 0); }
-            get(0); load(offsetof(JitState, mem_fast_writes)); imm(1); op(Add);
-            store(offsetof(JitState, mem_fast_writes));
+            if (state.count_fast_memory()) {
+                get(0); load(offsetof(JitState, mem_fast_writes)); imm(1); op(Add);
+                store(offsetof(JitState, mem_fast_writes));
+            }
         } else {
             // Direct load: base + (addr & 0xfff); 8/16-bit zero-extending.
             guest_effective_address(addr_local, base_local);
@@ -1009,8 +1018,10 @@ private:
             else if (bytes == 2) { op(Load16U); uleb(code, 1); uleb(code, 0); }
             else { op(Load); uleb(code, 2); uleb(code, 0); }
             set(next_local);
-            get(0); load(offsetof(JitState, mem_fast_reads)); imm(1); op(Add);
-            store(offsetof(JitState, mem_fast_reads));
+            if (state.count_fast_memory()) {
+                get(0); load(offsetof(JitState, mem_fast_reads)); imm(1); op(Add);
+                store(offsetof(JitState, mem_fast_reads));
+            }
         }
         end_if(); // single probe gate
         if (emit_fast_guard)
@@ -3621,8 +3632,9 @@ private:
 };
 } // namespace
 
-std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block, uint32_t hot_nid) {
-    Emitter emitter(block, hot_nid);
+std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block, uint32_t hot_nid,
+    RegionStateOptions options) {
+    Emitter emitter(block, hot_nid, options);
     auto bytes = emitter.run();
     if (bytes.empty() && std::getenv("VITA3K_WASMJIT_REJECT_TRACE"))
         std::fprintf(stderr, "WasmJit emit_block rejected: %s\n", emitter.rejection.c_str());

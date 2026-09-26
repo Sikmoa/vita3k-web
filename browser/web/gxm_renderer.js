@@ -34,6 +34,19 @@ function bytes(value) {
     return new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice();
   throw new TypeError('expected a buffer or typed array');
 }
+// Non-copying view of the same inputs. Only for data the caller guarantees
+// stable until the synchronous prefix of submit() has staged it into padded
+// upload buffers (the bridge passes owned per-draw buffers, never Wasm views).
+// Public snapshot semantics are unchanged: every staged copy still happens
+// before the first await, so mutating the input after submit() returns can
+// never affect the draw. Use viewBytes() for staging, bytes() for retained
+// copies (initial surface, texture snapshots consumed across awaits).
+function viewBytes(value) {
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value))
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  throw new TypeError('expected a buffer or typed array');
+}
 
 // Memory64 host pointers may be BigInt. Never truncate them with >>>0 or Number
 // before checking representability. Pass a fresh heap view after memory.grow.
@@ -56,6 +69,23 @@ export function createGXMRenderer(device) {
   // destroying a handle never invalidates another handle using the pipeline.
   const pipelines = new Map(), pipelineLimit = 64;
   let pipelineHits = 0, pipelineMisses = 0;
+  // Resident GPU objects across submits. Samplers are immutable so they are
+  // shared by descriptor; the fragment texture is reused when dimensions
+  // match and re-uploaded every submit (queue order keeps the write after
+  // prior reads). Both are bounded (4 sampler shapes max, one texture) and
+  // cleared on dispose. Targets/programs stay caller-owned; the bridge
+  // caches those handles one-deep instead.
+  const samplers = new Map();
+  let residentTexture = null;
+  function samplerFor(spec) {
+    const key = spec.minFilter + '|' + spec.magFilter + '|' + spec.addressModeU + '|' + spec.addressModeV;
+    let sampler = samplers.get(key);
+    if (!sampler) {
+      sampler = device.createSampler({ ...spec, mipmapFilter: 'nearest', lodMinClamp: 0, lodMaxClamp: 0 });
+      samplers.set(key, sampler);
+    }
+    return sampler;
+  }
   let nextId = 1, busy = false, disposed = false, lost = null;
   device.lost.then(info => { lost = `WebGPU device lost: ${info.message}`; });
   function available() {
@@ -282,7 +312,10 @@ export function createGXMRenderer(device) {
         // use a pipeline that names it; otherwise depth would be ignored.
         if ((program.depthStencil?.format ?? null) !== (target.depthFormat ?? null))
           throw new Error('depth-stencil state does not match render target');
-        const vertices = bytes(draw.vertices), indices = bytes(draw.indices);
+        // Views, not copies: staging into padded upload buffers below happens
+        // synchronously before the first await, so post-submit mutation still
+        // cannot affect the draw (covered by the smoke test).
+        const vertices = viewBytes(draw.vertices), indices = viewBytes(draw.indices);
         const indexSize = draw.indexFormat === 'uint16' ? 2 : draw.indexFormat === 'uint32' ? 4 : 0;
         if (!indexSize) throw new Error('unsupported index format');
         if (!vertices.length || vertices.length % program.stride)
@@ -290,9 +323,9 @@ export function createGXMRenderer(device) {
         if (!indices.length || indices.length % (indexSize * 3))
           throw new RangeError('partial or empty triangle list');
         const vertexCount = vertices.length / program.stride;
-        const view = new DataView(indices.buffer);
+        const indexView = new DataView(indices.buffer, indices.byteOffset, indices.byteLength);
         for (let offset = 0; offset < indices.length; offset += indexSize) {
-          const index = indexSize === 2 ? view.getUint16(offset, true) : view.getUint32(offset, true);
+          const index = indexSize === 2 ? indexView.getUint16(offset, true) : indexView.getUint32(offset, true);
           if (index >= vertexCount) throw new RangeError('index exceeds vertex stream');
         }
         // Viewport rects are dynamic draw state like vertices, never pipeline
@@ -310,13 +343,13 @@ export function createGXMRenderer(device) {
           if (width < 0 || height < 0) throw new RangeError('viewport extent must be non-negative');
           viewportRect = { x, y, width, height };
         }
-        const uniforms = draw.uniforms === undefined ? new Uint8Array() : bytes(draw.uniforms);
+        const uniforms = draw.uniforms === undefined ? new Uint8Array() : viewBytes(draw.uniforms);
         if (uniforms.length !== program.uniformSize) throw new RangeError('uniform size mismatch');
         const supplied = program.explicitBindings ? draw.buffers ?? {} : { 0: uniforms };
         if (program.explicitBindings && Object.keys(supplied).length !== program.bindingLayout.length)
           throw new RangeError('buffer binding count mismatch');
         const boundBuffers = program.bindingLayout.map(binding => {
-          const data = bytes(supplied[binding.binding]);
+          const data = viewBytes(supplied[binding.binding]);
           if (data.length !== binding.size) throw new RangeError('buffer binding size mismatch');
           return { ...binding, data };
         });
@@ -343,9 +376,11 @@ export function createGXMRenderer(device) {
               || !['clamp-to-edge', 'repeat', 'mirror-repeat'].includes(addressModeU)
               || !['clamp-to-edge', 'repeat', 'mirror-repeat'].includes(addressModeV))
             throw new Error('unsupported fragment sampler state');
+          // Retained copy: the texture upload below runs before the first
+          // await, but the sampler/texture objects persist across submits,
+          // so texel bytes must stay owned here, not view the caller buffer.
           sampledTexture = { width, height, data,
-            sampler: { minFilter, magFilter, addressModeU, addressModeV, mipmapFilter: 'nearest',
-              lodMinClamp: 0, lodMaxClamp: 0 } };
+            sampler: { minFilter, magFilter, addressModeU, addressModeV } };
         } else if (draw.fragmentTexture !== undefined) {
           throw new Error('fragment texture supplied to untextured program');
         }
@@ -354,9 +389,13 @@ export function createGXMRenderer(device) {
       });
       busy = true;
       device.pushErrorScope('validation');
-      const buffers = [], textures = [];
+      const buffers = [];
       let readback, pixels, failure;
       try {
+        // Single staging copy per buffer: the padded upload is filled
+        // synchronously here (still before the first await), fusing the old
+        // snapshot-then-pad double copy with identical post-submit-mutation
+        // semantics.
         const upload = (data, usage) => {
           const padded = new Uint8Array(align(data.length, 4));
           padded.set(data);
@@ -390,16 +429,26 @@ export function createGXMRenderer(device) {
             } })) }));
           if (draw.sampledTexture) {
             const source = draw.sampledTexture;
-            const texture = device.createTexture({ size: [source.width, source.height], format: 'rgba8unorm',
-              usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-            textures.push(texture);
+            // Resident texture: same dimensions reuse the GPU object with a
+            // fresh upload every submit; a size change replaces it. The queue
+            // is ordered, so this write stays after prior passes that read it.
+            let texture;
+            if (residentTexture && residentTexture.width === source.width
+                && residentTexture.height === source.height) {
+              texture = residentTexture.texture;
+            } else {
+              texture = device.createTexture({ size: [source.width, source.height], format: 'rgba8unorm',
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+              if (residentTexture) { try { residentTexture.texture.destroy(); } catch {} }
+              residentTexture = { width: source.width, height: source.height, texture };
+            }
             device.queue.writeTexture({ texture }, source.data,
               { bytesPerRow: source.width * 4 }, [source.width, source.height]);
             for (const group of [1, 2]) pass.setBindGroup(group, device.createBindGroup({
               layout: draw.program.pipeline.getBindGroupLayout(group), entries: [] }));
             pass.setBindGroup(3, device.createBindGroup({ layout: draw.program.pipeline.getBindGroupLayout(3),
               entries: [{ binding: 0, resource: texture.createView() },
-                { binding: 1, resource: device.createSampler(source.sampler) }] }));
+                { binding: 1, resource: samplerFor(source.sampler) }] }));
           }
           pass.drawIndexed(draw.indexCount);
         }
@@ -421,7 +470,8 @@ export function createGXMRenderer(device) {
       finally {
         if (readback?.mapState === 'mapped') readback.unmap();
         for (const buffer of buffers) buffer.destroy();
-        for (const texture of textures) texture.destroy();
+        // Resident texture/samplers persist across submits by design; only
+        // per-submit upload buffers and the readback are destroyed here.
         try {
           const error = await device.popErrorScope();
           if (error && !failure) failure = new Error(error.message);
@@ -452,7 +502,9 @@ export function createGXMRenderer(device) {
         target.texture.destroy();
         target.depthTexture?.destroy();
       }
-      targets.clear(); programs.clear(); pipelines.clear(); disposed = true;
+      targets.clear(); programs.clear(); pipelines.clear();
+      if (residentTexture) { try { residentTexture.texture.destroy(); } catch {} residentTexture = null; }
+      samplers.clear(); disposed = true;
     },
   });
 }

@@ -71,6 +71,19 @@ try {
         // Matched diagnostic baseline; the native option also disables the
         // kernel table/bookkeeping, not just generated probes.
         VITA3K_JIT_INLINE_MUTEX: workerParams.get('inlineMutex') === '0' ? '0' : '1',
+        // Whole-cache revalidation gate: '1' sweeps every entry (measurement
+        // baseline), '0' sweeps only after host/HLE code actually ran.
+        VITA3K_WASMJIT_REVALIDATE_ALL: workerParams.get('revalidateAll') === '1' ? '1' : '0',
+        // Chained-usage LRU stamping: '1' records per-slot usage from the
+        // in-Wasm dispatcher for the region-cache eviction policy.
+        VITA3K_WASMJIT_STAMP_LRU: workerParams.get('stampLru') === '1' ? '1' : '0',
+        // Code-page write observer: default ON (load-bearing for code-page
+        // invalidation). '0' only for the isolation diagnostic; see
+        // write_observer_enabled().
+        VITA3K_WASMJIT_WRITE_OBSERVER: workerParams.get('writeObserver') === '0' ? '0' : '1',
+        // Region-cache size: unset keeps the built-in default (currently
+        // 4096); a number overrides it for cache-size A/B runs.
+        VITA3K_WASMJIT_REGION_CACHE: workerParams.get('regionCache') || undefined,
       });
       break;
     } catch (error) {
