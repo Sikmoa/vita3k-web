@@ -229,7 +229,12 @@ void ThreadState::run_loop(bool cooperative) {
             return;
         run_end_callback = false;
 
-        if (!kernel.thread_event_end || (kernel.execution_host && kernel.execution_host->stopping()))
+        if (kernel.execution_host && kernel.execution_host->stopping())
+            return;
+        lock.unlock();
+        const auto handlers = kernel.thread_event_handlers_for(id, SCE_KERNEL_THREAD_EVENT_TYPE_END);
+        lock.lock();
+        if (handlers.empty())
             return;
 
         const ThreadStatus old_status = status;
@@ -245,9 +250,11 @@ void ThreadState::run_loop(bool cooperative) {
         }
 
         lock.unlock();
-        const int ret = run_callback(kernel.thread_event_end.address(), { SCE_KERNEL_THREAD_EVENT_TYPE_END, static_cast<uint32_t>(id), 0, kernel.thread_event_end_arg });
-        if (ret != 0)
-            LOG_WARN("Thread end event handler returned {}", log_hex(ret));
+        for (const auto &handler : handlers) {
+            const int ret = run_callback(handler.handler.address(), { SCE_KERNEL_THREAD_EVENT_TYPE_END, static_cast<uint32_t>(id), 0, handler.common });
+            if (ret != 0)
+                LOG_WARN("Thread end event handler returned {}", log_hex(ret));
+        }
         lock.lock();
 
         if (kernel.execution_host) {
@@ -298,8 +305,8 @@ void ThreadState::run_loop(bool cooperative) {
         if (run_start_callback) {
             run_start_callback = false;
             lock.unlock();
-            if (kernel.thread_event_start) {
-                const int ret = run_callback(kernel.thread_event_start.address(), { SCE_KERNEL_THREAD_EVENT_TYPE_START, static_cast<uint32_t>(id), 0, kernel.thread_event_start_arg });
+            for (const auto &handler : kernel.thread_event_handlers_for(id, SCE_KERNEL_THREAD_EVENT_TYPE_START)) {
+                const int ret = run_callback(handler.handler.address(), { SCE_KERNEL_THREAD_EVENT_TYPE_START, static_cast<uint32_t>(id), 0, handler.common });
                 if (ret != 0)
                     LOG_WARN("Thread start event handler returned {}", log_hex(ret));
             }

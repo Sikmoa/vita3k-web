@@ -157,10 +157,19 @@ struct KernelState {
     unsigned int tls_psize = 0;
     unsigned int tls_msize = 0;
 
-    Ptr<const void> thread_event_start = Ptr<const void>(0);
-    Address thread_event_start_arg = 0;
-    Ptr<const void> thread_event_end = Ptr<const void>(0);
-    Address thread_event_end_arg = 0;
+    // sceKernelRegisterThreadEventHandler registrations, in registration
+    // order (firmware 3.74 appends to one list). thread_event_mutex guards
+    // only this list; nothing else is locked while it is held.
+    struct ThreadEventHandler {
+        SceUID uid;
+        SceUID target; // a thread, or SCE_KERNEL_THREAD_ID_USER: every user thread
+        SceUInt32 mask; // SCE_KERNEL_THREAD_EVENT_TYPE_START / _END
+        Ptr<const void> handler;
+        Address common;
+    };
+    std::mutex thread_event_mutex;
+    std::vector<ThreadEventHandler> thread_event_handlers;
+    std::vector<ThreadEventHandler> thread_event_handlers_for(SceUID thread_id, SceUInt32 type);
 
     SimpleEventPtrs simple_events;
     TimerPtrs timers;

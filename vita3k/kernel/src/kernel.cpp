@@ -276,10 +276,10 @@ void KernelState::deinit(MemState &mem) {
     tls_psize = 0;
     tls_msize = 0;
 
-    thread_event_start = Ptr<const void>(0);
-    thread_event_start_arg = 0;
-    thread_event_end = Ptr<const void>(0);
-    thread_event_end_arg = 0;
+    {
+        const std::lock_guard<std::mutex> guard(thread_event_mutex);
+        thread_event_handlers.clear();
+    }
 
     codec_blocks.clear();
 
@@ -310,4 +310,14 @@ SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {
         }
     }
     return nullptr;
+}
+
+std::vector<KernelState::ThreadEventHandler> KernelState::thread_event_handlers_for(SceUID thread_id, SceUInt32 type) {
+    const std::lock_guard<std::mutex> guard(thread_event_mutex);
+    std::vector<ThreadEventHandler> handlers;
+    for (const auto &handler : thread_event_handlers) {
+        if ((handler.mask & type) && (handler.target == SCE_KERNEL_THREAD_ID_USER || handler.target == thread_id))
+            handlers.push_back(handler);
+    }
+    return handlers;
 }

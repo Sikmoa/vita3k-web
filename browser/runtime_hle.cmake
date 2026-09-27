@@ -97,7 +97,10 @@ set(_hle_exports
     sceGxmRenderingContextIsWithinSceneInternal
     sceKernelCallAbortHandler
     sceIoWrite
-    sceKernelUnlockLwMutex2 sceKernelRegisterThreadEventHandler
+    sceKernelUnlockLwMutex2
+    # Thread event handlers: a UID per registration, firmware 3.74's target and
+    # event checks; libc unregisters its exit handler at teardown.
+    sceKernelRegisterThreadEventHandler sceKernelUnregisterThreadEventHandler
     # SceSysmodule imports: whether the calling thread runs its callbacks, a
     # QA flag (clear on retail) and the per-thread permission swap.
     SceThreadmgrForDriver_20C228E4 SceQafMgrForDriver_B9770A13 ksceKernelSetPermission

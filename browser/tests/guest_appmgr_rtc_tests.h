@@ -124,6 +124,29 @@ inline void test_guest_appmgr_rtc(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(sw_version, { 0 }) == 0x80022005);
     const uint32_t first_low = call(time_low, {});
     REQUIRE(call(time_low, {}) - first_low < 10000000u); // microseconds, monotonic within the test
+    // Thread event handlers: one UID per registration; libc's exit handler
+    // covers every user thread (0x10027) with END.
+    constexpr uint32_t register_handler = 0x6D8C0F13, unregister_handler = 0x2C8ED6F0;
+    const Address handler_name = put(block + 0x600, "fixture handler");
+    const Address saved_sp = read_sp(cpu);
+    write_sp(cpu, block + 0x7f0);
+    auto *stack = Ptr<uint32_t>(block + 0x7f0).get(env.mem);
+    stack[0] = 0; // common
+    const uint32_t handler_address = block + 0x401;
+    const uint32_t all_threads = call(register_handler, { handler_name, 0x10027, 8, handler_address });
+    const uint32_t own_thread = call(register_handler, { handler_name, 0, 8, handler_address });
+    REQUIRE(static_cast<int32_t>(all_threads) > 0 && static_cast<int32_t>(own_thread) > 0 && all_threads != own_thread);
+    REQUIRE(env.kernel.thread_event_handlers_for(thread.id, 8).size() == 2);
+    REQUIRE(env.kernel.thread_event_handlers_for(thread.id, 4).empty());
+    REQUIRE(call(register_handler, { handler_name, 0, 4, handler_address }) == 0x80020005); // own thread: END only
+    REQUIRE(call(register_handler, { handler_name, 0x10027, 0x10, handler_address }) == 0x80020005);
+    REQUIRE(call(register_handler, { handler_name, 0x7fff0001, 8, handler_address }) == 0x80028021);
+    REQUIRE(call(register_handler, { 0, 0x10027, 8, handler_address }) == 0x80020006);
+    REQUIRE(call(unregister_handler, { all_threads }) == 0 && call(unregister_handler, { all_threads }) == 0x80028061);
+    REQUIRE(call(unregister_handler, { own_thread }) == 0);
+    REQUIRE(env.kernel.thread_event_handlers_for(thread.id, 8).empty());
+    write_sp(cpu, saved_sp);
+
     // Module classes: loaded by the app, or a system load (preload,
     // sysmodule); kernel modules are not in the process.
     constexpr uint32_t module_list = 0x2EF2581F, called_from_sys = 0x85E6D2BB, call_module_exit = 0x15E2A45D;

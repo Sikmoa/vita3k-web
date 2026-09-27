@@ -1783,7 +1783,7 @@ EXPORT(int, sceKernelReceiveMsgPipeVectorCB) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceKernelRegisterThreadEventHandler, const char *name, SceUID thread_mask, SceUInt32 mask, Ptr<const void> handler, Address common) {
+EXPORT(SceUID, sceKernelRegisterThreadEventHandler, const char *name, SceUID thread_mask, SceUInt32 mask, Ptr<const void> handler, Address common) {
     TRACY_FUNC(sceKernelRegisterThreadEventHandler, name, thread_mask, mask, handler, common);
     sceKernelRegisterThreadEventHandlerOpt handler_opt = {
         .handler = handler,
