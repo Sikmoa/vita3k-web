@@ -3,6 +3,7 @@
 // commit message).
 #pragma once
 #include <io/functions.h>
+#include <modules/module_parent.h>
 #include <rtc/rtc.h>
 #include <cstring>
 #include <string>
@@ -72,6 +73,11 @@ inline void test_guest_appmgr_rtc(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(resolve_user_mount(env.io, text(out).c_str()) == "vs0:data/external/cert/CA_LIST.cer");
     put(path, "vs0:sys/external/libhttp.suprx");
     REQUIRE(call(convert_vs0, { path, out, 64 }) == 0 && text(out) == env.io.vs0_module_drive + "/libhttp.suprx");
+    // The module loader takes the drive's name for the same module.
+    const SceUID by_drive = load_module(env, env.io.vs0_module_drive + "/libfixture.suprx");
+    REQUIRE(by_drive >= 0 && load_module(env, "vs0:sys/external/libfixture.suprx") == by_drive);
+    REQUIRE(std::string(env.kernel.loaded_modules.at(by_drive)->info.path) == "vs0:sys/external/libfixture.suprx");
+    env.kernel.loaded_modules.erase(by_drive);
     put(path, "ux0:data/file.txt"); // not a vs0 user path: copied
     REQUIRE(call(convert_vs0, { path, out, 64 }) == 0 && text(out) == "ux0:data/file.txt");
     REQUIRE(call(convert_vs0, { path, out, 32 }) == 0x80800001 && Ptr<uint8_t>(out).get(env.mem)[0] == 0);
@@ -200,7 +206,7 @@ inline void test_guest_appmgr_rtc(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(called_from_sys, { block + 0x200 }) == 0 && call(called_from_sys, { block + 0x7f0 }) == 0);
     // Class 1 holds no started module with a module_exit: nothing runs.
     env.kernel.loaded_modules[system_module]->info.exit_entry = Ptr<const void>(block + 0x181);
-    env.kernel.loaded_modules[system_module]->info.state = 6;
+    env.kernel.loaded_modules[system_module]->started = true;
     REQUIRE(call(call_module_exit, { 1 }) == 0);
     env.kernel.loaded_modules = std::move(saved_modules);
 

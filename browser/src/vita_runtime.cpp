@@ -185,6 +185,7 @@ static int run_vita(const uint8_t *bytes, uint32_t size) {
         env->kernel.threads.emplace(thread->id, thread);
         env->main_thread_id = thread->id;
         if (thread->start(0, Ptr<void>{}, true) < 0) return -7;
+        env->kernel.loaded_modules.at(uid)->started = true; // its entry is the main thread
         thread->run_loop(true);
         if (const auto *interp = dynamic_cast<const InterpreterCPU *>(thread->cpu->cpu.get()))
             vita3k_web_bench_instructions = interp->instructions_executed();

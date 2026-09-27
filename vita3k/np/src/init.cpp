@@ -42,6 +42,15 @@ bool deinit(NpState &state) {
     return true;
 }
 
+void reset_process(NpState &state) {
+    state.basic_inited = false;
+    state.signaling_inited = false;
+    state.signaling_ctxs.clear();
+    state.auth_inited = false;
+    state.commerce2_inited = false;
+    state.near = {};
+}
+
 bool init(NpTrophyState &state) {
     state.inited = true;
     return true;

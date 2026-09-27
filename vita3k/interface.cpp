@@ -677,7 +677,7 @@ ExitCode run_app(EmuEnvState &emuenv, int32_t main_module_id, const AppLaunchReq
     // Run `module_start` export (entry point) of loaded libraries
     for (auto &[_, module] : emuenv.kernel.loaded_modules) {
         if (module->info.modid != main_module_id)
-            start_module(emuenv, module->info);
+            start_module(emuenv, *module);
     }
 
     SceKernelThreadOptParam param{ 0, 0 };
@@ -701,6 +701,7 @@ ExitCode run_app(EmuEnvState &emuenv, int32_t main_module_id, const AppLaunchReq
         LOG_ERROR("Failed to run main thread.");
         return RunThreadFailed;
     }
+    emuenv.kernel.loaded_modules[main_module_id]->started = true; // its entry is the main thread
 
     start_sync_thread(emuenv);
 

@@ -110,12 +110,12 @@ std::uint64_t __RtcPspTimeToTicks(const SceDateTime *pt) {
 }
 
 int rtc_local_offset_minutes() {
+    // The local wall-clock time read as UTC, minus the instant: daylight
+    // saving time counts once.
     const std::time_t t = std::time(nullptr);
     tm local_tm = {};
-    tm gmt_tm = {};
     SAFE_LOCALTIME(&t, &local_tm);
-    SAFE_GMTIME(&t, &gmt_tm);
-    return static_cast<int>((std::mktime(&local_tm) - std::mktime(&gmt_tm)) / 60);
+    return static_cast<int>((rtc_timegm(&local_tm) - t) / 60);
 }
 
 bool rtc_local_summertime() {

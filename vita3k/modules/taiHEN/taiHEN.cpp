@@ -930,7 +930,7 @@ EXPORT(SceUID, taiLoadStartKernelModuleForUser, const char *path, Ptr<void> args
         const std::lock_guard<std::mutex> kernel_lock(emuenv.kernel.mutex);
         const auto mod_it = emuenv.kernel.loaded_modules.find(uid);
         if (mod_it != emuenv.kernel.loaded_modules.end()) {
-            start_module(emuenv, mod_it->second->info);
+            start_module(emuenv, *mod_it->second);
         }
     }
     return uid;
@@ -950,7 +950,7 @@ EXPORT(SceUID, taiLoadStartModuleForPidForUser, const char *path, Ptr<void> args
         const std::lock_guard<std::mutex> kernel_lock(emuenv.kernel.mutex);
         const auto mod_it = emuenv.kernel.loaded_modules.find(uid);
         if (mod_it != emuenv.kernel.loaded_modules.end()) {
-            start_module(emuenv, mod_it->second->info);
+            start_module(emuenv, *mod_it->second);
         }
     }
     return uid;

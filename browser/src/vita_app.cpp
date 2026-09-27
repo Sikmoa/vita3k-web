@@ -558,9 +558,10 @@ static int run_app_impl() {
                 env->kernel.process_program_authority_id = env->kernel.loaded_modules[uid]->program_authority_id;
             }
             if (needs_module_start(path)) {
-                const auto &info = env->kernel.loaded_modules[uid]->info;
+                auto &module = *env->kernel.loaded_modules[uid];
+                const auto &info = module.info;
                 if (info.start_entry) {
-                    const std::uint32_t result = start_module(*env, info);
+                    const std::uint32_t result = start_module(*env, module);
                     std::printf("[vita3k-web] module_start %s returned %08x\n", info.module_name, result);
                     if (!env->missing_nids.empty()) {
                         for (const auto nid : env->missing_nids)
@@ -624,6 +625,7 @@ static int run_app_impl() {
 #endif
         env->main_thread_id = thread->id;
         if (thread->start(0, Ptr<void>{}, true) < 0) return -7;
+        env->kernel.loaded_modules.at(eboot_uid)->started = true; // its entry is the main thread
 #ifdef VITA3K_USE_WASM_JIT
         vita3k::web::GuestThreadRuntime::Progress progress;
         std::size_t dispatched = 0;

@@ -37,6 +37,9 @@ struct IOState;
 
 bool init(NpState &state, const np::CommunicationID *comm_id);
 bool deinit(NpState &state);
+// Forgets what the NP libraries (Basic, Signaling, Auth, Commerce2, Near)
+// keep for the process, which ends without their Term calls.
+void reset_process(NpState &state);
 
 bool init(NpTrophyState &state);
 bool deinit(NpTrophyState &state);

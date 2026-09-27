@@ -2,6 +2,7 @@
 // checks, empty neighbour and gift lists, the discovered-gift lookups, and
 // the own gift's set/get/delete round trip.
 #pragma once
+#include <np/functions.h>
 #include <np/state.h>
 #include <cstring>
 
@@ -105,6 +106,17 @@ inline void test_guest_near(EmuEnvState &env, ThreadState &thread) {
 
     REQUIRE(call(finalize, { bad_comm_id }) == 0x80104902 && call(finalize, { comm_id }) == 0);
     REQUIRE(call(finalize, { comm_id }) == 0x80104905);
+
+    // The process ends without Finalize or the other libraries' Term: the
+    // next process starts clean.
+    REQUIRE(call(initialize, { comm_id, param, 1 }) == 0);
+    REQUIRE(call(set_gift, { 9, text, 16, thumbnail, 32, data, 3600, gift_param }) == 0);
+    env.np.basic_inited = env.np.signaling_inited = env.np.auth_inited = env.np.commerce2_inited = true;
+    env.np.signaling_ctxs[1] = 0x81000001;
+    reset_process(env.np);
+    REQUIRE(!env.np.near.inited && !env.np.near.has_gift && !env.np.basic_inited && !env.np.signaling_inited);
+    REQUIRE(!env.np.auth_inited && !env.np.commerce2_inited && env.np.signaling_ctxs.empty());
+    REQUIRE(call(initialize, { comm_id, param, 1 }) == 0 && call(finalize, { comm_id }) == 0);
     free(env.mem, block);
     std::puts("Guest Near: initialization, empty lists, discovered-gift lookups and the own gift passed");
 }

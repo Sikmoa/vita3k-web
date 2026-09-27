@@ -24,6 +24,7 @@
 #include <cpu/functions.h>
 #include <emuenv/state.h>
 #include <io/device.h>
+#include <io/functions.h>
 #include <io/state.h>
 #include <io/vfs.h>
 #include <kernel/load_self.h>
@@ -310,7 +311,10 @@ static SceUID load_new_module(EmuEnvState &emuenv, const std::string &module_pat
     return load_module_data(module_buffer.data());
 }
 
-SceUID load_module(EmuEnvState &emuenv, const std::string &module_path, bool system_loaded) {
+SceUID load_module(EmuEnvState &emuenv, const std::string &requested_path, bool system_loaded) {
+    // An app's vs0 user drive (sceAppMgrConvertVs0UserDrivePath) names the
+    // same module as its vs0: path.
+    const std::string module_path = resolve_user_mount(emuenv.io, requested_path.c_str());
     {
         const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
         const auto &loaded_modules = emuenv.kernel.loaded_modules;
@@ -349,7 +353,7 @@ int unload_module(EmuEnvState &emuenv, SceUID module_id) {
     return unload_self(emuenv.kernel, emuenv.mem, *module);
 }
 
-uint32_t start_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, SceSize args, Ptr<const void> argp) {
+static uint32_t run_module_start(EmuEnvState &emuenv, const SceKernelModuleInfo &module, SceSize args, Ptr<const void> argp) {
     const auto module_start = module.start_entry;
     if (module_start) {
         if (emuenv.kernel.run_module_entry)
@@ -375,7 +379,7 @@ uint32_t start_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, Sc
     return 0;
 }
 
-uint32_t stop_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, SceSize args, Ptr<const void> argp) {
+static uint32_t run_module_stop(EmuEnvState &emuenv, const SceKernelModuleInfo &module, SceSize args, Ptr<const void> argp) {
     const auto module_stop = module.stop_entry;
     if (module_stop) {
         if (emuenv.kernel.run_module_entry)
@@ -398,6 +402,21 @@ uint32_t stop_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, Sce
         return ret;
     }
     return 0;
+}
+
+// A module is started once module_start returned SCE_KERNEL_START_SUCCESS
+// (or it has none) and until module_stop succeeds.
+uint32_t start_module(EmuEnvState &emuenv, KernelModule &module, SceSize args, Ptr<const void> argp) {
+    const uint32_t result = run_module_start(emuenv, module.info, args, argp);
+    module.started = result == SCE_KERNEL_START_SUCCESS;
+    return result;
+}
+
+uint32_t stop_module(EmuEnvState &emuenv, KernelModule &module, SceSize args, Ptr<const void> argp) {
+    const uint32_t result = run_module_stop(emuenv, module.info, args, argp);
+    if (result == SCE_KERNEL_STOP_SUCCESS)
+        module.started = false;
+    return result;
 }
 
 /**
@@ -427,7 +446,7 @@ bool load_sys_module(EmuEnvState &emuenv, SceSysmoduleModuleId module_id) {
         }
         loaded_uids.push_back(loaded_module_uid);
         const auto module = lock_and_find(loaded_module_uid, emuenv.kernel.loaded_modules, emuenv.kernel.mutex);
-        start_module(emuenv, module->info);
+        start_module(emuenv, *module);
     }
 
     std::lock_guard<std::mutex> guard(emuenv.kernel.mutex);
@@ -457,7 +476,7 @@ int unload_sys_module(EmuEnvState &emuenv, SceSysmoduleModuleId module_id) {
         if (!module)
             return RET_ERROR(SCE_SYSMODULE_ERROR_FATAL);
 
-        stop_module(emuenv, module->info);
+        stop_module(emuenv, *module);
     }
     for (SceUID uid : loaded_uids) {
         int ret = unload_module(emuenv, uid);
@@ -484,7 +503,7 @@ bool load_sys_module_internal_with_arg(EmuEnvState &emuenv, SceSysmoduleInternal
             return false;
         }
         const auto module = lock_and_find(loaded_module_uid, emuenv.kernel.loaded_modules, emuenv.kernel.mutex);
-        auto ret = start_module(emuenv, module->info, args, argp);
+        auto ret = start_module(emuenv, *module, args, argp);
         if (retcode)
             *retcode = static_cast<int>(ret);
     }

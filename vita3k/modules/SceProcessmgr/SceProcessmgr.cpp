@@ -111,12 +111,14 @@ EXPORT(int, sceKernelCallAbortHandler, SceInt32 code, SceInt32 arg) {
     if (!emuenv.kernel.process_is_game_program())
         return 0;
     LOG_CRITICAL("The process aborts: sceKernelCallAbortHandler({})", log_hex(code));
-    emuenv.kernel.request_process_exit(code);
+    // Waiting before the exit request: the process exit then always finds the
+    // thread waiting and wakes it (exit_delete sets it running).
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
     {
         const std::lock_guard<std::mutex> lock(thread->mutex);
         thread->update_status(ThreadStatus::wait);
     }
+    emuenv.kernel.request_process_exit(code);
     if (emuenv.kernel.execution_host) {
         emuenv.kernel.execution_host->wait_sync(*thread, std::nullopt);
     } else {

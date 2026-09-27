@@ -492,6 +492,7 @@ void shutdown_app_runtime(EmuEnvState &state) {
 
     // trophy (maybe namespace this?)
     deinit(state.np);
+    reset_process(state.np);
 
     state.http.deinit();
 

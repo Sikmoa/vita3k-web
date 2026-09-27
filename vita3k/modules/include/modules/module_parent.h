@@ -24,6 +24,7 @@
 struct CPUState;
 struct EmuEnvState;
 struct KernelState;
+struct KernelModule;
 
 void init_libraries(EmuEnvState &emuenv);
 void init_exported_vars(EmuEnvState &emuenv);
@@ -43,8 +44,9 @@ bool has_hle_implementation(uint32_t nid);
 SceUID load_module(EmuEnvState &emuenv, const std::string &module_path, bool system_loaded = false);
 int unload_module(EmuEnvState &emuenv, SceUID module_id);
 
-uint32_t start_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, SceSize args = 0, Ptr<const void> argp = Ptr<const void>{});
-uint32_t stop_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, SceSize args = 0, Ptr<const void> argp = Ptr<const void>{});
+// Run module_start / module_stop and keep KernelModule::started.
+uint32_t start_module(EmuEnvState &emuenv, KernelModule &module, SceSize args = 0, Ptr<const void> argp = Ptr<const void>{});
+uint32_t stop_module(EmuEnvState &emuenv, KernelModule &module, SceSize args = 0, Ptr<const void> argp = Ptr<const void>{});
 
 /**
  * \brief Loads and run a system module

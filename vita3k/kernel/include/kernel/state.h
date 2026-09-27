@@ -60,6 +60,8 @@ struct KernelModule {
     // 0x8000, as process preloads and sysmodule loads are. It decides
     // sceKernelIsCalledFromSysModule and the sceKernelGetModuleList classes.
     bool system_loaded = false;
+    // Between a successful module_start and module_stop (see start_module).
+    std::atomic<bool> started = false;
 };
 typedef std::shared_ptr<KernelModule> SceKernelModulePtr;
 

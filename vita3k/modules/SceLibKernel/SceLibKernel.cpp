@@ -1232,10 +1232,9 @@ EXPORT(int, sceKernelBacktraceSelf) {
 }
 
 // Firmware 3.74 libkernel 0x810012e5, which libc's exit() calls with 1: run
-// module_exit of the started modules of that class (system loads, among them
-// the preloaded libc and libfios2, are not in class 1) and return the last
-// result. The firmware passes its SceKernelModuleInfo copy as argp; nothing
-// here reads it, so argp is NULL.
+// module_exit(0, &info) of the started modules of that class (system loads,
+// among them the preloaded libc and libfios2, are not in class 1) and return
+// the last result.
 EXPORT(int, sceKernelCallModuleExit, SceUInt8 type) {
     TRACY_FUNC(sceKernelCallModuleExit, type);
     SceUID ids[128];
@@ -1244,13 +1243,19 @@ EXPORT(int, sceKernelCallModuleExit, SceUInt8 type) {
     if (result != 0 || count == 0)
         return result;
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    const Address info_address = alloc(emuenv.mem, sizeof(SceKernelModuleInfo), "module_exit info");
+    auto *info = Ptr<SceKernelModuleInfo>(info_address).get(emuenv.mem);
     for (SceUInt32 i = 0; i < count; ++i) {
-        SceKernelModuleInfo info{};
-        info.size = sizeof(info);
-        result = CALL_EXPORT(sceKernelGetModuleInfo, ids[i], &info);
-        if (result == 0 && info.exit_entry && info.state == 6)
-            result = static_cast<int>(thread->run_callback(info.exit_entry.address(), { 0, 0 }));
+        memset(info, 0, sizeof(*info));
+        info->size = sizeof(*info);
+        result = CALL_EXPORT(sceKernelGetModuleInfo, ids[i], info);
+        if (result != 0 || !info->exit_entry)
+            continue;
+        const SceKernelModulePtr module = lock_and_find(ids[i], emuenv.kernel.loaded_modules, emuenv.kernel.mutex);
+        if (module && module->started)
+            result = static_cast<int>(thread->run_callback(info->exit_entry.address(), { 0, info_address }));
     }
+    free(emuenv.mem, info_address);
     return result;
 }
 

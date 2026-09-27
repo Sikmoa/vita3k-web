@@ -282,6 +282,9 @@ void KernelState::deinit(MemState &mem) {
     }
 
     codec_blocks.clear();
+    mspace_usage.clear();
+    pmuserenr = 0;
+    process_program_authority_id = 0;
 
     halt_instruction = nullptr;
     halt_instruction_pc = 0;
