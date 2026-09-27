@@ -162,9 +162,13 @@ EXPORT(SceInt32, sceImeUpdate) {
     memcpy(emuenv.ime.edit_text.str.get(emuenv.mem), emuenv.ime.str.c_str(), (emuenv.ime.str.length() + 1) * sizeof(SceWChar16));
     e->param.text = emuenv.ime.edit_text;
     e->param.caretIndex = emuenv.ime.caretIndex;
+    // Consume the event before the handler runs: it may call sceImeUpdate
+    // again or yield to a thread that does (the browser's cooperative
+    // threads share this mutex without blocking), and a new event may be set
+    // meanwhile; neither may deliver or lose an event twice.
+    emuenv.ime.event_id = SCE_IME_EVENT_OPEN;
     CALL_EXPORT(SceImeEventHandler, emuenv.ime.param.arg, e);
     free(emuenv.mem, event.address());
-    emuenv.ime.event_id = SCE_IME_EVENT_OPEN;
 
     return 0;
 }

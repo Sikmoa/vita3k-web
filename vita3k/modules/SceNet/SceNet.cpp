@@ -323,8 +323,12 @@ EXPORT(int, sceNetEpollControl, int eid, SceNetEpollControlFlag op, int id, SceN
 #ifdef __EMSCRIPTEN__
     if ((op == SCE_NET_EPOLL_CTL_ADD || op == SCE_NET_EPOLL_CTL_MOD) && !ev)
         RET_NET_ERRNO(SCE_NET_ERROR_EINVAL);
-    if (op == SCE_NET_EPOLL_CTL_ADD && emuenv.net.resolvers.contains(id))
-        RET_NET_ERRNO(epoll->add(id, {}, ev));
+    if (op == SCE_NET_EPOLL_CTL_ADD && emuenv.net.resolvers.contains(id)) {
+        const int result = epoll->add(id, {}, ev);
+        if (result >= 0)
+            offline_net_wake(emuenv.net);
+        RET_NET_ERRNO(result);
+    }
 #else
     if (id == emuenv.net.resolver_id) {
         STUBBED("Async DNS resolve is not supported");
@@ -332,6 +336,22 @@ EXPORT(int, sceNetEpollControl, int eid, SceNetEpollControlFlag op, int id, SceN
     }
 #endif
 
+#ifdef __EMSCRIPTEN__
+    // A new or changed subscription can make a parked sceNetEpollWait ready.
+    int result = SCE_NET_ERROR_EINVAL;
+    switch (op) {
+    case SCE_NET_EPOLL_CTL_ADD: {
+        const auto sock = lock_and_find(id, emuenv.net.socks, emuenv.kernel.mutex);
+        result = sock ? epoll->add(id, sock, ev) : SCE_NET_ERROR_EBADF;
+        break;
+    }
+    case SCE_NET_EPOLL_CTL_DEL: result = epoll->del(id); break;
+    case SCE_NET_EPOLL_CTL_MOD: result = epoll->mod(id, ev); break;
+    }
+    if (result >= 0)
+        offline_net_wake(emuenv.net);
+    RET_NET_ERRNO(result);
+#endif
     switch (op) {
     case SCE_NET_EPOLL_CTL_ADD: {
         const auto sock = lock_and_find(id, emuenv.net.socks, emuenv.kernel.mutex);

@@ -29,6 +29,19 @@
 namespace {
 constexpr uint32_t loopback_address = 0x7F000001; // host order
 constexpr unsigned int max_datagram = 65507; // 65535 - IP and UDP headers
+// Datagram socket buffer defaults: FreeBSD's udp_recvspace/udp_sendspace
+// (40 * (1024 + sizeof(sockaddr_in)) and 9216); the firmware's own values
+// were not recovered.
+constexpr int default_udp_rcvbuf = 41600, default_udp_sndbuf = 9216;
+
+int int_option(const OfflineSocket &socket, int level, int name, int fallback) {
+    const auto option = socket.options.find({ level, name });
+    if (option == socket.options.end())
+        return fallback;
+    int value = 0;
+    std::memcpy(&value, option->second.data(), sizeof(value));
+    return value;
+}
 
 uint32_t host_address(const SceNetSockaddrIn &addr) {
     return ntohl(addr.sin_addr.s_addr);
@@ -159,6 +172,7 @@ int OfflineSocket::abort(int flags) {
 
 int OfflineSocket::close() {
     queue.clear();
+    queued_bytes = 0;
     offline_net_wake(net);
     return 0;
 }
@@ -258,6 +272,12 @@ int OfflineSocket::deliver(const void *msg, unsigned int len, const SceNetSockad
             || receiver.local.sin_port != to.sin_port || (p2p() && receiver.local.sin_vport != to.sin_vport)
             || (address != 0 && address != host_address(to)) || (receiver.connected && !same_peer(receiver)))
             continue;
+        // A full receive buffer drops the datagram, as UDP does.
+        const size_t cost = datagram.data.size() + sizeof(SceNetSockaddrIn);
+        const int limit = int_option(receiver, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVBUF, default_udp_rcvbuf);
+        if (receiver.queued_bytes + cost > static_cast<size_t>(std::max(limit, 0)))
+            break;
+        receiver.queued_bytes += cost;
         receiver.queue.push_back(std::move(datagram));
         offline_net_wake(net);
         break;
@@ -306,8 +326,10 @@ int OfflineSocket::recv_packet(void *buf, unsigned int len, int flags, SceNetSoc
         return SCE_NET_ERROR_EFAULT;
     std::memcpy(buf, datagram.data.data(), copied);
     write_address(datagram.from, from, fromlen);
-    if (!(flags & SCE_NET_MSG_PEEK))
+    if (!(flags & SCE_NET_MSG_PEEK)) {
+        queued_bytes -= datagram.data.size() + sizeof(SceNetSockaddrIn);
         queue.pop_front();
+    }
     return static_cast<int>(copied);
 }
 
@@ -347,6 +369,9 @@ int OfflineSocket::get_socket_options(int level, int optname, void *optval, unsi
         std::memcpy(value.data(), &sce_type, sizeof(sce_type));
     } else if (const auto stored = options.find({ level, optname }); stored != options.end()) {
         value = stored->second;
+    } else if (level == SCE_NET_SOL_SOCKET && !stream() && (optname == SCE_NET_SO_RCVBUF || optname == SCE_NET_SO_SNDBUF)) {
+        const int size = optname == SCE_NET_SO_RCVBUF ? default_udp_rcvbuf : default_udp_sndbuf;
+        std::memcpy(value.data(), &size, sizeof(size));
     }
     std::memcpy(optval, value.data(), value.size());
     *optlen = spec->size;

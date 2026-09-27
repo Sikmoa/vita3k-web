@@ -46,6 +46,7 @@ struct OfflineSocket final : Socket {
     SceNetSockaddrIn peer{};
     bool shut_rd = false, shut_wr = false;
     std::deque<OfflineDatagram> queue;
+    size_t queued_bytes = 0; // payload + address per queued datagram, bounded by SO_RCVBUF
     int so_error = 0;
     // Abort: each sceNetSocketAbort ends the waits in progress; PRESERVATION
     // flags also fail every later receive/send with EINTR.

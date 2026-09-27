@@ -1,7 +1,8 @@
 // Genuine VitaSDK on-screen keyboard (SceIme) fixture: opens the IME with an
 // initial text and, as titles do, calls sceImeUpdate once per presented frame
 // until its event handler sees Enter. Exit code 100 when the text the user
-// entered is "Grüße, Vita!" and every event reached the handler in order;
+// entered is "Grüße, Vita!" and every event reached the handler once, in
+// order (the handler calls sceImeUpdate itself, which must deliver nothing);
 // 101 when the user closed the keyboard; 1..12 are failures (see main()).
 #include <stdint.h>
 #include <string.h>
@@ -17,11 +18,16 @@
 static SceWChar16 input[MAX_TEXT + 1];
 static uint8_t work[0x5000];
 static SceWChar16 seen[MAX_TEXT + 1]; // text of the last UPDATE_TEXT event
-static int update_events, enter_events, close_events, wrong_arg, out_of_order;
+static int update_events, enter_events, close_events, wrong_arg, out_of_order, depth;
 
 static void handler(void *arg, const SceImeEventData *e) {
     if (arg != work)
         wrong_arg = 1;
+    if (depth)
+        out_of_order = 1; // an event delivered again from inside its own handler
+    ++depth;
+    sceImeUpdate(); // the event is already consumed: this delivers nothing
+    --depth;
     if (enter_events || close_events)
         out_of_order = 1; // nothing may follow the final key
     switch (e->id) {

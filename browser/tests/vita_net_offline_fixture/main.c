@@ -46,6 +46,11 @@ static int aborter(SceSize args, void *argp) {
     sceNetSocketAbort(helper_target, 0);
     return 0;
 }
+static int helper_epoll;
+static SceNetEpollEvent helper_event;
+static int epoll_waiter(SceSize args, void *argp) {
+    return sceNetEpollWait(helper_epoll, &helper_event, 1, -1); // no time limit
+}
 static SceUID start_helper(SceKernelThreadEntry entry) {
     const SceUID thread = sceKernelCreateThread("net helper", entry, 0x40, 0x4000, 0, 0, NULL);
     if (thread >= 0)
@@ -137,6 +142,31 @@ int main(void) {
     CHECK(34, sceNetEpollWait(epoll, ready, 2, 10000) == 1 && ready[0].events == SCE_NET_EPOLLIN && ready[0].data.u32 == 0x1234);
     CHECK(35, sceNetRecv(receiver, buffer, sizeof(buffer), 0) == 5);
     CHECK(36, sceNetEpollDestroy(epoll) == 0);
+    // A thread parked on an epoll with nothing ready wakes when a ready
+    // descriptor is added.
+    helper_epoll = sceNetEpollCreate("epoll2", 0);
+    CHECK(54, helper_epoll >= 0);
+    const SceUID epoll_thread = start_helper(epoll_waiter);
+    CHECK(55, epoll_thread >= 0 && sceKernelDelayThread(20000) == 0);
+    event.events = SCE_NET_EPOLLOUT;
+    event.data.u32 = 0x55;
+    CHECK(56, sceNetEpollControl(helper_epoll, SCE_NET_EPOLL_CTL_ADD, sender_socket, &event) == 0);
+    int woken = -1;
+    CHECK(57, sceKernelWaitThreadEnd(epoll_thread, &woken, NULL) == 0 && woken == 1);
+    CHECK(58, helper_event.events == SCE_NET_EPOLLOUT && helper_event.data.u32 == 0x55);
+    CHECK(59, sceNetEpollDestroy(helper_epoll) == 0);
+
+    // A full receive buffer drops datagrams: 64 bytes hold one 20-byte
+    // datagram with its address, not two.
+    int rcvbuf = 64;
+    CHECK(60, sceNetSetsockopt(receiver, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) == 0);
+    static const char twenty[20] = "twenty bytes";
+    for (int i = 0; i < 3; ++i) {
+        SceNetSockaddrIn to = address(LOOPBACK, RECEIVER_PORT, 0);
+        CHECK(61, sceNetSendto(sender_socket, twenty, sizeof(twenty), 0, (SceNetSockaddr *)&to, sizeof(to)) == (int)sizeof(twenty));
+    }
+    CHECK(62, sceNetRecv(receiver, buffer, sizeof(buffer), 0) == (int)sizeof(twenty));
+    CHECK(63, sceNetRecv(receiver, buffer, sizeof(buffer), SCE_NET_MSG_DONTWAIT) == (int)SCE_NET_ERROR_EAGAIN);
 
     // TCP: no route off lo0, nothing listening on it, never connected.
     const int stream = sceNetSocket("stream", SCE_NET_AF_INET, SCE_NET_SOCK_STREAM, 0);
