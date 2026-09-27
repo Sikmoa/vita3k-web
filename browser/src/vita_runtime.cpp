@@ -116,10 +116,13 @@ static int run_vita(const uint8_t *bytes, uint32_t size) {
         EmuEnvState &env;
         ThreadStatePtr &thread;
         ~Cleanup() {
-            // This host used a cooperative ThreadState, not an SDL host thread.
-            // It has returned from run_loop before cleanup and must be removed
-            // before kernel teardown waits for host-thread deletion notifications.
-            if (thread) { env.kernel.threads.erase(thread->id); thread.reset(); }
+            // This host has no SDL host threads: the main thread ran
+            // cooperatively and has returned from run_loop, and threads HLE
+            // created (sceGxmInitialize's display-queue thread) never ran. None
+            // of them removes itself, so remove them all before kernel
+            // teardown waits for host-thread deletion notifications.
+            thread.reset();
+            env.kernel.threads.clear();
             env.kernel.deinit(env.mem);
             deinit_mem(env.mem);
         }

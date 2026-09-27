@@ -27,13 +27,11 @@ runner-owned scratch/cache directories. The historical guest-probe builder and
 server still assume a previous host's shader/WASI asset staging arrangement;
 they need portable dependency paths before they are clean-checkout commands.
 
-Historical color-only baseline: guest `exit 42`, 56 imports, zero missing NIDs,
-`missingSceGxmBridge=false`, two draw readback log lines. The extended texture
-fixture now expects **nine** `GXM WebGPU GXP indexed draw readback completed`
-lines and `CPU backend: WasmJitCPU (no fallback)`. Its Memory64/Chromium run
-passed: exit 42, 113 imports, zero missing NIDs, and nine readbacks on the
-Memory64 WASM JIT in Chromium/SwiftShader. This is the extended fixture's result,
-not the old color-only result.
+The per-draw bridge that read every draw back is gone: render targets stay on
+the GPU. `gxm_guest_probe_chromium.mjs` therefore runs the fixture with surface
+sync (`?surfaceSync=1`), which reads each scene's target back into guest memory
+before sceGxmFinish returns; the guest's own pixel checks and its exit code are
+the result.
 
 Regression baseline: `gxp_translation_smoke.mjs` (22 checks) and
 `gxm_guest_probe_chromium.mjs` pass in Chromium/SwiftShader.

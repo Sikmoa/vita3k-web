@@ -31,6 +31,7 @@
 //   LIMBO_FPS_HACK=1        Vita3K fps-hack: display waits use one vblank
 //   LIMBO_TEXTURE_VERIFY=1  verify cached textures against guest memory
 //   LIMBO_SCALE=N           internal resolution multiplier (default 2)
+//   LIMBO_SURFACE_SYNC=1    read rendered surfaces back into guest memory
 //   LIMBO_AOT               ahead-of-time module to supply to the run (AOT.md)
 //   LIMBO_LOG_OUT           write the retained worker log tail (4000 lines) to this file
 import { createServer } from 'node:http';
@@ -302,8 +303,8 @@ try {
     });
   }
 
-  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver, useAot, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale }) => {
-    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&revalidateAll=${revalidateAll ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}${textureVerify ? '&textureVerify=1' : ''}${scale ? '&scale=' + scale : ''}`, { type: 'module' });
+  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver, useAot, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale, surfaceSync }) => {
+    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&revalidateAll=${revalidateAll ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}${textureVerify ? '&textureVerify=1' : ''}${scale ? '&scale=' + scale : ''}${surfaceSync ? '&surfaceSync=1' : ''}`, { type: 'module' });
     const state = { logs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
       backend: null, memory: null, workerErrors: [], ready: false, timedOut: false,
       gxmSceneStats: null, gxmFailures: [], gxmSkips: [],
@@ -478,7 +479,7 @@ try {
       };
     });
     return result;
-  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver, useAot: Boolean(aotPath), fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '' });
+  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver, useAot: Boolean(aotPath), fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '', surfaceSync: process.env.LIMBO_SURFACE_SYNC === '1' });
 
   const saved = [];
   for (const frame of outcome.saved) {

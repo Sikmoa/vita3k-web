@@ -5,10 +5,12 @@
 // browser/web/gxm_scene.js: pass begin/end, draws with their fixed-function
 // state, and the vertex/index/uniform/texture bytes the draws reference, all
 // copied at submission so the guest may reuse its buffers immediately. The
-// stream is submitted synchronously and never read back: render targets live
-// on the GPU, sampled directly when a texture aliases one, and are presented
-// from there. Command-list completion (notifications, sync objects) is
-// therefore published as soon as the scene is submitted, as before.
+// stream is submitted synchronously: render targets live on the GPU, sampled
+// directly when a texture aliases one, and are presented from there.
+// Command-list completion (notifications, sync objects) is published as soon
+// as the scene is submitted. Opt-in surface sync (VITA3K_SURFACE_SYNC=1, like
+// desktop's disable-surface-sync=false) also reads each rendered target back
+// into guest memory first, suspending the guest until the copy arrives.
 #include "gxm_webgpu_bridge.h"
 #include "gxm_webgpu_program.h"
 #include <display/state.h>
@@ -86,6 +88,28 @@ EM_JS(int, web_gxm_submit, (const uint32_t *words, uint32_t count, const uint8_t
     }
 });
 
+// Surface sync: copies the render target at `address` (downscaled to its guest
+// size, in the guest's texel layout) into the guest rows at `dest`. The guest
+// thread suspends until the GPU copy is mapped.
+EM_ASYNC_JS(int, web_gxm_sync_surface, (uint32_t address, uint8_t *dest, uint32_t width, uint32_t height,
+    uint32_t stride_bytes, uint32_t pixel_bytes), {
+    const scene = Module['vita3kGxm'];
+    if (!scene) return 0;
+    try {
+        await scene.readTarget(address >>> 0, width, height, pixel_bytes, (mapped, bytesPerRow) => {
+            // Only the surface's pixels: bytes past `width` in a row belong to the guest.
+            const row = width * pixel_bytes;
+            const guest = Module['vita3kHostBytes'](dest, (height - 1) * stride_bytes + row);
+            for (let y = 0; y < height; ++y)
+                guest.set(mapped.subarray(y * bytesPerRow, y * bytesPerRow + row), y * stride_bytes);
+        });
+        return 0;
+    } catch (error) {
+        err('[vita3k-web] GXM surface sync of ' + (address >>> 0).toString(16) + ' failed: ' + (error.stack || error));
+        return -1;
+    }
+});
+
 // Presents the GPU render target at `address` (1) or reports that none exists
 // there (0). Frames go to the Worker's page hook; pixels are read back only
 // every Module.VITA3K_FRAME_READBACK frames (0 = never; default every frame
@@ -111,8 +135,8 @@ EM_JS(int, web_gxm_survey_enabled, (), {
 namespace {
 // Host milliseconds per stage, reported with the run progress.
 struct Timing {
-    double build = 0, decode = 0, submit = 0;
-    unsigned decodes = 0, hashes = 0, clean = 0, untracked = 0;
+    double build = 0, decode = 0, submit = 0, sync = 0;
+    unsigned decodes = 0, hashes = 0, clean = 0, untracked = 0, syncs = 0;
 };
 // VITA3K_TEXTURE_VERIFY=1: hash every bound texture even when no write was
 // tracked, and report changes the write tracking missed.
@@ -133,6 +157,17 @@ uint32_t resolution_scale() {
 }
 uint32_t surface_scale(uint32_t width, uint32_t height) {
     return width >= 960 && height >= 544 ? resolution_scale() : 1;
+}
+// VITA3K_SURFACE_SYNC=1: every scene that drew into a color surface reads the
+// target back into guest memory before its completions are published, for
+// titles that read rendered pixels with the CPU. Off by default: each sync
+// stalls the guest on a GPU round trip.
+bool surface_sync() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("VITA3K_SURFACE_SYNC");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
 }
 bool texture_verify() {
     static const bool enabled = std::getenv("VITA3K_TEXTURE_VERIFY") != nullptr;
@@ -181,7 +216,7 @@ struct WebState final : renderer::State {
     MemState &mem;
     explicit WebState(MemState &m) : mem(m) {
         current_backend = renderer::Backend::WebGPU;
-        context = nullptr; res_multiplier = 1; disable_surface_sync = false;
+        context = nullptr; res_multiplier = 1; disable_surface_sync = !surface_sync();
         should_display = false; stretch_the_display_area = false;
         fullscreen_hd_res_pixel_perfect = false;
     }
@@ -205,8 +240,11 @@ struct WebState final : renderer::State {
 namespace browser {
 void gxm_timing_report() {
     const auto &t = timing();
-    std::printf("[gxm] scene_ms=%.0f (decode_ms=%.0f decodes=%u hashes=%u clean=%u untracked=%u js_submit_ms=%.0f)\n",
+    std::printf("[gxm] scene_ms=%.0f (decode_ms=%.0f decodes=%u hashes=%u clean=%u untracked=%u js_submit_ms=%.0f)",
         t.build, t.decode, t.decodes, t.hashes, t.clean, t.untracked, t.submit);
+    if (surface_sync())
+        std::printf(" surface_syncs=%u surface_sync_ms=%.0f", t.syncs, t.sync);
+    std::printf("\n");
 }
 void gxm_survey_report() {
     for (const auto &[reason, count] : survey_counts())
@@ -217,6 +255,8 @@ int gxm_initialize(EmuEnvState &env) {
     if (env.renderer) return SCE_GXM_ERROR_ALREADY_INITIALIZED;
     if (web_gxm_init() != 0) return SCE_GXM_ERROR_DRIVER;
     env.renderer = std::make_unique<WebState>(env.mem);
+    if (surface_sync())
+        std::puts("[vita3k-web] GXM surface sync: on (rendered targets are read back into guest memory)");
     env.gxm.notification_region = Ptr<uint32_t>(alloc(env.mem, 1024 * 1024, "SceGxmNotificationRegion"));
     if (!env.gxm.notification_region) { env.renderer.reset(); return SCE_GXM_ERROR_DRIVER; }
     memset(env.gxm.notification_region.get(env.mem), 0, 1024 * 1024);
@@ -477,6 +517,7 @@ struct Writer {
         pass_snapshot_word += command.size();
     }
     uint32_t draws = 0;
+    uint32_t pass_first_draw = 0; // `draws` when the open pass began
     // Vertex streams: Vita3K sizes a stream from its base to the draw's
     // largest index, and a frame's draws index one growing buffer, so copying
     // per draw re-sends the same prefix many times. Draws of this submission
@@ -1083,6 +1124,7 @@ static void begin_pass(WebContext &ctx, scene::Writer &out) {
     out.word(0);
     out.word(surface_scale(color.width, color.height));
     out.pass_address = color.data.address();
+    out.pass_first_draw = out.draws;
     out.pass_open = true;
     const uint32_t pixel_bytes = uint32_t(gxm::bits_per_pixel(
         static_cast<SceGxmColorBaseFormat>(color.colorFormat & SCE_GXM_COLOR_BASE_FORMAT_MASK)) / 8);
@@ -1298,6 +1340,37 @@ static bool submit_scene(scene::Writer &out, MemState &mem) {
     return result == 0;
 }
 
+// Surface sync (VITA3K_SURFACE_SYNC=1) of one color surface a submitted scene
+// drew into: its GPU target is copied into the guest bytes the surface
+// describes, and the write is tracked so textures cached from those bytes are
+// checked again.
+struct SurfaceReadback {
+    Address address = 0;
+    uint32_t width = 0, height = 0, stride_bytes = 0, pixel_bytes = 0;
+};
+static bool surface_readback(const SceGxmColorSurface &color, SurfaceReadback &readback) {
+    // The consumer renders every surface linearly (see SetContext); its bytes
+    // only match guest memory for linear, full-size surfaces.
+    if (color.surfaceType != SCE_GXM_COLOR_SURFACE_LINEAR || color.downscale) {
+        skip_draw("surface sync of a tiled/swizzled or downscaled color surface");
+        return false;
+    }
+    const uint32_t pixel_bytes = uint32_t(gxm::bits_per_pixel(
+        static_cast<SceGxmColorBaseFormat>(color.colorFormat & SCE_GXM_COLOR_BASE_FORMAT_MASK)) / 8);
+    readback = { color.data.address(), color.width, color.height, color.strideInPixels * pixel_bytes, pixel_bytes };
+    return true;
+}
+static void sync_surface(MemState &mem, const SurfaceReadback &r) {
+    const size_t size = size_t(r.height - 1) * r.stride_bytes + size_t(r.width) * r.pixel_bytes;
+    require_guest(mem, r.address, size);
+    const double started = emscripten_get_now();
+    if (web_gxm_sync_surface(r.address, Ptr<uint8_t>(r.address).get(mem), r.width, r.height, r.stride_bytes, r.pixel_bytes) != 0)
+        unsupported("surface sync failed (see browser log)");
+    mem_mark_written(mem, r.address, size);
+    timing().sync += emscripten_get_now() - started;
+    ++timing().syncs;
+}
+
 // Fill guest memory (the CPU view) and the GPU target living there, if any.
 static int transfer_fill(MemState &mem, uint32_t color, const SceGxmTransferImage &d, scene::Writer &out) {
     const uint64_t start = uint64_t(d.address.address()) + uint64_t(d.y) * d.stride + uint64_t(d.x) * 4;
@@ -1342,11 +1415,16 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
     int result = 0;
     std::exception_ptr failure;
     // Guest-visible completion (notifications, sync signals, command
-    // statuses) is published only once the scene stream was accepted.
+    // statuses) is published only once the scene stream was accepted and,
+    // with surface sync, its rendered surfaces are back in guest memory.
     std::vector<std::function<void()>> completions;
+    std::vector<SurfaceReadback> readbacks;
     const auto publish = [&] {
         if (!submit_scene(out, mem))
             unsupported("scene submission failed (see browser log)");
+        for (const auto &readback : readbacks)
+            sync_surface(mem, readback);
+        readbacks.clear();
         for (const auto &complete : completions)
             complete();
         completions.clear();
@@ -1398,6 +1476,13 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
             const auto vertex = helper.pop<SceGxmNotification>(), fragment = helper.pop<SceGxmNotification>();
             for (const auto &n : {vertex, fragment}) if (n.address)
                 require_guest(mem, n.address.address(), sizeof(uint32_t));
+            // Surface sync (desktop sync_surface_data): the scene's surface,
+            // when it drew anything, is read back before these notifications.
+            SurfaceReadback readback;
+            if (!state.disable_surface_sync && ctx && static_cast<WebContext &>(*ctx).has_surface
+                && out.pass_open && out.draws > out.pass_first_draw
+                && surface_readback(ctx->record.color_surface, readback))
+                readbacks.push_back(readback);
             if (vertex.address || fragment.address) {
                 completions.push_back([&state, &mem, vertex, fragment] {
                     std::unique_lock<std::mutex> lock(state.notification_mutex);

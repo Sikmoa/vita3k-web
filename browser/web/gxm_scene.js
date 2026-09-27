@@ -4,14 +4,15 @@
 // Render targets stay on the GPU for their whole life, keyed by the guest color
 // surface (address, format, size). A scene is one synchronous call: every draw
 // is encoded into one render pass and submitted without waiting; guest memory
-// never receives rendered pixels. Textures that alias a render target sample it
-// directly; others arrive as RGBA8 mip chains the producer decoded and caches by
-// content. Presentation draws the displayed target into an OffscreenCanvas when
-// the page attached one, and posts sampled frames for headless observers.
+// receives rendered pixels only through opt-in surface sync (readTarget).
+// Textures that alias a render target sample it directly; others arrive as
+// RGBA8 mip chains the producer decoded and caches by content. Presentation
+// draws the displayed target into an OffscreenCanvas when the page attached
+// one, and posts sampled frames for headless observers.
 //
-// Everything asynchronous (device, GXP -> WGSL translation) happens before the
-// guest can draw: init() at sceGxmInitialize, registerProgram() when the guest
-// creates a shader program.
+// The asynchronous calls suspend the calling guest thread: init() at
+// sceGxmInitialize, registerProgram() when a draw first uses a shader program,
+// and readTarget() after each scene when surface sync is on.
 import { createGXPShaderAdapter } from './gxp_shader_adapter.js';
 
 let device, compiler;
@@ -30,7 +31,7 @@ let layouts, sceneBuffer, sceneBufferSize = 0;
 let canvas, canvasContext, canvasFormat, blitPipeline, blitSampler;
 let presentGeneration = 0;
 const stagingBuffers = []; // per-submission fill sources, destroyed after submit
-const stats = { scenes: 0, draws: 0, pipelines: 0, textureUploads: 0, presents: 0, bindGroups: 0, submitMs: 0, sceneBytes: 0 };
+const stats = { scenes: 0, draws: 0, pipelines: 0, textureUploads: 0, presents: 0, bindGroups: 0, submitMs: 0, sceneBytes: 0, surfaceSyncs: 0 };
 let log = message => console.warn(message);
 let statsReportedAt = 0;
 const warned = new Set();
@@ -136,6 +137,7 @@ function targetFor(address, format, width, height, scale) {
     return target;
   target?.texture.destroy();
   target?.snapshot?.texture.destroy();
+  target?.guestCopy?.destroy();
   const gpuFormat = colorFormat(format);
   const gpuWidth = width * scale, gpuHeight = height * scale;
   const texture = device.createTexture({ size: [gpuWidth, gpuHeight], format: gpuFormat,
@@ -628,6 +630,77 @@ export function presentTarget(address, onFrame, readbackEvery) {
     onFrame(generation, target.gpuWidth, target.gpuHeight, null);
   }
   return true;
+}
+
+// Surface sync (producer: VITA3K_SURFACE_SYNC=1). The target's texels already
+// have the guest's byte layout (the shaders write components in memory order;
+// rgba8unorm, rgb10a2unorm and rgba16float match the U8x4, U2U10U10U10 and
+// F16x4 surfaces bit for bit), so a scaled target is only box-filtered back to
+// its guest size, in its own format. `write(mapped, bytesPerRow)` receives the
+// rows while the copy is mapped.
+const texelBytes = { rgba8unorm: 4, rgb10a2unorm: 4, rgba16float: 8 };
+const downscalePipelines = new Map(); // `${format}:${scale}` -> pipeline
+const readbackBuffers = new Map();    // size -> idle MAP_READ buffer
+function downscalePipeline(format, scale) {
+  const key = `${format}:${scale}`;
+  let pipeline = downscalePipelines.get(key);
+  if (!pipeline) {
+    const module = device.createShaderModule({ code: `
+      @group(0) @binding(0) var image: texture_2d<f32>;
+      @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+        let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+        return vec4f(uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0), 0.0, 1.0);
+      }
+      @fragment fn fs(@builtin(position) position: vec4f) -> @location(0) vec4f {
+        let base = vec2u(position.xy) * ${scale}u;
+        var sum = vec4f(0.0);
+        for (var y = 0u; y < ${scale}u; y++) {
+          for (var x = 0u; x < ${scale}u; x++) { sum += textureLoad(image, base + vec2u(x, y), 0); }
+        }
+        return sum / ${scale * scale}.0;
+      }` });
+    pipeline = device.createRenderPipeline({ layout: 'auto', vertex: { module, entryPoint: 'vs' },
+      fragment: { module, entryPoint: 'fs', targets: [{ format }] }, primitive: { topology: 'triangle-list' } });
+    downscalePipelines.set(key, pipeline);
+  }
+  return pipeline;
+}
+export async function readTarget(address, width, height, pixelBytes, write) {
+  const target = targets.get(address);
+  if (!target || target.width !== width || target.height !== height)
+    throw new Error(`no ${width}x${height} render target at ${address.toString(16)}`);
+  if (texelBytes[target.gpuFormat] !== pixelBytes)
+    throw new Error(`${target.gpuFormat} target read back as ${pixelBytes}-byte guest pixels`);
+  const encoder = device.createCommandEncoder();
+  let source = target.texture;
+  if (target.scale !== 1) {
+    target.guestCopy ??= device.createTexture({ size: [width, height], format: target.gpuFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    source = target.guestCopy;
+    const pipeline = downscalePipeline(target.gpuFormat, target.scale);
+    const pass = encoder.beginRenderPass({ colorAttachments: [{ view: source.createView(), loadOp: 'clear', storeOp: 'store' }] });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: target.view }] }));
+    pass.draw(3);
+    pass.end();
+  }
+  const bytesPerRow = Math.ceil(width * pixelBytes / 256) * 256;
+  const size = bytesPerRow * height;
+  const buffer = readbackBuffers.get(size) ?? device.createBuffer({ size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  readbackBuffers.delete(size);
+  encoder.copyTextureToBuffer({ texture: source }, { buffer, bytesPerRow }, [width, height]);
+  device.queue.submit([encoder.finish()]);
+  try {
+    await buffer.mapAsync(GPUMapMode.READ);
+    write(new Uint8Array(buffer.getMappedRange()), bytesPerRow);
+    buffer.unmap();
+    readbackBuffers.set(size, buffer);
+  } catch (error) {
+    buffer.destroy();
+    throw error;
+  }
+  ++stats.surfaceSyncs;
 }
 
 export function sceneStats() { return { ...stats, targets: targets.size, textures: textures.size, pipelines: pipelines.size }; }

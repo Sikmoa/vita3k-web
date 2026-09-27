@@ -1,5 +1,6 @@
 // Real SDK lifecycle probe, no stdio: runtime logs imports and exit.
-// Guest ABI + transfer fill + real GXP indexed draw; guest checks GPU readback.
+// Guest ABI + transfer fill + real GXP indexed draw; guest checks the rendered
+// pixels in memory, so it needs surface sync (gxm_guest_probe_chromium.mjs).
 #include <psp2/gxm.h>
 #include "probe_shaders.h"
 static unsigned char patch_heap[256 * 1024] __attribute__((aligned(16)));
@@ -162,6 +163,18 @@ int main(void) {
             if (actual < want - tolerance || actual > want + tolerance) return 65 + draw;
         }
     }
+    // A texture inside the surface's bytes (not at its base, so not sampled
+    // from the GPU target) is decoded from guest memory. Rendering changes
+    // those bytes only through the readback, which must count as a write, or
+    // the cached decode of the old bytes would be sampled again.
+    SceGxmTexture inner;
+    if (sceGxmTextureInitLinear(&inner, frame + 8, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, 4, 4, 1)) return 76;
+    if (sceGxmBeginScene(context, 0, target, NULL, NULL, NULL, &surface, NULL)) return 77;
+    if (sceGxmSetFragmentTexture(context, 0, &inner)) return 78;
+    if (sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, indices, 3)) return 79;
+    if (sceGxmEndScene(context, NULL, NULL)) return 80;
+    sceGxmFinish(context);
+    for (unsigned i = 0; i < 32 * 32; ++i) if (frame[i] != 0x11224488) return 81;
     // Stale bound texture must not force a group-3 draw on an untextured GXP.
     if (sceGxmBeginScene(context, 0, target, NULL, NULL, NULL, &surface, NULL)) return 71;
     sceGxmSetVertexProgram(context, vp); sceGxmSetFragmentProgram(context, fp);
@@ -171,6 +184,16 @@ int main(void) {
     if (sceGxmEndScene(context, NULL, NULL)) return 74;
     sceGxmFinish(context);
     for (unsigned i = 0; i < 32 * 32; ++i) if (frame[i] != 0xff00ff00) return 75;
+    // The same inner texture now holds the green the readback wrote.
+    if (sceGxmBeginScene(context, 0, target, NULL, NULL, NULL, &surface, NULL)) return 82;
+    sceGxmSetVertexProgram(context, tvp); sceGxmSetFragmentProgram(context, tfp);
+    if (sceGxmSetVertexStream(context, 0, textured_vertices)
+        || sceGxmSetVertexDefaultUniformBuffer(context, matrix)
+        || sceGxmSetFragmentTexture(context, 0, &inner)) return 83;
+    if (sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, indices, 3)) return 84;
+    if (sceGxmEndScene(context, NULL, NULL)) return 85;
+    sceGxmFinish(context);
+    for (unsigned i = 0; i < 32 * 32; ++i) if (frame[i] != 0xff00ff00) return 86;
     if (sceGxmDestroyRenderTarget(target)) return 45;
     if (sceGxmDestroyContext(context) != 0) return 19;
     if (sceGxmTerminate() != 0) return 15;

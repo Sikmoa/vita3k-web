@@ -1,6 +1,12 @@
 // Diagnostic only: genuine VitaSDK SELF -> Memory64 Wasm JIT -> SceGxm NID.
 // Default expectation is working HLE (exit 42). --expect-missing explicitly
 // verifies the current blocker and must never be presented as renderer success.
+//
+// The fixture (vita_homebrew_fixture/gxm_probe.c) checks its rendered pixels in
+// guest memory after sceGxmFinish. By default render targets stay on the GPU
+// and guest memory never receives them (desktop's disable-surface-sync), so
+// the worker runs with surfaceSync=1: every scene's target is read back into
+// guest memory before its completion is published.
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
@@ -22,14 +28,16 @@ let browser;
 try {
   browser = await chromium.launch({ headless: true, args: [
     '--enable-unsafe-webgpu', '--use-angle=swiftshader', '--enable-features=Vulkan', '--disable-vulkan-surface'
-  ] });
+  ], ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+    ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}) });
   const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   const outcome = await page.evaluate(() => new Promise((resolveRun, reject) => {
-    const worker = new Worker('./worker.js?backend=jit&memory=w64', { type: 'module' });
+    const worker = new Worker('./worker.js?backend=jit&memory=w64&surfaceSync=1', { type: 'module' });
     const logs = []; let ready;
     const done = (error, value) => { clearTimeout(timer); worker.terminate(); error ? reject(error) : resolveRun(value); };
-    const timer = setTimeout(() => done(new Error('probe deadline')), 40000);
+    // A deadline still returns the logs: they name where the guest stopped.
+    const timer = setTimeout(() => done(null, { ready, exit: 'deadline', logs }), 40000);
     worker.onmessage = ({ data }) => {
       if (data.type === 'error') done(new Error(data.message));
       else if (data.type === 'ready') {
@@ -57,12 +65,10 @@ try {
     assert.equal(missing, true); assert.equal(outcome.exit, -8);
   } else {
     assert.equal(missing, false, 'sceGxmInitialize bridge must be registered (see HLE log above)');
+    assert.match(logs, /GXM surface sync: on/);
+    assert.doesNotMatch(logs, /surface sync of \w+ failed/);
     assert.equal(outcome.exit, 42, 'guest GXP pixel assertions and lifecycle operations must succeed');
-    assert.equal((logs.match(/GXM WebGPU GXP indexed draw readback completed/g) || []).length, 9,
-      'two color, six textured and final untextured guest draws must complete GPU readback');
     assert.match(logs, /missing_nids=0/);
-    assert.match(logs, /GXM finish entered/);
-    assert.match(logs, /GXM WebGPU queue fence completed/);
   }
   console.log(JSON.stringify({ backend: 'WasmJitCPU', memory: 'wasm64-direct',
     guestSceGxmCallReached: true, missingSceGxmBridge: missing, exit: outcome.exit, rendererComplete: false }));

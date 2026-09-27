@@ -111,6 +111,9 @@ try {
         // Check cached textures and vertex streams against guest memory and
         // report changes the write tracking missed (gxm_webgpu_bridge.cpp).
         VITA3K_TEXTURE_VERIFY: workerParams.get('textureVerify') === '1' ? '1' : undefined,
+        // Read rendered surfaces back into guest memory after each scene
+        // (gxm_webgpu_bridge.cpp); off by default, it stalls on the GPU.
+        VITA3K_SURFACE_SYNC: workerParams.get('surfaceSync') === '1' ? '1' : undefined,
       });
       break;
     } catch (error) {

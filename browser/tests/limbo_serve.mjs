@@ -12,6 +12,7 @@
 // fps-hack (display waits use one vblank; Limbo's logic is frame-locked, so it
 // also runs up to twice as fast);
 // ?scale=N renders at N times the Vita resolution (1-4; default 2 = 1920x1088);
+// ?surfaceSync=1 reads rendered surfaces back into guest memory after each scene;
 // ?inlineMutex=0 disables the inline-mutex optimization for A/B testing; ?auto=1 (start
 // immediately); ?present=readback keeps the canvas on the page and has the worker
 // read every GPU frame back instead (slower; for tools that read the page canvas,
@@ -289,7 +290,7 @@ async function run() {
   if (webgpuBlocked) log('warning: ' + webgpuBlocked);
   runButton.disabled = true; stopButton.disabled = false;
   ensureAudio();
-  worker = new Worker(\`./worker.js?backend=\${backend}&memory=\${memory}&inlineMutex=\${params.get('inlineMutex') === '0' ? '0' : '1'}\${params.get('fpsHack') === '1' ? '&fpsHack=1' : ''}\${params.get('scale') ? '&scale=' + params.get('scale') : ''}\`, { type: 'module' });
+  worker = new Worker(\`./worker.js?backend=\${backend}&memory=\${memory}&inlineMutex=\${params.get('inlineMutex') === '0' ? '0' : '1'}\${params.get('fpsHack') === '1' ? '&fpsHack=1' : ''}\${params.get('scale') ? '&scale=' + params.get('scale') : ''}\${params.get('surfaceSync') === '1' ? '&surfaceSync=1' : ''}\`, { type: 'module' });
   worker.onerror = (event) => { log('worker error: ' + event.message); status.textContent = 'worker error'; };
   worker.onmessage = async ({ data }) => {
     if (!data || typeof data !== 'object') return;
