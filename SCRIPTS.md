@@ -60,14 +60,17 @@ c++ -std=c++20 -O1 -Wall -Wextra -Werror \
   build/native-dynarmic/src/dynarmic/libdynarmic.a \
   build/native-dynarmic/externals/mcl/src/libmcl.a \
   build/native-dynarmic/externals/fmt/libfmt.a \
+  build/native-dynarmic/externals/zydis/libZydis.a \
+  build/native-dynarmic/externals/zydis/zycore/libZycore.a \
   -o /tmp/wasmjit-emitter-test
 /tmp/wasmjit-emitter-test /tmp/wasmjit-emitter-fixtures
 node vita3k/cpu/tests/wasmjit_emitter_test.mjs /tmp/wasmjit-emitter-fixtures
 ```
 
-The first two commands build a standalone native Dynarmic with its bundled
-fmt; the headers must be that fmt (`external/fmt` is a different version and
-does not link). Then the native fixture generator is built (no CMake target
+The first two commands build a standalone native Dynarmic (with its x64
+backend, which runs the vitaslop cases as the oracle for the flags their
+goldens do not record) and its bundled fmt; the headers must be that fmt
+(`external/fmt` is a different version and does not link). Then the native fixture generator is built (no CMake target
 exists for it; see `vita3k/cpu/tests/wasmjit_emitter_README.md`), translates
 real ARM/Thumb into `.wasm` fixtures with expected-state JSON, and Node executes
 every module. Expected last line: `Wasm execution passed: ...`.

@@ -101,7 +101,9 @@ enum Wasm : uint8_t {
     Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtS = 0x48, LtU = 0x49, GtS = 0x4a, GtU = 0x4b, LeS = 0x4c, LeU = 0x4d, GeS = 0x4e, GeU = 0x4f, Eqz64 = 0x50,
     Clz = 0x67, Add = 0x6a, Sub = 0x6b, Mul = 0x6c, And = 0x71, Or = 0x72, Xor = 0x73,
     Shl = 0x74, ShrS = 0x75, ShrU = 0x76, RotR = 0x78,
-    Add64 = 0x7c, Sub64 = 0x7d, Mul64 = 0x7e, Or64 = 0x84, Shl64 = 0x86, ShrU64 = 0x88, ShrS64 = 0x87, Wrap = 0xa7, ExtendU = 0xad,
+    Eq64 = 0x51, LtS64 = 0x53, LtU64 = 0x54, GtS64 = 0x55,
+    Add64 = 0x7c, Sub64 = 0x7d, Mul64 = 0x7e, And64 = 0x83, Or64 = 0x84, Xor64 = 0x85, Shl64 = 0x86, ShrU64 = 0x88,
+    ShrS64 = 0x87, Wrap = 0xa7, ExtendS = 0xac, ExtendU = 0xad,
 };
 
 constexpr bool memory64 = memory_address_type == MemoryAddressType::I64;
@@ -205,6 +207,12 @@ bool scalar(Type type) {
 
 bool arithmetic(Op op) {
     return op == Op::Add32 || op == Op::Sub32;
+}
+
+// Scalar saturations whose GetOverflowFromOp (CPSR.Q) reads word +5.
+bool saturation(Op op) {
+    return op == Op::SignedSaturation || op == Op::UnsignedSaturation || op == Op::SignedSaturatedAddWithFlag32
+        || op == Op::SignedSaturatedSubWithFlag32;
 }
 
 // Differential-check canary (VITA3K_AOT_CANARY=1 while building an AOT
@@ -1699,14 +1707,17 @@ private:
         pack_lanes(2 * bits, 4, [&](unsigned i) { vector_lane(inst.GetArg(0), bits, i, true); });
         return ok;
     }
-    // VHADD: floor((a + b) / 2) per lane with the full-width intermediate.
-    bool vector_halving_add(const Inst &inst, unsigned bits, bool is_signed) {
+    // VHADD: floor((a + b) / 2) per lane with the full-width intermediate;
+    // VRHADD (rounding): floor((a + b + 1) / 2).
+    bool vector_halving_add(const Inst &inst, unsigned bits, bool is_signed, bool rounding = false) {
         if (bits == 32) {
-            const uint8_t extend = is_signed ? 0xac : ExtendU; // i64.extend_i32_s/u
+            const uint8_t extend = is_signed ? ExtendS : ExtendU;
             for (unsigned word = 0; word < 4; ++word) {
                 value_word(inst.GetArg(0), word); op(extend);
                 value_word(inst.GetArg(1), word); op(extend);
-                op(Add64); constant64(code, 1); op(is_signed ? ShrS64 : ShrU64); op(Wrap);
+                op(Add64);
+                if (rounding) { constant64(code, 1); op(Add64); }
+                constant64(code, 1); op(is_signed ? ShrS64 : ShrU64); op(Wrap);
                 set(next_local + word);
             }
             return ok;
@@ -1714,8 +1725,198 @@ private:
         pack_lanes(bits, 4, [&](unsigned i) {
             vector_lane(inst.GetArg(0), bits, i, is_signed);
             vector_lane(inst.GetArg(1), bits, i, is_signed);
-            op(Add); imm(1); op(is_signed ? ShrS : ShrU);
+            op(Add);
+            if (rounding) { imm(1); op(Add); }
+            imm(1); op(is_signed ? ShrS : ShrU);
         });
+        return ok;
+    }
+    // VSHL.S (register): shift each lane of a by the signed low byte s of
+    // the matching lane of b: s >= 0 shifts left (0 from s >= bits), s < 0
+    // shifts right arithmetically by -s (the sign fill from s <= -bits)
+    // (Dynarmic VShift<signed>).
+    bool vector_arithmetic_vshift(const Inst &inst, unsigned bits) {
+        const auto amount = next_local + 4, lane = next_local + 5;
+        if (bits == 64) {
+            for (unsigned word = 0; word < 4; word += 2) {
+                value_word(inst.GetArg(1), word); imm(24); op(Shl); imm(24); op(ShrS); set(amount);
+                push_i64_value(inst.GetArg(0), word); set(scratch_local);
+                // left: amount < 64 ? x << amount : 0
+                get(scratch_local); get(amount); op(ExtendU); op(Shl64);
+                constant64(code, 0);
+                get(amount); imm(64); op(LtS);
+                op(Select);
+                // right: x >> min(-amount, 63)
+                get(scratch_local);
+                imm(0); get(amount); op(Sub); set(lane);
+                get(lane); imm(63); get(lane); imm(63); op(LtU); op(Select); op(ExtendU);
+                op(ShrS64);
+                get(amount); imm(0); op(GeS);
+                op(Select);
+                store_i64_words(next_local + word);
+            }
+            return ok;
+        }
+        pack_lanes(bits, 4, [&](unsigned i) {
+            // The amount byte is the lowest byte of b's lane i.
+            const unsigned position = bits * i;
+            value_word(inst.GetArg(1), position / 32);
+            if (position % 32) { imm(position % 32); op(ShrU); }
+            imm(24); op(Shl); imm(24); op(ShrS); set(amount);
+            vector_lane(inst.GetArg(0), bits, i, true); set(lane);
+            get(lane); get(amount); op(Shl);
+            imm(0);
+            get(amount); imm(bits); op(LtS);
+            op(Select);
+            get(lane);
+            imm(0); get(amount); op(Sub);
+            imm(bits - 1);
+            imm(0); get(amount); op(Sub); imm(bits - 1); op(LtU);
+            op(Select);
+            op(ShrS);
+            get(amount); imm(0); op(GeS);
+            op(Select);
+        });
+        return ok;
+    }
+    // Pushes the i64 formed by words `word` and `word + 1` of a value.
+    void push_i64_value(const Value &v, unsigned word) {
+        value_word(v, word); op(ExtendU);
+        value_word(v, word + 1); op(ExtendU); constant64(code, 32); op(Shl64); op(Or64);
+    }
+    // Sets the sticky FPSCR.QC (bit 27) when the i32 in `slot` is nonzero,
+    // like Dynarmic's saturating vector emitters.
+    void set_qc_if(uint32_t slot) {
+        get(slot);
+        begin_if();
+        get(0); load(offsetof(JitState, fpscr)); imm(0x08000000u); op(Or); store(offsetof(JitState, fpscr));
+        end_if();
+    }
+    // Pushes clamp(value in `slot`, lo, hi) for i32 lanes and ORs "clamped"
+    // into `saturated`. Signed comparisons: every caller's value is exact in
+    // i32 (sign- or zero-extended lanes below 32 bits).
+    void clamp_i32(uint32_t slot, int32_t lo, int32_t hi, uint32_t saturated) {
+        get(saturated); get(slot); imm(uint32_t(lo)); op(LtS); get(slot); imm(uint32_t(hi)); op(GtS); op(Or); op(Or);
+        set(saturated);
+        imm(uint32_t(lo)); imm(uint32_t(hi)); get(slot); get(slot); imm(uint32_t(hi)); op(GtS); op(Select);
+        get(slot); imm(uint32_t(lo)); op(LtS); op(Select);
+    }
+    // The same for the i64 in scratch_local, pushing the low 32 bits.
+    void clamp_i64_low(int64_t lo, int64_t hi, uint32_t saturated) {
+        get(saturated); get(scratch_local); constant64(code, lo); op(LtS64);
+        get(scratch_local); constant64(code, hi); op(GtS64); op(Or); op(Or); set(saturated);
+        imm(uint32_t(lo)); imm(uint32_t(hi)); get(scratch_local); op(Wrap);
+        get(scratch_local); constant64(code, hi); op(GtS64); op(Select);
+        get(scratch_local); constant64(code, lo); op(LtS64); op(Select);
+    }
+    // VQMOVN.S/VQMOVUN (and the narrow of VQ(R)SHR(U)N.S): each signed
+    // `2 * bits` lane clamped to the signed (or unsigned) `bits` range,
+    // packed into the low 64 bits (upper 64 bits zero). Any clamp sets
+    // FPSCR.QC (Dynarmic EmitVectorSignedSaturatedNarrowTo{Signed,Unsigned}).
+    bool vector_signed_saturated_narrow(const Inst &inst, unsigned bits, bool to_unsigned) {
+        const auto saturated = next_local + 4, wide = next_local + 5;
+        imm(0); set(saturated);
+        if (bits == 32) {
+            for (unsigned lane = 0; lane < 2; ++lane) {
+                push_i64_value(inst.GetArg(0), 2 * lane); set(scratch_local);
+                clamp_i64_low(to_unsigned ? 0 : INT32_MIN, to_unsigned ? int64_t(UINT32_MAX) : INT32_MAX, saturated);
+                set(next_local + lane);
+            }
+            imm(0); set(next_local + 2); imm(0); set(next_local + 3);
+        } else {
+            const int32_t lo = to_unsigned ? 0 : -(1 << (bits - 1));
+            const int32_t hi = to_unsigned ? (1 << bits) - 1 : (1 << (bits - 1)) - 1;
+            pack_lanes(bits, 2, [&](unsigned i) {
+                vector_lane(inst.GetArg(0), 2 * bits, i, true); set(wide);
+                clamp_i32(wide, lo, hi, saturated);
+            });
+        }
+        set_qc_if(saturated);
+        return ok;
+    }
+    // VQADD/VQSUB .S/.U: per-lane saturating add or subtract; any clamp
+    // sets FPSCR.QC (Dynarmic Emit{Signed,Unsigned}SaturatedOp).
+    bool vector_saturated_add_sub(const Inst &inst, unsigned bits, bool is_signed, bool is_add) {
+        const auto saturated = next_local + 4, sum = next_local + 5, overflow = next_local + 6;
+        imm(0); set(saturated);
+        if (bits < 32) {
+            const int32_t lo = is_signed ? -(1 << (bits - 1)) : 0;
+            const int32_t hi = is_signed ? (1 << (bits - 1)) - 1 : (1 << bits) - 1;
+            pack_lanes(bits, 4, [&](unsigned i) {
+                vector_lane(inst.GetArg(0), bits, i, is_signed);
+                vector_lane(inst.GetArg(1), bits, i, is_signed);
+                op(is_add ? Add : Sub); set(sum);
+                clamp_i32(sum, lo, hi, saturated);
+            });
+        } else if (bits == 32) {
+            const uint8_t extend = is_signed ? ExtendS : ExtendU;
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(0), word); op(extend);
+                value_word(inst.GetArg(1), word); op(extend);
+                op(is_add ? Add64 : Sub64); set(scratch_local);
+                clamp_i64_low(is_signed ? INT32_MIN : 0, is_signed ? INT32_MAX : int64_t(UINT32_MAX), saturated);
+                set(next_local + word);
+            }
+        } else {
+            for (unsigned word = 0; word < 4; word += 2) {
+                push_i64_value(inst.GetArg(0), word); push_i64_value(inst.GetArg(1), word);
+                op(is_add ? Add64 : Sub64); set(scratch_local);
+                if (is_signed) {
+                    // Signed overflow: the result's sign differs from a's
+                    // and from b's (add) or a's and b's differ (sub); the
+                    // clamp takes a's sign.
+                    push_i64_value(inst.GetArg(0), word); get(scratch_local); op(Xor64);
+                    if (is_add) { push_i64_value(inst.GetArg(1), word); get(scratch_local); op(Xor64); }
+                    else { push_i64_value(inst.GetArg(0), word); push_i64_value(inst.GetArg(1), word); op(Xor64); }
+                    op(And64); constant64(code, 0); op(LtS64); set(overflow);
+                    constant64(code, INT64_MIN); constant64(code, INT64_MAX);
+                    value_word(inst.GetArg(0), word + 1); imm(31); op(ShrU); op(Select);
+                } else {
+                    // Unsigned: a carry out (sum below a) or a borrow (a below b).
+                    if (is_add) { get(scratch_local); push_i64_value(inst.GetArg(0), word); }
+                    else { push_i64_value(inst.GetArg(0), word); push_i64_value(inst.GetArg(1), word); }
+                    op(LtU64); set(overflow);
+                    constant64(code, is_add ? -1 : 0);
+                }
+                get(scratch_local); get(overflow); op(Select);
+                store_i64_words(next_local + word);
+                get(saturated); get(overflow); op(Or); set(saturated);
+            }
+        }
+        set_qc_if(saturated);
+        return ok;
+    }
+    // VQABS/VQNEG: the most negative lane saturates to the most positive
+    // one and sets FPSCR.QC; other lanes take their absolute value or
+    // negation (Dynarmic EmitVectorSignedSaturated{Abs,Neg}).
+    bool vector_saturated_abs_neg(const Inst &inst, unsigned bits, bool negate) {
+        const auto saturated = next_local + 4, lane = next_local + 5, minimum = next_local + 6;
+        imm(0); set(saturated);
+        if (bits == 64) {
+            for (unsigned word = 0; word < 4; word += 2) {
+                push_i64_value(inst.GetArg(0), word); set(scratch_local);
+                get(scratch_local); constant64(code, INT64_MIN); op(Eq64); set(minimum);
+                get(saturated); get(minimum); op(Or); set(saturated);
+                constant64(code, INT64_MAX);
+                constant64(code, 0); get(scratch_local); op(Sub64);
+                if (!negate) { get(scratch_local); get(scratch_local); constant64(code, 0); op(LtS64); op(Select); }
+                get(minimum); op(Select);
+                store_i64_words(next_local + word);
+            }
+        } else {
+            const int32_t min = bits == 32 ? INT32_MIN : -(1 << (bits - 1));
+            const int32_t max = bits == 32 ? INT32_MAX : (1 << (bits - 1)) - 1;
+            pack_lanes(bits, 4, [&](unsigned i) {
+                vector_lane(inst.GetArg(0), bits, i, true); set(lane);
+                get(lane); imm(uint32_t(min)); op(Eq); set(minimum);
+                get(saturated); get(minimum); op(Or); set(saturated);
+                imm(uint32_t(max));
+                imm(0); get(lane); op(Sub);
+                if (!negate) { get(lane); get(lane); imm(0); op(LtS); op(Select); }
+                get(minimum); op(Select);
+            });
+        }
+        set_qc_if(saturated);
         return ok;
     }
     // VSHL.U (register): shift each lane of a by the signed low byte s of the
@@ -2225,7 +2426,7 @@ private:
                 get(it->second + 4);
                 break;
             case Op::GetOverflowFromOp:
-                if (!arith) return false;
+                if (!arith && !saturation(producer->GetOpcode())) return false;
                 get(it->second + 5);
                 break;
             case Op::GetNZCVFromOp:
@@ -3375,30 +3576,64 @@ private:
         case Op::VectorUnsignedSaturatedNarrow64: return vector_unsigned_saturated_narrow(inst, 32);
         case Op::VectorPolynomialMultiply8: polynomial_multiply8(inst); return ok;
         case Op::VectorPolynomialMultiplyLong8: polynomial_multiply_long8(inst); return ok;
-        case Op::VectorArithmeticVShift32: {
-            // VSHL.S32 (register): shift by the signed low byte of each lane
-            // of b; left >= 32 gives 0, right >= 32 gives the sign fill.
-            const auto shift = next_local + 4, lane = next_local + 5;
-            for (unsigned word = 0; word < 4; ++word) {
-                value_word(inst.GetArg(0), word); set(lane);
-                value_word(inst.GetArg(1), word); imm(24); op(Shl); imm(24); op(ShrS); set(shift);
-                // left: shift < 32 ? lane << shift : 0
-                get(lane); get(shift); op(Shl);
-                imm(0);
-                get(shift); imm(32); op(LtS);
-                op(Select);
-                // right: lane >> min(-shift, 31)
-                const auto negated = next_local + 6;
-                get(lane);
-                imm(0); get(shift); op(Sub); set(negated);
-                get(negated); imm(31); get(negated); imm(31); op(LtU); op(Select);
-                op(ShrS);
-                // shift >= 0 selects the left result
-                get(shift); imm(0); op(LtS); op(Eqz);
-                op(Select); set(next_local + word);
-            }
+        case Op::VectorArithmeticVShift8: return vector_arithmetic_vshift(inst, 8);
+        case Op::VectorArithmeticVShift16: return vector_arithmetic_vshift(inst, 16);
+        case Op::VectorArithmeticVShift32: return vector_arithmetic_vshift(inst, 32);
+        case Op::VectorArithmeticVShift64: return vector_arithmetic_vshift(inst, 64);
+        case Op::VectorRoundingHalvingAddS8: return vector_halving_add(inst, 8, true, true);
+        case Op::VectorRoundingHalvingAddS16: return vector_halving_add(inst, 16, true, true);
+        case Op::VectorRoundingHalvingAddS32: return vector_halving_add(inst, 32, true, true);
+        case Op::VectorRoundingHalvingAddU8: return vector_halving_add(inst, 8, false, true);
+        case Op::VectorRoundingHalvingAddU16: return vector_halving_add(inst, 16, false, true);
+        case Op::VectorRoundingHalvingAddU32: return vector_halving_add(inst, 32, false, true);
+        case Op::VectorSignedSaturatedNarrowToSigned16: return vector_signed_saturated_narrow(inst, 8, false);
+        case Op::VectorSignedSaturatedNarrowToSigned32: return vector_signed_saturated_narrow(inst, 16, false);
+        case Op::VectorSignedSaturatedNarrowToSigned64: return vector_signed_saturated_narrow(inst, 32, false);
+        case Op::VectorSignedSaturatedNarrowToUnsigned16: return vector_signed_saturated_narrow(inst, 8, true);
+        case Op::VectorSignedSaturatedNarrowToUnsigned32: return vector_signed_saturated_narrow(inst, 16, true);
+        case Op::VectorSignedSaturatedNarrowToUnsigned64: return vector_signed_saturated_narrow(inst, 32, true);
+        case Op::VectorSignedSaturatedAdd8: return vector_saturated_add_sub(inst, 8, true, true);
+        case Op::VectorSignedSaturatedAdd16: return vector_saturated_add_sub(inst, 16, true, true);
+        case Op::VectorSignedSaturatedAdd32: return vector_saturated_add_sub(inst, 32, true, true);
+        case Op::VectorSignedSaturatedAdd64: return vector_saturated_add_sub(inst, 64, true, true);
+        case Op::VectorSignedSaturatedSub8: return vector_saturated_add_sub(inst, 8, true, false);
+        case Op::VectorSignedSaturatedSub16: return vector_saturated_add_sub(inst, 16, true, false);
+        case Op::VectorSignedSaturatedSub32: return vector_saturated_add_sub(inst, 32, true, false);
+        case Op::VectorSignedSaturatedSub64: return vector_saturated_add_sub(inst, 64, true, false);
+        case Op::VectorUnsignedSaturatedAdd8: return vector_saturated_add_sub(inst, 8, false, true);
+        case Op::VectorUnsignedSaturatedAdd16: return vector_saturated_add_sub(inst, 16, false, true);
+        case Op::VectorUnsignedSaturatedAdd32: return vector_saturated_add_sub(inst, 32, false, true);
+        case Op::VectorUnsignedSaturatedAdd64: return vector_saturated_add_sub(inst, 64, false, true);
+        case Op::VectorUnsignedSaturatedSub8: return vector_saturated_add_sub(inst, 8, false, false);
+        case Op::VectorUnsignedSaturatedSub16: return vector_saturated_add_sub(inst, 16, false, false);
+        case Op::VectorUnsignedSaturatedSub32: return vector_saturated_add_sub(inst, 32, false, false);
+        case Op::VectorUnsignedSaturatedSub64: return vector_saturated_add_sub(inst, 64, false, false);
+        case Op::VectorSignedSaturatedAbs8: return vector_saturated_abs_neg(inst, 8, false);
+        case Op::VectorSignedSaturatedAbs16: return vector_saturated_abs_neg(inst, 16, false);
+        case Op::VectorSignedSaturatedAbs32: return vector_saturated_abs_neg(inst, 32, false);
+        case Op::VectorSignedSaturatedAbs64: return vector_saturated_abs_neg(inst, 64, false);
+        case Op::VectorSignedSaturatedNeg8: return vector_saturated_abs_neg(inst, 8, true);
+        case Op::VectorSignedSaturatedNeg16: return vector_saturated_abs_neg(inst, 16, true);
+        case Op::VectorSignedSaturatedNeg32: return vector_saturated_abs_neg(inst, 32, true);
+        case Op::VectorSignedSaturatedNeg64: return vector_saturated_abs_neg(inst, 64, true);
+        case Op::VectorNarrow64:
+            // Low word of each 64-bit lane into the low doubleword (VMOVN.I64).
+            value_word(inst.GetArg(0), 0); set(next_local);
+            value_word(inst.GetArg(0), 2); set(next_local + 1);
+            imm(0); set(next_local + 2); imm(0); set(next_local + 3);
             return ok;
-        }
+        case Op::VectorZeroExtend32:
+            // Low two words widen to two doublewords (VMOVL.U32).
+            value_word(inst.GetArg(0), 0); set(next_local);
+            imm(0); set(next_local + 1);
+            value_word(inst.GetArg(0), 1); set(next_local + 2);
+            imm(0); set(next_local + 3);
+            return ok;
+        case Op::VectorZeroExtend64:
+            value_word(inst.GetArg(0), 0); set(next_local);
+            value_word(inst.GetArg(0), 1); set(next_local + 1);
+            imm(0); set(next_local + 2); imm(0); set(next_local + 3);
+            return ok;
         case Op::A32GetFpscr:
             load(offsetof(JitState, fpscr)); set(next_local);
             return ok;
@@ -4153,6 +4388,64 @@ private:
             }
             return ok;
         }
+        case Op::SignedSaturation: {
+            // SSAT (and SSAT16 per halfword): clamp to the signed N-bit
+            // range, 1 <= N <= 32; +5 = saturated, for CPSR.Q
+            // (Dynarmic EmitSignedSaturation).
+            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() < 1 || inst.GetArg(1).GetU8() > 32) return false;
+            const uint32_t n = inst.GetArg(1).GetU8();
+            const auto a = next_local + 6;
+            value_word(inst.GetArg(0)); set(a);
+            if (n == 32) {
+                get(a); set(next_local); imm(0); set(next_local + 5);
+                return ok;
+            }
+            const uint32_t positive = (1u << (n - 1)) - 1;
+            get(a); imm(1u << (n - 1)); op(Add); imm((1u << n) - 1); op(GtU); set(next_local + 5);
+            get(a); imm(31); op(ShrS); imm(positive); op(Xor);
+            get(a);
+            get(next_local + 5); op(Select); set(next_local);
+            return ok;
+        }
+        case Op::UnsignedSaturation: {
+            // USAT (and USAT16): clamp the signed value to [0, 2^N - 1],
+            // N <= 31; +5 = saturated (Dynarmic EmitUnsignedSaturation).
+            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() > 31) return false;
+            const uint32_t maximum = (1u << inst.GetArg(1).GetU8()) - 1;
+            const auto a = next_local + 6;
+            value_word(inst.GetArg(0)); set(a);
+            get(a); imm(maximum); op(GtU); set(next_local + 5);
+            imm(0); imm(maximum); get(a); imm(0); op(LtS); op(Select);
+            get(a);
+            get(next_local + 5); op(Select); set(next_local);
+            return ok;
+        }
+        case Op::SignedSaturatedAddWithFlag32:
+        case Op::SignedSaturatedSubWithFlag32: {
+            // QADD/QSUB (and the doubling of QDADD/QDSUB): the exact i64
+            // sum clamped to i32; +5 = saturated, for CPSR.Q.
+            value_word(inst.GetArg(0)); op(ExtendS);
+            value_word(inst.GetArg(1)); op(ExtendS);
+            op(kind == Op::SignedSaturatedAddWithFlag32 ? Add64 : Sub64); set(scratch_local);
+            imm(0); set(next_local + 5);
+            clamp_i64_low(INT32_MIN, INT32_MAX, next_local + 5);
+            set(next_local);
+            return ok;
+        }
+        case Op::A32GetGEFlags:
+            // CPSR.GE[3:0] in Dynarmic's expanded form: byte i is 0xff when
+            // GE[i] is set. The multiply spreads bit i to bit 8i without
+            // carries (the partial products occupy distinct bits).
+            state.read_dispatch_psr(code); imm(16); op(ShrU); mask(0xf);
+            imm(0x00204081u); op(Mul); mask(0x01010101u); imm(0xff); op(Mul);
+            break;
+        case Op::PackedSelect:
+            // SEL: bytes of b where the GE byte mask is set, else of a
+            // (Dynarmic EmitPackedSelect(ge, a, b)).
+            arg(2); arg(0); op(And);
+            arg(1); arg(0); imm(0xffffffffu); op(Xor); op(And);
+            op(Or);
+            break;
         case Op::A32SetGEFlags:
             // CPSR.GE[i] is bit 8i+7 of the expanded byte-mask form
             // (Dynarmic A32JitState::Cpsr); producers emit 0x00/0xff bytes.

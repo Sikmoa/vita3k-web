@@ -2003,6 +2003,7 @@ int main() {
     vector_integer_tests::guest_arithmetic(mem);
     vector_lane_tests::ir_lanes();
     vector_lane_tests::guest_lanes(mem);
+    vector_lane_tests::guest_qc(mem);
     vector_compare_tests::ir_comparisons();
     vector_compare_tests::guest_comparisons(mem);
     vectorfp_compare_tests::run(mem);
@@ -2012,6 +2013,8 @@ int main() {
     packed_saturate_tests::guest_saturation(mem);
     packed_saturate_tests::ir_unsigned_add8();
     packed_saturate_tests::guest_unsigned_add8(mem);
+    packed_saturate_tests::ir_q_saturation();
+    packed_saturate_tests::guest_q_saturation(mem);
     fpvector_abs_tests::ir_abs();
     fpvector_abs_tests::guest_abs(mem);
     exclusive_tests::guest_exclusive(mem);

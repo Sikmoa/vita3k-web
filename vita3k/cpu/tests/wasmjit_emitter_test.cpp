@@ -24,6 +24,8 @@
 #include <dynarmic/frontend/A32/translate/translate_callbacks.h>
 #include <dynarmic/ir/basic_block.h>
 #include <dynarmic/ir/opcodes.h>
+#include <dynarmic/interface/A32/a32.h>
+#include <dynarmic/interface/A32/config.h>
 
 #define CHECK(expr) do { if (!(expr)) { \
     std::cerr << "FAIL " << __FILE__ << ':' << __LINE__ << ": " #expr << '\n'; \
@@ -1341,6 +1343,12 @@ struct FpTracker {
     std::array<std::optional<uint32_t>, 64> words{};
     std::array<bool, 64> defined{};
     std::array<bool, 64> constrained{};
+    // Core registers as the block has written them so far (nullopt: a value
+    // the tracker cannot evaluate), and what each GetRegister read when the
+    // in-order scan reached it: a read after an in-block write (SSAT r4 ...;
+    // MOV r0, r4) sees that write, not the seed.
+    std::array<std::optional<uint32_t>, 16> current{};
+    std::map<const IR::Inst *, std::optional<uint32_t>> reads;
 };
 
 FpWords fp_eval_value(const Value &v, FpTracker &fp);
@@ -1349,11 +1357,12 @@ FpWords fp_eval_inst(const IR::Inst &inst, FpTracker &fp) {
     const auto arg = [&](size_t i) { return fp_eval_value(inst.GetArg(i), fp); };
     switch (inst.GetOpcode()) {
     case Opcode::A32GetRegister: {
-        const unsigned r = static_cast<unsigned>(inst.GetArg(0).GetA32RegRef());
-        CHECK(r < 16);
+        const auto read = fp.reads.find(&inst);
+        CHECK(read != fp.reads.end()); // recorded by the in-order scan
+        if (!read->second) return {};
         FpWords out;
         out.known = true;
-        out.lane[0] = fp.in.regs[r];
+        out.lane[0] = *read->second;
         out.lanes = 1;
         return out;
     }
@@ -1515,9 +1524,19 @@ uint32_t fp_golden_reg(const VCase &c, unsigned r) {
 }
 
 void fp_track_block(const IR::Block &block, FpTracker &fp) {
+    for (unsigned r = 0; r < 16; ++r) fp.current[r] = fp.in.regs[r];
+    // Only a register's last write in the block is what the golden records.
+    std::map<unsigned, const IR::Inst *> last_write;
+    for (const auto &inst : block)
+        if (inst.GetOpcode() == Opcode::A32SetRegister)
+            last_write[static_cast<unsigned>(inst.GetArg(0).GetA32RegRef())] = &inst;
     for (const auto &inst : block) {
         const auto op = inst.GetOpcode();
-        if (op == Opcode::A32SetRegister) {
+        if (op == Opcode::A32GetRegister) {
+            const unsigned r = static_cast<unsigned>(inst.GetArg(0).GetA32RegRef());
+            CHECK(r < 16);
+            fp.reads[&inst] = fp.current[r];
+        } else if (op == Opcode::A32SetRegister) {
             const unsigned r = static_cast<unsigned>(inst.GetArg(0).GetA32RegRef());
             if (r == 13 || r == 15) {
                 std::cerr << "vitaslop " << fp.c.name << ": unexpected write to r" << r << '\n';
@@ -1525,7 +1544,10 @@ void fp_track_block(const IR::Block &block, FpTracker &fp) {
             }
             const Value v = inst.GetArg(1);
             const FpWords known = fp_eval_value(v, fp);
-            if (known.known) {
+            fp.current[r] = known.known && known.lanes == 1 ? std::optional<uint32_t>{known.lane[0]} : std::nullopt;
+            if (last_write.at(r) != &inst) {
+                // An intermediate value: later reads see it; the golden does not.
+            } else if (known.known) {
                 CHECK(known.lanes == 1); // cross-checks the tracker against the golden
                 CHECK(known.lane[0] == fp_golden_reg(fp.c, r));
             } else if (fp_touches(v)) {
@@ -1552,24 +1574,89 @@ void fp_track_block(const IR::Block &block, FpTracker &fp) {
         }
 }
 
-// Vitaslop seeds zeroed regs + [in].regs with cleared flags; unlisted integer
-// regs read back as 0, r13/r15 are harness-owned (sp gets a scratch slot the
-// goldens never capture), and NZCV comes from [out.flags] over the preserved
-// low cpsr bits (Q/GE/IT/mode start clear, matching the cleared-flags seed).
+// The goldens record r0-r12, r14 and NZCV, not the sticky CPSR.Q, the GE
+// bits or FPSCR (QC and the cumulative exception flags). For those, each case
+// also runs on Dynarmic's own x64 backend from the same seed: an independent
+// implementation of the same IR, whose registers and NZCV must first equal
+// the qemu golden so a run that went astray cannot vouch for the rest.
+struct OracleState {
+    std::array<uint32_t, 16> regs;
+    uint32_t cpsr, fpscr;
+};
+class DynarmicOracle final : public A32::UserCallbacks {
+public:
+    OracleState run(const VCase &c) {
+        memory.assign(0x10000, 0);
+        std::copy(c.bin.begin(), c.bin.end(), memory.begin() + kBase);
+        // An SVC right after the program halts the run.
+        const uint32_t svc = c.thumb ? 0xdf00u : 0xef000000u;
+        std::memcpy(memory.data() + kBase + c.bin.size(), &svc, c.thumb ? 2 : 4);
+        A32::UserConfig config;
+        config.callbacks = this;
+        config.arch_version = A32::ArchVersion::v7;
+        A32::Jit jit{config};
+        this->jit = &jit;
+        jit.Regs().fill(0);
+        for (const auto &[reg, value] : c.in_regs) jit.Regs()[reg] = value;
+        jit.Regs()[13] = 0x5000;
+        jit.Regs()[15] = kBase;
+        jit.SetCpsr(c.thumb ? 0x30u : 0x10u);
+        jit.SetFpscr(0);
+        jit.Run();
+        CHECK(halted);
+        return {jit.Regs(), jit.Cpsr(), jit.Fpscr()};
+    }
+
+private:
+    template <typename T> T read(A32::VAddr address) {
+        CHECK(address <= memory.size() - sizeof(T));
+        T value;
+        std::memcpy(&value, memory.data() + address, sizeof(T));
+        return value;
+    }
+    template <typename T> void write(A32::VAddr address, T value) {
+        CHECK(address <= memory.size() - sizeof(T));
+        std::memcpy(memory.data() + address, &value, sizeof(T));
+    }
+    std::uint8_t MemoryRead8(A32::VAddr a) override { return read<uint8_t>(a); }
+    std::uint16_t MemoryRead16(A32::VAddr a) override { return read<uint16_t>(a); }
+    std::uint32_t MemoryRead32(A32::VAddr a) override { return read<uint32_t>(a); }
+    std::uint64_t MemoryRead64(A32::VAddr a) override { return read<uint64_t>(a); }
+    void MemoryWrite8(A32::VAddr a, std::uint8_t v) override { write(a, v); }
+    void MemoryWrite16(A32::VAddr a, std::uint16_t v) override { write(a, v); }
+    void MemoryWrite32(A32::VAddr a, std::uint32_t v) override { write(a, v); }
+    void MemoryWrite64(A32::VAddr a, std::uint64_t v) override { write(a, v); }
+    void InterpreterFallback(A32::VAddr, size_t) override { CHECK(false); }
+    void CallSVC(std::uint32_t) override {
+        halted = true;
+        jit->HaltExecution();
+    }
+    void ExceptionRaised(A32::VAddr, A32::Exception) override { CHECK(false); }
+    void AddTicks(std::uint64_t ticks) override { remaining = ticks < remaining ? remaining - ticks : 0; }
+    std::uint64_t GetTicksRemaining() override { return remaining; }
+
+    std::vector<uint8_t> memory;
+    A32::Jit *jit = nullptr;
+    bool halted = false;
+    std::uint64_t remaining = 1000;
+};
+
+// Vitaslop seeds zeroed regs + [in].regs with cleared flags and a clear
+// FPSCR; unlisted integer regs read back as 0, r13/r15 are harness-owned (sp
+// gets a scratch slot the goldens never capture), NZCV comes from
+// [out.flags], and Q, GE and FPSCR from the Dynarmic oracle (IT/mode start
+// clear and stay so).
 Case make_case(const VCase &c, const IR::Block &block, uint32_t ticks) {
     JitState in = fixture_state();
     for (const auto &[reg, value] : c.in_regs) in.regs[reg] = value;
     in.regs[13] = 0x5000;
     in.regs[15] = kBase;
     in.cpsr = c.thumb ? 0x30u : 0x10u;
-    // The goldens do not record FPSCR. A saturating NEON op sets the sticky
-    // QC bit, so it starts set and the unchanged expectation holds either
-    // way; the backend lane tests pin QC itself.
-    in.fpscr = 0x08000000u;
+    in.fpscr = 0;
     in.svc = 0xbad;
     in.exit_reason = 99;
     in.executed = 99;
-    FpTracker fp{in, c};
+    FpTracker fp{in, c, {}, {}, {}, {}, {}};
     fp_track_block(block, fp);
     JitState out = in;
     for (unsigned i = 0; i < 64; ++i)
@@ -1577,9 +1664,24 @@ Case make_case(const VCase &c, const IR::Block &block, uint32_t ticks) {
     for (unsigned r = 0; r <= 12; ++r) out.regs[r] = c.out_regs.count(r) ? c.out_regs.at(r) : 0;
     out.regs[14] = c.out_regs.count(14) ? c.out_regs.at(14) : 0;
     out.regs[15] = kBase + static_cast<uint32_t>(c.bin.size());
-    out.cpsr = (in.cpsr & 0x0fffffff)
-        | (static_cast<uint32_t>(c.n) << 31) | (static_cast<uint32_t>(c.z) << 30)
+    const uint32_t nzcv = (static_cast<uint32_t>(c.n) << 31) | (static_cast<uint32_t>(c.z) << 30)
         | (static_cast<uint32_t>(c.c) << 29) | (static_cast<uint32_t>(c.v) << 28);
+    const OracleState oracle = DynarmicOracle{}.run(c);
+    for (unsigned r = 0; r <= 14; ++r) {
+        if (r == 13 || oracle.regs[r] == out.regs[r]) continue;
+        std::cerr << "vitaslop " << c.name << ": Dynarmic oracle r" << r << " differs from the golden\n";
+        std::abort();
+    }
+    if ((oracle.cpsr & 0xf0000000u) != nzcv) {
+        std::cerr << "vitaslop " << c.name << ": Dynarmic oracle NZCV differs from the golden\n";
+        std::abort();
+    }
+    constexpr uint32_t q_ge = 0x080f0000u; // CPSR.Q and GE[3:0]
+    out.cpsr = (in.cpsr & 0x0fffffff & ~q_ge) | (oracle.cpsr & q_ge) | nzcv;
+    out.fpscr = oracle.fpscr;
+    if ((out.cpsr & q_ge) || out.fpscr)
+        std::cout << "vitaslop " << c.name << ": oracle Q/GE/FPSCR cpsr=" << std::hex << (out.cpsr & q_ge)
+                  << " fpscr=" << out.fpscr << std::dec << '\n';
     out.svc = 0;
     out.exit_reason = 0;
     out.executed = ticks;

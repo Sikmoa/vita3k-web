@@ -1,6 +1,8 @@
 // Lane-rearranging, widening and pairwise NEON IR (VPADD, VPADDL, VZIP,
 // VUZP, VPMIN/VPMAX, VMOVL, VHADD, VSHL register, VMULL/VMLAL, VMUL.P8,
-// VQMOVN.U, VQ(R)SHRN.U64).
+// VQMOVN.U, VQ(R)SHRN.U64) and the saturating/rounding family (VQADD/VQSUB,
+// VQABS/VQNEG, VQMOVN.S/VQMOVUN, VRHADD, VSHL.S register, VMOVN.I64,
+// VMOVL.U32); any saturation sets the sticky FPSCR.QC.
 // References are byte-lane models of Dynarmic's IR definitions
 // (backend/x64/emit_x64_vector.cpp and ir/opt/polyfill_pass.cpp),
 // independent of the emitter's i32-word lowering. Guest cases run real
@@ -38,6 +40,40 @@ uint64_t logical_vshift(uint64_t a, uint64_t b, unsigned bits) {
     const int amount = int8_t(uint8_t(b));
     if (amount >= int(bits) || amount <= -int(bits)) return 0;
     return amount >= 0 ? a << amount : a >> -amount;
+}
+// Saturating models: the exact value clamped to the lane range.
+struct Saturated {
+    uint64_t value;
+    bool saturated;
+};
+Saturated clamp_lane(__int128 x, unsigned bits, bool is_signed) {
+    const __int128 lo = is_signed ? -(__int128(1) << (bits - 1)) : 0;
+    const __int128 hi = is_signed ? (__int128(1) << (bits - 1)) - 1 : (__int128(1) << bits) - 1;
+    if (x < lo) return {truncate(uint64_t(lo), bits), true};
+    if (x > hi) return {truncate(uint64_t(hi), bits), true};
+    return {truncate(uint64_t(x), bits), false};
+}
+__int128 lane_value(uint64_t x, unsigned bits, bool is_signed) {
+    return is_signed ? __int128(sext(x, bits)) : __int128(x);
+}
+Saturated saturated_add_sub(uint64_t a, uint64_t b, unsigned bits, bool is_signed, bool add) {
+    const auto x = lane_value(a, bits, is_signed), y = lane_value(b, bits, is_signed);
+    return clamp_lane(add ? x + y : x - y, bits, is_signed);
+}
+Saturated saturated_abs_neg(uint64_t a, unsigned bits, bool negate) {
+    const __int128 x = sext(a, bits);
+    return clamp_lane(negate || x < 0 ? -x : x, bits, true);
+}
+uint64_t rounding_halving_add(uint64_t a, uint64_t b, unsigned bits, bool is_signed) {
+    return truncate(uint64_t((lane_value(a, bits, is_signed) + lane_value(b, bits, is_signed) + 1) >> 1), bits);
+}
+// VSHL.S (register): Dynarmic VShift<signed>.
+uint64_t arithmetic_vshift(uint64_t a, uint64_t b, unsigned bits) {
+    const int amount = int8_t(uint8_t(b));
+    const int64_t x = sext(a, bits);
+    if (amount >= int(bits)) return 0;
+    if (amount <= -int(bits)) return truncate(uint64_t(x >> 63), bits);
+    return truncate(amount >= 0 ? uint64_t(x) << amount : uint64_t(x >> -amount), bits);
 }
 uint64_t multiply_widen(uint64_t a, uint64_t b, unsigned bits, bool is_signed) {
     return is_signed ? uint64_t(sext(a, bits) * sext(b, bits)) : a * b;
@@ -188,6 +224,176 @@ void ir_lanes() {
     h.test(Op::VectorEqual64, [&](auto &b) {
         write_q(b, append(b, Op::VectorEqual64, {read_q(b), read_q(b)}));
     }, [&](auto &s) { set_lane(s, 64, 0, ~uint64_t(0)); set_lane(s, 64, 1, ~uint64_t(0)); });
+    // Saturating families. A reference fixture over the harness patterns,
+    // then constant operands from a clear FPSCR (pattern 0): one that
+    // saturates some lane (QC set) and one that saturates none (QC clear).
+    constexpr uint32_t qc = 0x08000000u;
+    const auto constant = [](unsigned bits, auto value) {
+        JitState model{};
+        for (unsigned i = 0; i < 128 / bits; ++i) set_lane(model, bits, i, truncate(value(i), bits));
+        return std::array<uint64_t, 2>{lane(model, 64, 0), lane(model, 64, 1)};
+    };
+    const auto q_constant = [&](IR::Block &b, const std::array<uint64_t, 2> &words) {
+        return append(b, Op::Pack2x64To1x128, {Value{words[0]}, Value{words[1]}});
+    };
+    const auto saturating_binary = [&](Op operation, unsigned bits, auto reference,
+                                       const std::array<std::array<uint64_t, 2>, 2> &saturating,
+                                       const std::array<std::array<uint64_t, 2>, 2> &fitting) {
+        const auto expect = [&](JitState &s, const JitState &a, unsigned qa, const JitState &b, unsigned qb) {
+            bool saturated = false;
+            for (unsigned i = 0; i < 128 / bits; ++i) {
+                const Saturated r = reference(lane(a, bits, i, qa), lane(b, bits, i, qb));
+                set_lane(s, bits, i, r.value);
+                saturated |= r.saturated;
+            }
+            if (saturated) s.fpscr |= qc;
+            return saturated;
+        };
+        h.test(operation, [&](auto &b) {
+            write_q(b, append(b, operation, {read_q(b), read_q(b, 1)}));
+        }, [&](auto &s) { const auto before = s; expect(s, before, 0, before, 1); });
+        for (const auto *pair : {&saturating, &fitting}) {
+            JitState a{}, b{};
+            set_lane(a, 64, 0, (*pair)[0][0]); set_lane(a, 64, 1, (*pair)[0][1]);
+            set_lane(b, 64, 0, (*pair)[1][0]); set_lane(b, 64, 1, (*pair)[1][1]);
+            JitState probe{};
+            CHECK(expect(probe, a, 0, b, 0) == (pair == &saturating)); // the constants do what they claim
+            h.test(operation, [&](auto &block) {
+                write_q(block, append(block, operation, {q_constant(block, (*pair)[0]), q_constant(block, (*pair)[1])}));
+            }, [&](auto &s) { expect(s, a, 0, b, 0); });
+        }
+    };
+    const Op qadd_s[] = {Op::VectorSignedSaturatedAdd8, Op::VectorSignedSaturatedAdd16, Op::VectorSignedSaturatedAdd32, Op::VectorSignedSaturatedAdd64};
+    const Op qsub_s[] = {Op::VectorSignedSaturatedSub8, Op::VectorSignedSaturatedSub16, Op::VectorSignedSaturatedSub32, Op::VectorSignedSaturatedSub64};
+    const Op qadd_u[] = {Op::VectorUnsignedSaturatedAdd8, Op::VectorUnsignedSaturatedAdd16, Op::VectorUnsignedSaturatedAdd32, Op::VectorUnsignedSaturatedAdd64};
+    const Op qsub_u[] = {Op::VectorUnsignedSaturatedSub8, Op::VectorUnsignedSaturatedSub16, Op::VectorUnsignedSaturatedSub32, Op::VectorUnsignedSaturatedSub64};
+    const Op qabs[] = {Op::VectorSignedSaturatedAbs8, Op::VectorSignedSaturatedAbs16, Op::VectorSignedSaturatedAbs32, Op::VectorSignedSaturatedAbs64};
+    const Op qneg[] = {Op::VectorSignedSaturatedNeg8, Op::VectorSignedSaturatedNeg16, Op::VectorSignedSaturatedNeg32, Op::VectorSignedSaturatedNeg64};
+    const Op ashift[] = {Op::VectorArithmeticVShift8, Op::VectorArithmeticVShift16, Op::VectorArithmeticVShift32, Op::VectorArithmeticVShift64};
+    for (unsigned k = 0; k < 4; ++k) {
+        const unsigned bits = 8u << k;
+        const uint64_t min_s = uint64_t(1) << (bits - 1), max_s = min_s - 1, max_u = truncate(~uint64_t(0), bits);
+        // Lane i: the extremes and their neighbours against 1, -1 and
+        // themselves, rotated so that lane 0 saturates the operation even
+        // with two 64-bit lanes (max_s + 1, min_s - 1, max_u + 1, 0 - 1).
+        const auto edges = [&](unsigned rotate) {
+            return std::array<std::array<uint64_t, 2>, 2>{constant(bits, [&](unsigned i) {
+                const uint64_t v[] = {max_s, min_s, max_u, 0, 1, min_s + 1, max_s - 1, 2};
+                return v[(i + rotate) % 8];
+            }), constant(bits, [&](unsigned i) {
+                const uint64_t v[] = {1, 1, 1, 1, max_u, min_s, max_s, max_u};
+                return v[(i + rotate) % 8];
+            })};
+        };
+        const auto small = constant(bits, [&](unsigned i) { return uint64_t(i % 3 + 2); });
+        const auto ones = constant(bits, [&](unsigned) { return uint64_t(1); });
+        for (bool is_signed : {true, false}) for (bool add : {true, false}) {
+            const Op operation = is_signed ? (add ? qadd_s[k] : qsub_s[k]) : (add ? qadd_u[k] : qsub_u[k]);
+            saturating_binary(operation, bits, [&](uint64_t a, uint64_t b) {
+                return saturated_add_sub(a, b, bits, is_signed, add);
+            }, edges(is_signed ? (add ? 0 : 1) : (add ? 2 : 3)), {small, ones});
+        }
+        const auto edges_a = edges(0)[0];
+        for (bool negate : {false, true}) {
+            const Op operation = negate ? qneg[k] : qabs[k];
+            const auto expect = [&](JitState &s, const JitState &source) {
+                bool saturated = false;
+                for (unsigned i = 0; i < 128 / bits; ++i) {
+                    const Saturated r = saturated_abs_neg(lane(source, bits, i), bits, negate);
+                    set_lane(s, bits, i, r.value);
+                    saturated |= r.saturated;
+                }
+                if (saturated) s.fpscr |= qc;
+            };
+            h.test(operation, [&](auto &b) { write_q(b, append(b, operation, {read_q(b)})); },
+                [&](auto &s) { const auto before = s; expect(s, before); });
+            for (const auto &words : {edges_a, small}) {
+                JitState source{};
+                set_lane(source, 64, 0, words[0]); set_lane(source, 64, 1, words[1]);
+                h.test(operation, [&](auto &b) { write_q(b, append(b, operation, {q_constant(b, words)})); },
+                    [&](auto &s) { expect(s, source); });
+            }
+        }
+        binary(ashift[k], bits, [&](const JitState &s, unsigned i) {
+            return arithmetic_vshift(lane(s, bits, i, 0), lane(s, bits, i, 1), bits);
+        });
+        // Boundary amounts against negative and positive lanes.
+        const std::array<int, 11> amounts{0, 1, -1, int(bits) - 1, 1 - int(bits), int(bits), -int(bits),
+            int(bits) + 1, -int(bits) - 1, 127, -128};
+        for (unsigned first = 0; first < amounts.size(); first += 128 / bits) {
+            const auto shift = constant(bits, [&](unsigned i) {
+                return uint64_t(uint8_t(amounts[(first + i) % amounts.size()])) | (bits > 8 ? uint64_t(0xa5) << 8 : 0);
+            });
+            JitState model{};
+            set_lane(model, 64, 0, shift[0]); set_lane(model, 64, 1, shift[1]);
+            h.test(ashift[k], [&](auto &b) {
+                write_q(b, append(b, ashift[k], {read_q(b), q_constant(b, shift)}));
+            }, [&](auto &s) {
+                const auto before = s;
+                for (unsigned i = 0; i < 128 / bits; ++i)
+                    set_lane(s, bits, i, arithmetic_vshift(lane(before, bits, i), lane(model, bits, i), bits));
+            });
+        }
+    }
+    const Op rhadd_s[] = {Op::VectorRoundingHalvingAddS8, Op::VectorRoundingHalvingAddS16, Op::VectorRoundingHalvingAddS32};
+    const Op rhadd_u[] = {Op::VectorRoundingHalvingAddU8, Op::VectorRoundingHalvingAddU16, Op::VectorRoundingHalvingAddU32};
+    const Op narrow_s[] = {Op::VectorSignedSaturatedNarrowToSigned16, Op::VectorSignedSaturatedNarrowToSigned32,
+        Op::VectorSignedSaturatedNarrowToSigned64};
+    const Op narrow_su[] = {Op::VectorSignedSaturatedNarrowToUnsigned16, Op::VectorSignedSaturatedNarrowToUnsigned32,
+        Op::VectorSignedSaturatedNarrowToUnsigned64};
+    for (unsigned k = 0; k < 3; ++k) {
+        const unsigned bits = 8u << k; // lane width; narrow result width
+        for (bool is_signed : {true, false}) {
+            binary(is_signed ? rhadd_s[k] : rhadd_u[k], bits, [&](const JitState &s, unsigned i) {
+                return rounding_halving_add(lane(s, bits, i, 0), lane(s, bits, i, 1), bits, is_signed);
+            });
+        }
+        for (bool to_unsigned : {false, true}) {
+            const Op operation = to_unsigned ? narrow_su[k] : narrow_s[k];
+            const auto expect = [&](JitState &s, const JitState &source) {
+                bool saturated = false;
+                for (unsigned i = 0; i < 128 / bits; ++i) {
+                    Saturated r{0, false};
+                    if (i < 64 / bits) r = clamp_lane(sext(lane(source, 2 * bits, i), 2 * bits), bits, !to_unsigned);
+                    set_lane(s, bits, i, r.value);
+                    saturated |= r.saturated;
+                }
+                if (saturated) s.fpscr |= qc;
+                return saturated;
+            };
+            h.test(operation, [&](auto &b) { write_q(b, append(b, operation, {read_q(b)})); },
+                [&](auto &s) { const auto before = s; expect(s, before); });
+            const uint64_t min_s = uint64_t(1) << (bits - 1);
+            const auto saturating = constant(2 * bits, [&](unsigned i) {
+                const uint64_t v[] = {min_s, ~min_s, min_s - 1, uint64_t(1) << bits};
+                return v[i % 4];
+            });
+            const auto fitting = constant(2 * bits, [&](unsigned i) { return uint64_t(i + 1); });
+            for (const auto &words : {saturating, fitting}) {
+                JitState source{};
+                set_lane(source, 64, 0, words[0]); set_lane(source, 64, 1, words[1]);
+                JitState probe{};
+                CHECK(expect(probe, source) == (words == saturating));
+                h.test(operation, [&](auto &b) { write_q(b, append(b, operation, {q_constant(b, words)})); },
+                    [&](auto &s) { expect(s, source); });
+            }
+        }
+    }
+    h.test(Op::VectorNarrow64, [&](auto &b) { write_q(b, append(b, Op::VectorNarrow64, {read_q(b)})); }, [&](auto &s) {
+        const auto before = s;
+        for (unsigned i = 0; i < 4; ++i) set_lane(s, 32, i, i < 2 ? lane(before, 32, 2 * i) : 0);
+    });
+    for (unsigned bits : {8u, 32u, 64u}) {
+        const Op operation = bits == 8 ? Op::VectorZeroExtend8 : bits == 32 ? Op::VectorZeroExtend32 : Op::VectorZeroExtend64;
+        h.test(operation, [&](auto &b) { write_q(b, append(b, operation, {read_q(b)})); }, [&](auto &s) {
+            const auto before = s;
+            if (bits == 64) {
+                set_lane(s, 64, 1, 0);
+                return;
+            }
+            for (unsigned i = 0; i < 64 / bits; ++i) set_lane(s, 2 * bits, i, lane(before, bits, i));
+        });
+    }
     binary(Op::VectorPolynomialMultiply8, 8, [](const JitState &s, unsigned i) {
         return polynomial_multiply(lane(s, 8, i, 0), lane(s, 8, i, 1));
     });
@@ -342,6 +548,66 @@ void guest_lanes(MemState &mem) {
                     }
                 });
             }
+            // Dynarmic's A32 translator raises UNDEFINED for VQADD/VQSUB.<S|U>64
+            // (asimd_three_regs.cpp: sz == 0b11), which ARMv7 defines; the
+            // 64-bit lane lowering is covered by the IR fixtures.
+            for (unsigned size = 0; size < 3; ++size) {
+                const unsigned bits = 8u << size;
+                // VQADD/VQSUB.<S|U><bits> Dd, Dn, Dm
+                for (bool u : {false, true}) for (bool sub : {false, true}) {
+                    run(neon3((sub ? 0xf2000210u : 0xf2000010u) | (u ? 1u << 24 : 0) | (size << 20), d, n, m), [&](auto &s) {
+                        const auto before = s;
+                        for (unsigned i = 0; i < 64 / bits; ++i)
+                            set_dlane(s, d, bits, i, saturated_add_sub(dlane(before, n, bits, i), dlane(before, m, bits, i),
+                                bits, !u, !sub).value);
+                    });
+                }
+                // VRHADD.<S|U><bits> Dd, Dn, Dm
+                for (bool u : {false, true}) {
+                    run(neon3(0xf2000100u | (u ? 1u << 24 : 0) | (size << 20), d, n, m), [&](auto &s) {
+                        const auto before = s;
+                        for (unsigned i = 0; i < 64 / bits; ++i)
+                            set_dlane(s, d, bits, i, rounding_halving_add(dlane(before, n, bits, i), dlane(before, m, bits, i), bits, !u));
+                    });
+                }
+                // VQABS/VQNEG.S<bits> Dd, Dm
+                for (bool negate : {false, true}) {
+                    run(neon3((negate ? 0xf3b00780u : 0xf3b00700u) | (size << 18), d, 0, m), [&](auto &s) {
+                        const auto before = s;
+                        for (unsigned i = 0; i < 64 / bits; ++i)
+                            set_dlane(s, d, bits, i, saturated_abs_neg(dlane(before, m, bits, i), bits, negate).value);
+                    });
+                }
+                // VSHL.S<bits> Dd, Dm, Dn (the amounts are Dn's lanes)
+                run(neon3(0xf2000400u | (size << 20), d, n, m), [&](auto &s) {
+                    const auto before = s;
+                    for (unsigned i = 0; i < 64 / bits; ++i)
+                        set_dlane(s, d, bits, i, arithmetic_vshift(dlane(before, m, bits, i), dlane(before, n, bits, i), bits));
+                });
+                // VQMOVN.S<2*bits> / VQMOVUN.S<2*bits> Dd, Qm
+                for (bool to_unsigned : {false, true}) {
+                    run(neon3((to_unsigned ? 0xf3b20240u : 0xf3b20280u) | (size << 18), d, 0, 4), [&](auto &s) {
+                        const auto before = s;
+                        for (unsigned i = 0; i < 64 / bits; ++i)
+                            set_dlane(s, d, bits, i, clamp_lane(sext(lane(before, 2 * bits, i, 2), 2 * bits), bits, !to_unsigned).value);
+                    });
+                }
+            }
+            // VSHL.S64 Dd, Dm, Dn
+            run(neon3(0xf2300400u, d, n, m), [&](auto &s) {
+                const auto before = s;
+                set_dlane(s, d, 64, 0, arithmetic_vshift(dlane(before, m, 64, 0), dlane(before, n, 64, 0), 64));
+            });
+            // VMOVN.I64 Dd, Qm
+            run(neon3(0xf3ba0200u, d, 0, 4), [&](auto &s) {
+                const auto before = s;
+                for (unsigned i = 0; i < 2; ++i) set_dlane(s, d, 32, i, lane(before, 64, i, 2));
+            });
+            // VMOVL.U32 Qd, Dm
+            run(neon3(0xf3a00a10u, d, 0, m), [&](auto &s) {
+                const auto before = s;
+                for (unsigned i = 0; i < 2; ++i) set_lane(s, 64, i, dlane(before, m, 32, i), d / 2);
+            });
             // VMUL.P8 Qd, Qn, Qm
             run(neon3(0xf3000910 | 0x40, 4, 30, 6), [&](auto &s) {
                 const auto before = s;
@@ -357,5 +623,49 @@ void guest_lanes(MemState &mem) {
         }
     }
     std::printf("NEON lane/widen/pairwise guest encodings: %u cases passed\n", cases);
+}
+// The saturating family through the translator from a clear FPSCR: QC is
+// set exactly when some lane saturates (guest_lanes starts with QC set).
+void guest_qc(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    // Operands: Dn = d5 (or Qm = q2 = d4:d5 for the narrows), Dm = d7; Dd = d20.
+    struct Run { uint32_t opcode; uint64_t d5, d7; std::array<uint32_t, 4> q2; bool saturates; };
+    const Run runs[] = {
+        {neon3(0xf2100010u, 20, 5, 7), 0x7fff000100020003ull, 0x0001000100010001ull, {}, true}, // VQADD.S16: 0x7fff + 1
+        {neon3(0xf2100010u, 20, 5, 7), 0x0001000100020003ull, 0x0001000100010001ull, {}, false},
+        {neon3(0xf3100210u, 20, 5, 7), 0x0000000100020003ull, 0x0001000100010001ull, {}, true}, // VQSUB.U16: 0 - 1
+        {neon3(0xf3b40700u, 20, 0, 5), 0x8000000100020003ull, 0, {}, true}, // VQABS.S16: -32768
+        {neon3(0xf3b40780u, 20, 0, 5), 0x7fff000100020003ull, 0, {}, false}, // VQNEG.S16
+        {neon3(0xf3b60280u, 20, 0, 4), 0, 0, {0x00008000u, 1u, 2u, 3u}, true}, // VQMOVN.S32: 32768
+        {neon3(0xf3b60240u, 20, 0, 4), 0, 0, {0xffffffffu, 1u, 2u, 3u}, true}, // VQMOVUN.S32: -1
+        {neon3(0xf3b60240u, 20, 0, 4), 0, 0, {0x0000ffffu, 1u, 2u, 3u}, false},
+    };
+    unsigned count = 0;
+    for (bool region : {false, true}) for (bool thumb : {false, true}) for (const auto &r : runs) {
+        jit.set_region_mode(region);
+        if (thumb) put_thumb(mem, jit, {thumb_word(r.opcode), 0xbf00df00});
+        else put(mem, jit, {r.opcode, 0xef000000});
+        auto context = jit.save_context();
+        std::fill(context.fpu_registers.begin(), context.fpu_registers.end(), 0.0f);
+        std::memcpy(&context.fpu_registers[10], &r.d5, sizeof(r.d5)); // d5 = s10..s11
+        std::memcpy(&context.fpu_registers[14], &r.d7, sizeof(r.d7)); // d7 = s14..s15
+        if (r.q2 != std::array<uint32_t, 4>{})
+            std::memcpy(&context.fpu_registers[8], r.q2.data(), sizeof(r.q2)); // q2 = s8..s11
+        context.fpscr = 0;
+        context.cpsr = 0x10 | (thumb ? 0x20 : 0);
+        jit.load_context(context);
+        if (jit.run() != 0) {
+            std::fprintf(stderr, "QC guest failed: %08x: %s\n", r.opcode, jit.get_last_error().c_str());
+            CHECK(false);
+        }
+        const auto result = jit.save_context();
+        CHECK(result.fpscr == (r.saturates ? 0x08000000u : 0u));
+        CHECK(result.cpsr == context.cpsr);
+        ++count;
+    }
+    std::printf("NEON saturation QC: %u guest cases from a clear FPSCR passed\n", count);
 }
 } // namespace vector_lane_tests

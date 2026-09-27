@@ -67,27 +67,11 @@ unit case is not a proof that every host eviction path bumps the epoch.
 
 ## Run from repository root
 
-Requires the existing native Dynarmic/mcl/fmt archives (paths may differ with
-build configuration), a C++20 compiler, and Node. Dynarmic/mcl headers require
-exceptions enabled even though ordinary emitter rejection uses an empty vector
-(the frontend CMake target already propagates `-fexceptions` for Emscripten).
-No new dependencies or CMake changes are needed. Compile serially on small hosts:
-
-```sh
-c++ -std=c++20 -O1 -Wall -Wextra -Werror \
-  -Iexternal/dynarmic/src \
-  -Iexternal/dynarmic/externals/mcl/include \
-  -Iexternal/fmt/include -Iexternal/boost \
-  -Ivita3k/mem/include \
-  vita3k/cpu/src/wasmjit/emit_wasm.cpp \
-  vita3k/cpu/tests/wasmjit_emitter_test.cpp \
-  build/native/external/dynarmic/src/dynarmic/libdynarmic.a \
-  build/native/external/dynarmic/externals/mcl/src/libmcl.a \
-  build/native/external/fmt/libfmtd.a \
-  -o /tmp/wasmjit-emitter-test
-/tmp/wasmjit-emitter-test /tmp/wasmjit-emitter-fixtures
-node vita3k/cpu/tests/wasmjit_emitter_test.mjs /tmp/wasmjit-emitter-fixtures
-```
+The build and run commands are in [SCRIPTS.md](../../../SCRIPTS.md) ("Emitter
+fixture suite"): a standalone native Dynarmic (x64 backend included, for the
+vitaslop oracle), the generator linked against it, then Node on the fixtures.
+Dynarmic/mcl headers require exceptions enabled even though ordinary emitter
+rejection uses an empty vector.
 
 Historical pre-candidate counts: 78 deterministic modules, 21,432 input/expected-state pairs,
 42,856 successful **Wasm `call_indirect`** calls and 8 region calls at two
@@ -184,14 +168,18 @@ hand-rolled TOML-subset reader adds no dependencies.
 Each case loads at the same 0x1000 base as the existing corpus, translates
 through the real Dynarmic A32 translator, and becomes a `vitaslop_<stem>`
 reference + P/K/PK fixture exactly like existing entries: seeded input regs
-over zeroed state with cleared flags (sp gets scratch 0x5000, which no golden
-captures), expected integer regs from the golden (unlisted = 0, following the
-existing sp/pc convention) and expected NZCV from `[out.flags]`. NEON cases
-round-trip vectors through integer regs via vmov; a small IR dataflow tracker
-fills the fpu scratch words the Wasm is known to write (vmov seeds evaluated
-from input regs, ALU results constrained by their golden readback, cross-
-checked where both apply). Any written word left uncovered, or any unexpected
-shape, aborts loudly instead of guessing zero.
+over zeroed state with cleared flags and a clear FPSCR (sp gets scratch
+0x5000, which no golden captures), expected integer regs from the golden
+(unlisted = 0, following the existing sp/pc convention) and expected NZCV from
+`[out.flags]`. The goldens do not record CPSR.Q, the GE bits or FPSCR (QC and
+the cumulative exception flags); those come from running the same case on
+Dynarmic's own x64 backend (`DynarmicOracle`), whose registers and NZCV must
+first equal the golden. NEON cases round-trip vectors through integer regs
+via vmov; a small IR dataflow tracker fills the fpu scratch words the Wasm is
+known to write (vmov seeds evaluated from input regs and in-block register
+writes, ALU results constrained by their golden readback, cross-checked where
+both apply). Any written word left uncovered, or any unexpected shape, aborts
+loudly instead of guessing zero.
 
 Skip rule: only `capture = "output"` programs (svc/host-output, e.g.
 `hello`) are skipped; everything else must fixture or gap-report.
@@ -203,11 +191,8 @@ further shapes are reported, not fixtured: `needs-runtime-split` (the block
 path rejects by design, e.g. multi-tick memory blocks the runtime splits,
 while the region path lowers them through store continuations) and
 `multi-block-program` (loops/IT splits whose whole-program golden cannot
-live in one single-block fixture). Current tally: 27 fixtures (11 NEON, 16
-scalar; the passing NEON/FP-vector lowerings match their qemu goldens in
-Node), 1 host-capture skip, 30 gaps (27 ir-coverage incl. narrowing,
-saturating, table, pairwise/deinterleave, reverse, halving and GE-write ops;
-1 needs-runtime-split; 2 multi-block).
+live in one single-block fixture). The generator's `vitaslop import:` line
+reports the current fixture, skip and gap counts.
 
 Pinning future retail crashes as cases: mirror the corpus split discipline.
 Add one file per crash with a human top only — description of the crash,
