@@ -27,6 +27,34 @@ typedef SceUInt32 SceAppUtilSaveDataSlotStatus;
 typedef SceUInt32 SceAppUtilAppParamId;
 typedef SceUInt32 SceAppUtilBgdlStatusType;
 
+struct SceAppUtilBgdlStatus {
+    SceAppUtilBgdlStatusType type;
+    SceUInt32 addcontNumReady;
+    SceUInt32 addcontNumNotReady;
+    SceUInt32 licenseReady;
+    SceChar8 reserved[28];
+};
+static_assert(sizeof(SceAppUtilBgdlStatus) == 0x2C);
+
+struct SceAppUtilInitParam {
+    SceSize workBufSize;
+    uint8_t reserved[60];
+};
+static_assert(sizeof(SceAppUtilInitParam) == 0x40);
+
+struct SceAppUtilBootParam {
+    SceUInt32 attr;
+    SceUInt32 appVersion;
+    uint8_t reserved[32];
+};
+static_assert(sizeof(SceAppUtilBootParam) == 0x28);
+
+struct SceAppUtilAppEventParam {
+    SceUInt32 type;
+    uint8_t dat[1024];
+};
+static_assert(sizeof(SceAppUtilAppEventParam) == 0x404);
+
 #define SCE_APPUTIL_APPPARAM_ID_SKU_FLAG 0
 #define SCE_APPUTIL_MOUNTPOINT_DATA_MAXSIZE 16
 #define SCE_APPUTIL_NP_DRM_ADDCONT_ID_SIZE 17

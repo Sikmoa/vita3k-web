@@ -17,6 +17,9 @@
 
 #include <module/module.h>
 
+#include "../SceDisplay/SceDisplay.h"
+#include "../SceGxm/SceGxm.h"
+
 #include <dialog/state.h>
 #include <dialog/types.h>
 #include <emuenv/app_util.h>
@@ -114,21 +117,65 @@ EXPORT(int, sceCommonDialogIsRunning) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceCommonDialogSetConfigParam) {
-    TRACY_FUNC(sceCommonDialogSetConfigParam);
-    return UNIMPLEMENTED();
+struct SceCommonDialogConfigParam {
+    SceUInt32 sdkVersion;
+    SceInt32 language;
+    SceInt32 enterButtonAssign;
+    SceUInt8 reserved[32];
+};
+static_assert(sizeof(SceCommonDialogConfigParam) == 0x2C);
+
+// Checks of firmware 3.74 libcdlg.suprx. Vita3K keeps no per-process dialog
+// configuration: dialogs take language and enter button from the emulator
+// configuration, as before.
+EXPORT(int, sceCommonDialogSetConfigParam, const SceCommonDialogConfigParam *configParam) {
+    TRACY_FUNC(sceCommonDialogSetConfigParam, configParam);
+    if (!configParam)
+        return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NULL);
+    if (emuenv.common_dialog.status == SCE_COMMON_DIALOG_STATUS_RUNNING)
+        return RET_ERROR(SCE_COMMON_DIALOG_ERROR_BUSY);
+    constexpr uint32_t invalid_language = 0x80020431, invalid_enter_button = 0x80020432;
+    if (static_cast<SceUInt32>(configParam->language) > 19)
+        return RET_ERROR(invalid_language);
+    if (configParam->enterButtonAssign != 0 && configParam->enterButtonAssign != 1)
+        return RET_ERROR(invalid_enter_button);
+    return 0;
 }
 
-// The running dialog is drawn by the host (the desktop overlay, the browser
-// page), not into updateParam's render target, so an update only advances
-// the dialogs the host completes by time.
+// Firmware 3.74 libcdlg (0x81001726, 0x8100132a). Without an initialized
+// dialog the parameter is not read. The render target checks come before
+// the scene check; the dialog's own update then draws into the target, which
+// the host does here (desktop overlay, browser page): only the dialogs the
+// host completes by time advance.
 EXPORT(int, sceCommonDialogUpdate, const SceCommonDialogUpdateParam *updateParam) {
     TRACY_FUNC(sceCommonDialogUpdate, updateParam);
-    if (!updateParam)
+    if (emuenv.gxm.display_queue_thread && thread_id == emuenv.gxm.display_queue_thread)
+        return RET_ERROR(SCE_COMMON_DIALOG_ERROR_ILLEGAL_CALLER_THREAD);
+    if (emuenv.common_dialog.status == SCE_COMMON_DIALOG_STATUS_NONE)
+        return 0;
+    if (!updateParam || !updateParam->renderTarget.colorSurfaceData)
         return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NULL);
-    // sceGxmInitialize allocates the notification region (desktop and browser).
-    if (!emuenv.gxm.notification_region)
-        return RET_ERROR(SCE_COMMON_DIALOG_ERROR_GXM_IS_UNINITIALIZED);
+    const auto &target = updateParam->renderTarget;
+    if (target.colorFormat != 0) // SCE_GXM_COLOR_FORMAT_A8B8G8R8
+        return RET_ERROR(SCE_COMMON_DIALOG_ERROR_INVALID_COLOR_FORMAT);
+    if (target.surfaceType != 0) // SCE_GXM_COLOR_SURFACE_LINEAR
+        return RET_ERROR(SCE_COMMON_DIALOG_ERROR_INVALID_SURFACE_TYPE);
+    // 1280x720 needs a 720-line display, 1920x1080 a 1080-line one (PS TV);
+    // the listed titles may use both.
+    SceInt32 max_width = 0, max_height = 0;
+    CALL_EXPORT(_sceDisplayGetMaximumFrameBufResolution, &max_width, &max_height);
+    const bool listed = is_display_listed_title(emuenv.io.title_id);
+    const bool hd = listed || max_height >= 720, full_hd = listed || max_height >= 1080;
+    const auto size_is = [&](uint32_t width, uint32_t height) { return target.width == width && target.height == height; };
+    const bool size_ok = size_is(480, 272) || size_is(640, 368) || size_is(720, 408) || size_is(960, 544)
+        || (hd && (size_is(1280, 720) || size_is(1280, 725)))
+        || (full_hd && (target.width == 1440 || target.width == 1920) && (target.height == 1080 || target.height == 1088));
+    if (!size_ok)
+        return RET_ERROR(SCE_COMMON_DIALOG_ERROR_INVALID_SURFACE_RESOLUTION);
+    if (target.strideInPixels < target.width || target.strideInPixels % 64)
+        return RET_ERROR(SCE_COMMON_DIALOG_ERROR_INVALID_SURFACE_STRIDE);
+    if (CALL_EXPORT(sceGxmRenderingContextIsWithinSceneInternal))
+        return RET_ERROR(SCE_COMMON_DIALOG_ERROR_WITHIN_SCENE);
     complete_trophy_setup_dialog(emuenv.common_dialog);
     return 0;
 }

@@ -62,7 +62,8 @@ EXPORT(int, sceGxmMapVertexUsseMemoryInternal) {
 }
 
 EXPORT(int, sceGxmRenderingContextIsWithinSceneInternal) {
-    return UNIMPLEMENTED();
+    TRACY_FUNC(sceGxmRenderingContextIsWithinSceneInternal);
+    return gxm_immediate_context_within_scene(emuenv) ? 1 : 0;
 }
 
 EXPORT(int, sceGxmSetCallbackInternal) {

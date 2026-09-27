@@ -1208,6 +1208,12 @@ struct SceGxmContext {
     }
 };
 
+bool gxm_immediate_context_within_scene(EmuEnvState &emuenv) {
+    if (!emuenv.gxm.notification_region || !emuenv.gxm.immediate_context)
+        return false;
+    return Ptr<SceGxmContext>(emuenv.gxm.immediate_context).get(emuenv.mem)->state.active;
+}
+
 // the size of the context on a PS Vita is 2048 bytes
 // the +4 is for alignment reasons
 static_assert(sizeof(SceGxmContext) + 4 <= 2048);

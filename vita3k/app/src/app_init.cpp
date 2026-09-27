@@ -504,6 +504,7 @@ void shutdown_app_runtime(EmuEnvState &state) {
     state.common_dialog.deinit();
 
     state.ime.deinit();
+    state.app_util_inited = false;
 
     state.touch.reset_runtime();
 

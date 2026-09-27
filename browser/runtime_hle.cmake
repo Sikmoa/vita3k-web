@@ -73,17 +73,19 @@ set(_hle_exports
     sceKernelCreateLwCond
     sceFiosOverlayGetList02
     sceKernelGetModuleInfoByAddr
-    # sceAppUtilInit is UNIMPLEMENTED() upstream (returns 0), so this matches the
-    # desktop behaviour the game already runs with instead of adding a new stub.
+    # AppUtil lifecycle and queries with firmware 3.74's initialized-flag and
+    # argument checks (sceAppUtilInit writes the boot parameter).
     sceAppUtilInit sceAppUtilShutdown
     # Parameter queries read EmuEnvState config/licence fields only; no new stubs.
     sceAppUtilAppParamGetInt sceAppUtilSystemParamGetInt sceAppUtilSystemParamGetString
     sceAppUtilDrmOpen sceAppUtilDrmClose
-    # SetConfigParam, IsRunning and GetWorkerThreadId are UNIMPLEMENTED()/STUBBED()
-    # upstream; selecting them reproduces desktop behaviour instead of inventing
-    # new return values. sceCommonDialogUpdate validates its parameter and leaves
-    # drawing to the page (msg_dialog_bridge.cpp), as desktop leaves it to its overlay.
+    # Common-dialog configuration and update with firmware 3.74's checks
+    # (the host draws the dialog: desktop overlay, browser page); IsRunning and
+    # GetWorkerThreadId are upstream UNIMPLEMENTED()/STUBBED() bodies.
     sceCommonDialogSetConfigParam sceCommonDialogUpdate sceCommonDialogIsRunning sceCommonDialogGetWorkerThreadId
+    # CALL_EXPORT dependency of sceCommonDialogUpdate: the immediate context's
+    # scene state.
+    sceGxmRenderingContextIsWithinSceneInternal
     sceKernelCallAbortHandler
     sceIoWrite
     sceKernelUnlockLwMutex2 sceKernelRegisterThreadEventHandler
@@ -373,6 +375,10 @@ set(_hle_exports
     sceNpSignalingCreateCtx sceNpSignalingDestroyCtx sceNpSignalingSetCtxOpt
     sceNpSignalingTerminateConnection sceNpSignalingGetConnectionInfo
     sceNpActivityPostStatus sceNpGetPlatformType sceNpManagerGetContentRatingFlag
+    # Firmware 3.74 apputil/livearea_util checks; the background-download
+    # queue is empty and the browser has no LiveArea (a valid update
+    # completes at once).
+    sceAppUtilBgdlGetStatus sceLiveAreaUpdateFrameAsync
 )
 
 # Take NID values from the one authoritative database, never a second resolver.
@@ -403,6 +409,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 
 set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceGxm/SceGxm.cpp"
+    "${_HLE_ROOT}/modules/SceGxm/SceGxmInternal.cpp"
     "${_HLE_ROOT}/modules/SceLibKernel/SceLibKernel.cpp"
     "${_HLE_ROOT}/modules/SceLibDbg/SceDbg.cpp"
     "${_HLE_ROOT}/modules/SceKernelThreadMgr/SceThreadmgr.cpp"
@@ -438,6 +445,7 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceNpCommon/SceNpCommon.cpp"
     "${_HLE_ROOT}/modules/SceNpSignaling/SceNpSignaling.cpp"
     "${_HLE_ROOT}/modules/SceNpActivity/SceNpActivity.cpp"
+    "${_HLE_ROOT}/modules/SceLiveArea/SceLiveAreaUtil.cpp"
     "${_HLE_ROOT}/modules/SceNpTrophy/SceNpTrophy.cpp"
     "${_HLE_ROOT}/modules/SceAppUtil/SceAppUtil.cpp"
     "${_HLE_ROOT}/modules/SceCommonDialog/SceCommonDialog.cpp"

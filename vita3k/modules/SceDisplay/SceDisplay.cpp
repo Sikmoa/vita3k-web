@@ -84,6 +84,14 @@ EXPORT(int, _sceDisplayGetFrameBufInternal) {
     return UNIMPLEMENTED();
 }
 
+bool is_display_listed_title(std::string_view title_id) {
+    for (const std::string_view listed : { "PCSG80001", "PCSG80007", "PCSG00318", "PCSG00319", "PCSG00320", "PCSG00321", "PCSH00059" }) {
+        if (title_id == listed)
+            return true;
+    }
+    return false;
+}
+
 EXPORT(SceInt32, _sceDisplayGetMaximumFrameBufResolution, SceInt32 *width, SceInt32 *height) {
     TRACY_FUNC(_sceDisplayGetMaximumFrameBufResolution, width, height);
     if (!width || !height)
@@ -93,15 +101,7 @@ EXPORT(SceInt32, _sceDisplayGetMaximumFrameBufResolution, SceInt32 *width, SceIn
         *height = 1088;
     } else {
         // PSVita does this exact same check
-        auto &title_id = emuenv.io.title_id;
-        bool cond = (title_id == "PCSG80001")
-            || (title_id == "PCSG80007")
-            || (title_id == "PCSG00318")
-            || (title_id == "PCSG00319")
-            || (title_id == "PCSG00320")
-            || (title_id == "PCSG00321")
-            || (title_id == "PCSH00059");
-        if (cond) {
+        if (is_display_listed_title(emuenv.io.title_id)) {
             *width = 960;
             *height = 544;
 

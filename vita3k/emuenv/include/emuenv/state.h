@@ -166,6 +166,7 @@ public:
     Ime &ime;
     License &license;
     RegMgrState &regmgr;
+    bool app_util_inited = false; // sceAppUtilInit ran and sceAppUtilShutdown did not
     SfoFile &sfo_handle;
     NIDSet missing_nids;
     float system_dpi_scale = 1.f;

@@ -2,7 +2,8 @@
 // linear image: tiled and swizzled surfaces, downscaled surfaces (rendered at
 // twice their size and box-filtered), multisampled render targets, textures
 // over rendered surfaces (whole surfaces and rectangles inside them), and
-// transfers into and out of rendered surfaces; plus sceCommonDialogUpdate.
+// transfers into and out of rendered surfaces; plus sceCommonDialogUpdate's
+// checks with a message dialog open.
 //
 // Every surface gets the same pattern (red, a green top-left strip, a blue
 // bottom-right block), drawn with the repository's color GXP. Results are
@@ -11,6 +12,7 @@
 // its tiled and Morton addressing. Exit code 100 (surface sync on) or 101
 // (off) is success; anything else names the failed check (see fail()).
 #include <psp2/common_dialog.h>
+#include <psp2/message_dialog.h>
 #include <psp2/gxm.h>
 #include <string.h>
 
@@ -512,17 +514,40 @@ int main(void) {
     read_surface(halves, SCE_GXM_TRANSFER_LINEAR, 0, 0, 32, 4, 32);
     if (check(32, 4, halves_then_green, 93)) return failed;
 
-    // 7. sceCommonDialogUpdate: the host draws dialogs, so any frame is fine.
-    if (sceCommonDialogUpdate(0) != (int)SCE_COMMON_DIALOG_ERROR_NULL) return 80;
+    // 7. sceCommonDialogUpdate (firmware 3.74 libcdlg). Without a dialog the
+    // parameter is not read; with one, the render target is checked and the
+    // call must come from outside a scene. The host draws the dialog, so the
+    // target's memory is never touched.
+    if (sceCommonDialogUpdate(0) != 0) return 120;
+    SceMsgDialogUserMessageParam message;
+    memset(&message, 0, sizeof(message));
+    message.buttonType = SCE_MSG_DIALOG_BUTTON_TYPE_OK;
+    message.msg = (const SceChar8 *)"GXM surface fixture";
+    SceMsgDialogParam dialog;
+    sceMsgDialogParamInit(&dialog);
+    dialog.mode = SCE_MSG_DIALOG_MODE_USER_MSG;
+    dialog.userMsgParam = &message;
+    if (sceMsgDialogInit(&dialog)) return 121;
+    if (sceCommonDialogUpdate(0) != (int)SCE_COMMON_DIALOG_ERROR_NULL) return 122;
     SceCommonDialogUpdateParam update;
     memset(&update, 0, sizeof(update));
-    update.renderTarget.colorFormat = SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR;
+    update.renderTarget.colorFormat = SCE_GXM_COLOR_FORMAT_A8B8G8R8;
     update.renderTarget.surfaceType = SCE_GXM_COLOR_SURFACE_LINEAR;
+    update.renderTarget.width = 960;
+    update.renderTarget.height = 544;
+    update.renderTarget.strideInPixels = 960;
+    update.renderTarget.colorSurfaceData = linear64;
+    if (sceCommonDialogUpdate(&update) != 0) return 123;
+    begin(rt164, &s_quarter);
+    const int within = sceCommonDialogUpdate(&update);
+    end();
+    if (within != (int)SCE_COMMON_DIALOG_ERROR_WITHIN_SCENE) return 124;
+    if (sceCommonDialogUpdate(&update) != 0) return 125;
     update.renderTarget.width = 64;
     update.renderTarget.height = 64;
     update.renderTarget.strideInPixels = 64;
-    update.renderTarget.colorSurfaceData = linear64;
-    if (sceCommonDialogUpdate(&update) != 0) return 81;
+    if (sceCommonDialogUpdate(&update) != (int)SCE_COMMON_DIALOG_ERROR_INVALID_SURFACE_RESOLUTION) return 126;
+    if (sceMsgDialogClose() || sceMsgDialogTerm()) return 127;
 
     if (failed) return failed;
     sceGxmDestroyContext(context);

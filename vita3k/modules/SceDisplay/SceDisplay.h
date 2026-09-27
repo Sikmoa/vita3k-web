@@ -21,6 +21,8 @@
 #include <module/module.h>
 #include <util/tracy.h>
 
+#include <string_view>
+
 enum SceDisplaySetBufSync {
     SCE_DISPLAY_SETBUF_IMMEDIATE = 0,
     SCE_DISPLAY_SETBUF_NEXTFRAME = 1
@@ -68,5 +70,9 @@ struct SceDisplayFrameBuf2 : public SceDisplayFrameBuf {
 
 DECL_EXPORT(SceInt32, _sceDisplayGetFrameBuf, SceDisplayFrameBuf *pFrameBuf, SceDisplaySetBufSync sync, uint32_t *pFrameBuf_size);
 DECL_EXPORT(SceInt32, _sceDisplayGetMaximumFrameBufResolution, SceInt32 *width, SceInt32 *height);
+
+// Titles firmware 3.74 singles out by title ID: SceDisplay gives them a
+// 960x544 maximum frame buffer, libcdlg accepts every dialog render size.
+bool is_display_listed_title(std::string_view title_id);
 DECL_EXPORT(SceInt32, _sceDisplaySetFrameBuf, const SceDisplayFrameBuf *pFrameBuf, SceDisplaySetBufSync sync, uint32_t *pFrameBuf_size);
 DECL_EXPORT(SceInt32, sceDisplayRegisterVblankStartCallback, SceUID uid);

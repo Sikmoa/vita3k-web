@@ -5,7 +5,6 @@
 #include <ctrl/ctrl.h>
 #include <dialog/state.h>
 #include <lang/state.h>
-#include <gxm/state.h>
 #include <cstring>
 #include <new>
 
@@ -95,20 +94,51 @@ inline void test_guest_msg_dialog(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(answer(SCE_MSG_DIALOG_BUTTON_TYPE_OK, SCE_CTRL_CIRCLE, 0) == SCE_MSG_DIALOG_BUTTON_ID_INVALID);
     REQUIRE(answer(SCE_MSG_DIALOG_BUTTON_TYPE_YESNO, SCE_CTRL_TRIANGLE, 0) == SCE_MSG_DIALOG_BUTTON_ID_INVALID);
 
-    // sceCommonDialogUpdate: parameter and GXM checks; the dialog itself is
-    // drawn by the page, and the update completes a timed trophy setup dialog.
+    // sceCommonDialogUpdate (firmware 3.74 libcdlg): without an initialized
+    // dialog the parameter is not read; with one, the render target is
+    // checked. The page draws the dialog; an update completes a timed trophy
+    // setup dialog.
     constexpr uint32_t update = 0x90530F2F, trophy_status = 0xC3A59547, trophy_term = 0xA81082DD;
     const Address update_param = block + 0x300;
     static_assert(sizeof(SceCommonDialogUpdateParam) <= 0x100);
-    REQUIRE(call(update, 0) == SCE_COMMON_DIALOG_ERROR_NULL);
-    REQUIRE(!env.gxm.notification_region);
-    REQUIRE(call(update, update_param) == SCE_COMMON_DIALOG_ERROR_GXM_IS_UNINITIALIZED);
-    env.gxm.notification_region = Ptr<uint32_t>(block + 0x3f0); // as sceGxmInitialize leaves it
-    REQUIRE(call(update, update_param) == 0);
+    auto &target = Ptr<SceCommonDialogUpdateParam>(update_param).get(env.mem)->renderTarget;
+    std::memset(&target, 0, sizeof(SceCommonDialogUpdateParam));
+    REQUIRE(call(update, 0) == 0);
     p->mode = SCE_MSG_DIALOG_MODE_USER_MSG;
     REQUIRE(call(init, param) == 0);
+    REQUIRE(call(update, 0) == SCE_COMMON_DIALOG_ERROR_NULL);
+    REQUIRE(call(update, update_param) == SCE_COMMON_DIALOG_ERROR_NULL); // no color surface
+    target.colorSurfaceData = Ptr<void>(block + 0x3f0); // never read
+    target.width = 960;
+    target.height = 544;
+    target.strideInPixels = 960;
     REQUIRE(call(update, update_param) == 0 && call(get_status) == SCE_COMMON_DIALOG_STATUS_RUNNING);
+    target.colorFormat = 1;
+    REQUIRE(call(update, update_param) == SCE_COMMON_DIALOG_ERROR_INVALID_COLOR_FORMAT);
+    target.colorFormat = 0;
+    target.surfaceType = 1;
+    REQUIRE(call(update, update_param) == SCE_COMMON_DIALOG_ERROR_INVALID_SURFACE_TYPE);
+    target.surfaceType = 0;
+    target.width = 64;
+    target.height = 64;
+    REQUIRE(call(update, update_param) == SCE_COMMON_DIALOG_ERROR_INVALID_SURFACE_RESOLUTION);
+    // A handheld's display allows 1280x720 targets, not 1920x1080 ones.
+    REQUIRE(!env.cfg.pstv_mode);
+    target.width = 1920;
+    target.height = 1080;
+    target.strideInPixels = 1920;
+    REQUIRE(call(update, update_param) == SCE_COMMON_DIALOG_ERROR_INVALID_SURFACE_RESOLUTION);
+    target.width = 1280;
+    target.height = 720;
+    target.strideInPixels = 1280;
+    REQUIRE(call(update, update_param) == 0);
+    target.strideInPixels = 1300; // not a multiple of 64
+    REQUIRE(call(update, update_param) == SCE_COMMON_DIALOG_ERROR_INVALID_SURFACE_STRIDE);
+    target.strideInPixels = 1216; // below the width
+    REQUIRE(call(update, update_param) == SCE_COMMON_DIALOG_ERROR_INVALID_SURFACE_STRIDE);
+    target.strideInPixels = 1280;
     REQUIRE(call(close) == 0 && call(term) == 0);
+    REQUIRE(call(update, 0) == 0);
     {
         const std::lock_guard<std::recursive_mutex> lock(dialog.mutex);
         dialog.type = TROPHY_SETUP_DIALOG;
@@ -118,7 +148,6 @@ inline void test_guest_msg_dialog(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(update, update_param) == 0);
     REQUIRE(dialog.status == SCE_COMMON_DIALOG_STATUS_FINISHED && dialog.result == SCE_COMMON_DIALOG_RESULT_OK);
     REQUIRE(call(trophy_status) == SCE_COMMON_DIALOG_STATUS_FINISHED && call(trophy_term) == 0);
-    env.gxm.notification_region.reset();
     free(env.mem, block);
     std::puts("Guest message dialog: init, status, close, result, term, page answers, English catalog texts and sceCommonDialogUpdate passed");
 }

@@ -24,5 +24,10 @@ struct SceGxmRenderTargetParams;
 struct SceGxmRenderTarget;
 
 DECL_EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params);
+DECL_EXPORT(int, sceGxmRenderingContextIsWithinSceneInternal);
+
+// False before sceGxmInitialize; else whether the immediate context is
+// between sceGxmBeginScene and sceGxmEndScene.
+bool gxm_immediate_context_within_scene(EmuEnvState &emuenv);
 DECL_EXPORT(int, sceGxmCreateRenderTarget, const SceGxmRenderTargetParams *params, Ptr<SceGxmRenderTarget> *renderTarget);
 DECL_EXPORT(int, sceGxmGetRenderTargetMemSize, const SceGxmRenderTargetParams *params, uint32_t *hostMemSize);
