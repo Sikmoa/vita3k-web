@@ -351,6 +351,41 @@ struct SceNetInAddr {
 };
 #pragma pop_macro("s_addr")
 
+// sceNetGetSockInfo entry (SceNetPs 0x8100a1dc).
+struct SceNetSockInfo {
+    char name[32];
+    SceUID pid;
+    int s;
+    uint8_t socket_type;
+    uint8_t policy;
+    uint16_t reserved0;
+    int recv_queue_length;
+    int send_queue_length;
+    SceNetInAddr local_adr; // network byte order, as the ports
+    SceNetInAddr remote_adr;
+    uint16_t local_port;
+    uint16_t remote_port;
+    uint16_t local_vport;
+    uint16_t remote_vport;
+    int state;
+    int flags;
+    int reserved[8];
+};
+static_assert(sizeof(SceNetSockInfo) == 0x6c);
+
+enum SceNetSockInfoFlag : uint32_t {
+    SCE_NET_SOCKINFO_F_SELF = 0x1,
+    SCE_NET_SOCKINFO_F_RECV_WAIT = 0x10000,
+    SCE_NET_SOCKINFO_F_SEND_WAIT = 0x20000,
+    SCE_NET_SOCKINFO_F_RECV_EWAIT = 0x40000,
+    SCE_NET_SOCKINFO_F_SEND_EWAIT = 0x80000,
+};
+
+enum SceNetSockInfoState {
+    SCE_NET_SOCKINFO_STATE_CLOSED = 1,
+    SCE_NET_SOCKINFO_STATE_OPENED = 2,
+};
+
 struct SceNetSockaddrIn {
     unsigned char sin_len;
     unsigned char sin_family;

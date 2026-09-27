@@ -385,14 +385,24 @@ int OfflineSocket::connect(const SceNetSockaddr *addr, unsigned int addrlen) {
     SceNetSockaddrIn dst;
     if (const int error = read_address(addr, addrlen, dst))
         return error;
+    // TCP binds a port before it looks for a route (SceNetPs 0x81026788).
+    if (stream() && !bound) {
+        if (const int error = bind_ephemeral())
+            return error;
+    }
     if (const int error = route(dst))
         return error;
-    if (stream())
+    if (stream()) {
+        pcb_dropped = true; // the RST drops it (tcp_close)
         return SCE_NET_ERROR_ECONNREFUSED; // nothing listens on lo0 here
+    }
     if (!bound) {
         if (const int error = bind_ephemeral())
             return error;
     }
+    // The source address the route picks: lo0's (in_pcbconnect).
+    if (host_address(local) == 0)
+        local.sin_addr.s_addr = htonl(loopback_address);
     peer = dst;
     connected = true;
     return 0;

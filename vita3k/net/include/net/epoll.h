@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 #include <net/socket.h>
 
 struct EpollSocket {
@@ -14,6 +16,7 @@ struct Epoll {
     // PRESERVATION flag also fails later waits.
     unsigned abort_generation = 0;
     bool abort_preserved = false;
+    std::string name; // sceNetEpollCreate's, at most 31 characters (offline stack)
 
     int add(int id, std::weak_ptr<Socket> sock, SceNetEpollEvent *ev);
     int del(int id);

@@ -392,6 +392,8 @@ set(_hle_exports
     # The CB wait runs the thread's notified callbacks before it parks; ICM
     # connect finds no interface to bring up and completes at once.
     sceNetEpollWaitCB sceNetInternalIcmConnect
+    # Socket info: the process's sockets and epolls as SceNetPs lists them.
+    sceNetGetSockInfo
     sceNetResolverCreate sceNetResolverStartNtoa sceNetResolverGetError
     sceNetResolverAbort sceNetResolverDestroy
     sceNetInetPton sceNetInternalInetPton

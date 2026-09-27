@@ -31,6 +31,7 @@
 
 #include <deque>
 #include <optional>
+#include <string>
 #include <vector>
 
 struct OfflineDatagram {
@@ -51,6 +52,13 @@ struct OfflineSocket final : Socket {
     // sceNetInternalIcmConnect found no usable interface: the next epoll
     // scan of the socket reports SCE_NET_EPOLL_ICM_DONE once.
     bool icm_completed = false;
+    std::string name; // sceNetSocket's, at most 31 characters
+    // A refused TCP connect drops the protocol control block: the socket
+    // keeps no addresses (sceNetGetSockInfo).
+    bool pcb_dropped = false;
+    // Threads parked in a receive on it, and epoll waits parked while it was
+    // not readable or writable (sceNetGetSockInfo wait flags).
+    unsigned recv_waiters = 0, epoll_recv_waiters = 0, epoll_send_waiters = 0;
     // Abort: each sceNetSocketAbort ends the waits in progress; PRESERVATION
     // flags also fail every later receive/send with EINTR.
     unsigned abort_generation = 0;

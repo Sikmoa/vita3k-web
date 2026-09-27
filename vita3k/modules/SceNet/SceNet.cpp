@@ -25,7 +25,9 @@
 #include <util/lock_and_find.h>
 #include <util/net_utils.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <thread>
 
@@ -158,7 +160,10 @@ static int recv_offline(EmuEnvState &emuenv, SceUID thread_id, int sid, void *bu
                 return SCE_NET_ERROR_EAGAIN;
             remaining = *timeout - elapsed;
         }
-        if (offline_net_park(emuenv.kernel, emuenv.net, thread_id, remaining) == KernelExecutionHost::WaitResult::cancelled)
+        ++sock->recv_waiters;
+        const auto parked = offline_net_park(emuenv.kernel, emuenv.net, thread_id, remaining);
+        --sock->recv_waiters;
+        if (parked == KernelExecutionHost::WaitResult::cancelled)
             return SCE_NET_ERROR_EINTR;
     }
 }
@@ -223,7 +228,23 @@ static int epoll_wait_offline(EmuEnvState &emuenv, SceUID thread_id, int eid, Sc
         // A callback may have made an entry ready: scan again before waiting.
         if (callbacks && process_callbacks(emuenv.kernel, thread_id) > 0)
             continue;
-        if (offline_net_park(emuenv.kernel, emuenv.net, thread_id, remaining) == KernelExecutionHost::WaitResult::cancelled)
+        // The scan marks the directions it waits for (SceNetPs 0x81009822,
+        // 0x81009846); leaving the wait clears them.
+        std::vector<std::pair<std::shared_ptr<OfflineSocket>, unsigned int>> waiting;
+        for (const auto &[id, entry] : epoll->eventEntries) {
+            if (const auto sock = std::static_pointer_cast<OfflineSocket>(entry.sock.lock()); sock && !sock->so_error) {
+                const unsigned int directions = entry.events & (SCE_NET_EPOLLIN | SCE_NET_EPOLLOUT);
+                waiting.emplace_back(sock, directions);
+                sock->epoll_recv_waiters += (directions & SCE_NET_EPOLLIN) != 0;
+                sock->epoll_send_waiters += (directions & SCE_NET_EPOLLOUT) != 0;
+            }
+        }
+        const auto parked = offline_net_park(emuenv.kernel, emuenv.net, thread_id, remaining);
+        for (const auto &[sock, directions] : waiting) {
+            sock->epoll_recv_waiters -= (directions & SCE_NET_EPOLLIN) != 0;
+            sock->epoll_send_waiters -= (directions & SCE_NET_EPOLLOUT) != 0;
+        }
+        if (parked == KernelExecutionHost::WaitResult::cancelled)
             return SCE_NET_ERROR_EINTR;
     }
 }
@@ -371,6 +392,8 @@ EXPORT(int, sceNetEpollCreate, const char *name, int flags) {
     TRACY_FUNC(sceNetEpollCreate, name, flags);
     auto id = ++emuenv.net.next_epoll_id;
     auto epoll = std::make_shared<Epoll>();
+    if (name)
+        epoll->name.assign(name, strnlen(name, 31));
     const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
     emuenv.net.epolls.emplace(id, epoll);
     return id;
@@ -544,9 +567,99 @@ EXPORT(int, sceNetGetSockIdInfo) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNetGetSockInfo) {
-    TRACY_FUNC(sceNetGetSockInfo);
+#ifdef __EMSCRIPTEN__
+// SceNetPs 0x8100a1dc: one entry of a socket, all of which belong to the
+// game (SELF). Addresses and ports stay in network byte order.
+static SceNetSockInfo offline_sock_info(int id, const OfflineSocket &sock, int flags) {
+    SceNetSockInfo info{};
+    if (flags & 2)
+        std::memcpy(info.name, sock.name.data(), sock.name.size());
+    info.pid = KernelState::process_id;
+    info.s = id;
+    info.socket_type = static_cast<uint8_t>(sock.sce_type);
+    info.recv_queue_length = static_cast<int>(sock.queued_bytes); // payload and sender address per datagram
+    info.flags = SCE_NET_SOCKINFO_F_SELF | (sock.recv_waiters ? SCE_NET_SOCKINFO_F_RECV_WAIT : 0)
+        | (sock.epoll_recv_waiters ? SCE_NET_SOCKINFO_F_RECV_EWAIT : 0)
+        | (sock.epoll_send_waiters ? SCE_NET_SOCKINFO_F_SEND_EWAIT : 0);
+    // UDP is always "opened"; TCP never leaves CLOSED offline, and a refused
+    // connect leaves it without a control block, reported as opened.
+    info.state = sock.stream() && !sock.pcb_dropped ? SCE_NET_SOCKINFO_STATE_CLOSED : SCE_NET_SOCKINFO_STATE_OPENED;
+    if (sock.pcb_dropped)
+        return info;
+    if (sock.bound) {
+        info.local_adr = sock.local.sin_addr;
+        info.local_port = sock.local.sin_port;
+    }
+    if (sock.connected) {
+        info.remote_adr = sock.peer.sin_addr;
+        info.remote_port = sock.peer.sin_port;
+    }
+    if (sock.p2p()) {
+        info.local_vport = sock.bound ? sock.local.sin_vport : 0;
+        info.remote_vport = sock.connected ? sock.peer.sin_vport : 0;
+    }
+    return info;
+}
+#endif
+
+// SceNetPs 0x8100a510: one socket, or all of the process's: TCP sockets
+// that lost their control block in id order, then TCP, UDP and P2P
+// datagram sockets, each newest first, then (flag 0x20) the epolls. Flag 2
+// adds names; flag 1 widens the list for system programs only. A null info
+// counts the entries; otherwise at most n are written.
+EXPORT(int, sceNetGetSockInfo, int s, SceNetSockInfo *info, int n, int flags) {
+    TRACY_FUNC(sceNetGetSockInfo, s, info, n, flags);
+#ifdef __EMSCRIPTEN__
+    if (!emuenv.net.inited)
+        return RET_ERROR(SCE_NET_ERROR_ENOTINIT); // libnet 0x81003b18, errno untouched
+    if ((flags & ~0x23) || n < 0)
+        RET_NET_ERRNO(SCE_NET_ERROR_EINVAL);
+    std::vector<SceNetSockInfo> entries;
+    const auto offline = [](const SocketPtr &sock) -> const OfflineSocket & { return static_cast<const OfflineSocket &>(*sock); };
+    if (s >= 0) {
+        const auto sock = lock_and_find(s, emuenv.net.socks, emuenv.kernel.mutex);
+        if (!sock)
+            RET_NET_ERRNO(SCE_NET_ERROR_EBADF);
+        entries.push_back(offline_sock_info(s, offline(sock), flags));
+    } else {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        for (const auto &[id, sock] : emuenv.net.socks) {
+            if (offline(sock).pcb_dropped)
+                entries.push_back(offline_sock_info(id, offline(sock), flags));
+        }
+        // Ids grow with creation: newest first is descending id order.
+        const auto list = [&](auto belongs) {
+            for (auto it = emuenv.net.socks.rbegin(); it != emuenv.net.socks.rend(); ++it) {
+                const auto &sock = offline(it->second);
+                if (!sock.pcb_dropped && belongs(sock))
+                    entries.push_back(offline_sock_info(it->first, sock, flags));
+            }
+        };
+        list([](const OfflineSocket &sock) { return sock.stream(); });
+        list([](const OfflineSocket &sock) { return sock.sce_type == SCE_NET_SOCK_DGRAM; });
+        list([](const OfflineSocket &sock) { return sock.sce_type == SCE_NET_SOCK_DGRAM_P2P; });
+        if (flags & 0x20) {
+            for (const auto &[id, epoll] : emuenv.net.epolls) {
+                SceNetSockInfo entry{};
+                if (flags & 2)
+                    std::memcpy(entry.name, epoll->name.data(), epoll->name.size());
+                entry.pid = KernelState::process_id;
+                entry.s = id;
+                entry.socket_type = 11; // epoll
+                entry.state = SCE_NET_SOCKINFO_STATE_OPENED;
+                entry.flags = SCE_NET_SOCKINFO_F_SELF;
+                entries.push_back(entry);
+            }
+        }
+    }
+    if (!info)
+        return static_cast<int>(entries.size());
+    const size_t written = std::min(entries.size(), static_cast<size_t>(n));
+    std::copy_n(entries.begin(), written, info);
+    return static_cast<int>(written);
+#else
     return UNIMPLEMENTED();
+#endif
 }
 
 EXPORT(int, sceNetGetStatisticsInfo) {
@@ -880,6 +993,8 @@ EXPORT(int, sceNetShutdown, int sid, int how) {
 EXPORT(int, sceNetSocket, const char *name, int domain, SceNetSocketType type, SceNetProtocol protocol) {
     TRACY_FUNC(sceNetSocket, name, domain, type, protocol);
 #ifdef __EMSCRIPTEN__
+    if (!name)
+        RET_NET_ERRNO(SCE_NET_ERROR_EINVAL); // SceNetPs 0x810074a8
     if (domain != SCE_NET_AF_INET)
         RET_NET_ERRNO(SCE_NET_ERROR_EAFNOSUPPORT);
     const bool stream = type == SCE_NET_SOCK_STREAM || type == SCE_NET_SOCK_STREAM_P2P;
@@ -889,7 +1004,9 @@ EXPORT(int, sceNetSocket, const char *name, int domain, SceNetSocketType type, S
         RET_NET_ERRNO(SCE_NET_ERROR_EPROTONOSUPPORT);
     const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
     const int id = ++emuenv.net.next_id;
-    emuenv.net.socks.emplace(id, std::make_shared<OfflineSocket>(emuenv.net, type));
+    const auto sock = std::make_shared<OfflineSocket>(emuenv.net, type);
+    sock->name.assign(name, strnlen(name, 31));
+    emuenv.net.socks.emplace(id, sock);
     return id;
 #else
     bool isP2P = (type == SCE_NET_SOCK_DGRAM_P2P || type == SCE_NET_SOCK_STREAM_P2P);
