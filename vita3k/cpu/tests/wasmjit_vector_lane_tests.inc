@@ -548,12 +548,10 @@ void guest_lanes(MemState &mem) {
                     }
                 });
             }
-            // Dynarmic's A32 translator raises UNDEFINED for VQADD/VQSUB.<S|U>64
-            // (asimd_three_regs.cpp: sz == 0b11), which ARMv7 defines; the
-            // 64-bit lane lowering is covered by the IR fixtures.
-            for (unsigned size = 0; size < 3; ++size) {
+            // VQADD/VQSUB.<S|U><bits> Dd, Dn, Dm, 64-bit lanes included (the
+            // translator adaptation in browser/runtime_dynarmic_frontend.cmake)
+            for (unsigned size = 0; size < 4; ++size) {
                 const unsigned bits = 8u << size;
-                // VQADD/VQSUB.<S|U><bits> Dd, Dn, Dm
                 for (bool u : {false, true}) for (bool sub : {false, true}) {
                     run(neon3((sub ? 0xf2000210u : 0xf2000010u) | (u ? 1u << 24 : 0) | (size << 20), d, n, m), [&](auto &s) {
                         const auto before = s;
@@ -562,6 +560,9 @@ void guest_lanes(MemState &mem) {
                                 bits, !u, !sub).value);
                     });
                 }
+            }
+            for (unsigned size = 0; size < 3; ++size) {
+                const unsigned bits = 8u << size;
                 // VRHADD.<S|U><bits> Dd, Dn, Dm
                 for (bool u : {false, true}) {
                     run(neon3(0xf2000100u | (u ? 1u << 24 : 0) | (size << 20), d, n, m), [&](auto &s) {

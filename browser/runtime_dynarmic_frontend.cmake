@@ -41,10 +41,43 @@ endif()
 set(_dynarmic_portable_ir "${CMAKE_CURRENT_BINARY_DIR}/dynarmic-frontend/ir_emitter.cpp")
 file(GENERATE OUTPUT "${_dynarmic_portable_ir}" CONTENT "#include <stdexcept>\n${_dynarmic_ir_text}")
 
+# Upstream A32 declares VQADD/VQSUB with 64-bit lanes (sz == 0b11) UNDEFINED;
+# ARMv7 defines them and the IR already has 64-bit saturated add/sub. The
+# build-local copy drops exactly those two guards; wasmjit_vector_lane_tests
+# runs the 64-bit forms. Fails when upstream changes the functions.
+set(_dynarmic_three_regs "${_dynarmic_src}/frontend/A32/translate/impl/asimd_three_regs.cpp")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_dynarmic_three_regs}")
+file(READ "${_dynarmic_three_regs}" _dynarmic_three_regs_text)
+foreach(_op VQADD VQSUB)
+    set(_guarded "bool TranslatorVisitor::asimd_${_op}(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool Q, bool M, size_t Vm) {
+    if (Q && (mcl::bit::get_bit<0>(Vd) || mcl::bit::get_bit<0>(Vn) || mcl::bit::get_bit<0>(Vm))) {
+        return UndefinedInstruction();
+    }
+
+    if (sz == 0b11) {
+        return UndefinedInstruction();
+    }
+")
+    string(FIND "${_dynarmic_three_regs_text}" "${_guarded}" _guard_at)
+    if(_guard_at EQUAL -1)
+        message(FATAL_ERROR "Dynarmic asimd_${_op} changed; review the 64-bit lane adaptation")
+    endif()
+    string(REPLACE "
+    if (sz == 0b11) {
+        return UndefinedInstruction();
+    }
+" "" _unguarded "${_guarded}")
+    string(REPLACE "${_guarded}" "${_unguarded}" _dynarmic_three_regs_text "${_dynarmic_three_regs_text}")
+endforeach()
+set(_dynarmic_portable_three_regs "${CMAKE_CURRENT_BINARY_DIR}/dynarmic-frontend/asimd_three_regs.cpp")
+file(GENERATE OUTPUT "${_dynarmic_portable_three_regs}" CONTENT "${_dynarmic_three_regs_text}")
+
 # All visitor implementations are required by the upstream decoder tables,
 # including VFP/ASIMD. This glob is deliberately confined to the A32 frontend.
 file(GLOB _dynarmic_a32_impl CONFIGURE_DEPENDS
     "${_dynarmic_src}/frontend/A32/translate/impl/*.cpp")
+list(REMOVE_ITEM _dynarmic_a32_impl "${_dynarmic_three_regs}")
+list(APPEND _dynarmic_a32_impl "${_dynarmic_portable_three_regs}")
 add_library(vita3k_dynarmic_frontend STATIC
     ${_dynarmic_a32_impl}
     "${_dynarmic_src}/frontend/A32/translate/a32_translate.cpp"
