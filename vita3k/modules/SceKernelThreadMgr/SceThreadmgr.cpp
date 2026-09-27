@@ -215,7 +215,7 @@ EXPORT(SceInt32, _sceKernelGetCondInfo, SceUID condId, Ptr<SceKernelCondInfo> pI
     TRACY_FUNC(_sceKernelGetCondInfo, condId, pInfo);
     const CondvarPtr condvar = lock_and_find(condId, emuenv.kernel.condvars, emuenv.kernel.mutex);
     if (!condvar)
-        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
+        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_COND_ID);
 
     SceKernelCondInfo *info = pInfo.get(emuenv.mem);
     if (!info)
@@ -224,10 +224,12 @@ EXPORT(SceInt32, _sceKernelGetCondInfo, SceUID condId, Ptr<SceKernelCondInfo> pI
     if (info->size != sizeof(*info))
         return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT_SIZE);
 
+    const std::lock_guard<std::mutex> condvar_lock(condvar->mutex);
     info->condId = condId;
     strncpy(info->name, condvar->name, KERNELOBJECT_MAX_NAME_LENGTH + 1);
     info->attr = condvar->attr;
-    info->mutexId = condvar->associated_mutex->uid;
+    // Firmware (0x81020908) reports -1 once the mutex is deleted.
+    info->mutexId = condvar->associated_mutex ? condvar->associated_mutex->uid : -1;
     info->numWaitThreads = condvar->waiting_threads->size();
 
     return SCE_KERNEL_OK;

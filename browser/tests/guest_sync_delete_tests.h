@@ -10,6 +10,7 @@
 #include <limits>
 #include <module/module.h>
 
+DECL_EXPORT(SceInt32, _sceKernelGetCondInfo, SceUID condId, Ptr<SceKernelCondInfo> pInfo);
 DECL_EXPORT(int, _sceKernelWaitEventCB, SceUID event_id, SceUInt32 bit_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout);
 
 namespace guest_sync_delete {
@@ -154,6 +155,14 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
                 REQUIRE(!cond->associated_mutex);
             }
             REQUIRE(cond->waiting_threads->empty() && mutex->waiting_threads->empty());
+            if (scenario == 1) {
+                // The dissociated condition reports mutex -1 (firmware 0x81020908).
+                auto *info = Ptr<SceKernelCondInfo>(data + 0xa0).get(env.mem);
+                std::memset(info, 0xcc, sizeof(*info));
+                info->size = sizeof(*info);
+                REQUIRE(export__sceKernelGetCondInfo(env, 0, "fixture", cond_id, Ptr<SceKernelCondInfo>(data + 0xa0)) == 0);
+                REQUIRE(info->condId == cond_id && info->mutexId == -1 && info->numWaitThreads == 0);
+            }
             run_until([&] { return waiter->status == ThreadStatus::dormant; });
             REQUIRE(word(0) == uint32_t(expected));
             REQUIRE(mutex->owner == (relock ? holder : ThreadStatePtr{}));
@@ -163,6 +172,7 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
         finish();
         REQUIRE(condvar_delete(env.kernel, "fixture", 0, cond_id, SyncWeight::Heavy)
             == (scenario == 0 || scenario == 3 ? SCE_KERNEL_ERROR_UNKNOWN_COND_ID : 0));
+        REQUIRE(export__sceKernelGetCondInfo(env, 0, "fixture", cond_id, Ptr<SceKernelCondInfo>(data + 0xa0)) == SCE_KERNEL_ERROR_UNKNOWN_COND_ID);
         REQUIRE(mutex_delete(env.kernel, "fixture", 0, mutex_id, SyncWeight::Heavy)
             == (scenario == 1 || scenario == 4 ? SCE_KERNEL_ERROR_UNKNOWN_MUTEX_ID : 0));
         std::printf("Cond deletion case %u passed\n", scenario);
@@ -244,6 +254,16 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
         REQUIRE(simple_event_delete(env.kernel, "fixture", 0, event) == 0);
         REQUIRE(!env.kernel.simple_events.contains(event));
         REQUIRE(simple_event_delete(env.kernel, "fixture", 0, event) == SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
+        // A waiting desktop thread that is deleted is only set running; its
+        // wait must unlink itself instead of reporting an acquired semaphore.
+        const SceUID sema = semaphore_create(env.kernel, "fixture", "desktop sema", 0, 0, 0, 1);
+        REQUIRE(sema >= 0);
+        a->status = ThreadStatus::wait;
+        a->exit_delete(false);
+        REQUIRE(a->status == ThreadStatus::run);
+        REQUIRE(semaphore_wait(env.kernel, "fixture", a->id, sema, 1, nullptr) == SCE_KERNEL_ERROR_WAIT_CANCEL);
+        REQUIRE(env.kernel.semaphores.at(sema)->waiting_threads->empty());
+        REQUIRE(semaphore_delete(env.kernel, "fixture", 0, sema) == 0);
         a->status = ThreadStatus::dormant;
         env.kernel.execution_host = host;
     }
