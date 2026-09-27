@@ -3,7 +3,7 @@
 // dist as deployed (GXM_RUNTIME_DIST, target vita3k_web_dist), except that
 // the files of browser/web come from source so edits apply without a build.
 import { readFile } from 'node:fs/promises';
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -19,8 +19,10 @@ if (!existsSync(join(runtimeRoot, 'shaders/gxp_compiler.mjs')))
     if (!existsSync(dir)) continue;
     for (const name of readdirSync(dir).filter((file) => file.endsWith('.wasm'))) {
       const built = join(buildOutput, basename(name));
-      if (existsSync(built) && statSync(built).mtimeMs > statSync(join(dir, name)).mtimeMs)
-        throw new Error(`${join(dir, name)} is older than ${built}: build target vita3k_web_dist`);
+      // copy_if_different keeps an identical copy's older mtime: compare bytes.
+      if (existsSync(built) && statSync(built).mtimeMs > statSync(join(dir, name)).mtimeMs
+          && !readFileSync(built).equals(readFileSync(join(dir, name))))
+        throw new Error(`${join(dir, name)} differs from the newer ${built}: build target vita3k_web_dist`);
     }
   }
 }
