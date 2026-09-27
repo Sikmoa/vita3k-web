@@ -3,6 +3,17 @@
 
 #include <emscripten/fiber.h>
 
+// A fiber switch unwinds and rewinds through Asyncify; no C++ exception
+// crosses it. The same imports declared noexcept (fiber.h cannot say so), so
+// the noexcept callers below call them directly: a potentially-throwing
+// callee would get a terminate landing pad, which Emscripten's JS exceptions
+// turn into an invoke_* wrapper that allocates BigInt arguments on every
+// guest thread switch.
+extern "C" void fiber_swap(emscripten_fiber_t *old_fiber, emscripten_fiber_t *new_fiber) noexcept
+    __asm__("emscripten_fiber_swap");
+extern "C" void fiber_init_from_current_context(emscripten_fiber_t *fiber, void *asyncify_stack,
+    size_t asyncify_stack_size) noexcept __asm__("emscripten_fiber_init_from_current_context");
+
 #include <cstdlib>
 #include <exception>
 #include <limits>
@@ -169,7 +180,7 @@ struct GuestFiberScheduler::Impl {
         // The callback and all its RAII frames have finished, including exception
         // cleanup. Only this terminal trampoline remains; never enqueue it again.
         task.status.state = State::completed;
-        emscripten_fiber_swap(&task.fiber, &task.owner.root);
+        fiber_swap(&task.fiber, &task.owner.root);
         std::abort(); // A completed fiber must NEVER be resumed.
     }
 
@@ -181,7 +192,7 @@ struct GuestFiberScheduler::Impl {
         else if (aged)
             active->penalty = std::min(active->penalty + kAgingStep, kAgingCap);
         active->status.state = state;
-        emscripten_fiber_swap(&active->fiber, &root);
+        fiber_swap(&active->fiber, &root);
         return true;
     }
 };
@@ -222,12 +233,12 @@ std::size_t GuestFiberScheduler::resume(std::size_t max_swaps) noexcept {
         return 0;
     Impl::dispatch_owner = &self;
     // Capture this root invocation, not a constructor frame that already returned.
-    emscripten_fiber_init_from_current_context(&self.root, self.root_stack.data.get(), self.root_stack.bytes);
+    fiber_init_from_current_context(&self.root, self.root_stack.data.get(), self.root_stack.bytes);
     std::size_t swaps = 0;
     while (swaps < max_swaps && self.ready) {
         auto *task = self.take_next();
         self.active = task;
-        emscripten_fiber_swap(&self.root, &task->fiber);
+        fiber_swap(&self.root, &task->fiber);
         self.active = nullptr;
         ++swaps;
         if (task->status.state == State::runnable)

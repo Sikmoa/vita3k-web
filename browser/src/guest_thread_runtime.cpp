@@ -411,18 +411,14 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
         return woke;
     }
 
-    GuestThreadRuntime::Progress pump(std::size_t budget) {
-        GuestThreadRuntime::Progress p;
-        if (!kernel || dispatching)
-            return p;
-        root_cpu = get_current_cpu_state();
-        dispatching = true;
-        struct Restore {
-            Impl &self;
-            ~Restore() { self.dispatching = false; self.active = nullptr; set_current_cpu_state(self.root_cpu); }
-        } restore{*this};
+    // The dispatch loop, once per guest thread switch. Out of line and with
+    // no locals with destructors, so its calls are direct: in a try region or
+    // next to a cleanup, Emscripten's JS exceptions would route each one
+    // through an invoke_* wrapper that allocates its 64-bit arguments.
+    [[gnu::noinline]] std::size_t dispatch(std::size_t budget) {
+        std::size_t dispatches = 0;
         service();
-        while (p.dispatches < budget) {
+        while (dispatches < budget) {
             const auto count = scheduler.resume(1);
             if (!count) {
                 // Every fiber is parked. service() can still wake one (an
@@ -432,9 +428,25 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
                     break;
                 continue;
             }
-            p.dispatches += count;
+            dispatches += count;
             service();
         }
+        return dispatches;
+    }
+    GuestThreadRuntime::Progress pump(std::size_t budget) {
+        GuestThreadRuntime::Progress p;
+        if (!kernel || dispatching)
+            return p;
+        root_cpu = get_current_cpu_state();
+        dispatching = true;
+        const auto restore = [this] { dispatching = false; active = nullptr; set_current_cpu_state(root_cpu); };
+        try {
+            p.dispatches = dispatch(budget);
+        } catch (...) {
+            restore();
+            throw;
+        }
+        restore();
         p.failed = failures;
         for (const auto &[id, pointer] : records) {
             const auto &r = *pointer;

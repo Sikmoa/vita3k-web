@@ -32,6 +32,17 @@ const hot = new Map([
   ['ThreadState::run_host_active_loop()', 0],
   // One: the debugger's single-step path calls the virtual CPUInterface::step.
   ['vita3k::web::GuestThreadRuntime::Impl::run_cpu(ThreadState&, bool)', 1],
+  // Every guest thread switch: the dispatch loop and the fiber swaps
+  // (guest_thread_runtime.cpp, guest_fiber_scheduler.cpp). Two: suspend's
+  // logic_error constructions on its misuse paths.
+  ['vita3k::web::GuestThreadRuntime::Impl::dispatch(unsigned long)', 0],
+  ['vita3k::web::GuestThreadRuntime::Impl::suspend(bool, bool)', 2],
+  // GXM command recording, several calls per guest draw (renderer.cpp,
+  // SceGxm.cpp): commands are allocated through the context's std::function.
+  ['renderer::set_program(renderer::State&, renderer::Context*, Ptr<void const>, bool)', 0],
+  ['renderer::set_texture(renderer::State&, renderer::Context*, unsigned int, SceGxmTexture)', 0],
+  ['renderer::set_vertex_stream(renderer::State&, renderer::Context*, unsigned long, unsigned long, Ptr<void const>)', 0],
+  ['gxmSetUniformBuffers(renderer::State&, GxmState&, SceGxmContext*, SceGxmProgram const&, std::__2::span<Ptr<void const>, 18446744073709551615ul>, std::__2::array<unsigned int, 15ul> const&, MemState const&)', 0],
 ]);
 // call_import may keep invokes on its cold paths (debug watch, missing NID),
 // but the HLE body itself must be a direct call_indirect after resolve_import.
@@ -78,4 +89,4 @@ if (failures.length) {
   console.error(`hot path invoke check failed:\n  ${failures.join('\n  ')}`);
   process.exit(1);
 }
-console.log(`hot path invoke check passed (${[...hot.keys()].length} functions, call_import HLE call direct)`);
+console.log(`hot path invoke check passed (${hot.size} functions, call_import HLE call direct)`);

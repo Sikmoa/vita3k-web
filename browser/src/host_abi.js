@@ -27,26 +27,31 @@ Module['vita3kNullGpu'] = Module['VITA3K_NULL_GPU'] === '1' ||
 
 // Typed-array offsets are Numbers; raw Wasm i64 arguments are BigInts. Convert
 // only after an exact range check. No bitwise coercion of native pointers.
+// These run on every JIT dispatch and GXM submission, so the checks use
+// Numbers (exact below 2^53, far above any memory size) and allocate nothing:
+// BigInt arithmetic and an 8 GiB byteLength are heap values each time.
+let hostLimit = 0;
 Module['vita3kHostOffset'] = (pointer, length = 0) => {
   // Raw wasm32 i32 pointer exports/imports may arrive as signed Numbers.
   // Reinterpret only that known 32-bit ABI; never coerce a wasm64 pointer.
   if (!Module['vita3kMemory64'] && typeof pointer === 'number' &&
       Number.isInteger(pointer) && pointer < 0 && pointer >= -0x80000000)
     pointer += 0x100000000;
-  if ((typeof pointer !== 'number' && typeof pointer !== 'bigint') ||
-      (typeof pointer === 'number' && !Number.isSafeInteger(pointer)) ||
+  // A BigInt at or above 2^53 converts to at least 2^53 and fails the limit.
+  const start = typeof pointer === 'bigint' ? Number(pointer) : pointer;
+  if (typeof start !== 'number' || !Number.isSafeInteger(start) || start < 0 ||
       !Number.isSafeInteger(length) || length < 0)
     throw new RangeError('invalid host memory range');
-  const start = BigInt(pointer);
-  const end = start + BigInt(length);
-  const limit = BigInt(wasmMemory.buffer.byteLength);
-  if (start < 0n || end > limit || end > BigInt(wasmMemory.buffer.byteLength))
+  // The memory can only grow: re-read its size only when a range exceeds it.
+  if (start + length > hostLimit) hostLimit = wasmMemory.buffer.byteLength;
+  if (start + length > hostLimit)
     throw new RangeError('host memory range is outside the runtime area');
-  return Number(start);
+  return start;
 };
 Module['vita3kHostPointer'] = (pointer) => {
   const offset = Module['vita3kHostOffset'](pointer);
-  return Module['vita3kMemory64'] ? BigInt(offset) : offset;
+  if (!Module['vita3kMemory64']) return offset;
+  return typeof pointer === 'bigint' ? pointer : BigInt(offset);
 };
 Module['vita3kHostBytes'] = (pointer, length) =>
   new Uint8Array(wasmMemory.buffer, Module['vita3kHostOffset'](pointer, length), length);
