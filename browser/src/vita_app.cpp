@@ -206,17 +206,20 @@ static int build_aot_image(EmuEnvState &env, const char *out_path) {
             seed_values.push_back(value);
         std::fclose(in);
     }
-    // Code = each module's text segment (segment 0). Page permissions cannot
-    // tell text from data here (data pages are mapped executable too), and a
-    // module with no unwind table, entry point or executed seed (e.g. the
-    // bootimage container) contributes no code.
+    // Code = each module's text segment (segment 0) up to its .ARM.exidx
+    // end-of-code sentinel, past which the segment holds read-only data.
+    // Page permissions cannot tell text from data here (data pages are
+    // mapped executable too), and a module with no unwind table, entry point
+    // or executed seed (e.g. the bootimage container) contributes no code.
     for (const auto &[uid, module] : env.kernel.loaded_modules) {
         const auto &info = module->info;
         const auto &segment = info.segments[0];
         const Address base = segment.vaddr.address();
         if (!segment.memsz || !executable(base))
             continue;
-        const uint32_t size = static_cast<uint32_t>(segment.memsz & ~1u);
+        const uint32_t size = WasmJitCPU::aot_code_size(env.mem, base, static_cast<uint32_t>(segment.memsz),
+                                  base + info.exidx_top.address(), base + info.exidx_btm.address())
+            & ~1u;
         const bool has_seed = std::any_of(seed_values.begin(), seed_values.end(),
             [&](uint64_t value) { return static_cast<uint32_t>(value) - base < size; });
         const bool has_exidx = info.exidx_top.address() < info.exidx_btm.address();
@@ -276,7 +279,9 @@ static int build_aot_image(EmuEnvState &env, const char *out_path) {
             }
         }
     }
-    for (const auto &[nid, address] : env.kernel.export_nids)
+    // Function exports only: export_nids also maps variable exports, which
+    // are data addresses.
+    for (const auto &[key, address] : env.kernel.export_nids_by_lib)
         add(address, export_roots);
     spec.extra_entries = seed_values;
     const std::size_t seeds = seed_values.size();

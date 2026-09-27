@@ -127,6 +127,10 @@ public:
     // Root location for a code address (bit 0 = Thumb) in the default
     // execution state: IT/E clear and the default FPSCR mode.
     static uint64_t aot_location(uint32_t address);
+    // Bytes of guest code at the start of a module's text segment
+    // [text, text + size): up to the .ARM.exidx end-of-code sentinel when the
+    // table [exidx_begin, exidx_end) ends with one, else the whole segment.
+    static uint32_t aot_code_size(MemState &mem, uint32_t text, uint32_t size, uint32_t exidx_begin, uint32_t exidx_end);
     // Bump when the module ABI changes: JitState layout, imports or the
     // fp64 helper operations generated code calls (fp64.h).
     static constexpr uint32_t aot_version = 4;

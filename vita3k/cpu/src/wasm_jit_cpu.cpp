@@ -2268,6 +2268,29 @@ uint64_t WasmJitCPU::aot_location(uint32_t address) {
         Dynarmic::A32::FPSCR{0}}.UniqueHash();
 }
 
+// The linker ends .ARM.exidx with an EXIDX_CANTUNWIND entry at the first
+// byte past the code it covers, so the last function has an end (entries are
+// sorted by function start; each function extends to the next entry). Past
+// it, the text segment holds read-only data: module info, export tables,
+// strings. Scanning that as code turns data into roots and junk blocks.
+uint32_t WasmJitCPU::aot_code_size(MemState &mem, uint32_t text, uint32_t size, uint32_t exidx_begin, uint32_t exidx_end) {
+    constexpr uint32_t exidx_cantunwind = 1;
+    if (exidx_end < exidx_begin || exidx_end - exidx_begin < 16 || (exidx_end - exidx_begin) % 8)
+        return size;
+    std::array<uint32_t, 4> last{}; // the last two entries
+    if (!mem_read(mem, exidx_end - 16, last.data(), sizeof(last)) || (last[0] | last[2]) & 0x80000000u
+        || last[3] != exidx_cantunwind)
+        return size;
+    const auto target = [](uint32_t entry, uint32_t word) {
+        return entry + static_cast<uint32_t>(static_cast<int32_t>(word << 1) >> 1);
+    };
+    const uint32_t previous = target(exidx_end - 16, last[0]) & ~1u;
+    const uint32_t end = target(exidx_end - 8, last[2]);
+    if (end & 1 || end <= previous || previous - text >= size || end - text > size)
+        return size;
+    return end - text;
+}
+
 bool WasmJitCPU::build_aot(MemState &mem, const AotBuildSpec &spec, std::vector<uint8_t> &out, std::string &report) {
     auto options = vita3k::wasmjit::region_state_options();
     // Same predicate as each CPU's lazy regions: the fast-path metadata arrays

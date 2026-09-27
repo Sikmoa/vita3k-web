@@ -355,7 +355,50 @@ TrapOutcome run_trap() {
 }
 } // namespace
 
+// A module's code ends at its .ARM.exidx end-of-code sentinel (a final
+// EXIDX_CANTUNWIND entry); the rest of the text segment is data and must not
+// become AOT code. Tables without that sentinel keep the whole segment.
+void code_size_from_exidx() {
+    constexpr uint32_t kText = 0x81060000, kSize = 0x1000, kTable = kText + 0x800;
+    MemState mem{};
+    CHECK(init(mem, true));
+    CHECK(alloc_at(mem, kText, kSize, "aot-exidx") == kText);
+    // prel31 word from an entry to a function start (negative: code below).
+    const auto entry = [](uint32_t at, uint32_t function, uint32_t second) {
+        return std::array<uint32_t, 2>{(function - at) & 0x7fffffffu, second};
+    };
+    const auto table = [&](std::initializer_list<std::array<uint32_t, 3>> rows) {
+        uint32_t at = kTable;
+        for (const auto &[function, second, unused] : rows) {
+            (void)unused;
+            const auto words = entry(at, function, second);
+            CHECK(mem_write(mem, at, words.data(), sizeof(words)));
+            at += 8;
+        }
+        return at;
+    };
+    // Thumb functions (one mid-table EXIDX_CANTUNWIND), 16-byte ARM import
+    // stubs, then the sentinel at the first byte past the last stub.
+    uint32_t end = table({{kText | 1, 0x80b0b0b0u, 0}, {kText + 0x101, 1, 0}, {kText + 0x200, 0x80b0b0b0u, 0},
+        {kText + 0x210, 0x80b0b0b0u, 0}, {kText + 0x220, 1, 0}});
+    CHECK(WasmJitCPU::aot_code_size(mem, kText, kSize, kTable, end) == 0x220);
+    // The same table without the sentinel: the last stub's end is unknown.
+    CHECK(WasmJitCPU::aot_code_size(mem, kText, kSize, kTable, end - 8) == kSize);
+    // A final Thumb or out-of-segment CANTUNWIND target is not a sentinel.
+    end = table({{kText | 1, 0x80b0b0b0u, 0}, {kText + 0x221, 1, 0}});
+    CHECK(WasmJitCPU::aot_code_size(mem, kText, kSize, kTable, end) == kSize);
+    end = table({{kText | 1, 0x80b0b0b0u, 0}, {kText + kSize + 4, 1, 0}});
+    CHECK(WasmJitCPU::aot_code_size(mem, kText, kSize, kTable, end) == kSize);
+    // Empty, single-entry and misaligned tables keep the whole segment.
+    CHECK(WasmJitCPU::aot_code_size(mem, kText, kSize, kTable, kTable) == kSize);
+    CHECK(WasmJitCPU::aot_code_size(mem, kText, kSize, kTable, kTable + 8) == kSize);
+    CHECK(WasmJitCPU::aot_code_size(mem, kText, kSize, kTable, kTable + 20) == kSize);
+    deinit_mem(mem);
+    std::puts("AOT code size: exidx end-of-code sentinel bounds the text segment");
+}
+
 int main() {
+    code_size_from_exidx();
     const Final oracle = run_interpreter();
     // Lazy slices must fit the largest block (64 instructions); smaller
     // ones make no progress by contract.
