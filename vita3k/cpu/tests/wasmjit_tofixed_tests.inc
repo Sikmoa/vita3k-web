@@ -186,7 +186,7 @@ void helper_differential() {
         0x447a0000u, // 1000
     };
     uint32_t rng = 0x51ab3c7d;
-    for (uint64_t iteration = 0; iteration < 200000; ++iteration) {
+    for (uint64_t iteration = 0; iteration < 1000000; ++iteration) {
         rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
         const uint32_t lane = iteration < sizeof(edges) / sizeof(edges[0]) ? edges[iteration] : rng;
         for (uint32_t operation : {6u, 7u}) {
@@ -204,7 +204,25 @@ void helper_differential() {
     // The first selector past VSQRT.F64 (10) must still reject.
     const auto invalid = fp64_arithmetic(11, 0, 0, 0);
     CHECK(invalid.bits == 0x7ff8000000000000ull && invalid.flags == 1);
-    std::puts("tofixed helper differential: 200000 patterns x 2 operations passed");
+    std::puts("tofixed helper differential: 1000000 patterns x 2 operations passed");
+    // Every sign and exponent with edge and random fractions: the lane
+    // conversion is independent of the vendored FPToFixed.
+    uint64_t swept = 0;
+    for (uint32_t high = 0; high < 512; ++high)
+        for (uint32_t fraction : {0u, 1u, 0x400000u, 0x7fffffu, 0x3fffffu, 0x000fffu}) {
+            for (uint32_t operation : {6u, 7u}) {
+                const uint32_t lane = high << 23 | fraction;
+                const auto result = fp64_arithmetic(operation, lane, 0, 0);
+                uint32_t oracle_flags = 0;
+                const uint32_t oracle = oracle_tofixed(lane, operation == 7, oracle_flags);
+                if (result.bits != oracle || result.flags != oracle_flags)
+                    std::fprintf(stderr, "tofixed sweep op=%u lane=%08x bits=%08x/%08x flags=%02x/%02x\n",
+                        operation, lane, uint32_t(result.bits), oracle, result.flags, oracle_flags);
+                CHECK(result.bits == oracle && result.flags == oracle_flags);
+                ++swept;
+            }
+        }
+    std::printf("tofixed exponent sweep: %llu cases passed\n", static_cast<unsigned long long>(swept));
 }
 
 // Exhaustive input-class coverage through the emitted IR, both operations

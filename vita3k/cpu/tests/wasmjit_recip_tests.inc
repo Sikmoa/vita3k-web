@@ -165,9 +165,64 @@ void hand_cases() {
     std::puts("recip hand cases: standard FZ/DN, fused results, flags and mode independence passed");
 }
 
-// Direct helper differential: sampled bit patterns, one lane at a time,
-// against the same Dynarmic entry points the helper calls. This proves the
-// FP64Result packing (bits + newly-raised flags only), not the algorithm.
+// Direct helper differential against Dynarmic called directly: sampled bit
+// patterns, one lane at a time. RECPE (memoized) and VRECPS (binary64 with
+// rounding to odd) are independent implementations, so this checks their
+// algorithms as well as the FP64Result packing.
+bool same_as_dynarmic(uint32_t operation, uint32_t lane_a, uint32_t lane_b) {
+    const auto result = vita3k::wasmjit::fp64_arithmetic(operation, lane_a, lane_b, 0);
+    const auto fpcr = Dynarmic::FP::FPCR{0}.ASIMDStandardValue();
+    Dynarmic::FP::FPSR fpsr{0};
+    const uint32_t oracle = operation == 4 ? Dynarmic::FP::FPRecipEstimate<uint32_t>(lane_a, fpcr, fpsr)
+                                           : Dynarmic::FP::FPRecipStepFused<uint32_t>(lane_a, lane_b, fpcr, fpsr);
+    const uint32_t oracle_flags = fpsr.Value() & 0x9f;
+    if (result.bits != oracle || result.flags != oracle_flags)
+        std::fprintf(stderr, "recip lane op=%u a=%08x b=%08x bits=%08x/%08x flags=%02x/%02x\n",
+            operation, lane_a, lane_b, uint32_t(result.bits), oracle, result.flags, oracle_flags);
+    return result.bits == oracle && result.flags == oracle_flags;
+}
+// RECPE for every sign, exponent and top-8 fraction key, each with three
+// different low fraction parts (the memo claims they cannot matter), and
+// VRECPS on the operands Newton iterations produce: b near 1/a (result near
+// 1) and a*b near 2 (deep cancellation), plus products near overflow.
+void lane_algorithms() {
+    uint32_t rng = 0x2545f491;
+    const auto next = [&rng] { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; };
+    uint64_t checked = 0;
+    for (uint32_t key = 0; key < (1u << 17); ++key)
+        for (int low = 0; low < 3; ++low, ++checked)
+            CHECK(same_as_dynarmic(4, key << 15 | (low == 0 ? 0 : low == 1 ? 0x7fff : (next() & 0x7fff)), 0));
+    for (int i = 0; i < 1500000; ++i, ++checked) {
+        const float a = std::ldexp(1.0f + float(next() & 0xffffff) / 16777216.0f, int(next() % 250) - 125)
+            * ((next() & 1) ? -1.0f : 1.0f);
+        const uint32_t ulps = next() % 2048;
+        const int32_t delta = (next() & 1) ? int32_t(ulps) : -int32_t(ulps);
+        const float target = (i % 3 == 2) ? 2.0f / a : 1.0f / a;
+        const uint32_t b = std::bit_cast<uint32_t>(target) + uint32_t(delta);
+        CHECK(same_as_dynarmic(5, std::bit_cast<uint32_t>(a), b));
+    }
+    // Products that fall exactly on a binary32 rounding midpoint, where
+    // rounding the binary64 sum first would round twice: a short-mantissa b
+    // makes the exact a*b land on midpoints, and the 2.0 (large products) or
+    // the product itself (small ones) decides the direction.
+    const uint32_t short_mantissas[] = {0x3fa00000u, 0x3fc00000u, 0x3f900000u, 0x3fe00000u, 0x40400000u, 0x3f880000u};
+    for (int i = 0; i < 1000000; ++i, ++checked) {
+        const uint32_t a = (next() & 0x807fffffu) | ((1u + next() % 254u) << 23);
+        const uint32_t base = short_mantissas[next() % 6];
+        const int shift = int(next() % 250) - 125;
+        const uint32_t exponent = uint32_t(int((base >> 23) & 0xff) + shift);
+        if (exponent < 1 || exponent > 254) continue;
+        const uint32_t b = (base & 0x807fffffu) | exponent << 23 | (next() & 0x80000000u);
+        CHECK(same_as_dynarmic(5, a, b));
+    }
+    for (int i = 0; i < 200000; ++i, ++checked) {
+        const uint32_t a = (next() & 0x807fffffu) | ((200u + next() % 55u) << 23);
+        const uint32_t b = (next() & 0x807fffffu) | ((170u + next() % 85u) << 23);
+        CHECK(same_as_dynarmic(5, a, b));
+    }
+    std::printf("recip lane algorithms: %llu cases (every RECPE key, Newton and overflow VRECPS) passed\n",
+        static_cast<unsigned long long>(checked));
+}
 void helper_differential() {
     using vita3k::wasmjit::fp64_arithmetic;
     uint32_t rng = 0x9e3779b9;
@@ -198,6 +253,7 @@ void helper_differential() {
     const auto invalid = fp64_arithmetic(11, 0, 0, 0);
     CHECK(invalid.bits == 0x7ff8000000000000ull && invalid.flags == 1);
     std::puts("recip helper differential: 400000 patterns x 4 operations passed");
+    lane_algorithms();
 }
 
 // Exhaustive input-class coverage through the emitted IR, in Q/D and both

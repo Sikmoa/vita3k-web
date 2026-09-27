@@ -27,16 +27,17 @@ struct FP64Result {
 // A32 translator's fpcr_controlled=false call sites, regardless of `fpscr`.
 // Subnormal inputs flush to signed zero with IDC, NaNs become default NaNs,
 // and flushed tiny results raise UFC without IXC. Only newly raised IDC/DZC/
-// OFC/UFC/IXC/IOC bits (mask 0x9f) are returned. Their results come from the
-// vendored Dynarmic FP implementation (common/fp), which is linked in, so
-// there is no second estimate algorithm to keep in sync.
+// OFC/UFC/IXC/IOC bits (mask 0x9f) are returned. RECPE memoizes the vendored
+// Dynarmic FPRecipEstimate per sign, exponent and top 8 fraction bits (all
+// it reads of a normal input); VRECPS is computed exactly in binary64 with
+// rounding to odd. The backend tests check both against Dynarmic directly.
 // Operations 6 and 7 implement the ARM vector float-to-int VCVT for one
 // binary32 lane packed in the low 32 bits of `a`: operation 6 = signed
 // (vcvt.s32.f32), operation 7 = unsigned (vcvt.u32.f32). The A32 translator
 // emits fbits=0, TowardsZero rounding and fpcr_controlled=false for these,
 // so both always execute as FPToFixed(ibits=32, fbits=0, TowardsZero) under
 // ASIMDStandardValue() (FZ=1, DN=1; explicit rounding overrides RN), regardless
-// of `fpscr`, via the vendored implementation. Only newly raised IOC/IXC/IDC
+// of `fpscr` (checked against the vendored implementation). Only newly raised IOC/IXC/IDC
 // bits (mask 0x9f) are returned: either sign of subnormal input becomes zero
 // with IDC only. The 32-bit integer result rides in the low 32 result bits.
 // Operations 8 and 9 are the reciprocal square root counterparts of 4 and 5,

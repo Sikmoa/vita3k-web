@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "fp64.h"
 
+#include <bit>
+#include <cmath>
+
 #include "dynarmic/common/fp/op.h"
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/common/fp/fpsr.h"
@@ -240,21 +243,102 @@ FP64Result fp32_lane_estimate(uint32_t operation, uint32_t lane_a, uint32_t lane
     return {result, fpsr.Value() & 0x9f};
 }
 
-// Binary32 lane float-to-int VCVT backed by the vendored Dynarmic
-// implementation (common/fp/op/FPToFixed.cpp). The A32 translator emits the
-// standard VCVT shape (fbits=0, TowardsZero, fpcr_controlled=false), so the
-// conversion always runs as FPToFixed(ibits=32, fbits=0, TowardsZero) under
-// the standard FPSCR value (FZ=1, DN=1, with explicit TowardsZero rounding).
-// Flushed subnormal inputs return zero with IDC, not IOC/IXC. The emitter
-// rejects any other immediate shape before the helper can run. The u32
-// result and the newly raised flag bits map onto the FP64Result contract.
-FP64Result fp32_lane_to_fixed(uint32_t operation, uint32_t lane) noexcept {
-    const auto fpcr = Dynarmic::FP::FPCR{0}.ASIMDStandardValue(); // RN, FZ=1, DN=1
-    Dynarmic::FP::FPSR fpsr{0}; // cumulative flags, freshly cleared
-    const bool unsigned_ = operation == 7;
-    const uint64_t result = Dynarmic::FP::FPToFixed<uint32_t>(
-        32, lane, 0, unsigned_, fpcr, Dynarmic::FP::RoundingMode::TowardsZero, fpsr);
-    return {result & 0xffffffffu, fpsr.Value() & 0x9f};
+// Lane fast paths for the hot vector estimates and conversions (Limbo runs
+// ~1M of them a second). Each returns exactly what the vendored Dynarmic
+// functions above return, flags included; wasmjit_recip_tests.inc and
+// wasmjit_tofixed_tests.inc check them against Dynarmic called directly.
+
+// VRECPE: for a normal input, FPRecipEstimate depends only on the sign, the
+// exponent and the top 8 fraction bits (it scales the mantissa to 9 bits), so
+// results are memoized per bits >> 15 from the vendored implementation.
+// Zero, subnormal (flushed, IDC), infinity and NaN inputs call it directly.
+FP64Result recip_estimate_lane(uint32_t lane) noexcept {
+    const uint32_t exponent = (lane >> 23) & 0xff;
+    if (exponent == 0 || exponent == 0xff)
+        return fp32_lane_estimate(4, lane, 0);
+    static uint64_t memo[1u << 17]; // bits | flags << 32 | filled << 40
+    uint64_t &entry = memo[lane >> 15];
+    if (!(entry >> 40)) {
+        const FP64Result result = fp32_lane_estimate(4, lane, 0);
+        entry = (result.bits & 0xffffffffu) | uint64_t(result.flags) << 32 | uint64_t(1) << 40;
+    }
+    return {entry & 0xffffffffu, uint32_t(entry >> 32) & 0xff};
+}
+
+// VRECPS: 2.0 + (-a) * b fused, standard FPSCR (RN, FZ, DN). The product of
+// two binary32 values is exact in binary64; the sum is rounded to odd (TwoSum
+// error term) so that one binary32 rounding of it is correct, and the FZ
+// underflow test sees the exact magnitude (rounding to odd never lands on the
+// binary64 value 2^-126 from below).
+FP64Result recip_step_lane(uint32_t a, uint32_t b) noexcept {
+    uint32_t flags = 0;
+    const auto flush = [&flags](uint32_t lane) {
+        if ((lane & 0x7f800000u) == 0 && (lane & 0x007fffffu) != 0) {
+            flags |= idc;
+            return lane & 0x80000000u;
+        }
+        return lane;
+    };
+    const uint32_t x = flush(a ^ 0x80000000u), y = flush(b);
+    const auto nan = [](uint32_t v) { return (v & 0x7fffffffu) > 0x7f800000u; };
+    if (nan(x) || nan(y)) {
+        const auto signaling = [&](uint32_t v) { return nan(v) && !(v & 0x00400000u); };
+        if (signaling(x) || signaling(y))
+            flags |= ioc;
+        return {0x7fc00000u, flags};
+    }
+    const bool inf_x = (x & 0x7fffffffu) == 0x7f800000u, inf_y = (y & 0x7fffffffu) == 0x7f800000u;
+    const bool zero_x = (x & 0x7fffffffu) == 0, zero_y = (y & 0x7fffffffu) == 0;
+    if ((inf_x && zero_y) || (zero_x && inf_y))
+        return {0x40000000u, flags}; // +2.0
+    if (inf_x || inf_y)
+        return {((x ^ y) & 0x80000000u) | 0x7f800000u, flags};
+    const double product = double(std::bit_cast<float>(x)) * double(std::bit_cast<float>(y));
+    double sum = 2.0 + product;
+    const double back = sum - 2.0;
+    const double error = (2.0 - (sum - back)) + (product - back);
+    if (sum == 0.0)
+        return {0, flags}; // exact zero: +0 under RN
+    if (error != 0.0) {
+        uint64_t bits = std::bit_cast<uint64_t>(sum);
+        if (!(bits & 1))
+            bits += ((error > 0.0) == (sum > 0.0)) ? 1 : uint64_t(-1); // toward the exact value
+        sum = std::bit_cast<double>(bits);
+    }
+    if (std::fabs(sum) < 0x1p-126)
+        return {sum < 0.0 ? 0x80000000u : 0u, flags | ufc};
+    const float rounded = float(sum);
+    if (std::isinf(rounded))
+        return {std::bit_cast<uint32_t>(rounded), flags | ofc | ixc};
+    if (error != 0.0 || double(rounded) != sum)
+        flags |= ixc;
+    return {std::bit_cast<uint32_t>(rounded), flags};
+}
+
+// VCVT.S32/U32.F32 (fbits 0, towards zero, FZ): FPToFixed(32, 0).
+FP64Result to_fixed_lane(uint32_t lane, bool unsigned_) noexcept {
+    const uint32_t exponent = (lane >> 23) & 0xff, fraction = lane & 0x007fffffu;
+    const bool negative = lane >> 31;
+    if (exponent == 0)
+        return {0, fraction ? idc : 0u}; // zero, or a subnormal flushed to zero
+    if (exponent == 0xff && fraction)
+        return {0, ioc}; // NaN
+    if (negative && unsigned_)
+        return {0, ioc};
+    if (exponent == 0xff)
+        return {unsigned_ ? 0xffffffffu : negative ? 0x80000000u : 0x7fffffffu, ioc};
+    const double value = double(std::bit_cast<float>(lane));
+    const double truncated = std::trunc(value);
+    if (unsigned_) {
+        if (truncated >= 0x1p32)
+            return {0xffffffffu, ioc};
+    } else if (truncated >= 0x1p31) {
+        return {0x7fffffffu, ioc};
+    } else if (truncated < -0x1p31) {
+        return {0x80000000u, ioc};
+    }
+    const uint32_t result = unsigned_ ? uint32_t(truncated) : uint32_t(int32_t(truncated));
+    return {result, truncated != value ? ixc : 0u};
 }
 
 } // namespace
@@ -270,13 +354,11 @@ FP64Result fp64_arithmetic(uint32_t operation, uint64_t a, uint64_t b, uint32_t 
     // packs the a lane into memory_value[0] and, for VRECPS, the b lane into
     // memory_value[2]; the i64 arguments arrive as those packed words.
     if (operation == 4)
-        return fp32_lane_estimate(4, uint32_t(a), uint32_t(b));
+        return recip_estimate_lane(uint32_t(a));
     if (operation == 5)
-        return fp32_lane_estimate(5, uint32_t(a), uint32_t(b));
-    if (operation == 6)
-        return fp32_lane_to_fixed(6, uint32_t(a));
-    if (operation == 7)
-        return fp32_lane_to_fixed(7, uint32_t(a));
+        return recip_step_lane(uint32_t(a), uint32_t(b));
+    if (operation == 6 || operation == 7)
+        return to_fixed_lane(uint32_t(a), operation == 7);
     if (operation == 8 || operation == 9)
         return fp32_lane_estimate(operation, uint32_t(a), uint32_t(b));
     if (operation == 10)

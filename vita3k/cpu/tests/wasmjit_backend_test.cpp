@@ -8,6 +8,7 @@
 #include <dynarmic/common/fp/op.h>
 #include <dynarmic/common/fp/fpcr.h>
 #include <dynarmic/common/fp/fpsr.h>
+#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
