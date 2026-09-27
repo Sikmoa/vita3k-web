@@ -138,10 +138,11 @@ inline void test_guest_clib(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(text(out) == "he");
     // sceClibVprintf reads the va_list in r1, not r1 itself as the first argument.
     word(cell) = 0xcccccccc;
-    REQUIRE(call(kVprintf, { put("abcd%n"), words({ cell }) }) == SCE_KERNEL_OK);
+    // Firmware 3.74 printf and vprintf return the formatter's length.
+    REQUIRE(call(kVprintf, { put("abcd%n"), words({ cell }) }) == 4);
     REQUIRE(word(cell) == 4);
     word(cell) = 0xcccccccc;
-    REQUIRE(call(kPrintf, { put("%lld%n"), 0xdeadbeef, 1, 0, cell }) == SCE_KERNEL_OK);
+    REQUIRE(call(kPrintf, { put("%lld%n"), 0xdeadbeef, 1, 0, cell }) == 1);
     REQUIRE(word(cell) == 1);
 
     // Register-pair doubles are read as bit patterns, not converted integers.
@@ -181,6 +182,14 @@ inline void test_guest_clib(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call64(kStrtoll, { big, cell, 0 }) == 0x7fffffffffffffffull);
     REQUIRE(word(cell) == big + 18);
     REQUIRE(call64(kStrtoll, { number, 0, 10 }) == uint64_t(-123ll));
+    // Errors go to the SceLibKernel errno word, TLS slot 0x20: ERANGE clamps,
+    // a bad base is EINVAL with the end at the start.
+    auto &errno_word = *env.kernel.get_thread_tls_addr(env.mem, thread.id, 0x20).cast<uint32_t>().get(env.mem);
+    errno_word = 0;
+    REQUIRE(call64(kStrtoll, { put("99999999999999999999"), cell, 10 }) == 0x7fffffffffffffffull);
+    REQUIRE(errno_word == SCE_ERROR_ERRNO_ERANGE);
+    errno_word = 0;
+    REQUIRE(call64(kStrtoll, { number, cell, 1 }) == 0 && word(cell) == number && errno_word == SCE_ERROR_ERRNO_EINVAL);
 
     // sceDbg handlers: five named arguments, so the message and its arguments
     // are on the stack. The assertion handler reports and returns its third
@@ -205,5 +214,5 @@ inline void test_guest_clib(EmuEnvState &env, ThreadState &thread) {
     env.kernel.process_exit_callback = saved_exit;
 
     free(env.mem, page);
-    std::puts("Guest clib: printf length modifiers, va_list alignment, strlcpy/strlcat, strtoll and sceDbg handlers passed");
+    std::puts("Guest clib: printf length modifiers, va_list alignment, strlcpy/strlcat, strtoll errno and sceDbg handlers passed");
 }

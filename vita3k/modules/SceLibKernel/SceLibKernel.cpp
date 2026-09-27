@@ -42,6 +42,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <stdexcept>
 
 enum class TimerFlags : uint32_t {
     FIFO_THREAD = 0x00000000,
@@ -74,15 +75,29 @@ VAR_EXPORT(__stack_chk_guard) {
     return ptr.address();
 }
 
+// Firmware 3.74 __sce_aeabi_idiv0/ldiv0 are `bkpt 0x80` and __stack_chk_fail
+// is `bkpt 0x81`: a user breakpoint the kernel treats as a fatal fault. The
+// browser runtime fails the calling thread with a diagnostic, as it does for
+// any other guest fault.
+[[maybe_unused]] static void guest_breakpoint(const char *what) {
+#ifdef __EMSCRIPTEN__
+    throw std::runtime_error(what);
+#else
+    (void)what;
+#endif
+}
+
 EXPORT(int, __sce_aeabi_idiv0) {
     TRACY_FUNC(__sce_aeabi_idiv0);
     LOG_ERROR("Division by zero");
+    guest_breakpoint("__sce_aeabi_idiv0: integer division by zero (bkpt 0x80)");
     return UNIMPLEMENTED();
 }
 
 EXPORT(int, __sce_aeabi_ldiv0) {
     TRACY_FUNC(__sce_aeabi_ldiv0);
     LOG_ERROR("Division by zero");
+    guest_breakpoint("__sce_aeabi_ldiv0: 64-bit integer division by zero (bkpt 0x80)");
     return UNIMPLEMENTED();
 }
 
@@ -94,6 +109,7 @@ EXPORT(int, __stack_chk_fail) {
     auto ctx = save_context(*thread->cpu);
     LOG_ERROR("{}", ctx.description());
 
+    guest_breakpoint("__stack_chk_fail: stack corruption (bkpt 0x81)");
     assert(false); // if this triggers then something is seriously wrong somewhere else
 
     return UNIMPLEMENTED();
@@ -313,7 +329,8 @@ EXPORT(int, sceClibPrintf, const char *fmt, module::vargs args) {
 
     LOG_INFO("{}{}", text->text, text->length > text->text.size() ? " [truncated]" : "");
 
-    return SCE_KERNEL_OK;
+    // Firmware 3.74 returns the formatter's length.
+    return static_cast<int>(text->length);
 }
 
 EXPORT(int, sceClibSnprintf, char *dst, SceSize dst_max_size, const char *fmt, module::vargs args) {
@@ -448,11 +465,26 @@ EXPORT(Ptr<char>, sceClibStrstr, const char *s1, const char *s2) {
     return Ptr<char>(res, emuenv.mem);
 }
 
+// Firmware 3.74 reports EINVAL (bad base, endptr = str) and ERANGE
+// (overflow, result clamped) through the SceLibKernel errno word, TLS slot 0x20.
 EXPORT(int64_t, sceClibStrtoll, Ptr<const char> str, Ptr<char> *endptr, int base) {
     TRACY_FUNC(sceClibStrtoll, str, endptr, base);
+    const auto set_errno = [&](uint32_t error) {
+        if (const auto slot = emuenv.kernel.get_thread_tls_addr(emuenv.mem, thread_id, 0x20))
+            *slot.cast<uint32_t>().get(emuenv.mem) = error;
+    };
+    if (base != 0 && (base < 2 || base > 36)) {
+        set_errno(SCE_ERROR_ERRNO_EINVAL);
+        if (endptr)
+            *endptr = Ptr<char>(str.address());
+        return 0;
+    }
     const char *const host_str = str.get(emuenv.mem);
     char *host_end = nullptr;
+    errno = 0;
     const int64_t result = strtoll(host_str, &host_end, base);
+    if (errno == ERANGE)
+        set_errno(SCE_ERROR_ERRNO_ERANGE);
     if (endptr) {
         *endptr = Ptr<char>(str.address() + static_cast<Address>(host_end - host_str));
     }
@@ -487,7 +519,7 @@ EXPORT(int, sceClibVprintf, const char *fmt, Address list) {
         return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
     }
     LOG_INFO("{}{}", text->text, text->length > text->text.size() ? " [truncated]" : "");
-    return SCE_KERNEL_OK;
+    return static_cast<int>(text->length);
 }
 
 EXPORT(int, sceClibVsnprintf, char *dst, SceSize dst_max_size, const char *fmt, Address list) {

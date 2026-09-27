@@ -309,15 +309,20 @@ set(_hle_exports
     sceClibMemcmp sceClibMemmove sceClibMemcpy_safe sceClibLookCtypeTable
     sceClibStrchr sceClibStrrchr sceClibStrncmp sceClibStrncasecmp sceClibStrnlen
     sceClibStrncpy sceClibStrncat sceClibTolower sceClibToupper
-    # BSD strlcpy/strlcat returns; strtoll stores the guest end address.
+    # BSD strlcpy/strlcat returns; strtoll stores the guest end address and
+    # reports EINVAL/ERANGE in the SceLibKernel errno word, TLS slot 0x20.
     sceClibStrlcpy sceClibStrlcat sceClibStrtoll
     # Guest printf family: module::format_guest reads each argument with its
     # guest ARM EABI width (32-bit long, size_t and pointers; 8-byte aligned
-    # long long and double), from registers, stack or a guest va_list.
+    # long long and double), from registers, stack or a guest va_list; each
+    # returns the formatted length.
     sceClibPrintf sceClibVprintf sceClibSnprintf sceClibVsnprintf
     # Log the formatted message; the assertion handler returns its third
     # argument and leaves stopping to the guest's own break instruction.
     sceDbgAssertionHandler sceDbgLoggingHandler
+    # Firmware bkpt handlers (division by zero, stack check): the calling
+    # thread fails with a diagnostic, as on any guest fault.
+    __sce_aeabi_idiv0 __sce_aeabi_ldiv0 __stack_chk_fail
     # LwCond signal/delete: signal unlinks parked waiters and sets them
     # running (notify only); delete wakes waiters with WAIT_DELETE_LW_COND.
     # No host condition variable is reached.
