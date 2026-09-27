@@ -750,6 +750,10 @@ void free(MemState &state, Address address) {
     page = {};
     state.allocator.free(page_num, page_count);
     std::fill_n(state.page_permissions.get() + page_num, page_count, MemPerm::None);
+    // Unmapping removes Execute as mem_set_permissions does: cached
+    // translations of these pages must not run again.
+    if (g_mem_write_observer)
+        g_mem_write_observer(region_start, static_cast<size_t>(region_end - region_start));
     if (PAGE_NAME_TRACKING)
         state.page_name_map.erase(page_num);
     if (state.sparse_host_memory) {
