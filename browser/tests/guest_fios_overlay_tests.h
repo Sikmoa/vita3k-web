@@ -11,7 +11,7 @@ inline void test_guest_fios_overlay(EmuEnvState &env, ThreadState &thread) {
     constexpr uint32_t add_nid = 0x6C4BE9CD, get_info = 0xAB7B4213, get_list = 0x1DD808D1, modify = 0xCA388053,
                        remove_nid = 0xE5D1B6F5, resolve_nid = 0x61C4AAC4, is_disabled = 0x23B8DB1D,
                        set_disabled = 0x70321220;
-    constexpr uint32_t self = GUEST_PROCESS_ID, bad_path = 0x80820005, bad_ptr = 0x80820006, access = 0x80820013,
+    constexpr uint32_t self = KernelState::process_id, bad_path = 0x80820005, bad_ptr = 0x80820006, access = 0x80820013,
                        too_long = 0x80820018, too_many = 0x80820019, bad_overlay = 0x8082001A;
     const Address data = alloc(env.mem, 4096, "fios overlay fixture");
     REQUIRE(data);

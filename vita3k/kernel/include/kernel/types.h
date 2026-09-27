@@ -565,9 +565,6 @@ enum SceSysmoduleInternalModuleId : uint32_t {
     SCE_SYSMODULE_INTERNAL_LOCATION_FACTORY = 0x80000029 //!< Location Factory module
 };
 
-// The emulator runs one guest process; this is its pid (TLS_PROCESS_ID).
-constexpr SceUID GUEST_PROCESS_ID = 1;
-
 // Indexes in thread local storage (TLS) for system data. It is used mostly by libkernel.
 enum TlsItems {
     TLS_PROCESS_ID = 0,

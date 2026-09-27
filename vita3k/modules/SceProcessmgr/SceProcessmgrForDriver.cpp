@@ -47,7 +47,7 @@ EXPORT(int, SceProcessmgrForDriver_B1C3EFCA, SceUID pid, SceUInt32 value) {
 // Firmware 3.74 processmgr resolves pid 0 (and its own pid) to the calling
 // process; any other is 0x80029001 here, where there is one process.
 static bool is_own_process(SceUID pid) {
-    return pid == 0 || pid == GUEST_PROCESS_ID;
+    return pid == 0 || pid == KernelState::process_id;
 }
 
 // Processmgr 0x81000a69: the SDK version from the executable's

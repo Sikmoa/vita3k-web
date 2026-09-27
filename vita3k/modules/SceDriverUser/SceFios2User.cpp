@@ -53,12 +53,12 @@ EXPORT(int, sceFiosOverlayAddForProcess02, SceUID processId, SceFiosProcessOverl
     TRACY_FUNC(sceFiosOverlayAddForProcess02, processId, pOverlay, pOutID);
     if (pOverlay && pOverlay->type != SCE_FIOS_OVERLAY_TYPE_OPAQUE)
         LOG_WARN("Using unimplemented overlay type {}.", fmt::underlying(pOverlay->type));
-    return create_overlay(emuenv.io, GUEST_PROCESS_ID, processId, pOverlay, pOutID);
+    return create_overlay(emuenv.io, KernelState::process_id, processId, pOverlay, pOutID);
 }
 
 EXPORT(int, sceFiosOverlayGetInfoForProcess02, SceUID processId, SceFiosOverlayID id, SceFiosProcessOverlay *pOutOverlay) {
     TRACY_FUNC(sceFiosOverlayGetInfoForProcess02, processId, id, pOutOverlay);
-    return get_overlay(emuenv.io, GUEST_PROCESS_ID, processId, id, pOutOverlay);
+    return get_overlay(emuenv.io, KernelState::process_id, processId, id, pOutOverlay);
 }
 
 EXPORT(int, sceFiosOverlayGetList02, SceUID processId, uint32_t minOrder, uint32_t maxOrder, SceFiosOverlayID *pOutIDs, SceUInt32 maxIDs, SceUInt32 *pActualIDs) {
@@ -71,7 +71,7 @@ EXPORT(int, sceFiosOverlayGetList02, SceUID processId, uint32_t minOrder, uint32
     // Another process's overlays and privileged ones are left out, not refused.
     SceUInt32 count = 0;
     for (const auto &overlay : emuenv.io.overlays) {
-        if (processId != GUEST_PROCESS_ID || overlay.process_id != processId || overlay.order >= 0x80)
+        if (processId != KernelState::process_id || overlay.process_id != processId || overlay.order >= 0x80)
             continue;
         if (overlay.order < minOrder || overlay.order > maxOrder)
             continue;
@@ -99,12 +99,12 @@ EXPORT(int, sceFiosOverlayGetRecommendedScheduler02, int param1, const char *pat
 
 EXPORT(int, sceFiosOverlayModifyForProcess02, SceUID processId, SceFiosOverlayID id, const SceFiosProcessOverlay *pNewValue) {
     TRACY_FUNC(sceFiosOverlayModifyForProcess02, processId, id, pNewValue);
-    return modify_overlay(emuenv.io, GUEST_PROCESS_ID, processId, id, pNewValue);
+    return modify_overlay(emuenv.io, KernelState::process_id, processId, id, pNewValue);
 }
 
 EXPORT(int, sceFiosOverlayRemoveForProcess02, SceUID processId, SceFiosOverlayID id) {
     TRACY_FUNC(sceFiosOverlayRemoveForProcess02, processId, id);
-    return remove_overlay(emuenv.io, GUEST_PROCESS_ID, processId, id);
+    return remove_overlay(emuenv.io, KernelState::process_id, processId, id);
 }
 
 EXPORT(int, sceFiosOverlayResolveSync02) {
