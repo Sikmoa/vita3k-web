@@ -296,7 +296,7 @@ void KernelState::deinit(MemState &mem) {
 
     debugger.deinit();
 
-    next_uid = 1;
+    next_uid = first_object_uid;
 
     paused_threads_status.clear();
 }

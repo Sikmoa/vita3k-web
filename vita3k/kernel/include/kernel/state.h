@@ -242,6 +242,7 @@ struct KernelState {
     // The emulated title runs as one process; its uid is reserved so that no
     // other kernel object can share it.
     static constexpr SceUID process_id = 1;
+    static constexpr SceUID first_object_uid = process_id + 1;
     Ptr<void> client_vtable = Ptr<void>(0);
     Ptr<Address> shellsvc_client = Ptr<Address>(0);
     Ptr<void> libc_dso_handle_main = Ptr<void>(0);
@@ -284,6 +285,6 @@ struct KernelState {
     SceKernelModuleInfo *find_module_by_addr(Address address);
 
 private:
-    std::atomic<SceUID> next_uid{ process_id + 1 };
+    std::atomic<SceUID> next_uid{ first_object_uid };
     std::map<SceUID, ThreadStatus> paused_threads_status;
 };
