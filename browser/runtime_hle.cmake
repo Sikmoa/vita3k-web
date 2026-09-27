@@ -472,6 +472,8 @@ add_custom_command(
     VERBATIM)
 
 add_library(vita3k_web_runtime_hle STATIC
+    # decrypt_fself for module_parent.cpp's module loader.
+    "${_HLE_BROWSER_ROOT}/src/vita_self_decrypt.cpp"
     "${_HLE_BROWSER_ROOT}/src/gxm_webgpu_bridge.cpp"
     "${_HLE_BROWSER_ROOT}/src/msg_dialog_bridge.cpp"
     "${_lang_root}/src/lang.cpp"

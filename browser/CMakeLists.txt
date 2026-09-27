@@ -48,7 +48,6 @@ if(EMSCRIPTEN)
     # variants below; backend selection stays a compile definition.
     set(VITA3K_WEB_APP_SOURCES
         src/vita_app.cpp
-        src/vita_self_decrypt.cpp
     )
     add_executable(vita3k_web_app_bench
         src/vita_runtime.cpp
@@ -65,7 +64,6 @@ if(EMSCRIPTEN)
     endif()
     add_executable(vita3k_guest_thread_tests
         tests/guest_thread_lifecycle_test.cpp
-        src/vita_self_decrypt.cpp
     )
     target_link_libraries(vita3k_guest_thread_tests PRIVATE vita3k_guest_thread_runtime)
     target_link_options(vita3k_guest_thread_tests PRIVATE
