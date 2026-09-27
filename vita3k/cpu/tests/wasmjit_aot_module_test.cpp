@@ -3,9 +3,10 @@
 // A small Thumb-2 program (calls, returns through BX LR and POP {PC}, a loop,
 // an IT block, a tail jump, loads and stores) runs on the interpreter oracle,
 // on the lazy region JIT and on an AOT module built from the same guest
-// memory. Final registers, flags, memory and instruction counts must agree,
-// including when the AOT run is cut into tiny scheduler slices so every
-// re-entry goes through the lookup table into the middle of a function.
+// memory. Final registers, the full CPSR and FPSCR, memory and instruction
+// counts must agree, including when the AOT run is cut into tiny scheduler
+// slices so every re-entry goes through the lookup table into the middle of a
+// function.
 #include "../src/wasm_jit_cpu.cpp"
 #include <cpu/impl/interpreter_cpu.h>
 
@@ -55,6 +56,13 @@ constexpr uint32_t kDone = kCode + 0x62;
 // classify(7) + 3 * 49 + sum(i*i + (i > 50)) for i < 100
 constexpr uint32_t kResult = 26 + 147 + 328350 + 49;
 
+// Non-default entry state the program never writes: the Q flag, GE bits and
+// user mode in the CPSR, and FPSCR NZCV plus every cumulative exception flag.
+// None of these is part of the location key (IT, T, E and the FPSCR mode are),
+// so the AOT lookup still matches, and every run must hand them back as-is.
+constexpr uint32_t kEntryCpsr = (1u << 27) | (0x5u << 16) | 0x20 | 0x10;
+constexpr uint32_t kEntryFpscr = 0xa0000000u | 0x9f;
+
 struct Fixture {
     MemState mem{};
     Fixture() {
@@ -70,7 +78,7 @@ struct Fixture {
 
 struct Final {
     std::array<uint32_t, 16> regs{};
-    uint32_t nzcv = 0;
+    uint32_t cpsr = 0, fpscr = 0; // full architectural words
     std::array<uint32_t, 100> table{};
     uint64_t executed = 0;
 };
@@ -82,8 +90,8 @@ void reset(Cpu &cpu, MemState &mem) {
     cpu.set_sp(kStackTop);
     cpu.set_lr(0xdeadbeef);
     cpu.set_pc(kCode);
-    cpu.set_cpsr(0x20);
-    cpu.set_fpscr(0);
+    cpu.set_cpsr(kEntryCpsr);
+    cpu.set_fpscr(kEntryFpscr);
     std::array<uint32_t, 100> zero{};
     CHECK(mem_write(mem, kData, zero.data(), sizeof(zero)));
 }
@@ -93,7 +101,8 @@ Final capture(Cpu &cpu, MemState &mem, uint64_t executed) {
     Final out;
     for (unsigned r = 0; r < 16; ++r)
         out.regs[r] = cpu.get_reg(r);
-    out.nzcv = cpu.get_cpsr() & 0xf0000000;
+    out.cpsr = cpu.get_cpsr();
+    out.fpscr = cpu.get_fpscr();
     CHECK(mem_read(mem, kData, out.table.data(), sizeof(out.table)));
     out.executed = executed;
     return out;
@@ -105,7 +114,10 @@ void check_same(const Final &a, const Final &b) {
             std::fprintf(stderr, "r%u: %08x vs %08x\n", r, a.regs[r], b.regs[r]);
         CHECK(a.regs[r] == b.regs[r]);
     }
-    CHECK(a.nzcv == b.nzcv);
+    if (a.cpsr != b.cpsr || a.fpscr != b.fpscr)
+        std::fprintf(stderr, "cpsr %08x vs %08x, fpscr %08x vs %08x\n", a.cpsr, b.cpsr, a.fpscr, b.fpscr);
+    CHECK(a.cpsr == b.cpsr);
+    CHECK(a.fpscr == b.fpscr);
     CHECK(a.table == b.table);
     CHECK(a.executed == b.executed);
 }
@@ -121,6 +133,7 @@ Final run_interpreter() {
     CHECK(cpu.get_pc() == kDone + 2);
     const Final out = capture(cpu, fixture.mem, cpu.instructions_executed());
     CHECK(out.regs[0] == kResult && out.regs[5] == 0x1005); // main restores r4/r5
+    CHECK((out.cpsr & 0x0fffffffu) == kEntryCpsr && out.fpscr == kEntryFpscr);
     for (uint32_t i = 0; i < 100; ++i)
         CHECK(out.table[i] == i * i + (i > 50));
     return out;
