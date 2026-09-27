@@ -9,6 +9,7 @@
 // function.
 #include "../src/wasm_jit_cpu.cpp"
 #include <cpu/impl/interpreter_cpu.h>
+#include <kernel/relocation.h>
 
 #include <array>
 #include <cstdio>
@@ -340,6 +341,37 @@ void write_epochs_recorded(bool aot) {
     CHECK(fixture.mem.write_epochs[kCode >> 12] != 77);
     CHECK((cpu.regions_formed() == 0) == aot);
 }
+// AOT pointer roots come from the absolute values a module's relocations
+// write (vita_app.cpp build_aot_image): ABS32/TARGET1 words and MOVW/MOVT
+// pairs, once per pair; relative and prel31 relocations are not pointers.
+void relocation_pointers() {
+    constexpr uint32_t kText = 0x81070000, kData = 0x81071000;
+    MemState mem{};
+    CHECK(init(mem, true));
+    CHECK(alloc_at(mem, kText, 0x1000, "reloc-text") == kText);
+    CHECK(alloc_at(mem, kData, 0x1000, "reloc-data") == kData);
+    const SegmentInfosForReloc segments{{0, {kText, kText, 0x1000}}, {1, {kData, kData, 0x1000}}};
+    // Format 0: format, symbol segment, code, patch segment (code2 = 0); addend; offset.
+    const auto format0 = [](uint32_t code, uint32_t addend, uint32_t offset) {
+        return std::array<uint32_t, 3>{0u | 0u << 4 | code << 8 | 1u << 16, addend, offset};
+    };
+    std::vector<uint32_t> entries;
+    for (const auto &entry : {format0(2, 0x41, 0), format0(3, 0x81, 4), format0(38, 0x80, 8), format0(42, 0x101, 12)})
+        entries.insert(entries.end(), entry.begin(), entry.end());
+    // Format 3: Thumb MOVW at g_offset + 4 (16), MOVT 4 bytes later, symbol segment 0.
+    entries.push_back(3u | 0u << 4 | 1u << 8 | 4u << 9 | 4u << 27);
+    entries.push_back(0x1235);
+    std::vector<Address> pointers;
+    CHECK(relocate(entries.data(), static_cast<uint32_t>(entries.size() * 4), segments, mem, false, 0, &pointers));
+    CHECK((pointers == std::vector<Address>{kText + 0x41, kText + 0x80, kText + 0x1235}));
+    uint32_t word = 0;
+    CHECK(mem_read(mem, kData, &word, sizeof(word)) && word == kText + 0x41);
+    CHECK(mem_read(mem, kData + 4, &word, sizeof(word)) && word == kText + 0x81 - (kData + 4));
+    // Without a sink the same relocations still apply.
+    CHECK(relocate(entries.data(), static_cast<uint32_t>(entries.size() * 4), segments, mem));
+    deinit_mem(mem);
+    std::puts("AOT pointer roots: absolute relocation values recorded, relative ones not");
+}
 // Lazy (before the module loads) and AOT runs of the trap program must fail
 // the same way: the emission-time rejection error, PC on the UDF, and the
 // MOVS before it executed.
@@ -390,28 +422,61 @@ void code_size_from_exidx() {
         }
         return at;
     };
+    // No module info in the segment (0 here) bounds nothing.
+    const auto code_size = [&](uint32_t end, uint32_t module_info = 0) {
+        return WasmJitCPU::aot_code_size(mem, kText, kSize, kTable, end, module_info);
+    };
     // Thumb functions (one mid-table EXIDX_CANTUNWIND), 16-byte ARM import
     // stubs, then the sentinel at the first byte past the last stub.
     uint32_t end = table({{kText | 1, 0x80b0b0b0u, 0}, {kText + 0x101, 1, 0}, {kText + 0x200, 0x80b0b0b0u, 0},
         {kText + 0x210, 0x80b0b0b0u, 0}, {kText + 0x220, 1, 0}});
-    CHECK(WasmJitCPU::aot_code_size(mem, kText, kSize, kTable, end) == 0x220);
-    // The same table without the sentinel: the last stub's end is unknown.
-    CHECK(WasmJitCPU::aot_code_size(mem, kText, kSize, kTable, end - 8) == kSize);
-    // A final Thumb or out-of-segment CANTUNWIND target is not a sentinel.
+    CHECK(code_size(end) == 0x220);
+    // The module info never extends the code past the sentinel.
+    CHECK(code_size(end, kText + 0x300) == 0x220);
+    // The same table without the sentinel: the last stub's end is unknown,
+    // unless the module info follows it (SceLibft2, SceSysmodule).
+    CHECK(code_size(end - 8) == kSize);
+    CHECK(code_size(end - 8, kText + 0x220) == 0x220);
+    // Module info below the last function start, at the segment end or
+    // outside the segment is not an end of code.
+    CHECK(code_size(end - 8, kText + 0x210) == kSize);
+    CHECK(code_size(end - 8, kText + kSize) == kSize);
+    CHECK(code_size(end - 8, kText - 0x100) == kSize);
+    // A final Thumb or out-of-segment CANTUNWIND target is not a sentinel;
+    // the table then ends with a function that the module info can bound
+    // (SceLibPvf, SceLibSsl end with an unwound Thumb function).
     end = table({{kText | 1, 0x80b0b0b0u, 0}, {kText + 0x221, 1, 0}});
-    CHECK(WasmJitCPU::aot_code_size(mem, kText, kSize, kTable, end) == kSize);
+    CHECK(code_size(end) == kSize);
+    CHECK(code_size(end, kText + 0x300) == 0x300);
     end = table({{kText | 1, 0x80b0b0b0u, 0}, {kText + kSize + 4, 1, 0}});
-    CHECK(WasmJitCPU::aot_code_size(mem, kText, kSize, kTable, end) == kSize);
+    CHECK(code_size(end) == kSize);
+    CHECK(code_size(end, kText + 0x300) == kSize);
     // Empty, single-entry and misaligned tables keep the whole segment.
-    CHECK(WasmJitCPU::aot_code_size(mem, kText, kSize, kTable, kTable) == kSize);
-    CHECK(WasmJitCPU::aot_code_size(mem, kText, kSize, kTable, kTable + 8) == kSize);
-    CHECK(WasmJitCPU::aot_code_size(mem, kText, kSize, kTable, kTable + 20) == kSize);
+    CHECK(code_size(kTable, kText + 0x300) == kSize);
+    CHECK(code_size(kTable + 8, kText + 0x300) == kSize);
+    CHECK(code_size(kTable + 20, kText + 0x300) == kSize);
+    // Function starts: the Thumb bit as recorded, and restored for an entry
+    // that lacks it at a halfword-aligned start or at a conditional ARM
+    // word (SceLibc 8035b520: push {r0,r4,lr}; subs r2,#32 reads as ARM
+    // 0x3a20b511, "bcc"). AL and unconditional-space words stay ARM, and
+    // an inline-unwind first word (bit 31) is not a function.
+    const std::array<uint32_t, 4> starts{0xe92d4010u, 0x3a20b511u, 0xf5d1f000u, 0x0000bf00u};
+    CHECK(mem_write(mem, kText + 0x400, starts.data(), sizeof(starts)));
+    end = table({{kText | 1, 0x80b0b0b0u, 0}, {kText + 0x400, 1, 0}, {kText + 0x404, 1, 0}, {kText + 0x408, 1, 0},
+        {kText + 0x40e, 1, 0}});
+    const uint32_t skipped = 0x80000000u;
+    CHECK(mem_write(mem, end, &skipped, sizeof(skipped)));
+    CHECK((WasmJitCPU::aot_exidx_functions(mem, kTable, end + 8)
+        == std::vector<uint32_t>{kText | 1, kText + 0x400, kText + 0x405, kText + 0x408, kText + 0x40f}));
+    CHECK(WasmJitCPU::aot_exidx_functions(mem, kTable, kTable).empty());
+    CHECK(WasmJitCPU::aot_exidx_functions(mem, kTable + 8, kTable).empty());
     deinit_mem(mem);
-    std::puts("AOT code size: exidx end-of-code sentinel bounds the text segment");
+    std::puts("AOT code size: the exidx end-of-code sentinel and the module info bound the text segment; exidx Thumb bits restored");
 }
 
 int main() {
     code_size_from_exidx();
+    relocation_pointers();
     const Final oracle = run_interpreter();
     // Lazy slices must fit the largest block (64 instructions); smaller
     // ones make no progress by contract.

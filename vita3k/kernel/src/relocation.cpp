@@ -300,7 +300,7 @@ static bool relocate_entry(void *data, uint32_t code, uint32_t symval, uint32_t 
     return true; // ignore unhandled relocations
 }
 
-bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &segments, const MemState &mem, bool is_var_import, uint32_t explicit_symval) {
+bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &segments, const MemState &mem, bool is_var_import, uint32_t explicit_symval, std::vector<Address> *absolute_values) {
     const void *const end = static_cast<const uint8_t *>(entries) + size;
     const Entry *entry = static_cast<const Entry *>(entries);
 
@@ -326,7 +326,12 @@ bool relocate(const void *entries, uint32_t size, const SegmentInfosForReloc &se
         if (code == None || code == V4BX || code == RBase)
             return true;
         auto *data = target_pointer(address, code == Abs8 ? 1 : 4);
-        return data && relocate_entry(data, code, symbol, addend, static_cast<Address>(address));
+        if (!data || !relocate_entry(data, code, symbol, addend, static_cast<Address>(address)))
+            return false;
+        // MOVT carries the high half of the value its MOVW pair records.
+        if (absolute_values && (code == Abs32 || code == Target1 || code == MovwAbsNc || code == ThumbMovwAbsNc))
+            absolute_values->push_back(symbol + addend);
+        return true;
     };
 
     if (LOG_RELOCATIONS) {

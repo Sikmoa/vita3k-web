@@ -49,9 +49,12 @@ struct MemState;
 struct CodecEngineBlock;
 
 struct KernelModule {
-    SceKernelModuleInfo info;
+    SceKernelModuleInfo info{};
     Ptr<const uint8_t> info_segment_address;
-    uint32_t info_offset;
+    uint32_t info_offset = 0;
+    // Addresses the module's own relocations wrote as absolute values: the
+    // pointers its code and data hold (see relocate()).
+    std::vector<Address> absolute_relocations;
 };
 typedef std::shared_ptr<KernelModule> SceKernelModulePtr;
 

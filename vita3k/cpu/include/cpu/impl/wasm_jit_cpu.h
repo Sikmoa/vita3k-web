@@ -129,8 +129,14 @@ public:
     static uint64_t aot_location(uint32_t address);
     // Bytes of guest code at the start of a module's text segment
     // [text, text + size): up to the .ARM.exidx end-of-code sentinel when the
-    // table [exidx_begin, exidx_end) ends with one, else the whole segment.
-    static uint32_t aot_code_size(MemState &mem, uint32_t text, uint32_t size, uint32_t exidx_begin, uint32_t exidx_end);
+    // table [exidx_begin, exidx_end) ends with one, and never past the module
+    // info (read-only data) when every function in the table starts below it.
+    static uint32_t aot_code_size(MemState &mem, uint32_t text, uint32_t size, uint32_t exidx_begin, uint32_t exidx_end,
+        uint32_t module_info);
+    // Function starts (bit 0 = Thumb) of the .ARM.exidx table
+    // [exidx_begin, exidx_end). An entry without the Thumb bit whose first
+    // ARM instruction is conditional is a Thumb function (see the definition).
+    static std::vector<uint32_t> aot_exidx_functions(MemState &mem, uint32_t exidx_begin, uint32_t exidx_end);
     // Bump when the module ABI changes: JitState layout, imports or the
     // fp64 helper operations generated code calls (fp64.h).
     static constexpr uint32_t aot_version = 4;

@@ -229,7 +229,6 @@ SceUID load_module(EmuEnvState &emuenv, const std::string &module_path) {
         if (!is_lle_module(module_name, emuenv)) {
             LOG_INFO("Module {} is HLE. Skipping load.", module_name);
             const SceKernelModulePtr kernelModuleInfo = std::make_shared<KernelModule>();
-            memset(kernelModuleInfo.get(), 0, sizeof(KernelModule));
 
             auto *sceKernelModuleInfo = &kernelModuleInfo->info;
             sceKernelModuleInfo->size = sizeof(*sceKernelModuleInfo);

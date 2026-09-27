@@ -208,7 +208,8 @@ static int build_aot_image(EmuEnvState &env, const char *out_path) {
         std::fclose(in);
     }
     // Code = each module's text segment (segment 0) up to its .ARM.exidx
-    // end-of-code sentinel, past which the segment holds read-only data.
+    // end-of-code sentinel or its module info, past which the segment holds
+    // read-only data (WasmJitCPU::aot_code_size).
     // Page permissions cannot tell text from data here (data pages are
     // mapped executable too), and a module with no unwind table, entry point
     // or executed seed (e.g. the bootimage container) contributes no code.
@@ -219,7 +220,8 @@ static int build_aot_image(EmuEnvState &env, const char *out_path) {
         if (!segment.memsz || !executable(base))
             continue;
         const uint32_t size = WasmJitCPU::aot_code_size(env.mem, base, static_cast<uint32_t>(segment.memsz),
-                                  base + info.exidx_top.address(), base + info.exidx_btm.address())
+                                  base + info.exidx_top.address(), base + info.exidx_btm.address(),
+                                  module->info_segment_address.address() + module->info_offset)
             & ~1u;
         const bool has_seed = std::any_of(seed_values.begin(), seed_values.end(),
             [&](uint64_t value) { return static_cast<uint32_t>(value) - base < size; });
@@ -238,7 +240,7 @@ static int build_aot_image(EmuEnvState &env, const char *out_path) {
                 return true;
         return false;
     };
-    std::size_t exidx_roots = 0, pointer_roots = 0, export_roots = 0, entry_roots = 0;
+    std::size_t exidx_roots = 0, relocation_roots = 0, export_roots = 0, entry_roots = 0;
     const auto add = [&](Address address, std::size_t &counter) {
         const Address pc = address & ~1u;
         if (!in_code(pc) || ((address & 1) == 0 && (pc & 3)))
@@ -252,33 +254,22 @@ static int build_aot_image(EmuEnvState &env, const char *out_path) {
             add(info.start_entry.address(), entry_roots);
         if (info.stop_entry)
             add(info.stop_entry.address(), entry_roots);
-        // .ARM.exidx: 8-byte entries whose first word is a prel31 offset to a
-        // function start (bit 0 = Thumb). The module info stores the table
-        // bounds relative to the text segment.
+        // .ARM.exidx function starts; the module info stores the table bounds
+        // relative to the text segment.
         const Address text = info.segments[0].vaddr.address();
-        const Address top = info.exidx_top.address(), bottom = info.exidx_btm.address();
-        if (top < bottom && bottom - top < (64u << 20)) {
-            for (Address entry = text + top; entry + 8 <= text + bottom; entry += 8) {
-                uint32_t word = 0;
-                if (!mem_read(env.mem, entry, &word, sizeof(word)) || (word & 0x80000000u))
-                    continue;
-                const int32_t offset = static_cast<int32_t>(word << 1) >> 1;
-                add(entry + static_cast<uint32_t>(offset), exidx_roots);
-            }
-        }
-        // Thumb code pointers anywhere in the module image (vtables, callback
-        // tables, literal pools). ARM pointers are indistinguishable from data
-        // here; they come from exidx, exports and seeds.
-        for (const auto &segment : info.segments) {
-            const Address base = segment.vaddr.address();
-            for (Address at = base; at + 4 <= base + segment.memsz; at += 4) {
-                uint32_t word = 0;
-                if (!mem_read(env.mem, at, &word, sizeof(word)))
-                    break;
-                if ((word & 1) && in_code(word & ~1u))
-                    add(word, pointer_roots);
-            }
-        }
+        for (const uint32_t function : WasmJitCPU::aot_exidx_functions(env.mem,
+                 text + info.exidx_top.address(), text + info.exidx_btm.address()))
+            add(function, exidx_roots);
+        // Thumb code pointers: the absolute values the module's relocations
+        // wrote (vtables, callback tables, literal pools, MOVW/MOVT pairs).
+        // Words that merely look like Thumb code addresses are not pointers:
+        // instruction halfword pairs, constants and non-module data such as
+        // the bootimage container match too, and turn data into roots. ARM
+        // targets cannot be told from data pointers into code; they come
+        // from exidx, exports and seeds.
+        for (const Address value : module->absolute_relocations)
+            if (value & 1)
+                add(value, relocation_roots);
     }
     // Function exports only: export_nids also maps variable exports, which
     // are data addresses.
@@ -300,8 +291,8 @@ static int build_aot_image(EmuEnvState &env, const char *out_path) {
     std::printf("[vita3k-web] AOT scan: %zu imported NIDs without an HLE implementation in this build\n", unserviced.size());
     for (const auto &[nid, stubs] : unserviced)
         std::printf("[vita3k-web]   unserviced NID=%08x %s\n", nid, import_name(nid));
-    std::printf("[vita3k-web] AOT roots: entries=%zu exidx=%zu pointers=%zu exports=%zu seeds=%zu\n",
-        entry_roots, exidx_roots, pointer_roots, export_roots, seeds);
+    std::printf("[vita3k-web] AOT roots: entries=%zu exidx=%zu relocations=%zu exports=%zu seeds=%zu\n",
+        entry_roots, exidx_roots, relocation_roots, export_roots, seeds);
     std::vector<std::uint8_t> image;
     std::string report;
     const auto started = std::chrono::steady_clock::now();

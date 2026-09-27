@@ -851,6 +851,7 @@ static SceUID load_self_impl(KernelState &kernel, MemState &mem, const void *sel
     };
 
     SegmentInfosForReloc segment_reloc_info;
+    std::vector<Address> absolute_relocations;
 
     auto free_all_segments = [](MemState &mem, SegmentInfosForReloc &segs_info) {
         for (auto &[_, segment] : segs_info) {
@@ -941,7 +942,7 @@ static SceUID load_self_impl(KernelState &kernel, MemState &mem, const void *sel
                 std::memcpy(aligned_relocations.data(), reloc_data, seg_header.p_filesz);
                 reloc_data = aligned_relocations.data();
             }
-            if (!relocate(reloc_data, seg_header.p_filesz, segment_reloc_info, mem)) {
+            if (!relocate(reloc_data, seg_header.p_filesz, segment_reloc_info, mem, false, 0, &absolute_relocations)) {
                 free_all_segments(mem, segment_reloc_info);
                 return -1;
             }
@@ -1004,8 +1005,8 @@ static SceUID load_self_impl(KernelState &kernel, MemState &mem, const void *sel
     }
 
     const SceKernelModulePtr kernelModuleInfo = std::make_shared<KernelModule>();
-    memset(kernelModuleInfo.get(), 0, sizeof(KernelModule));
 
+    kernelModuleInfo->absolute_relocations = std::move(absolute_relocations);
     kernelModuleInfo->info_segment_address = module_info_segment_address;
     kernelModuleInfo->info_offset = module_info_offset;
 

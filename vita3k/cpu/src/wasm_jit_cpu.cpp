@@ -2250,22 +2250,57 @@ uint64_t WasmJitCPU::aot_location(uint32_t address) {
 // sorted by function start; each function extends to the next entry). Past
 // it, the text segment holds read-only data: module info, export tables,
 // strings. Scanning that as code turns data into roots and junk blocks.
-uint32_t WasmJitCPU::aot_code_size(MemState &mem, uint32_t text, uint32_t size, uint32_t exidx_begin, uint32_t exidx_end) {
+// Tables without the sentinel (they end with an import stub or a function
+// with unwind data) give no end, but the module info the linker places after
+// the code still does, as long as every function in the table starts below
+// it; in every Limbo module with a sentinel, the sentinel is the module info.
+uint32_t WasmJitCPU::aot_code_size(MemState &mem, uint32_t text, uint32_t size, uint32_t exidx_begin, uint32_t exidx_end,
+    uint32_t module_info) {
     constexpr uint32_t exidx_cantunwind = 1;
     if (exidx_end < exidx_begin || exidx_end - exidx_begin < 16 || (exidx_end - exidx_begin) % 8)
         return size;
     std::array<uint32_t, 4> last{}; // the last two entries
-    if (!mem_read(mem, exidx_end - 16, last.data(), sizeof(last)) || (last[0] | last[2]) & 0x80000000u
-        || last[3] != exidx_cantunwind)
+    if (!mem_read(mem, exidx_end - 16, last.data(), sizeof(last)) || (last[0] | last[2]) & 0x80000000u)
         return size;
     const auto target = [](uint32_t entry, uint32_t word) {
         return entry + static_cast<uint32_t>(static_cast<int32_t>(word << 1) >> 1);
     };
     const uint32_t previous = target(exidx_end - 16, last[0]) & ~1u;
     const uint32_t end = target(exidx_end - 8, last[2]);
-    if (end & 1 || end <= previous || previous - text >= size || end - text > size)
-        return size;
-    return end - text;
+    uint32_t code = size;
+    if (last[3] == exidx_cantunwind && !(end & 1) && previous < end && previous - text < size && end - text <= size)
+        code = end - text;
+    // The highest function start: the sentinel's predecessor, or the last entry.
+    const uint32_t highest = code != size ? previous : end & ~1u;
+    if (highest - text < size && module_info - text < code && highest < module_info)
+        code = module_info - text;
+    return code;
+}
+
+// Each 8-byte entry starts with a prel31 offset to a function. Its bit 0 is
+// the Thumb bit of the symbol the linker resolved, and SCE modules have Thumb
+// functions whose symbol lacks it (SceLibc 8035b520, SceLibHttp 803bf198:
+// hand-written routines that relocations and executed code enter as Thumb).
+// Taken as ARM they decode Thumb halfword pairs into junk blocks. No
+// function starts with a conditional instruction (flags are undefined on
+// entry), so an ARM start whose condition field is neither AL nor the
+// unconditional space is Thumb code, as is a start that is not word-aligned.
+std::vector<uint32_t> WasmJitCPU::aot_exidx_functions(MemState &mem, uint32_t exidx_begin, uint32_t exidx_end) {
+    std::vector<uint32_t> functions;
+    if (exidx_end < exidx_begin || exidx_end - exidx_begin >= (64u << 20))
+        return functions;
+    for (uint32_t entry = exidx_begin; exidx_end - entry >= 8; entry += 8) {
+        uint32_t word = 0;
+        if (!mem_read(mem, entry, &word, sizeof(word)) || (word & 0x80000000u))
+            continue;
+        uint32_t function = entry + static_cast<uint32_t>(static_cast<int32_t>(word << 1) >> 1);
+        uint32_t first = 0;
+        if (!(function & 1)
+            && ((function & 3) || (mem_read(mem, function, &first, sizeof(first)) && (first >> 28) < 0xe)))
+            function |= 1;
+        functions.push_back(function);
+    }
+    return functions;
 }
 
 bool WasmJitCPU::build_aot(MemState &mem, const AotBuildSpec &spec, std::vector<uint8_t> &out, std::string &report) {

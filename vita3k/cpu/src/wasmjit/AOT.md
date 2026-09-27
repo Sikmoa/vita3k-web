@@ -21,11 +21,14 @@ VITA3K_NULL_GPU=1 VITA3K_AOT_BUILD=limbo.aot.wasm [VITA3K_AOT_SEEDS=seeds.txt] \
 
 * Code ranges: text segment (segment 0) of each loaded module with an unwind
   table, an entry point or a seed, up to the `.ARM.exidx` end-of-code sentinel
-  (a final `EXIDX_CANTUNWIND` entry) when the table has one; the rest of the
-  segment is read-only data (`WasmJitCPU::aot_code_size`).
-* Roots: module start/stop, `.ARM.exidx` function starts, function exports
-  (variable exports are data), Thumb code pointers found in module images, and
-  optional seeds. Seeds are full location keys of blocks the lazy JIT executed
+  (a final `EXIDX_CANTUNWIND` entry) or the module info, whichever comes first;
+  the rest of the segment is read-only data (`WasmJitCPU::aot_code_size`).
+* Roots: module start/stop, `.ARM.exidx` function starts
+  (`WasmJitCPU::aot_exidx_functions`, which restores the Thumb bit SCE tables
+  omit for some Thumb routines), function exports (variable exports are data),
+  Thumb values of the module's absolute relocations (function pointers; a
+  fixed-address executable such as Limbo has none), and optional seeds. Seeds
+  are full location keys of blocks the lazy JIT executed
   (`VITA3K_AOT_SEEDS_OUT=<file>` records them in any JIT run).
 * The build also reports untranslatable blocks by first rejected IR op, and
   imported NIDs this build has no HLE body for.
