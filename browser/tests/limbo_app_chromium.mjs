@@ -417,9 +417,18 @@ try {
           state.runStartedAt = performance.now();
           worker.postMessage({ type: 'run-app', vitaFs: data.root, title, app,
             fastVblank, ...(useAot ? { aotUrl: '/aot.wasm' } : {}) });
-          for (const { at, mask, axes, hold } of inputScript) {
-            setTimeout(() => worker.postMessage({ type: 'input', buttons: mask, axes }), at);
-            setTimeout(() => worker.postMessage({ type: 'input', buttons: 0 }), at + hold);
+          // At every press/release boundary send the combined state of all
+          // inputs held then, so releasing one input keeps the others held.
+          const boundaries = [...new Set(inputScript.flatMap(({ at, hold }) => [at, at + hold]))];
+          for (const time of boundaries) {
+            let buttons = 0;
+            const axes = [0, 0, 0, 0];
+            for (const input of inputScript) {
+              if (time < input.at || time >= input.at + input.hold) continue;
+              buttons |= input.mask;
+              input.axes.forEach((value, axis) => { if (value) axes[axis] = value; });
+            }
+            setTimeout(() => worker.postMessage({ type: 'input', buttons, axes }), time);
           }
           break;
         case 'vita-present':
