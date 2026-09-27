@@ -1193,10 +1193,12 @@ EXPORT(int, sceKernelChangeThreadVfpException, SceInt32 clearMask, SceInt32 setM
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
     if (!thread)
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+    // The mask only selects which cumulative VFP exception flags interrupt
+    // the thread; the emulated CPU raises no such interrupt, so the mask is
+    // state that libkernel reads back from TLS.
     int &vfp_exception = thread->tls.get_ptr<int>().get(emuenv.mem)[TLS_VFP_EXCEPTION];
     int old_exception = vfp_exception;
     vfp_exception = setMask | (vfp_exception & ~clearMask);
-    STUBBED("");
     return old_exception;
 }
 
