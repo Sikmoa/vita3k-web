@@ -68,7 +68,7 @@ add_library(vita3k_dynarmic_frontend STATIC
     "${_dynarmic_src}/ir/opt/naming_pass.cpp"
     "${_dynarmic_src}/ir/opt/verification_pass.cpp"
     # Portable FP helpers: the wasmjit fp64 host helper delegates the ARM
-    # vector RECPE/VRECPS estimates to these implementations instead of
+    # vector RECPE/VRECPS/VRSQRTE/VRSQRTS estimates to these implementations instead of
     # re-deriving the algorithms (correct-by-construction, one copy).
     "${_dynarmic_src}/common/fp/fused.cpp"
     "${_dynarmic_src}/common/fp/process_exception.cpp"
@@ -76,6 +76,8 @@ add_library(vita3k_dynarmic_frontend STATIC
     "${_dynarmic_src}/common/fp/unpacked.cpp"
     "${_dynarmic_src}/common/fp/op/FPRecipEstimate.cpp"
     "${_dynarmic_src}/common/fp/op/FPRecipStepFused.cpp"
+    "${_dynarmic_src}/common/fp/op/FPRSqrtEstimate.cpp"
+    "${_dynarmic_src}/common/fp/op/FPRSqrtStepFused.cpp"
     "${_dynarmic_src}/common/fp/op/FPToFixed.cpp"
     "${_dynarmic_src}/common/u128.cpp"
     "${_dynarmic_src}/common/math_util.cpp"

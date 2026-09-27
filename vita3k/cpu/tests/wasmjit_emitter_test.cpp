@@ -990,7 +990,9 @@ void reject_block(const IR::Block &block, const char *context = "") {
 void rejects() {
     const auto reject = [](const IR::Block &b) { reject_block(b); };
     auto block = blank(); append(block, Opcode::Breakpoint, {}); reject(block);
-    block = blank(); append(block, Opcode::A32GetFpscr, {}); reject(block);
+    // Full CPSR writes stay unsupported (VMSR/VMRS FPSCR access is supported).
+    block = blank(); append(block, Opcode::A32SetCpsr, {Value{uint32_t(0)}}); reject(block);
+    block = blank(); append(block, Opcode::A32GetFpscr, {}); CHECK(!emit_block(block).empty());
     block = blank(); block.ReplaceTerminal(IR::Term::Interpret{loc()}); reject(block);
     block = blank(); block.ReplaceTerminal(IR::Term::Invalid{}); reject(block);
     block = blank(); block.ReplaceTerminal(IR::Term::ReturnToDispatch{}); reject(block);

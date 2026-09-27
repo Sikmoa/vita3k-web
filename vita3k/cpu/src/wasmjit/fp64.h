@@ -39,6 +39,9 @@ struct FP64Result {
 // of `fpscr`, via the vendored implementation. Only newly raised IOC/IXC/IDC
 // bits (mask 0x9f) are returned: either sign of subnormal input becomes zero
 // with IDC only. The 32-bit integer result rides in the low 32 result bits.
+// Operations 8 and 9 are the reciprocal square root counterparts of 4 and 5,
+// under the same contract: operation 8 = vrsqrte.f32(a); operation 9 =
+// vrsqrts.f32(a, b) = (3.0 + (-a) * b) / 2 fused.
 FP64Result fp64_arithmetic(uint32_t operation, uint64_t a, uint64_t b, uint32_t fpscr) noexcept;
 
 } // namespace vita3k::wasmjit

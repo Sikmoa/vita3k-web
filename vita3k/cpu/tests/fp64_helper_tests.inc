@@ -95,8 +95,8 @@ inline void run() {
         // flags are newly raised only: do not echo NZCV/QC or cumulative bits.
         {0, 0x3ff0000000000000, 0x3ff0000000000000, 0xf800009f, 0x4000000000000000, 0},
         // Out-of-range operation selectors (vector RECPE/VRECPS occupy 4/5,
-        // vector float-to-int VCVT occupies 6/7).
-        {8, 0x3ff0000000000000, 0x3ff0000000000000, rn, 0x7ff8000000000000, ioc},
+        // vector float-to-int VCVT 6/7, vector VRSQRTE/VRSQRTS 8/9).
+        {10, 0x3ff0000000000000, 0x3ff0000000000000, rn, 0x7ff8000000000000, ioc},
     };
     for (const auto &c : cases) {
         const auto actual = fp64_arithmetic(c.op, c.a, c.b, c.fpscr);

@@ -201,8 +201,8 @@ void helper_differential() {
             CHECK(result.flags == oracle_flags);
         }
     }
-    // The next selector past the VCVT pair must still reject.
-    const auto invalid = fp64_arithmetic(8, 0, 0, 0);
+    // The first selector past the VRSQRTE/VRSQRTS pair must still reject.
+    const auto invalid = fp64_arithmetic(10, 0, 0, 0);
     CHECK(invalid.bits == 0x7ff8000000000000ull && invalid.flags == 1);
     std::puts("tofixed helper differential: 200000 patterns x 2 operations passed");
 }

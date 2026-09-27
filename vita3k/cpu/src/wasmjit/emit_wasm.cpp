@@ -2796,6 +2796,186 @@ private:
             }
             return ok;
         }
+        case Op::FPVectorNeg32:
+            // VNEG.F32 flips the sign bit only; it raises no FP exception.
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(0), word); imm(0x80000000u); op(Xor); set(next_local + word);
+            }
+            return ok;
+        case Op::FPVectorMin32:
+        case Op::FPVectorMax32: {
+            // VMIN/VMAX.F32 under the A32 standard FPSCR (fpcr_controlled=0):
+            // denormal inputs flush to signed zero (IDC), any NaN gives the
+            // default NaN (IOC for a signaling one), min(+0,-0) = -0 and
+            // max(+0,-0) = +0 (Wasm f32.min/max order zeros the same way).
+            // fast_fp drops the cumulative flags like the other FP operations.
+            if (!inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU1())
+                return false;
+            const bool minimum = kind == Op::FPVectorMin32;
+            const bool flags = !state.fast_fp();
+            const auto la = next_local + 4, lb = next_local + 5, lflags = next_local + 6;
+            if (flags) {
+                load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+                begin_if(); ret(ExitReason::Unsupported); end_if();
+                imm(0); set(lflags);
+            }
+            for (unsigned word = 0; word < 4; ++word) {
+                for (unsigned i = 0; i < 2; ++i) {
+                    const auto lane = i ? lb : la;
+                    value_word(inst.GetArg(i), word); set(lane);
+                    if (flags) {
+                        // IOC: signaling NaN (quiet bit clear, nonzero mantissa).
+                        get(lane); mask(0x7fffffff); imm(0x7f800000); op(GtU);
+                        get(lane); mask(0x00400000); op(Eqz); op(And);
+                        // IDC: nonzero denormal input about to be flushed.
+                        get(lane); mask(0x7fffffff); imm(0x00800000); op(LtU);
+                        get(lane); mask(0x7fffffff); op(Eqz); op(Eqz); op(And);
+                        imm(7); op(Shl); op(Or);
+                        get(lflags); op(Or); set(lflags);
+                    }
+                    // flush: |x| < min normal -> sign only
+                    get(lane); mask(0x80000000u);
+                    get(lane);
+                    get(lane); mask(0x7fffffff); imm(0x00800000); op(LtU);
+                    op(Select); set(lane);
+                }
+                imm(0x7fc00000);
+                get(la); op(0xbe); get(lb); op(0xbe); op(minimum ? 0x96 : 0x97); op(0xbc);
+                get(la); mask(0x7fffffff); imm(0x7f800000); op(GtU);
+                get(lb); mask(0x7fffffff); imm(0x7f800000); op(GtU); op(Or);
+                op(Select); set(next_local + word);
+            }
+            if (flags) {
+                get(0); load(offsetof(JitState, fpscr)); get(lflags); op(Or);
+                store(offsetof(JitState, fpscr));
+            }
+            return ok;
+        }
+        case Op::FPSqrt64:
+            if (!state.fast_fp() || start.FPSCR().FTZ() || (start.FPSCR().Value() & 0x00c00000u))
+                return false;
+            value64(inst.GetArg(0)); op(0xbf); op(0x9f); // f64.sqrt
+            store_f64_words(next_local);
+            return ok;
+        case Op::VectorZeroExtend8:
+            // Low eight bytes widen to eight halfwords (pmovzxbw).
+            for (unsigned word = 0; word < 4; ++word) {
+                const unsigned source = word / 2, shift = (word % 2) * 16;
+                value_word(inst.GetArg(0), source); if (shift) { imm(shift); op(ShrU); } mask(0xff);
+                value_word(inst.GetArg(0), source); imm(shift + 8); op(ShrU); mask(0xff); imm(16); op(Shl);
+                op(Or); set(next_local + word);
+            }
+            return ok;
+        case Op::VectorTable:
+            // Tuple of 1..4 table registers; VectorTableLookup reads its args.
+            return ok;
+        case Op::VectorTableLookup64: {
+            // VTBL/VTBX: byte i = idx < 8n ? table byte idx : defaults byte i.
+            const auto &table_value = inst.GetArg(1);
+            if (table_value.IsImmediate() || table_value.GetInst()->GetOpcode() != Op::VectorTable)
+                return false;
+            const Inst *table = table_value.GetInst();
+            std::vector<Value> registers;
+            for (size_t i = 0; i < table->NumArgs(); ++i) {
+                const Value reg = table->GetArg(i);
+                if (reg.IsEmpty()) break;
+                if (reg.GetType() != Type::U64) return false;
+                registers.push_back(reg);
+            }
+            if (registers.empty()) return false;
+            const uint32_t table_words = static_cast<uint32_t>(registers.size() * 2);
+            const auto idx = next_local + 2, acc = next_local + 3;
+            for (unsigned i = 0; i < 8; ++i) {
+                const unsigned word = i / 4, shift = (i % 4) * 8;
+                if (shift == 0) { imm(0); set(acc); }
+                value_word(inst.GetArg(2), word); if (shift) { imm(shift); op(ShrU); } mask(0xff); set(idx);
+                // Word (idx >> 2) of the table by a select chain.
+                value_word(registers[0], 0);
+                for (uint32_t k = 1; k < table_words; ++k) {
+                    set(next_local + 4);
+                    value_word(registers[k / 2], k % 2);
+                    get(next_local + 4);
+                    get(idx); imm(2); op(ShrU); imm(k); op(Eq);
+                    op(Select);
+                }
+                get(idx); imm(3); op(And); imm(3); op(Shl); op(ShrU); mask(0xff);
+                value_word(inst.GetArg(0), word); if (shift) { imm(shift); op(ShrU); } mask(0xff);
+                get(idx); imm(table_words * 4); op(LtU);
+                op(Select);
+                if (shift) { imm(shift); op(Shl); }
+                get(acc); op(Or); set(acc);
+                if (i % 4 == 3) { get(acc); set(next_local + word); }
+            }
+            return ok;
+        }
+        case Op::VectorZeroExtend16:
+            // Low four halfwords widen to four words (pmovzxwd).
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(0), word / 2);
+                if (word % 2) { imm(16); op(ShrU); } else mask(0xffff);
+                set(next_local + word);
+            }
+            return ok;
+        case Op::VectorNarrow32:
+            // Low halfword of each 32-bit lane into the low doubleword (pmovdw).
+            for (unsigned word = 0; word < 2; ++word) {
+                value_word(inst.GetArg(0), word * 2); mask(0xffff);
+                value_word(inst.GetArg(0), word * 2 + 1); imm(16); op(Shl);
+                op(Or); set(next_local + word);
+            }
+            imm(0); set(next_local + 2); imm(0); set(next_local + 3);
+            return ok;
+        case Op::VectorTranspose32: {
+            // part 0: {a0, b0, a2, b2}; part 1: {a1, b1, a3, b3} (VTRN.32).
+            if (!inst.GetArg(2).IsImmediate()) return false;
+            const unsigned part = inst.GetArg(2).GetU1() ? 1 : 0;
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(word % 2), (word / 2) * 2 + part);
+                set(next_local + word);
+            }
+            return ok;
+        }
+        case Op::VectorHalvingAddS32:
+            // (a + b) >> 1 with the 33-bit intermediate sum (VHADD.S32).
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(0), word); op(0xac); // i64.extend_i32_s
+                value_word(inst.GetArg(1), word); op(0xac);
+                op(Add64); constant64(code, 1); op(ShrS64); op(Wrap);
+                set(next_local + word);
+            }
+            return ok;
+        case Op::VectorArithmeticVShift32: {
+            // VSHL.S32 (register): shift by the signed low byte of each lane
+            // of b; left >= 32 gives 0, right >= 32 gives the sign fill.
+            const auto shift = next_local + 4, lane = next_local + 5;
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(0), word); set(lane);
+                value_word(inst.GetArg(1), word); imm(24); op(Shl); imm(24); op(ShrS); set(shift);
+                // left: shift < 32 ? lane << shift : 0
+                get(lane); get(shift); op(Shl);
+                imm(0);
+                get(shift); imm(32); op(LtS);
+                op(Select);
+                // right: lane >> min(-shift, 31)
+                const auto negated = next_local + 6;
+                get(lane);
+                imm(0); get(shift); op(Sub); set(negated);
+                get(negated); imm(31); get(negated); imm(31); op(LtU); op(Select);
+                op(ShrS);
+                // shift >= 0 selects the left result
+                get(shift); imm(0); op(LtS); op(Eqz);
+                op(Select); set(next_local + word);
+            }
+            return ok;
+        }
+        case Op::A32GetFpscr:
+            load(offsetof(JitState, fpscr)); set(next_local);
+            return ok;
+        case Op::A32SetFpscr:
+            // VMSR ends its block (PopRSBHint); later blocks are keyed by the
+            // new FPSCR mode through the normal location checks.
+            get(0); arg(0); store(offsetof(JitState, fpscr));
+            return ok;
         case Op::FPVectorMul32:
         case Op::FPVectorAdd32:
         case Op::FPVectorSub32: {
@@ -2908,14 +3088,17 @@ private:
             return ok;
         }
         case Op::FPVectorRecipEstimate32:
-        case Op::FPVectorRecipStepFused32: {
-            // ARM vector reciprocal estimates (vrecpe.f32 / vrecps.f32), one
+        case Op::FPVectorRecipStepFused32:
+        case Op::FPVectorRSqrtEstimate32:
+        case Op::FPVectorRSqrtStepFused32: {
+            // ARM vector reciprocal (square root) estimates and steps
+            // (vrecpe/vrecps/vrsqrte/vrsqrts .f32), one
             // helper call per lane. The A32 translator passes
             // fpcr_controlled=false for both, so the estimate always runs
             // under the standard FPSCR value; the native helper re-derives
             // every result from the vendored Dynarmic FP implementation.
             // Like FPAdd64 and friends, live exception enables must be clear.
-            const bool fused = kind == Op::FPVectorRecipStepFused32;
+            const bool fused = kind == Op::FPVectorRecipStepFused32 || kind == Op::FPVectorRSqrtStepFused32;
             const auto control = inst.GetArg(fused ? 2 : 1);
             if (!control.IsImmediate() || control.GetType() != Type::U1 || control.GetU1())
                 return false;
@@ -2934,7 +3117,8 @@ private:
                 get(0); value_word(inst.GetArg(0), word);
                 store(offsetof(JitState, memory_value));
                 get(0);
-                imm(kind == Op::FPVectorRecipEstimate32 ? 4 : 5);
+                imm(kind == Op::FPVectorRecipEstimate32 ? 4 : kind == Op::FPVectorRecipStepFused32 ? 5
+                    : kind == Op::FPVectorRSqrtEstimate32 ? 8 : 9);
                 load(offsetof(JitState, fpscr));
                 op(Call); uleb(code, 2); set(next_local + word);
                 // OR the returned cumulative-flag bits into FPSCR.

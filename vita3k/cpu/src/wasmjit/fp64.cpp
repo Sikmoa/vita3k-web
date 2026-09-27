@@ -177,8 +177,9 @@ uint64_t quotient_jam(uint64_t a, uint64_t b) noexcept {
 }
 
 // Binary32 lane helpers backed by the vendored Dynarmic implementation
-// (common/fp/op/FPRecipEstimate.cpp, FPRecipStepFused.cpp). The A32 decoder
-// emits fpcr_controlled=false for the vector RECPE/VRECPS instructions, which
+// (common/fp/op/FPRecipEstimate.cpp, FPRecipStepFused.cpp, FPRSqrtEstimate.cpp,
+// FPRSqrtStepFused.cpp). The A32 decoder emits fpcr_controlled=false for the
+// vector RECPE/VRECPS/VRSQRTE/VRSQRTS instructions, which
 // means the STANDARD FPSCR value (FPCR: RN, FZ=1, DN=1; AHP/FZ16 irrelevant
 // at esize 32) and the FPSR cumulative flags in bits [7,4:0]. Exception enables
 // are rejected by the emitter before the helper can run, so FPProcessException
@@ -188,10 +189,11 @@ FP64Result fp32_lane_estimate(uint32_t operation, uint32_t lane_a, uint32_t lane
     const auto fpcr = Dynarmic::FP::FPCR{0}.ASIMDStandardValue(); // RN, FZ=1, DN=1
     Dynarmic::FP::FPSR fpsr{0}; // cumulative flags, freshly cleared
     uint32_t result;
-    if (operation == 4) {
-        result = Dynarmic::FP::FPRecipEstimate<uint32_t>(lane_a, fpcr, fpsr);
-    } else {
-        result = Dynarmic::FP::FPRecipStepFused<uint32_t>(lane_a, lane_b, fpcr, fpsr);
+    switch (operation) {
+    case 4: result = Dynarmic::FP::FPRecipEstimate<uint32_t>(lane_a, fpcr, fpsr); break;
+    case 5: result = Dynarmic::FP::FPRecipStepFused<uint32_t>(lane_a, lane_b, fpcr, fpsr); break;
+    case 8: result = Dynarmic::FP::FPRSqrtEstimate<uint32_t>(lane_a, fpcr, fpsr); break;
+    default: result = Dynarmic::FP::FPRSqrtStepFused<uint32_t>(lane_a, lane_b, fpcr, fpsr); break;
     }
     return {result, fpsr.Value() & 0x9f};
 }
@@ -233,7 +235,9 @@ FP64Result fp64_arithmetic(uint32_t operation, uint64_t a, uint64_t b, uint32_t 
         return fp32_lane_to_fixed(6, uint32_t(a));
     if (operation == 7)
         return fp32_lane_to_fixed(7, uint32_t(a));
-    if (operation > 7)
+    if (operation == 8 || operation == 9)
+        return fp32_lane_estimate(operation, uint32_t(a), uint32_t(b));
+    if (operation > 9)
         return {default_nan, ioc};
 
     uint32_t flags = 0;

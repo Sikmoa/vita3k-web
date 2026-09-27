@@ -1,7 +1,7 @@
 // Vita3K emulator project
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Included by wasmjit_backend_test.cpp after its shared CHECK/put helpers.
-// Vector RECPE/VRECPS (FPVectorRecipEstimate32/FPVectorRecipStepFused32)
+// Vector RECPE/VRECPS/VRSQRTE/VRSQRTS (FPVector{Recip,RSqrt}{Estimate,StepFused}32)
 // fixtures. The native helper delegates to the vendored Dynarmic FP
 // implementation, so the differential oracle here IS that same library
 // called directly: the fixtures therefore prove the wiring (lane packing,
@@ -116,6 +116,19 @@ void hand_cases() {
         {5, 0x7f7fffffu, 0x40000000u, 0xff800000u, 0x14u}, // finite overflow, OFC+IXC
         {5, 0x00800000u, 0x00800000u, 0x40000000u, 0x10u}, // tiny PRODUCT, normal fused result: IXC, not UFC
         {5, 0x3f800001u, 0x3ffffffeu, 0x29000000u, 0x00u}, // exact fused residual 2^-45
+        {8, 0x00000000u, 0, 0x7f800000u, 0x02u}, // RSQRTE(+0) -> +inf, DZC
+        {8, 0x80000000u, 0, 0xff800000u, 0x02u}, // RSQRTE(-0) -> -inf, DZC
+        {8, 0x00000001u, 0, 0x7f800000u, 0x82u}, // FZ: denormal -> +0 -> +inf, IDC+DZC
+        {8, 0x7f800000u, 0, 0x00000000u, 0x00u}, // RSQRTE(+inf) -> +0
+        {8, 0xbf800000u, 0, 0x7fc00000u, 0x01u}, // negative operand: default NaN, IOC
+        {8, 0xff800000u, 0, 0x7fc00000u, 0x01u}, // -inf is negative too
+        {8, 0x7fc12345u, 0, 0x7fc00000u, 0x00u}, // DN qNaN, no IOC
+        {8, 0x7f812345u, 0, 0x7fc00000u, 0x01u}, // DN sNaN raises IOC
+        {9, 0x3f800000u, 0x3f800000u, 0x3f800000u, 0x00u}, // (3 - 1*1) / 2 = 1
+        {9, 0x40000000u, 0x3f000000u, 0x3f800000u, 0x00u}, // (3 - 2*0.5) / 2 = 1
+        {9, 0x00000000u, 0x7f800000u, 0x3fc00000u, 0x00u}, // special 0*inf -> 1.5, no IOC
+        {9, 0x80000001u, 0x7f800000u, 0x3fc00000u, 0x80u}, // flushed 0*inf -> 1.5, IDC only
+        {9, 0x3f800000u, 0xff812345u, 0x7fc00000u, 0x01u}, // signaling b -> IOC
     };
     for (const auto &item : cases) {
         for (uint32_t mode = 0; mode < 16; ++mode) {
@@ -130,9 +143,12 @@ void hand_cases() {
         for (uint32_t scr : {0u, 0x03c00000u}) {
             auto block = blank(code, scr);
             const auto a = read_q(block);
-            const auto result = item.operation == 4
-                ? append(block, Op::FPVectorRecipEstimate32, {a, Value{false}})
-                : append(block, Op::FPVectorRecipStepFused32, {a, read_q(block, 2), Value{false}});
+            const Op op = item.operation == 4 ? Op::FPVectorRecipEstimate32
+                : item.operation == 5 ? Op::FPVectorRecipStepFused32
+                : item.operation == 8 ? Op::FPVectorRSqrtEstimate32 : Op::FPVectorRSqrtStepFused32;
+            const bool step = item.operation == 5 || item.operation == 9;
+            const auto result = step ? append(block, op, {a, read_q(block, 2), Value{false}})
+                                     : append(block, op, {a, Value{false}});
             write_q(block, result, 1);
             auto state = base_state();
             state.fpscr = scr | 0xa8000004u; // preserve NZCV/QC and a preexisting OFC
@@ -160,13 +176,14 @@ void helper_differential() {
         const uint32_t lane_a = iteration < 8 ? uint32_t(0xff000000 * iteration) : rng;
         rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
         const uint32_t lane_b = iteration < 8 ? uint32_t(0x00800000 * iteration) : rng;
-        for (uint32_t operation : {4u, 5u}) {
+        for (uint32_t operation : {4u, 5u, 8u, 9u}) {
             const auto result = fp64_arithmetic(operation, lane_a, lane_b, 0);
             const auto fpcr = Dynarmic::FP::FPCR{0}.ASIMDStandardValue();
             Dynarmic::FP::FPSR fpsr{0};
-            const uint32_t oracle = operation == 4
-                ? Dynarmic::FP::FPRecipEstimate<uint32_t>(lane_a, fpcr, fpsr)
-                : Dynarmic::FP::FPRecipStepFused<uint32_t>(lane_a, lane_b, fpcr, fpsr);
+            const uint32_t oracle = operation == 4 ? Dynarmic::FP::FPRecipEstimate<uint32_t>(lane_a, fpcr, fpsr)
+                : operation == 5 ? Dynarmic::FP::FPRecipStepFused<uint32_t>(lane_a, lane_b, fpcr, fpsr)
+                : operation == 8 ? Dynarmic::FP::FPRSqrtEstimate<uint32_t>(lane_a, fpcr, fpsr)
+                                 : Dynarmic::FP::FPRSqrtStepFused<uint32_t>(lane_a, lane_b, fpcr, fpsr);
             const uint32_t oracle_flags = fpsr.Value() & 0x9f;
             if (result.bits != oracle || result.flags != oracle_flags) {
                 std::fprintf(stderr, "recip differential op=%u a=%08x b=%08x bits=%08x/%08x flags=%02x/%02x\n",
@@ -176,11 +193,10 @@ void helper_differential() {
             CHECK(result.flags == oracle_flags);
         }
     }
-    // The binary64 operations must still reject out-of-range selectors
-    // (vector float-to-int VCVT now occupies 6/7).
-    const auto invalid = fp64_arithmetic(8, 0, 0, 0);
+    // Out-of-range selectors still reject (VCVT occupies 6/7, VRSQRTE/VRSQRTS 8/9).
+    const auto invalid = fp64_arithmetic(10, 0, 0, 0);
     CHECK(invalid.bits == 0x7ff8000000000000ull && invalid.flags == 1);
-    std::puts("recip helper differential: 400000 patterns x 2 operations passed");
+    std::puts("recip helper differential: 400000 patterns x 4 operations passed");
 }
 
 // Exhaustive input-class coverage through the emitted IR, in Q/D and both
@@ -205,6 +221,8 @@ void ir_lanes() {
         const auto q0 = read_q(block);
         write_q(block, append(block, Op::FPVectorRecipEstimate32, {q0, Value{false}}), 1);
         write_q(block, append(block, Op::FPVectorRecipStepFused32, {q0, read_q(block, 2), Value{false}}), 3);
+        write_q(block, append(block, Op::FPVectorRSqrtEstimate32, {q0, Value{false}}), 4);
+        write_q(block, append(block, Op::FPVectorRSqrtStepFused32, {q0, read_q(block, 2), Value{false}}), 5);
         JitState state = base_state();
         for (unsigned word = 0; word < 4; ++word) {
             state.fpu[word] = item.a; // Q0: recpe source
@@ -222,23 +240,27 @@ void ir_lanes() {
             expected.fpu[4 + lane] = Dynarmic::FP::FPRecipEstimate<uint32_t>(a, fpcr, fpsr);
             fpsr = Dynarmic::FP::FPSR{fpsr.Value() & 0x9f};
             expected.fpu[12 + lane] = Dynarmic::FP::FPRecipStepFused<uint32_t>(a, b, fpcr, fpsr);
+            expected.fpu[16 + lane] = Dynarmic::FP::FPRSqrtEstimate<uint32_t>(a, fpcr, fpsr);
+            expected.fpu[20 + lane] = Dynarmic::FP::FPRSqrtStepFused<uint32_t>(a, b, fpcr, fpsr);
             fpscr |= fpsr.Value() & 0x9f;
         }
         expected.fpscr = fpscr;
         run(block, state, &expected);
     }
-    std::printf("recip ir lanes: %zu cases x 2 ops x (block+region) passed\n", cases.size());
+    std::printf("recip ir lanes: %zu cases x 4 ops x (block+region) passed\n", cases.size());
 }
 
 // Only an immediate fpcr_controlled=false is supported. A runtime U1
 // (even one whose live value would be false) must not bypass the shape guard.
 void immediate_guards() {
-    for (Op op : {Op::FPVectorRecipEstimate32, Op::FPVectorRecipStepFused32}) {
+    for (Op op : {Op::FPVectorRecipEstimate32, Op::FPVectorRecipStepFused32,
+             Op::FPVectorRSqrtEstimate32, Op::FPVectorRSqrtStepFused32}) {
         for (unsigned shape : {0u, 1u, 2u}) {
             auto block = blank();
             const auto controlled = shape == 2 ? append(block, Op::A32GetCFlag) : Value{shape == 1};
             const auto a = read_q(block);
-            const auto result = op == Op::FPVectorRecipEstimate32
+            const bool estimate = op == Op::FPVectorRecipEstimate32 || op == Op::FPVectorRSqrtEstimate32;
+            const auto result = estimate
                 ? append(block, op, {a, controlled})
                 : append(block, op, {a, read_q(block, 2), controlled});
             write_q(block, result, 1);

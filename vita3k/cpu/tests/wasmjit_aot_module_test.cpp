@@ -188,6 +188,39 @@ Final run_aot(uint64_t slice) {
     CHECK(cpu.regions_formed() == 0);
     return capture(cpu, fixture.mem, cpu.instructions_executed());
 }
+// VMIN/VMAX.F32 under the standard FPSCR on the lazy (exact FP) path:
+// signaling NaN -> default NaN + IOC, denormal input flushed + IDC.
+//   vldr d1, lit1; vldr d2, lit2; vmin.f32 d0,d1,d2; vmax.f32 d3,d1,d2
+//   vstr d0,[r0]; vstr d3,[r0,#8]; vmrs r1,fpscr; svc #0
+//   lit1: 0x7f800001, 1.0f   lit2: 2.0f, 0x00000001
+void vector_min_max_flags() {
+    constexpr uint32_t kNeon = 0x81030000;
+    constexpr uint8_t kNeonProgram[] = {
+        0x06, 0x1b, 0x9f, 0xed, 0x07, 0x2b, 0x9f, 0xed, 0x02, 0x0f, 0x21, 0xf2,
+        0x02, 0x3f, 0x01, 0xf2, 0x00, 0x0b, 0x80, 0xed, 0x02, 0x3b, 0x80, 0xed,
+        0x10, 0x1a, 0xf1, 0xee, 0x00, 0x00, 0x00, 0xef, 0x01, 0x00, 0x80, 0x7f,
+        0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00,
+    };
+    Fixture fixture;
+    CHECK(alloc_at(fixture.mem, kNeon, 0x1000, "aot-neon") == kNeon);
+    CHECK(mem_write(fixture.mem, kNeon, kNeonProgram, sizeof(kNeonProgram)));
+    CHECK(mem_set_permissions(fixture.mem, kNeon, 0x1000, MemPerm::ReadExecute));
+    CPUState parent{};
+    parent.mem = &fixture.mem;
+    WasmJitCPU cpu(&parent, 0);
+    cpu.set_region_mode(true);
+    cpu.set_reg(0, kData);
+    cpu.set_pc(kNeon);
+    cpu.set_cpsr(0x10);
+    cpu.set_fpscr(0);
+    run_to_svc(cpu, parent, 0);
+    std::array<uint32_t, 4> lanes{};
+    CHECK(mem_read(fixture.mem, kData, lanes.data(), sizeof(lanes)));
+    CHECK(lanes[0] == 0x7fc00000u && lanes[1] == 0x00000000u); // vmin
+    CHECK(lanes[2] == 0x7fc00000u && lanes[3] == 0x3f800000u); // vmax
+    CHECK((cpu.get_reg(1) & 0x81u) == 0x81u);                   // IDC | IOC
+}
+
 // Guest code that changes after the AOT module loaded must not keep running
 // from the module: invalidate_jit_cache retires the overlapping functions.
 // square's MULS r0,r0 (+0x36) becomes ADDS r0,r0,r0.
@@ -264,8 +297,9 @@ int main() {
     check_same(oracle, run_aot(0));
     for (const uint64_t slice : {1u, 2u, 3u, 7u, 50u, 1000u})
         check_same(oracle, run_aot(slice));
+    vector_min_max_flags();
     tls_addr_intrinsic();
     invalidation_retires_aot();
-    std::printf("AOT module: %u checks passed (interpreter oracle, lazy JIT, AOT with slices, invalidation, TLS intrinsic)\n", checks);
+    std::printf("AOT module: %u checks passed (interpreter oracle, lazy JIT, AOT with slices, invalidation, VMIN/VMAX flags, TLS intrinsic)\n", checks);
     return 0;
 }
