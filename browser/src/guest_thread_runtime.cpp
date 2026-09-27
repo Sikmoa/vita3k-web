@@ -27,7 +27,7 @@ constexpr uint32_t context_error = static_cast<uint32_t>(SCE_KERNEL_ERROR_ILLEGA
 // These paths use host waits outside sync_primitives.cpp, or notification
 // callbacks holding Callback::_mutex. Guard aliases by their canonical name.
 // Custom/device HLE must obey the host contract too; this is not a sandbox.
-bool unsupported_import(uint32_t nid) {
+bool classify_unsupported_import(uint32_t nid) {
     const char *name = import_name(nid);
     const std::string_view n = name ? name : "";
     if (n.find("WaitSema") != n.npos && n.find("CB") == n.npos)
@@ -60,6 +60,17 @@ bool unsupported_import(uint32_t nid) {
     return n.find("Wait") != n.npos || n.find("DelayThread") != n.npos
         || n.find("CheckCallback") != n.npos || n.find("CB") != n.npos
         || n.find("ReceiveMsgPipe") != n.npos || n.find("SendMsgPipe") != n.npos;
+}
+
+// Every import passes here, so the name classification above is cached per
+// NID in a direct-mapped table; a collision just classifies again.
+bool unsupported_import(uint32_t nid) {
+    struct Entry { uint32_t nid; bool valid, unsupported; };
+    static Entry cache[1024];
+    Entry &entry = cache[(nid ^ (nid >> 10) ^ (nid >> 20)) & 1023];
+    if (!entry.valid || entry.nid != nid)
+        entry = { nid, true, classify_unsupported_import(nid) };
+    return entry.unsupported;
 }
 }
 
