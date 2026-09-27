@@ -19,9 +19,11 @@
 
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 #include <cpu/functions.h>
 #include <kernel/state.h>
+#include <kernel/sync_primitives.h>
 #include <kernel/thread/thread_state.h>
 #include <mem/functions.h>
 #include <net/state.h>
@@ -30,8 +32,8 @@
 
 // Firmware 3.74 np_signaling.suprx. Contexts are local. Offline, a
 // connection lives only until the library's SceNpSignalingMain thread has
-// reported it dead to its context's handler; then it is freed, so outside
-// that handler no connection is ever found.
+// reported it dead to its contexts' handlers; then it is freed, so no
+// connection is ever found by id.
 enum SceNpSignalingError : uint32_t {
     SCE_NP_ERROR_INVALID_NPID = 0x80550605, // name unknown
     SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED = 0x80552701,
@@ -52,40 +54,133 @@ constexpr uint32_t SCE_NET_CTL_ERROR_NOT_CONNECTED = 0x80412108;
 DECL_EXPORT(int, sceNpCmpNpId, np::SceNpId *npid1, np::SceNpId *npid2);
 DECL_EXPORT(SceUID, sceKernelCreateThread, const char *name, SceKernelThreadEntry entry, int init_priority, int stack_size, SceUInt attr, int cpu_affinity_mask, Ptr<SceKernelThreadOptParam> option);
 
+DECL_EXPORT(int, sceKernelWaitThreadEnd, SceUID thid, int *stat, SceUInt *timeout);
+
 #ifdef __EMSCRIPTEN__
-// Guest code run as SceNpSignalingMain's entry: calls the handler in the
-// block at argp as handler(ctx_id, conn_id, event, error, arg).
-constexpr uint32_t signaling_trampoline_code[] = {
-    0xe92d4010, // push {r4, lr}
-    0xe24dd008, // sub sp, sp, #8
-    0xe1a04001, // mov r4, r1
-    0xe594c000, // ldr r12, [r4]
-    0xe5940014, // ldr r0, [r4, #20]
-    0xe58d0000, // str r0, [sp]
-    0xe5940004, // ldr r0, [r4, #4]
-    0xe5941008, // ldr r1, [r4, #8]
-    0xe594200c, // ldr r2, [r4, #12]
-    0xe5943010, // ldr r3, [r4, #16]
-    0xe12fff3c, // blx r12
-    0xe28dd008, // add sp, sp, #8
-    0xe8bd8010, // pop {r4, pc}
+// SceNpSignalingMain's message pipe and the connections the messages name
+// are modelled as a guest ring of events: the thread waits on a semaphore
+// for each, then calls handler(ctx_id, conn_id, event, error, arg) for
+// every context attached to the connection. An event with count ~0 ends
+// the thread (sceNpSignalingTerm's message 1).
+constexpr uint32_t signaling_ring_events = 64; // the pipe's 0x400 bytes of 16-byte messages
+constexpr uint32_t SCE_KERNEL_ERROR_MPP_FULL = 0x800201b3;
+constexpr uint32_t signaling_event_contexts = 8; // contexts per connection
+struct SignalingEvent {
+    uint32_t conn_id;
+    uint32_t error;
+    uint32_t count;
+    struct {
+        uint32_t handler; // 0: the context was destroyed meanwhile
+        uint32_t ctx_id;
+        uint32_t arg;
+    } contexts[signaling_event_contexts];
 };
+static_assert(sizeof(SignalingEvent) == 108);
+constexpr uint32_t signaling_code_words = 64;
+struct SignalingRing {
+    uint32_t read; // events the thread has finished
+    uint32_t reserved;
+    SignalingEvent events[signaling_ring_events];
+};
+
+static std::vector<uint32_t> signaling_main_code(Address code, SceUID sema, Address ring) {
+    std::vector<uint32_t> w;
+    const auto movw_movt = [&](unsigned reg, uint32_t value) {
+        w.push_back(0xe3000000u | ((value & 0xf000u) << 4) | (reg << 12) | (value & 0xfffu));
+        value >>= 16;
+        w.push_back(0xe3400000u | ((value & 0xf000u) << 4) | (reg << 12) | (value & 0xfffu));
+    };
+    // Branch with condition `cond` from the next word to word index `target`.
+    const auto branch = [&](uint32_t cond_op, size_t target) {
+        const int32_t offset = static_cast<int32_t>(target) - static_cast<int32_t>(w.size() + 2);
+        w.push_back(cond_op | (static_cast<uint32_t>(offset) & 0xffffffu));
+    };
+    const Address stub = code + (signaling_code_words - 4) * 4;
+    w.push_back(0xe92d41f0); // push {r4-r8, lr}
+    w.push_back(0xe24dd008); // sub sp, sp, #8
+    movw_movt(4, ring);
+    const size_t loop = w.size();
+    movw_movt(0, static_cast<uint32_t>(sema));
+    w.push_back(0xe3a01001); // mov r1, #1
+    w.push_back(0xe3a02000); // mov r2, #0
+    const int32_t to_stub = static_cast<int32_t>(stub - (code + w.size() * 4 + 8));
+    w.push_back(0xeb000000u | ((static_cast<uint32_t>(to_stub) >> 2) & 0xffffffu)); // bl sceKernelWaitSema
+    w.push_back(0xe3500000); // cmp r0, #0
+    const size_t exit_on_error = w.size();
+    w.push_back(0); // bne done (patched)
+    w.push_back(0xe5945000); // ldr r5, [r4]: events finished
+    w.push_back(0xe205603f); // and r6, r5, #63
+    w.push_back(0xe3a0706c); // mov r7, #108
+    w.push_back(0xe0264796); // mla r6, r6, r7, r4
+    w.push_back(0xe2866008); // add r6, r6, #8: the event
+    w.push_back(0xe5968008); // ldr r8, [r6, #8]: count
+    w.push_back(0xe3780001); // cmn r8, #1
+    const size_t exit_on_marker = w.size();
+    w.push_back(0); // beq done (patched)
+    w.push_back(0xe286700c); // add r7, r6, #12
+    const size_t inner = w.size();
+    w.push_back(0xe3580000); // cmp r8, #0
+    const size_t to_next = w.size();
+    w.push_back(0); // beq next (patched)
+    w.push_back(0xe597c000); // ldr r12, [r7]: handler
+    w.push_back(0xe35c0000); // cmp r12, #0
+    w.push_back(0x0a000006); // beq skip (6 words on)
+    w.push_back(0xe5970008); // ldr r0, [r7, #8]: arg
+    w.push_back(0xe58d0000); // str r0, [sp]
+    w.push_back(0xe5970004); // ldr r0, [r7, #4]: context id
+    w.push_back(0xe5961000); // ldr r1, [r6]: connection id
+    w.push_back(0xe3a02000); // mov r2, #0: dead
+    w.push_back(0xe5963004); // ldr r3, [r6, #4]: error
+    w.push_back(0xe12fff3c); // blx r12
+    w.push_back(0xe287700c); // skip: add r7, r7, #12
+    w.push_back(0xe2488001); // sub r8, r8, #1
+    branch(0xea000000, inner); // b inner
+    const size_t next = w.size();
+    w.push_back(0xe2855001); // add r5, r5, #1
+    w.push_back(0xe5845000); // str r5, [r4]
+    branch(0xea000000, loop); // b loop
+    const size_t done = w.size();
+    w.push_back(0xe28dd008); // add sp, sp, #8
+    w.push_back(0xe8bd81f0); // pop {r4-r8, pc}
+    const auto patch = [&](size_t at, uint32_t cond_op, size_t target) {
+        const int32_t offset = static_cast<int32_t>(target) - static_cast<int32_t>(at + 2);
+        w[at] = cond_op | (static_cast<uint32_t>(offset) & 0xffffffu);
+    };
+    patch(exit_on_error, 0x1a000000, done);
+    patch(exit_on_marker, 0x0a000000, done);
+    patch(to_next, 0x0a000000, next);
+    w.resize(signaling_code_words - 4, 0xe1a00000); // nop
+    w.insert(w.end(), { 0xef000000, 0xe1a0f00e, 0x0C7B834B, 0 }); // sceKernelWaitSema stub
+    return w;
+}
+
+static SignalingRing &signaling_ring(EmuEnvState &emuenv) {
+    return *Ptr<SignalingRing>(emuenv.np.signaling_code + signaling_code_words * 4).get(emuenv.mem);
+}
+
+// Posts an event to SceNpSignalingMain: false when its ring is full.
+static bool post_signaling_event(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, const SignalingEvent &event) {
+    auto &np = emuenv.np;
+    auto &ring = signaling_ring(emuenv);
+    if (np.signaling_queued - ring.read >= signaling_ring_events)
+        return false;
+    ring.events[np.signaling_queued % signaling_ring_events] = event;
+    ++np.signaling_queued;
+    return semaphore_signal(emuenv.kernel, export_name, thread_id, np.signaling_sema, 1) == 0;
+}
 #endif
 
 static bool same_np_id(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, const np::SceNpId &a, const np::SceNpId &b) {
     return CALL_EXPORT(sceNpCmpNpId, const_cast<np::SceNpId *>(&a), const_cast<np::SceNpId *>(&b)) == 0;
 }
 
-// np_signaling 0x81001052: the checks and a connection, reused when one to
+// np_signaling 0x81001052: the checks and a connection, reused while one to
 // the same peer is still live (0x8100220e) or new (0x8100234a), whose id is
-// written before SceNpSignalingMain handles it. There (0x810051c6 ->
-// 0x810049a0) the first send has no socket and the fallback reads the IP
-// address, sceNetCtlInetGetInfo(15), whose error ends the connection: each
-// attached context's handler gets the dead event with that error
-// (0x81002660 -> 0x810018fc) and the connection is freed (0x810024ec). The
-// handlers run here before this call returns, as when SceNpSignalingMain
-// outranks the caller; called from a handler, the connection waits for the
-// thread's current one, as its message does.
+// written before SceNpSignalingMain handles its message. There
+// (0x810051c6 -> 0x810049a0) the first send has no socket and the fallback
+// reads the IP address, sceNetCtlInetGetInfo(15), whose error ends the
+// connection: each attached context's handler gets the dead event with that
+// error (0x81002660 -> 0x810018fc) and the connection is freed (0x810024ec).
 EXPORT(int, sceNpSignalingActivateConnection, SceInt32 ctx_id, np::SceNpId *peer_id, SceInt32 *conn_id) {
 #ifdef __EMSCRIPTEN__
     auto &np = emuenv.np;
@@ -101,56 +196,35 @@ EXPORT(int, sceNpSignalingActivateConnection, SceInt32 ctx_id, np::SceNpId *peer
     const np::SceNpId own_id = ctx->second.own_id;
     if (same_np_id(emuenv, export_name, thread_id, own_id, *peer_id))
         return RET_ERROR(SCE_NP_SIGNALING_ERROR_OWN_NP_ID);
-    const auto same_pair = [&](const NpState::SignalingConnection &c) {
-        return same_np_id(emuenv, export_name, thread_id, c.own_id, own_id) && same_np_id(emuenv, export_name, thread_id, c.peer_id, *peer_id);
-    };
-    // A live connection: the one being reported, or one queued behind it
-    // (its dead event reaches the contexts attached when it is reported).
-    if (np.signaling_dying && same_pair(*np.signaling_dying)) {
-        *conn_id = np.signaling_dying->id;
+    auto &ring = signaling_ring(emuenv);
+    // Events the thread has finished free their connections.
+    while (!np.signaling_pending.empty() && np.signaling_pending.front().seq < ring.read)
+        np.signaling_pending.pop_front();
+    for (const auto &live : np.signaling_pending) {
+        if (!same_np_id(emuenv, export_name, thread_id, live.own_id, own_id) || !same_np_id(emuenv, export_name, thread_id, live.peer_id, *peer_id))
+            continue;
+        // Attached before its event is handled, the context gets it too;
+        // while it is being handled, no longer.
+        auto &event = ring.events[live.seq % signaling_ring_events];
+        const bool attached = std::any_of(event.contexts, event.contexts + event.count, [&](const auto &c) { return c.ctx_id == uint32_t(ctx_id); });
+        if (!attached && event.count < signaling_event_contexts)
+            event.contexts[event.count++] = { ctx->second.handler, static_cast<uint32_t>(ctx_id), ctx->second.arg };
+        *conn_id = live.id;
         return 0;
-    }
-    for (auto &pending : np.signaling_pending) {
-        if (same_pair(pending)) {
-            if (std::ranges::find(pending.ctx_ids, ctx_id) == pending.ctx_ids.end())
-                pending.ctx_ids.push_back(ctx_id);
-            *conn_id = pending.id;
-            return 0;
-        }
     }
     // The first id is random on the console; ids wrap from 65535 to 1.
-    np.signaling_last_conn_id = np.signaling_last_conn_id == 0xffff ? 1 : np.signaling_last_conn_id + 1;
-    *conn_id = np.signaling_last_conn_id;
-    const uint32_t error = emuenv.netctl.inited ? SCE_NET_CTL_ERROR_NOT_CONNECTED : SCE_NET_CTL_ERROR_NOT_INITIALIZED;
-    np.signaling_pending.push_back({ { ctx_id }, np.signaling_last_conn_id, own_id, *peer_id, error });
-    if (np.signaling_dying)
-        return 0;
-    const ThreadStatePtr main_thread = emuenv.kernel.get_thread(np.signaling_main_thread);
-    const ThreadStatePtr caller = emuenv.kernel.get_thread(thread_id);
-    while (!np.signaling_pending.empty()) {
-        np.signaling_dying = np.signaling_pending.front();
-        np.signaling_pending.pop_front();
-        const auto dying = *np.signaling_dying;
-        for (const int target_id : dying.ctx_ids) {
-            // Contexts are looked up when the message is handled: one
-            // destroyed meanwhile gets no event.
-            const auto target = np.signaling_ctxs.find(target_id);
-            if (target == np.signaling_ctxs.end() || !target->second.handler || !main_thread)
-                continue;
-            const uint32_t call[] = { target->second.handler, static_cast<uint32_t>(target_id), dying.id,
-                SCE_NP_SIGNALING_EVENT_DEAD, dying.error, target->second.arg };
-            // start() copies the block onto SceNpSignalingMain's stack.
-            const Address block = stack_alloc(*caller->cpu, sizeof(call));
-            std::memcpy(Ptr<uint32_t>(block).get(emuenv.mem), call, sizeof(call));
-            main_thread->run_guest_function(np.signaling_trampoline, sizeof(call), Ptr<void>(block));
-            stack_free(*caller->cpu, sizeof(call));
-        }
-        np.signaling_dying.reset();
-        if (!np.signaling_inited) {
-            np.signaling_pending.clear(); // sceNpSignalingTerm from a handler
-            break;
-        }
-    }
+    const uint16_t id = np.signaling_last_conn_id == 0xffff ? 1 : np.signaling_last_conn_id + 1;
+    SignalingEvent event{};
+    event.conn_id = id;
+    event.error = emuenv.netctl.inited ? SCE_NET_CTL_ERROR_NOT_CONNECTED : SCE_NET_CTL_ERROR_NOT_INITIALIZED;
+    event.count = 1;
+    event.contexts[0] = { ctx->second.handler, static_cast<uint32_t>(ctx_id), ctx->second.arg };
+    const uint32_t seq = np.signaling_queued;
+    if (!post_signaling_event(emuenv, export_name, thread_id, event))
+        return RET_ERROR(SCE_KERNEL_ERROR_MPP_FULL); // the pipe's 64 messages; the console would wait
+    np.signaling_last_conn_id = id;
+    np.signaling_pending.push_back({ seq, id, own_id, *peer_id });
+    *conn_id = id;
     return 0;
 #else
     return UNIMPLEMENTED();
@@ -185,6 +259,19 @@ EXPORT(int, sceNpSignalingDestroyCtx, SceInt32 ctx_id) {
     if (!emuenv.np.signaling_inited)
         return RET_ERROR(SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED);
     emuenv.np.signaling_ctxs.erase(ctx_id); // 0 even for an unknown id
+#ifdef __EMSCRIPTEN__
+    // Its handler gets no event still queued (message 20 detaches it).
+    auto &ring = signaling_ring(emuenv);
+    for (const auto &live : emuenv.np.signaling_pending) {
+        if (live.seq < ring.read)
+            continue;
+        auto &event = ring.events[live.seq % signaling_ring_events];
+        for (uint32_t i = 0; i < event.count; ++i) {
+            if (event.contexts[i].ctx_id == uint32_t(ctx_id))
+                event.contexts[i].handler = 0;
+        }
+    }
+#endif
     return 0;
 }
 
@@ -235,21 +322,38 @@ EXPORT(int, sceNpSignalingInit, SceSize pool_size, SceInt32 thread_priority, Sce
     if (emuenv.np.signaling_inited)
         return RET_ERROR(SCE_NP_SIGNALING_ERROR_ALREADY_INITIALIZED);
 #ifdef __EMSCRIPTEN__
-    // SceNpSignalingMain (0x81000b3e), with Init's defaults for 0 arguments.
-    const Address trampoline = alloc(emuenv.mem, sizeof(signaling_trampoline_code), "SceNpSignalingMain entry");
-    if (!trampoline)
+    // SceNpSignalingMain (0x81000b3e), with Init's defaults for 0 arguments;
+    // it starts at once and waits for messages.
+    auto &np = emuenv.np;
+    const Address code = alloc(emuenv.mem, signaling_code_words * 4 + sizeof(SignalingRing), "SceNpSignalingMain");
+    if (!code)
         return RET_ERROR(SCE_KERNEL_ERROR_NO_MEMORY);
-    std::memcpy(Ptr<uint32_t>(trampoline).get(emuenv.mem), signaling_trampoline_code, sizeof(signaling_trampoline_code));
-    const SceUID main_thread = CALL_EXPORT(sceKernelCreateThread, "SceNpSignalingMain", SceKernelThreadEntry(trampoline),
+    const SceUID sema = semaphore_create(emuenv.kernel, export_name, "SceNpSignalingEventQueue", thread_id, 0, 0, signaling_ring_events);
+    if (sema < 0) {
+        free(emuenv.mem, code);
+        return sema;
+    }
+    const auto words = signaling_main_code(code, sema, code + signaling_code_words * 4);
+    std::memcpy(Ptr<uint32_t>(code).get(emuenv.mem), words.data(), words.size() * 4);
+    std::memset(Ptr<SignalingRing>(code + signaling_code_words * 4).get(emuenv.mem), 0, sizeof(SignalingRing));
+    const SceUID main_thread = CALL_EXPORT(sceKernelCreateThread, "SceNpSignalingMain", SceKernelThreadEntry(code),
         thread_priority ? thread_priority : SCE_KERNEL_DEFAULT_PRIORITY_USER, stack_size ? stack_size : 0x4000, 0, cpu_affinity,
         Ptr<SceKernelThreadOptParam>());
-    if (main_thread < 0) {
-        free(emuenv.mem, trampoline);
-        return main_thread;
+    const ThreadStatePtr thread = main_thread < 0 ? nullptr : emuenv.kernel.get_thread(main_thread);
+    const int started = thread ? thread->start(0, Ptr<void>{}) : main_thread;
+    if (started < 0) {
+        if (thread)
+            thread->exit_delete(false);
+        semaphore_delete(emuenv.kernel, export_name, thread_id, sema);
+        free(emuenv.mem, code);
+        return started;
     }
-    emuenv.np.signaling_main_thread = main_thread;
-    emuenv.np.signaling_trampoline = trampoline;
-    emuenv.np.signaling_last_conn_id = 0;
+    np.signaling_main_thread = main_thread;
+    np.signaling_sema = sema;
+    np.signaling_code = code;
+    np.signaling_queued = 0;
+    np.signaling_last_conn_id = 0;
+    np.signaling_pending.clear();
 #endif
     emuenv.np.signaling_inited = true;
     return 0;
@@ -271,11 +375,25 @@ EXPORT(int, sceNpSignalingTerm) {
     emuenv.np.signaling_inited = false;
     emuenv.np.signaling_ctxs.clear();
 #ifdef __EMSCRIPTEN__
-    if (const ThreadStatePtr main_thread = emuenv.kernel.get_thread(emuenv.np.signaling_main_thread))
-        main_thread->exit_delete(false);
-    free(emuenv.mem, emuenv.np.signaling_trampoline);
-    emuenv.np.signaling_main_thread = 0;
-    emuenv.np.signaling_trampoline = 0;
+    // Term's message 1 comes after those queued: SceNpSignalingMain handles
+    // them first, and Term waits for it to end (0x81000c60).
+    auto &np = emuenv.np;
+    SignalingEvent stop{};
+    stop.count = ~0u;
+    // Only a running guest thread can wait (not a host-side call).
+    const ThreadStatePtr caller = emuenv.kernel.get_thread(thread_id);
+    if (caller && caller->status == ThreadStatus::run && thread_id != np.signaling_main_thread
+        && post_signaling_event(emuenv, export_name, thread_id, stop))
+        CALL_EXPORT(sceKernelWaitThreadEnd, np.signaling_main_thread, nullptr, nullptr);
+    semaphore_delete(emuenv.kernel, export_name, thread_id, np.signaling_sema);
+    if (thread_id != np.signaling_main_thread) {
+        if (const ThreadStatePtr main_thread = emuenv.kernel.get_thread(np.signaling_main_thread))
+            main_thread->exit_delete(false);
+        free(emuenv.mem, np.signaling_code);
+    }
+    np.signaling_main_thread = np.signaling_sema = 0;
+    np.signaling_code = 0;
+    np.signaling_pending.clear();
 #endif
     return 0;
 }

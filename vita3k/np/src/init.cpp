@@ -46,11 +46,12 @@ void reset_process(NpState &state) {
     state.basic_inited = false;
     state.signaling_inited = false;
     state.signaling_ctxs.clear();
-    state.signaling_main_thread = 0; // the process's threads and memory end with it
-    state.signaling_trampoline = 0;
+    // The process's threads, semaphores and memory end with it.
+    state.signaling_main_thread = state.signaling_sema = 0;
+    state.signaling_code = 0;
+    state.signaling_queued = 0;
     state.signaling_last_conn_id = 0;
     state.signaling_pending.clear();
-    state.signaling_dying.reset();
     state.auth_inited = false;
     state.auth_requests = {};
     state.commerce2_inited = false;

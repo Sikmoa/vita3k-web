@@ -118,21 +118,21 @@ struct NpState {
         Address arg;
     };
     std::map<int, SignalingCtx> signaling_ctxs; // context id (1..8)
-    // SceNpSignalingMain (created by sceNpSignalingInit), the guest code that
-    // calls a context handler on it, and the last connection id handed out.
+    // SceNpSignalingMain (created by sceNpSignalingInit) runs guest code that
+    // waits on a semaphore for dead-connection events in a guest ring and
+    // calls their contexts' handlers (np/signaling.h).
     SceUID signaling_main_thread = 0;
-    Address signaling_trampoline = 0;
+    SceUID signaling_sema = 0;
+    Address signaling_code = 0; // the loop, then the ring
+    uint32_t signaling_queued = 0; // events written to the ring
     uint16_t signaling_last_conn_id = 0;
-    // Connections SceNpSignalingMain has yet to report dead, in order; the
-    // one being reported stays findable until its handler returns.
+    // Connections whose event is still in the ring, by ring sequence.
     struct SignalingConnection {
-        std::vector<int> ctx_ids; // attached contexts
+        uint32_t seq;
         uint16_t id;
         np::SceNpId own_id, peer_id;
-        uint32_t error;
     };
     std::deque<SignalingConnection> signaling_pending;
-    std::optional<SignalingConnection> signaling_dying;
 
     NpTrophyState trophy_state;
     NearState near;

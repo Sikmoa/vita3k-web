@@ -89,7 +89,9 @@ inline void test_guest_np_signaling(EmuEnvState &env, vita3k::web::GuestThreadRu
     REQUIRE(call(sig_init, { 0, 0, 0, 0 }) == 0);
     const SceUID main_thread = env.np.signaling_main_thread;
     const auto main = env.kernel.get_thread(main_thread);
-    REQUIRE(main && main->name == "SceNpSignalingMain" && main->status == ThreadStatus::dormant);
+    REQUIRE(main && main->name == "SceNpSignalingMain");
+    const auto main_waiting = [&] { return main->status == ThreadStatus::wait; };
+    run_until(main_waiting); // for its first message
     REQUIRE(call(create_ctx, { own, handler, 0x1234, ctx_out }) == 0);
     const uint32_t ctx = word(0x10);
     REQUIRE(call(activate, { ctx, 0, conn_out }) == 0x80552715 && call(activate, { ctx, peer, 0 }) == 0x80552715);
@@ -104,32 +106,61 @@ inline void test_guest_np_signaling(EmuEnvState &env, vita3k::web::GuestThreadRu
     auto caller = env.kernel.create_thread(env.mem, "signaling caller", Ptr<const void>(code), SCE_KERNEL_DEFAULT_PRIORITY_USER,
         SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
     REQUIRE(caller && caller->start(0, Ptr<void>{}, false) == 0);
-    run_until([&] { return caller->status == ThreadStatus::dormant; });
+    run_until([&] { return caller->status == ThreadStatus::dormant && word(0x3c) == 2 && main_waiting(); });
     REQUIRE(word(0x20) == 0 && word(0x14) == 1);
     // The dead event (0) with the NetCtl error, on SceNpSignalingMain; the
     // connection activated from the handler is reported after it.
-    REQUIRE(word(0x3c) == 2);
     REQUIRE(word(0x40) == ctx && word(0x44) == 1 && word(0x48) == 0 && word(0x4c) == 0x80412108);
     REQUIRE(word(0x50) == 0x1234 && word(0x54) == uint32_t(main_thread) && word(0x58) == 0 && word(0x18) == 2);
     REQUIRE(word(0x60) == ctx && word(0x64) == 2 && word(0x68) == 0 && word(0x6c) == 0x80412108);
     REQUIRE(word(0x74) == uint32_t(main_thread));
-    REQUIRE(main->status == ThreadStatus::dormant && env.np.signaling_pending.empty());
     // Both connections were freed after their events.
     REQUIRE(call(terminate, { ctx, 1 }) == 0x8055270e && call(terminate, { ctx, 2 }) == 0x8055270e);
-    // Before sceNetCtlInit the error is NetCtl's NOT_INITIALIZED; the next id.
+
+    // Activation does not wait for the handler. Before the event is handled
+    // the connection is live: the same peer gets its id again, and another
+    // context attached to it gets the event as well.
+    const Address peer3 = data + 0x8c0;
+    set_id(peer3, "peer3", 1);
+    REQUIRE(call(create_ctx, { own, handler, 0x5678, ctx_out }) == 0);
+    const uint32_t ctx2 = word(0x10);
+    word(0x3c) = 1; // no nested activation this time
+    REQUIRE(call(activate, { ctx, peer3, conn_out }) == 0 && word(0x14) == 3);
+    REQUIRE(call(activate, { ctx, peer3, conn_out }) == 0 && word(0x14) == 3);
+    REQUIRE(call(activate, { ctx2, peer3, conn_out }) == 0 && word(0x14) == 3);
+    REQUIRE(word(0x3c) == 1);
+    run_until([&] { return word(0x3c) == 3 && main_waiting(); });
+    REQUIRE(word(0x60) == ctx && word(0x64) == 3 && word(0x70) == 0x1234);
+    REQUIRE(word(0x80) == ctx2 && word(0x84) == 3 && word(0x90) == 0x5678);
+    // A context destroyed before the event is handled gets nothing, even if
+    // its id is given to a new context.
+    REQUIRE(call(activate, { ctx2, peer2, conn_out }) == 0 && word(0x14) == 4);
+    REQUIRE(call(destroy_ctx, { ctx2 }) == 0 && call(create_ctx, { own, handler, 0x9abc, ctx_out }) == 0 && word(0x10) == ctx2);
+    run_until(main_waiting);
+    REQUIRE(word(0x3c) == 3);
+    // Before sceNetCtlInit the error is NetCtl's NOT_INITIALIZED.
     env.netctl.inited = false;
     word(0x3c) = 0;
     REQUIRE(caller->start(0, Ptr<void>{}, false) == 0);
-    run_until([&] { return caller->status == ThreadStatus::dormant; });
-    REQUIRE(word(0x20) == 0 && word(0x14) == 3 && word(0x18) == 4 && word(0x4c) == 0x80412101);
+    run_until([&] { return caller->status == ThreadStatus::dormant && word(0x3c) == 2 && main_waiting(); });
+    REQUIRE(word(0x20) == 0 && word(0x14) == 5 && word(0x18) == 6 && word(0x4c) == 0x80412101);
     env.netctl.inited = netctl_was_inited;
     // A context without a handler gets no event.
     REQUIRE(call(create_ctx, { own, 0, 0, ctx_out }) == 0);
     word(0x3c) = 0;
-    REQUIRE(call(activate, { word(0x10), peer, conn_out }) == 0 && word(0x14) == 5 && word(0x3c) == 0);
+    REQUIRE(call(activate, { word(0x10), peer, conn_out }) == 0 && word(0x14) == 7);
+    run_until(main_waiting);
+    REQUIRE(word(0x3c) == 0);
 
-    REQUIRE(call(destroy_ctx, { ctx }) == 0 && call(sig_term, {}) == 0);
-    run_until([&] { return !env.kernel.threads.contains(main_thread); });
+    // Term handles the queued messages first, then ends the thread.
+    word(0x3c) = 1;
+    REQUIRE(call(activate, { ctx, peer3, conn_out }) == 0 && word(0x14) == 8);
+    guest_sync_delete::build_call(env.mem, code, sig_term, { 0, 0, 0, 0, 0 }, data + 0x20);
+    word(0x20) = 0xcccccccc;
+    REQUIRE(caller->start(0, Ptr<void>{}, false) == 0);
+    run_until([&] { return caller->status == ThreadStatus::dormant && !env.kernel.threads.contains(main_thread); });
+    REQUIRE(word(0x20) == 0 && word(0x3c) == 2 && word(0x64) == 8 && !env.np.signaling_inited);
+    REQUIRE(call(destroy_ctx, { ctx }) == 0x80552701);
     REQUIRE(runtime.shutdown());
     REQUIRE(env.kernel.threads.empty());
     free(env.mem, data);
