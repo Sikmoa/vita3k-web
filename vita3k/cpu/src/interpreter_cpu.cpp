@@ -604,26 +604,38 @@ int InterpreterCPU::arm(uint32_t op, uint32_t pc) {
         if (d == 15) return -1;
         const uint32_t imm = ((op >> 4) & 0xf000) | (op & 0xfff);
         regs[d] = (op & 0x400000) ? (regs[d] & 65535) | (imm << 16) : imm;
-    } else if ((op & 0x0fe00000) == 0x03a00000) { // MOV immediate, ARM rotated imm8
-        const unsigned d = (op >> 12) & 15, rotation = ((op >> 8) & 15) * 2;
-        const uint32_t value = std::rotr(uint32_t(op & 255), int(rotation));
-        if (d == 15) return -1;
-        regs[d] = value;
-        if (op & 0x100000) nzc(value, rotation ? bool(value & n_flag) : bool(cpsr & c_flag));
-    } else if ((op & 0x0fe00010) == 0x01a00000) { // MOV register; loader's MOV pc,lr interworks on ARMv7
-        const unsigned d = (op >> 12) & 15;
+    } else if ((op & 0x0c000000) == 0 && ((op & 0x02000000) || !(op & 0x10)) && (op & 0x01900000) != 0x01000000) {
+        // Data processing, immediate or immediate-shifted register operand.
+        const unsigned opcode = (op >> 21) & 15, n = (op >> 16) & 15, d = (op >> 12) & 15;
         const bool flags = op & 0x100000;
         if (d == 15 && flags) return -1; // exception return is outside this user-mode subset
-        const auto value = immediate_shift(operand(op & 15, pc, false), (op >> 5) & 3, (op >> 7) & 31, cpsr & c_flag);
-        if (d == 15) set_pc(value.value); else regs[d] = value.value;
-        if (flags) nzc(value.value, value.carry);
-    } else if ((op & 0x0fe00010) == 0x00800000) { // ADD register, immediate shift (linker veneers)
-        const unsigned n = (op >> 16) & 15, d = (op >> 12) & 15;
-        const bool flags = op & 0x100000;
-        if (d == 15 && flags) return -1;
-        const auto b = immediate_shift(operand(op & 15, pc, false), (op >> 5) & 3, (op >> 7) & 31, cpsr & c_flag);
-        const uint32_t value = add(operand(n, pc, false), b.value, false, flags);
-        if (d == 15) set_pc(value); else regs[d] = value;
+        Shift b{};
+        if (op & 0x02000000) {
+            const unsigned rotation = ((op >> 8) & 15) * 2;
+            b.value = std::rotr(uint32_t(op & 255), int(rotation));
+            b.carry = rotation ? bool(b.value & n_flag) : bool(cpsr & c_flag);
+        } else b = immediate_shift(operand(op & 15, pc, false), (op >> 5) & 3, (op >> 7) & 31, cpsr & c_flag);
+        const uint32_t a = operand(n, pc, false);
+        const bool carry = cpsr & c_flag;
+        uint32_t value = 0;
+        switch (opcode) {
+        case 0: case 8: value = a & b.value; break; // AND, TST
+        case 1: case 9: value = a ^ b.value; break; // EOR, TEQ
+        case 2: case 10: value = add(a, ~b.value, true, flags); break; // SUB, CMP
+        case 3: value = add(~a, b.value, true, flags); break; // RSB
+        case 4: case 11: value = add(a, b.value, false, flags); break; // ADD, CMN
+        case 5: value = add(a, b.value, carry, flags); break; // ADC
+        case 6: value = add(a, ~b.value, carry, flags); break; // SBC
+        case 7: value = add(~a, b.value, carry, flags); break; // RSC
+        case 12: value = a | b.value; break; // ORR
+        case 13: value = b.value; break; // MOV
+        case 14: value = a & ~b.value; break; // BIC
+        default: value = ~b.value; break; // MVN
+        }
+        const bool logical = !(opcode >= 2 && opcode <= 7) && opcode != 10 && opcode != 11;
+        if (logical && flags) nzc(value, b.carry);
+        if (opcode >= 8 && opcode <= 11) return 0; // TST, TEQ, CMP, CMN write no register
+        if (d == 15) set_pc(value); else regs[d] = value; // ARMv7 ALUWritePC interworks
     } else if ((op & 0x0e500000) == 0x04100000) { // LDR word immediate
         const unsigned n = (op >> 16) & 15, d = (op >> 12) & 15;
         const bool pre = op & 0x1000000, up = op & 0x800000, wb = !pre || (op & 0x200000);

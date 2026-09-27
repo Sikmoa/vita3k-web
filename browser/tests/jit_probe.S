@@ -27,6 +27,12 @@
 .section .text.arm_add,"ax",%progbits
     adds r2, r0, r1
     svc #0x42
+.section .text.arm_sub,"ax",%progbits
+    subs r2, r0, r1
+    svc #0x42
+.section .text.arm_cmp,"ax",%progbits
+    cmp r0, r1
+    svc #0x42
 
 .section .text.arm_patch,"ax",%progbits
     mov r0, #7

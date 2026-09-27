@@ -105,9 +105,9 @@ try {
   assert.equal(result.inWorker, true, 'tests must run inside a real Worker');
   assert.equal(result.crossOriginIsolated, true);
   assert.equal(result.exitCode, 0, 'C++ JIT tests failed');
-  assert.ok(result.trace.some(line => /^M14 SUMMARY mode=emscripten-jit passed=[1-9][0-9]* failed=0 oracle_gaps=/.test(line)),
+  assert.ok(result.trace.some(line => /^M14 SUMMARY mode=emscripten-jit passed=[1-9][0-9]* failed=0$/.test(line)),
     'missing genuine Emscripten JIT summary (native/reference-only is not sufficient)');
-  console.log('M14 Worker JIT smoke passed (oracle gaps, if any, remain explicit above)');
+  console.log('M14 Worker JIT smoke passed');
 } finally {
   await browser?.close();
   await new Promise(resolve => server.close(resolve));

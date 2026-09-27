@@ -128,8 +128,8 @@ server supplies COOP/COEP headers for consistency with the other smoke tests.
 - Integrated Node and Chromium Worker runs:
 
   ```text
-  M14 SUMMARY mode=emscripten-jit passed=35 failed=0 oracle_gaps=1
-  M14 Worker JIT smoke passed (oracle gaps, if any, remain explicit above)
+  M14 SUMMARY mode=emscripten-jit passed=45 failed=0
+  M14 Worker JIT smoke passed
   ```
 
   Comparisons cover r0–r15, CPSR, FPSCR, TPIDRURO, preserved FP registers,
@@ -137,11 +137,10 @@ server supplies COOP/COEP headers for consistency with the other smoke tests.
   invalidation, checked and trusted code writes, NX/unmap rejection, shared
   Wasm-memory growth, bounded execution, no-fallback rejection, and real
   `KernelState + ThreadState::run_loop(true)` preimport integration.
-- **Oracle gap is real:** the current interpreter's ARM decoder lacks the
-  SUB/CMP coverage needed by the full ARM loop. That loop is checked against
-  independent architectural expectations, NOT claimed as a full differential
-  pass. The corresponding Thumb loop and supported ARM cases do compare
-  against the interpreter. The reference implementation was left untouched.
+- The interpreter decodes the ARM data-processing group (immediate and
+  immediate-shifted register operands), so the full ARM loop and the ARM
+  SUBS/CMP flag edges compare against it as well as against independent
+  architectural expectations.
 - Native/default Dynarmic build remains up to date; **2/2 CTests pass**.
   Native interpreter build: **6/6 CTests pass**. Existing Node M2/M3/guest/
   generated-ELF/runtime-convergence suites pass. Chromium generic ELF and

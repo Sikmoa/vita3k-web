@@ -193,7 +193,7 @@ struct Fixture {
 };
 
 struct Suite {
-    unsigned passed = 0, failed = 0, oracle_gaps = 0;
+    unsigned passed = 0, failed = 0;
     void test(const std::string &label, const std::function<void()> &body) {
         try {
             body();
@@ -228,7 +228,7 @@ void loops_and_conditions(Suite &suite, Fixture &fixture) {
             fixture.compare(start, expected);
         });
     }
-    suite.test("ARM full loop (independent expectation; oracle availability checked)", [&] {
+    suite.test("ARM MOV/ADD/SUB/CMP/BNE loop (independent expectation)", [&] {
         fixture.install(arm_loop, sizeof(arm_loop));
         const auto start = initial(false, 0x90000000);
         auto expected = at_svc(start, sizeof(arm_loop));
@@ -238,24 +238,9 @@ void loops_and_conditions(Suite &suite, Fixture &fixture) {
         expected.context.cpsr = (start.context.cpsr & ~nzcv_mask) | 0x60000000;
         restore(*fixture.reference, start);
         const auto bytes = read_bytes(fixture.memory.state, code_address, mapped_size);
-        const int result = run(*fixture.reference);
+        REQUIRE(run(*fixture.reference) == 0);
         REQUIRE(bytes == read_bytes(fixture.memory.state, code_address, mapped_size));
-        if (result == 0) {
-            equal_state(snapshot(*fixture.reference), expected, "ARM loop oracle vs architecture");
-        } else {
-            // Current real InterpreterCPU::arm has no SUB-immediate or CMP.
-            // Verify the actual supported prefix; NEVER invent its final state.
-            REQUIRE(result < 0);
-            REQUIRE(fixture.interpreter().get_last_error().find("unsupported") != std::string::npos);
-            auto prefix = start;
-            prefix.context.cpu_registers[0] = 7;
-            prefix.context.cpu_registers[1] = 3;
-            prefix.context.cpu_registers[2] = 7;
-            prefix.context.cpu_registers[15] = code_address + 16;
-            equal_state(snapshot(*fixture.reference), prefix, "known ARM oracle boundary");
-            ++suite.oracle_gaps;
-            std::puts("M14 ORACLE GAP: ARM full loop stops at SUB; final differential NOT RUN");
-        }
+        equal_state(snapshot(*fixture.reference), expected, "ARM loop oracle vs architecture");
 #ifdef __EMSCRIPTEN__
         equal_state(fixture.run_jit(start), expected, "ARM loop JIT vs architecture");
         const auto compiled = fixture.jit().regions_formed() + fixture.jit().compiled_blocks();
@@ -301,12 +286,14 @@ void arithmetic(Suite &suite, Fixture &fixture) {
             });
         }
     }
-    for (bool compare_only : { false, true }) {
+    for (bool thumb : { false, true }) for (bool compare_only : { false, true }) {
         for (const auto &edge : subtractions) {
-            suite.test(std::string(compare_only ? "Thumb CMP " : "Thumb SUBS ") + edge.name, [&] {
-                const size_t size = compare_only ? sizeof(thumb_cmp) : sizeof(thumb_sub);
-                fixture.install(compare_only ? thumb_cmp : thumb_sub, size);
-                auto start = initial(true, nzcv_mask);
+            suite.test(std::string(thumb ? "Thumb " : "ARM ") + (compare_only ? "CMP " : "SUBS ") + edge.name, [&] {
+                const uint8_t *code = thumb ? (compare_only ? thumb_cmp : thumb_sub) : (compare_only ? arm_cmp : arm_sub);
+                const size_t size = thumb ? (compare_only ? sizeof(thumb_cmp) : sizeof(thumb_sub))
+                                          : (compare_only ? sizeof(arm_cmp) : sizeof(arm_sub));
+                fixture.install(code, size);
+                auto start = initial(thumb, nzcv_mask);
                 start.context.cpu_registers[0] = edge.a;
                 start.context.cpu_registers[1] = edge.b;
                 auto expected = at_svc(start, size);
@@ -589,8 +576,7 @@ int vita3k_web_jit_tests() {
     constexpr const char *mode = "native-reference-only";
     std::puts("M14 NOT RUN: native cannot execute WasmJitCPU; no JIT/fallback claimed");
 #endif
-    std::printf("M14 SUMMARY mode=%s passed=%u failed=%u oracle_gaps=%u\n",
-        mode, suite.passed, suite.failed, suite.oracle_gaps);
+    std::printf("M14 SUMMARY mode=%s passed=%u failed=%u\n", mode, suite.passed, suite.failed);
     return suite.failed ? 1 : 0;
 }
 }
