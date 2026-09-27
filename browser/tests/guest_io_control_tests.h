@@ -117,6 +117,42 @@ inline void test_guest_io_control(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(io_getstat, { new_name, got }) == 0 && same_second(got_stat->st_ctime, created));
     REQUIRE(call(io_rename, { new_name, put("savedata0:save.bin") }) == 0);
 
+    // getstat shows the write bit MODE sets and clears.
+    st->st_mode = 0x100;
+    REQUIRE(call(io_chstat, { put("savedata0:save.bin"), stat, SCE_CST_MODE }) == 0);
+    REQUIRE(call(io_getstat, { put("savedata0:save.bin"), got }) == 0 && (got_stat->st_mode & 0x180) == 0x100);
+    st->st_mode = 0x180;
+    REQUIRE(call(io_chstat, { put("savedata0:save.bin"), stat, SCE_CST_MODE }) == 0);
+    REQUIRE(call(io_getstat, { put("savedata0:save.bin"), got }) == 0 && (got_stat->st_mode & 0x180) == 0x180);
+    // Dates move with a renamed directory; its old name keeps none.
+    fs::create_directories(save / "dir");
+    make_file(save / "dir/inner.bin", 1);
+    REQUIRE(call(io_chstat, { put("savedata0:dir/inner.bin"), stat, SCE_CST_CT }) == 0);
+    std::strcpy(Ptr<char>(new_name).get(env.mem), "savedata0:moved");
+    REQUIRE(call(io_rename, { put("savedata0:dir"), new_name }) == 0);
+    REQUIRE(call(io_getstat, { put("savedata0:moved/inner.bin"), got }) == 0 && same_second(got_stat->st_ctime, created));
+    fs::create_directories(save / "dir");
+    make_file(save / "dir/inner.bin", 1);
+    REQUIRE(call(io_getstat, { put("savedata0:dir/inner.bin"), got }) == 0 && !same_second(got_stat->st_ctime, created));
+    // A case-insensitive lookup searches the mount the path names.
+    make_file(save / "UPPER.BIN", 1);
+    const bool saved_case = env.io.case_isens_find_enabled;
+    env.io.case_isens_find_enabled = true;
+    env.io.cachemap.clear();
+    REQUIRE(call(io_chstat, { put("savedata0:upper.bin"), stat, SCE_CST_MT }) == 0 && call(io_sync, { path, 0 }) == 0);
+    env.io.case_isens_find_enabled = saved_case;
+    // Sync writes out what the host still buffers for the file.
+    constexpr uint32_t io_write = 0x34EFD876, io_sync_by_fd = 0x16512F59;
+    const uint32_t writer = call(io_open, { put("savedata0:buffered.bin"), SCE_O_WRONLY | SCE_O_CREAT, 0 });
+    REQUIRE(static_cast<int32_t>(writer) >= 0);
+    REQUIRE(call(io_write, { writer, block + 0x780, 4 }) == 4 && fs::file_size(save / "buffered.bin") == 0);
+    REQUIRE(call(io_sync, { put("savedata0:buffered.bin"), 0 }) == 0 && fs::file_size(save / "buffered.bin") == 4);
+    REQUIRE(call(io_write, { writer, block + 0x780, 4 }) == 4 && fs::file_size(save / "buffered.bin") == 4);
+    REQUIRE(call(io_sync, { put("savedata0:"), 0 }) == 0 && fs::file_size(save / "buffered.bin") == 8);
+    REQUIRE(call(io_write, { writer, block + 0x780, 4 }) == 4);
+    REQUIRE(call(io_sync_by_fd, { writer, 0 }) == 0 && fs::file_size(save / "buffered.bin") == 12);
+    REQUIRE(call(io_close, { writer }) == 0);
+
     // sceIoDevctl: capacity of the volume behind ux0:, 32 MiB kept back.
     VolumeInfo volume{};
     REQUIRE(get_volume_info(ux0, volume));
@@ -160,6 +196,11 @@ inline void test_guest_io_control(EmuEnvState &env, ThreadState &thread) {
     set[6] = 1;
     set[5] = 1;
     REQUIRE(call(io_ioctl, { fd, 0x1001, in, 0x1c, 0, 0 }) == 0x80010016);
+    // Sizes whose line (unit * ways) overflows 32 bits are refused.
+    set[6] = 0;
+    set[0] = 0x2000, set[1] = 0x80000000, set[2] = 2, set[3] = 0x80000000, set[5] = 15;
+    REQUIRE(call(io_ioctl, { fd, 0x1001, in, 0x1c, 0, 0 }) == 0x80010016);
+    set[0] = 0x4000, set[1] = 0x200, set[2] = 3, set[3] = 0x200, set[5] = 1;
     REQUIRE(call(io_ioctl, { fd, 0x1002, 0, 0, out, 0x20 }) == 0 && word[0] == 0x4000 && word[2] == 2);
     REQUIRE(call(io_ioctl, { fd, 0x3001, 0, 0, out, 0x20 }) == 0x80010030);
     REQUIRE(call(io_ioctl, { fd, 0x0801, 0, 0, out, 0x20 }) == 0x80010030);

@@ -636,6 +636,11 @@ int stat_file(IOState &io, const char *file_in, SceIoStat *statp, const fs::path
 
     // report regular files as readable but not executable
     statp->st_mode = SCE_S_IRUSR | SCE_S_IRGRP | SCE_S_IROTH;
+    // and writable unless read-only (sceIoChstat MODE 0x100): a game's write
+    // bit is 0x80, SCE_S_IWOTH here.
+    boost::system::error_code perms_error;
+    if ((fs::status(file_path, perms_error).permissions() & fs::perms::owner_write) != fs::perms::no_perms)
+        statp->st_mode |= SCE_S_IWOTH;
 
     if (fs::is_regular_file(file_path)) {
         statp->st_size = fs::file_size(file_path);
@@ -715,7 +720,9 @@ int lookup_path(IOState &io, const char *path_in, const fs::path &vita_fs_path, 
             host_path = cached;
             return 0;
         }
-        const bool found = find_case_isens_path(io, redirected, translated_path, host_path);
+        // The search knows the mount by its own device, as open_file passes it.
+        VitaIoDevice search_device = device;
+        const bool found = find_case_isens_path(io, search_device, translated_path, host_path);
         if (auto cached = find_in_cache(io, string_utils::tolower(host_path.string())); found && !cached.empty()) {
             host_path = cached;
             return 0;
@@ -817,9 +824,20 @@ int sync_path(IOState &io, const char *path, const fs::path &vita_fs_path, const
     bool volume_root = false;
     const int error = lookup_path(io, path, vita_fs_path, export_name, device, host_path, volume_root);
     // The root of a mount is always there, even before a file is on it.
-    if (error == SCE_ERROR_ERRNO_ENOENT && volume_root)
-        return 0;
-    return error;
+    if (error && !(error == SCE_ERROR_ERRNO_ENOENT && volume_root))
+        return error;
+    // What the host still buffers for the file, or every file on the volume.
+    std::string target = host_path.generic_path().string();
+    while (target.size() > 1 && target.ends_with('/'))
+        target.pop_back();
+    for (const auto &[fd, file] : io.std_files) {
+        const std::string location = file.get_system_location().generic_path().string();
+        if (location == target || (volume_root && location.starts_with(target + "/"))) {
+            if (std::fflush(file.get_file_pointer()) != 0)
+                return IO_ERROR(SCE_ERROR_ERRNO_EIO);
+        }
+    }
+    return 0;
 }
 
 bool get_volume_info(const fs::path &host_path, VolumeInfo &info) {
@@ -923,11 +941,22 @@ int rename(IOState &io, const char *old_name_in, const char *new_name_in, const 
         LOG_ERROR("Error code: {} ({})", error_code.value(), error_code.message());
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
-    io.chstat_times.erase(emulated_new_path.generic_path().string());
-    if (auto times = io.chstat_times.extract(emulated_old_path.generic_path().string())) {
-        times.key() = emulated_new_path.generic_path().string();
-        io.chstat_times.insert(std::move(times));
+    // Dates set on the renamed file, or on everything under a renamed
+    // directory, move with it; whatever the new name replaced is gone.
+    const std::string old_key = emulated_old_path.generic_path().string(), new_key = emulated_new_path.generic_path().string();
+    const auto under = [](const std::string &key, const std::string &root) {
+        return key == root || key.starts_with(root + "/");
+    };
+    std::erase_if(io.chstat_times, [&](const auto &entry) { return under(entry.first, new_key); });
+    std::vector<std::pair<std::string, IOState::ChstatTimes>> moved;
+    for (auto it = io.chstat_times.begin(); it != io.chstat_times.end();) {
+        if (under(it->first, old_key)) {
+            moved.emplace_back(new_key + it->first.substr(old_key.size()), it->second);
+            it = io.chstat_times.erase(it);
+        } else
+            ++it;
     }
+    io.chstat_times.insert(moved.begin(), moved.end());
 
     return 0;
 }

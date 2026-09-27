@@ -20,6 +20,7 @@
 #include <kernel/thread/thread_state.h>
 #include <util/log.h>
 
+#include <algorithm>
 #include <mutex>
 
 uint32_t process_callbacks(KernelState &kernel, SceUID thread_id) {
@@ -32,6 +33,9 @@ uint32_t process_callbacks(KernelState &kernel, SceUID thread_id) {
     // A callback may create or delete callbacks of this thread.
     const auto callbacks = thread->callbacks;
     for (const CallbackPtr &cb : callbacks) {
+        // One an earlier callback deleted no longer runs.
+        if (std::ranges::find(thread->callbacks, cb) == thread->callbacks.end())
+            continue;
         if (cb->is_executable()) {
             std::string name = cb->get_name();
             cb->execute(kernel, [name]() {

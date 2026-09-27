@@ -6,6 +6,9 @@
 #include <kernel/callback.h>
 #include <net/state.h>
 
+DECL_EXPORT(SceInt32, sceKernelNotifyCallback, SceUID callbackId, SceInt32 notifyArg);
+DECL_EXPORT(int, sceKernelDeleteCallback, SceUID callbackId);
+
 inline void test_guest_net_offline(EmuEnvState &env, vita3k::web::GuestThreadRuntime &runtime) {
     constexpr uint32_t socket_nid = 0xF084FCE3, bind_nid = 0x1296A94B, sendto_nid = 0x52DB31D5,
                        epoll_create = 0xF9D102AE, epoll_control = 0x4C8764AC, epoll_wait = 0x45CE337D,
@@ -17,7 +20,13 @@ inline void test_guest_net_offline(EmuEnvState &env, vita3k::web::GuestThreadRun
     const Address data = alloc(env.mem, 0x1000, "net offline data");
     REQUIRE(code && data);
     const auto word = [&](Address offset) -> uint32_t & { return *Ptr<uint32_t>(data + offset).get(env.mem); };
+    // Test-only import: sceKernelDeleteCallback (not registered here).
+    constexpr uint32_t delete_callback_import = 0xc0de0002;
     env.kernel.call_import = [&](CPUState &cpu, uint32_t nid, SceUID tid) {
+        if (nid == delete_callback_import) {
+            write_reg(cpu, 0, export_sceKernelDeleteCallback(env, tid, "fixture", read_reg(cpu, 0)));
+            return;
+        }
         call_import(env, cpu, nid, tid);
         REQUIRE(env.missing_nids.empty());
     };
@@ -157,6 +166,62 @@ inline void test_guest_net_offline(EmuEnvState &env, vita3k::web::GuestThreadRun
     REQUIRE(word(0x48) == 0 && word(0x40) == 0xcccccccc && cb->is_executable());
     cb = wait_with(epoll_wait_cb, 1000, false);
     REQUIRE(word(0x48) == 0 && word(0x40) == 0xcccccccc);
+    // A notification while the CB wait is parked ends the park: the callback
+    // runs, sends the datagram and the wait returns it.
+    REQUIRE(call(recv_nid, { first, data + 0x3c0, 16, SCE_NET_MSG_DONTWAIT }) == 0x80410123); // nothing queued (EAGAIN)
+    {
+        guest_sync_delete::build_call(env.mem, code, epoll_wait_cb, { eid, events, 1, 2000000, 0 }, data + 0x48);
+        word(0x40) = word(0x44) = word(0x48) = 0xcccccccc;
+        auto waiter = env.kernel.create_thread(env.mem, "net waiter", Ptr<const void>(code), SCE_KERNEL_DEFAULT_PRIORITY_USER,
+            SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
+        REQUIRE(waiter);
+        auto late = std::make_shared<Callback>(waiter->id, callback_name, Ptr<SceKernelCallbackFunction>(callback), Ptr<void>(data));
+        constexpr SceUID late_id = 0x7ffe0001;
+        waiter->callbacks.push_back(late);
+        env.kernel.callbacks.emplace(late_id, late);
+        REQUIRE(waiter->start(0, Ptr<void>{}, false) == 0);
+        run_until([&] { return waiter->status == ThreadStatus::wait; });
+        REQUIRE(export_sceKernelNotifyCallback(env, host->id, "fixture", late_id, 9) == 0);
+        run_until([&] { return waiter->status == ThreadStatus::dormant; });
+        REQUIRE(word(0x48) == 1 && word(0x40) == 9 && word(0x44) == 5);
+        env.kernel.callbacks.erase(late_id);
+        REQUIRE(call(recv_nid, { first, data + 0x3c0, 16, SCE_NET_MSG_DONTWAIT }) == 5);
+    }
+    // A callback deleted by one that ran before it in the same pass does not run.
+    {
+        const Address deleter = code + 0xa00, delete_stub = code + 0xb00, marker = code + 0xb80;
+        const uint32_t stub[] = { 0xef000000, 0xe1a0f00e, delete_callback_import };
+        std::memcpy(Ptr<void>(delete_stub).get(env.mem), stub, sizeof(stub));
+        constexpr SceUID victim_id = 0x7ffe0002;
+        guest_thread_fixture::Arm a(deleter);
+        a.emit(0xe92d4010); // push {r4, lr}
+        a.constant(0, victim_id);
+        a.call(delete_stub);
+        a.constant(0, 0);
+        a.emit(0xe8bd8010); // pop {r4, pc}
+        a.finish(env.mem);
+        guest_thread_fixture::Arm m(marker);
+        m.constant(0, data + 0x4c);
+        m.constant(1, 1);
+        m.emit(0xe5801000); // str r1, [r0]
+        m.constant(0, 0);
+        m.emit(0xe12fff1e); // bx lr
+        m.finish(env.mem);
+        guest_sync_delete::build_call(env.mem, code, epoll_wait_cb, { eid, events, 1, 1000, 0 }, data + 0x48);
+        word(0x4c) = 0;
+        auto waiter = env.kernel.create_thread(env.mem, "net waiter", Ptr<const void>(code), SCE_KERNEL_DEFAULT_PRIORITY_USER,
+            SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
+        REQUIRE(waiter);
+        auto first_cb = std::make_shared<Callback>(waiter->id, callback_name, Ptr<SceKernelCallbackFunction>(deleter), Ptr<void>(data));
+        auto victim = std::make_shared<Callback>(waiter->id, callback_name, Ptr<SceKernelCallbackFunction>(marker), Ptr<void>(data));
+        waiter->callbacks = { first_cb, victim };
+        env.kernel.callbacks.emplace(victim_id, victim);
+        first_cb->direct_notify(0);
+        victim->direct_notify(0);
+        REQUIRE(waiter->start(0, Ptr<void>{}, false) == 0);
+        run_until([&] { return waiter->status == ThreadStatus::dormant; });
+        REQUIRE(word(0x48) == 0 && word(0x4c) == 0 && !env.kernel.callbacks.contains(victim_id));
+    }
 
     // An epoll wait parked on a socket that is not readable marks it; a
     // receive parked on it marks it too; both clear when the waits end.

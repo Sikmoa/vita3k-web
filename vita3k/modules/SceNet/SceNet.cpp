@@ -19,6 +19,7 @@
 
 #include <kernel/callback.h>
 #include <kernel/state.h>
+#include <kernel/thread/thread_state.h>
 
 #include <net/state.h>
 
@@ -239,7 +240,10 @@ static int epoll_wait_offline(EmuEnvState &emuenv, SceUID thread_id, int eid, Sc
                 sock->epoll_send_waiters += (directions & SCE_NET_EPOLLOUT) != 0;
             }
         }
+        const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+        thread->in_callback_wait = callbacks;
         const auto parked = offline_net_park(emuenv.kernel, emuenv.net, thread_id, remaining);
+        thread->in_callback_wait = false;
         for (const auto &[sock, directions] : waiting) {
             sock->epoll_recv_waiters -= (directions & SCE_NET_EPOLLIN) != 0;
             sock->epoll_send_waiters -= (directions & SCE_NET_EPOLLOUT) != 0;

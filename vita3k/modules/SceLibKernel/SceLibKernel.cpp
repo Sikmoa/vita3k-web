@@ -805,7 +805,7 @@ EXPORT(int, sceIoIoctl, SceUID fd, int cmd, const void *argp, SceSize arglen, vo
         });
         if (!cache.unit || !cache.total || !cache.block || cache.block % cache.unit
             || (cache.block <= mount_block ? mount_block % cache.block != 0 : writer)
-            || (cache.ways != 1 && cache.ways != 2 && cache.ways != 4) || cache.total % (cache.unit * cache.ways) || cache.block % 512)
+            || (cache.ways != 1 && cache.ways != 2 && cache.ways != 4) || cache.total % (uint64_t(cache.unit) * cache.ways) || cache.block % 512)
             return RET_ERROR(SCE_ERROR_ERRNO_EINVAL);
         io.buffer_caches[key] = { cache.total, cache.unit, cache.ways, cache.block, 0, 0, 0 };
         return 0;

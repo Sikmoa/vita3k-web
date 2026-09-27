@@ -1523,6 +1523,11 @@ EXPORT(SceInt32, sceKernelNotifyCallback, SceUID callbackId, SceInt32 notifyArg)
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_CALLBACK_ID);
 
     cb->direct_notify(notifyArg);
+    if (const ThreadStatePtr owner = emuenv.kernel.get_thread(cb->get_owner_thread_id())) {
+        const std::lock_guard<std::mutex> lock(owner->mutex);
+        if (owner->in_callback_wait && owner->status == ThreadStatus::wait)
+            owner->update_status(ThreadStatus::run);
+    }
 
     return SCE_KERNEL_OK;
 }

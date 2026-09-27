@@ -89,6 +89,9 @@ struct ThreadState {
     uint64_t last_vblank_waited;
     // set to true if thread is processing kernel callbacks
     bool is_processing_callbacks = false;
+    // Parked in a wait that runs callbacks (a CB wait): a notification of one
+    // of its callbacks ends the park so that it runs.
+    bool in_callback_wait = false;
 
     CPUStatePtr cpu;
     ThreadStatus status = ThreadStatus::dormant;

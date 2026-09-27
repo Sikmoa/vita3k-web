@@ -19,8 +19,11 @@
 
 #include <mem/functions.h>
 #include <io/functions.h>
+#include <io/io.h>
 #include <io/state.h>
 #include <kernel/types.h>
+
+#include <cstdio>
 
 #include <util/tracy.h>
 TRACY_MODULE_NAME(SceIofilemgr);
@@ -311,13 +314,15 @@ EXPORT(int, sceIoSetThreadDefaultPriorityForSystem) {
 }
 
 // Firmware 3.74 iofilemgr 0x81017061: an unknown fd is EBADF (0x80010009
-// once the syscall exit clears the kernel bit). Host files are written
-// through, so there is nothing to flush.
+// once the syscall exit clears the kernel bit). The host's buffer for the
+// file is flushed.
 EXPORT(int, sceIoSyncByFd, SceUID fd, SceUInt32 flags) {
     TRACY_FUNC(sceIoSyncByFd, fd, flags);
-    constexpr uint32_t SCE_ERROR_ERRNO_EBADF = 0x80010009;
-    if (!emuenv.io.std_files.contains(fd) && !emuenv.io.tty_files.contains(fd))
+    const auto file = emuenv.io.std_files.find(fd);
+    if (file == emuenv.io.std_files.end() && !emuenv.io.tty_files.contains(fd))
         return RET_ERROR(SCE_ERROR_ERRNO_EBADF);
+    if (file != emuenv.io.std_files.end() && std::fflush(file->second.get_file_pointer()) != 0)
+        return RET_ERROR(SCE_ERROR_ERRNO_EIO);
     return 0;
 }
 

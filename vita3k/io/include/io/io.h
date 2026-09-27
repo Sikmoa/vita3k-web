@@ -24,6 +24,7 @@ constexpr int SCE_ERROR_ERRNO_EBADFD = 0x80010051; // File descriptor is invalid
 constexpr int SCE_ERROR_ERRNO_EOPNOTSUPP = 0x8001005F; // Operation not supported
 // Firmware 3.74 iofilemgr, exfatfs and PfsMgr answers.
 constexpr int SCE_ERROR_ERRNO_EPERM = 0x80010001; // PfsMgr refuses the operation on the mount
+constexpr int SCE_ERROR_ERRNO_EIO = 0x80010005;
 constexpr int SCE_ERROR_ERRNO_EBADF = 0x80010009;
 constexpr int SCE_ERROR_ERRNO_EACCES = 0x8001000D;
 constexpr int SCE_ERROR_ERRNO_EFAULT = 0x8001000E;
