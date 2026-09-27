@@ -21,11 +21,12 @@ if(VITA3K_WEB_JIT_TESTS)
 endif()
 
 # Genuine VitaSDK fixtures: the display fixture (CPU-rendered animated
-# framebuffer) and the message-dialog fixture.
+# framebuffer), the message-dialog fixture and the GXM surface fixture.
 option(VITA3K_WEB_DISPLAY_FIXTURE "Build the genuine VitaSDK display and message-dialog fixtures" ON)
 if(VITA3K_WEB_DISPLAY_FIXTURE)
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/tests/vita_display_fixture)
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/tests/vita_msg_dialog_fixture)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/tests/vita_gxm_surface_fixture)
     # M14c benchmark harness: Node bench modules/run targets over the short
     # fixture. Included before the -O2 add_compile_options line below so the
     # interpreter and JIT bench modules share one effective flag context

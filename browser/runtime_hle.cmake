@@ -8,7 +8,7 @@ set(_HLE_EXT "${CMAKE_CURRENT_LIST_DIR}/../external")
 
 set(_hle_exports
     sceGxmInitialize sceGxmTerminate sceGxmCreateContext sceGxmDestroyContext sceGxmFinish
-    sceGxmTransferFill
+    sceGxmTransferFill sceGxmTransferCopy sceGxmTransferDownscale sceGxmTransferFinish
     # Real GXP indexed-draw guest probe (production validation/state handling).
     sceGxmShaderPatcherCreate sceGxmShaderPatcherRegisterProgram
     sceGxmProgramFindParameterByName sceGxmProgramParameterGetResourceIndex
@@ -221,6 +221,7 @@ set(_hle_exports
     sceGxmTextureSetMipFilter sceGxmTextureSetLodBias sceGxmTextureSetLodMin
     sceGxmTextureGetStride sceGxmTextureGetType
     sceGxmTextureInitLinearStrided sceGxmTextureInitSwizzled sceGxmTextureInitSwizzledArbitrary
+    sceGxmTextureInitTiled
     # Fixed-function state setters (imports=4155 missing_nids=1 PC=8126b340):
     # pure context-state writes plus renderer command-queue appends, no waits.
     # The bridge records cull/polygon/depth state and draws proceed only on
@@ -495,6 +496,7 @@ add_library(vita3k_web_runtime_hle STATIC
     "${_HLE_ROOT}/gxm/src/gxp.cpp"
     "${_HLE_ROOT}/gxm/src/color.cpp"
     "${_HLE_ROOT}/gxm/src/stream.cpp"
+    "${_HLE_ROOT}/gxm/src/transfer.cpp"
     "${_HLE_BROWSER_ROOT}/src/gxm_hash.cpp"
     "${_HLE_EXT}/vita-toolchain/src/utils/sha256.c"
     "${_HLE_ROOT}/modules/module_parent.cpp"

@@ -5,8 +5,10 @@
 // surface (address, format, size). A scene is one synchronous call: every draw
 // is encoded into one render pass and submitted without waiting; guest memory
 // receives rendered pixels only through opt-in surface sync (readTarget).
-// Textures that alias a render target sample it directly; others arrive as
-// RGBA8 mip chains the producer decoded and caches by content. Presentation
+// Textures over a render target's texels sample it (or a copy of the
+// rectangle they cover); others arrive as RGBA8 mip chains the producer
+// decoded and caches by content. Transfers into a target arrive as texel
+// writes (WRITE_TEXELS). Presentation
 // draws the displayed target into an OffscreenCanvas when the page attached
 // one, and posts sampled frames for headless observers.
 //
@@ -30,7 +32,7 @@ const depthSurfaces = new Map(); // `${depth}:${stencil}` guest addresses -> kep
 let layouts, sceneBuffer, sceneBufferSize = 0;
 let canvas, canvasContext, canvasFormat, blitPipeline, blitSampler;
 let presentGeneration = 0;
-const stagingBuffers = []; // per-submission fill sources, destroyed after submit
+const stagingBuffers = [], transientTextures = []; // per-submission texel writes, destroyed after submit
 const stats = { scenes: 0, draws: 0, pipelines: 0, textureUploads: 0, presents: 0, bindGroups: 0, submitMs: 0, sceneBytes: 0, surfaceSyncs: 0 };
 let log = message => console.warn(message);
 let statsReportedAt = 0;
@@ -101,7 +103,10 @@ export function attachCanvas(offscreen) {
   canvasContext.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
 }
 
-// GXM color formats the consumer renders to (base format | swizzle).
+// GXM color formats the consumer renders to (base format | swizzle). The
+// shaders write components in memory order, so a target's texels have the
+// guest surface's bytes (rgba8unorm, rgb10a2unorm and rgba16float match the
+// U8x4, U2U10U10U10 and F16x4 surfaces bit for bit).
 const colorFormats = new Map([
   [0x00000000, 'rgba8unorm'],  // U8U8U8U8_ABGR
   [0x10000000, 'rgba8unorm'],  // U8U8U8U8 variants (swizzle handled by the shader)
@@ -109,43 +114,45 @@ const colorFormats = new Map([
   [0x61800000, 'rgb10a2unorm'],
   [0x01000000, 'rgba16float'], // F16F16F16F16
 ]);
-// One texel of `format` holding an RGBA8 color (partial target fills).
-function packColor(format, [r, g, b, a]) {
-  switch (format) {
-  case 'rgba8unorm': return new Uint8Array([r, g, b, a]);
-  case 'rgb10a2unorm': {
-    const scale = v => Math.round(v * 1023 / 255);
-    return new Uint8Array(new Uint32Array([(scale(r) | scale(g) << 10 | scale(b) << 20 | Math.round(a * 3 / 255) << 30) >>> 0]).buffer);
-  }
-  default: throw new Error(`partial fill of a ${format} render target`);
-  }
-}
+const texelBytes = { rgba8unorm: 4, rgb10a2unorm: 4, rgba16float: 8 };
 function colorFormat(guest) {
   const format = colorFormats.get(guest >>> 0) ?? colorFormats.get((guest & 0xf1800000) >>> 0);
   if (!format) throw new Error(`unsupported GXM color format ${(guest >>> 0).toString(16)}`);
   return format;
 }
 
-// A target is `scale` times its guest size in each dimension (BEGIN_PASS,
-// chosen by the producer); the stream keeps guest coordinates, scaled here
-// (viewport, scissor, fills, region copies). Its depth surfaces and snapshot
-// share its GPU size.
-function targetFor(address, format, width, height, scale) {
+// A target is `scale` times its guest surface size in each dimension (texel
+// writes, region copies and read-back use surface coordinates) and
+// `renderScale` times its render pixels (viewport, scissor): the two differ
+// for a downscaled surface, which renders at twice its size and is
+// box-filtered into guest memory. Both come from the producer (BEGIN_PASS).
+// Its depth surfaces and snapshot share its GPU size.
+function targetFor(address, format, width, height, scale, renderScale) {
   let target = targets.get(address);
   if (target && target.width === width && target.height === height && target.guestFormat === format
-      && target.scale === scale)
+      && target.scale === scale && target.renderScale === renderScale)
     return target;
   target?.texture.destroy();
   target?.snapshot?.texture.destroy();
+  target?.resolved?.texture.destroy();
   target?.guestCopy?.destroy();
   const gpuFormat = colorFormat(format);
   const gpuWidth = width * scale, gpuHeight = height * scale;
   const texture = device.createTexture({ size: [gpuWidth, gpuHeight], format: gpuFormat,
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
       | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST });
-  target = { address, width, height, scale, gpuWidth, gpuHeight, guestFormat: format, gpuFormat, texture,
+  target = { address, width, height, scale, renderScale, gpuWidth, gpuHeight, guestFormat: format, gpuFormat, texture,
     view: texture.createView(), depth: null, fresh: true };
+  // A downscaled surface is sampled as its guest texels: the render
+  // box-filtered to renderScale per surface texel after each pass.
+  if (scale !== renderScale) {
+    const resolved = device.createTexture({ size: [width * renderScale, height * renderScale], format: gpuFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC });
+    target.resolved = { texture: resolved, view: resolved.createView() };
+  }
   targets.set(address, target);
+  // Cached texture groups may reference the replaced target's views.
+  textureGroups.clear();
   return target;
 }
 
@@ -160,13 +167,14 @@ function depthAttachmentFor(target, mode, format, depthAddress, stencilAddress) 
   const gpuFormat = depthFormats.get(format >>> 0) ?? 'depth24plus-stencil8';
   if (mode === 1) {
     const key = `${target.gpuWidth}x${target.gpuHeight}:${gpuFormat}`;
-    let texture = depthScratch.get(key);
-    if (!texture) {
-      texture = device.createTexture({ size: [target.gpuWidth, target.gpuHeight], format: gpuFormat,
+    let scratch = depthScratch.get(key);
+    if (!scratch) {
+      const texture = device.createTexture({ size: [target.gpuWidth, target.gpuHeight], format: gpuFormat,
         usage: GPUTextureUsage.RENDER_ATTACHMENT });
-      depthScratch.set(key, texture);
+      scratch = { view: texture.createView(), format: gpuFormat, fresh: true };
+      depthScratch.set(key, scratch);
     }
-    return { view: texture.createView(), format: gpuFormat, fresh: true };
+    return scratch;
   }
   const key = `${depthAddress >>> 0}:${stencilAddress >>> 0}`;
   let surface = depthSurfaces.get(key);
@@ -323,6 +331,22 @@ function bufferGroupFor(vsSize, fsSize) {
   return group;
 }
 
+// What textures sample of a target: its texture, or a downscaled surface's
+// filtered image; `renderScale` texels per surface texel either way.
+function sampled(target) {
+  return target.resolved ?? target;
+}
+function resolveTarget(encoder, target) {
+  const factor = target.scale / target.renderScale;
+  const pipeline = downscalePipeline(target.gpuFormat, factor);
+  target.resolveGroup ??= device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: target.view }] });
+  const pass = encoder.beginRenderPass({ colorAttachments: [{ view: target.resolved.view, loadOp: 'clear', storeOp: 'store' }] });
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, target.resolveGroup);
+  pass.draw(3);
+  pass.end();
+}
 function textureView(id) {
   if (id & 0x80000000) {
     // Render target sampled as a texture: the id carries the guest address;
@@ -330,7 +354,7 @@ function textureView(id) {
     const target = targets.get((id & 0x3fffffff) * 4);
     if (!target) { warnOnce('texture aliases a render target that was never rendered'); return layouts.dummyView; }
     if (id & 0x40000000) return target.snapshot.view;
-    return target.view;
+    return sampled(target).view;
   }
   return textures.get(id)?.view ?? layouts.dummyView;
 }
@@ -339,13 +363,14 @@ function textureView(id) {
 // unit, id, min, mag, mip, u, v, lodMax; fragment and vertex stages apart.
 const unitWords = [new Uint32Array(16 * 8), new Uint32Array(16 * 8)];
 const unitCounts = [0, 0];
+// Groups are cached by their words; render-target aliases stay valid until
+// the target is recreated (targetFor clears the cache), textures until one
+// is replaced (TEXTURE, REGION).
 function textureGroupFor(stage) {
   const layout = stage ? layouts.vertexTextures : layouts.fragmentTextures;
   const words = unitWords[stage], length = unitCounts[stage] * 8;
-  let alias = false;
-  for (let i = 1; i < length; i += 8) if (words[i] & 0x80000000) alias = true;
   const key = hashWords(words, length, stage + 1);
-  let bucket = alias ? undefined : textureGroups.get(key);
+  let bucket = textureGroups.get(key);
   if (bucket) {
     for (let i = 0; i < bucket.length; ++i)
       if (sameWords(bucket[i].words, words, length)) return bucket[i].group;
@@ -361,16 +386,76 @@ function textureGroupFor(stage) {
   }
   ++stats.bindGroups;
   const group = device.createBindGroup({ layout, entries });
-  // Render-target aliases can be recreated; do not keep their groups.
-  if (!alias) {
-    if (!bucket) textureGroups.set(key, bucket = []);
-    bucket.push({ words: words.slice(0, length), group });
-  }
+  if (!bucket) textureGroups.set(key, bucket = []);
+  bucket.push({ words: words.slice(0, length), group });
   return group;
 }
 const emptyGroupCache = {};
 function emptyGroup() {
   return emptyGroupCache.group ??= device.createBindGroup({ layout: layouts.empty, entries: [] });
+}
+
+// WRITE_TEXELS: the guest texels are uploaded at surface size and drawn
+// into the target at its scale (nearest), discarding texels the mask leaves
+// out. Transfers are rare; the per-write objects are released after submit.
+const texelWritePipelines = new Map(); // gpu format -> pipeline
+function texelWritePipeline(format) {
+  let pipeline = texelWritePipelines.get(format);
+  if (!pipeline) {
+    const module = device.createShaderModule({ code: `
+      struct Rect { origin: vec2u, scale: u32, masked: u32 };
+      @group(0) @binding(0) var<uniform> rect: Rect;
+      @group(0) @binding(1) var texels: texture_2d<f32>;
+      @group(0) @binding(2) var mask: texture_2d<f32>;
+      @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+        let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+        return vec4f(uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0), 0.0, 1.0);
+      }
+      @fragment fn fs(@builtin(position) position: vec4f) -> @location(0) vec4f {
+        let texel = vec2u(position.xy) / rect.scale - rect.origin;
+        if (rect.masked != 0u && textureLoad(mask, texel, 0).r < 0.5) { discard; }
+        return textureLoad(texels, texel, 0);
+      }` });
+    pipeline = device.createRenderPipeline({ layout: 'auto', vertex: { module, entryPoint: 'vs' },
+      fragment: { module, entryPoint: 'fs', targets: [{ format }] }, primitive: { topology: 'triangle-list' } });
+    texelWritePipelines.set(format, pipeline);
+  }
+  return pipeline;
+}
+function writeTexels(encoder, target, x, y, width, height, data, dataOffset, maskOffset) {
+  const bytes = texelBytes[target.gpuFormat];
+  if (!bytes) throw new Error(`texel write into a ${target.gpuFormat} render target`);
+  const upload = (format, texel, offset) => {
+    const texture = device.createTexture({ size: [width, height], format,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    device.queue.writeTexture({ texture }, data.subarray(offset, offset + width * height * texel),
+      { bytesPerRow: width * texel }, [width, height]);
+    transientTextures.push(texture);
+    return texture;
+  };
+  const texels = upload(target.gpuFormat, bytes, dataOffset);
+  const masked = maskOffset !== 0xffffffff;
+  const mask = masked ? upload('r8unorm', 1, maskOffset) : texels;
+  const uniform = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM, mappedAtCreation: true });
+  new Uint32Array(uniform.getMappedRange()).set([x, y, target.scale, masked ? 1 : 0]);
+  uniform.unmap();
+  stagingBuffers.push(uniform);
+  const pipeline = texelWritePipeline(target.gpuFormat);
+  const pass = encoder.beginRenderPass({ colorAttachments: [{ view: target.view,
+    loadOp: target.fresh ? 'clear' : 'load', storeOp: 'store', clearValue: [0, 0, 0, 1] }] });
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: uniform } },
+    { binding: 1, resource: texels.createView() },
+    { binding: 2, resource: mask.createView() },
+  ] }));
+  const s = target.scale;
+  pass.setViewport(0, 0, target.gpuWidth, target.gpuHeight, 0, 1);
+  pass.setScissorRect(x * s, y * s, width * s, height * s);
+  pass.draw(3);
+  pass.end();
+  target.fresh = false;
+  if (target.resolved) resolveTarget(encoder, target);
 }
 
 // words: Uint32Array view of the command stream; data: Uint8Array payload.
@@ -406,17 +491,19 @@ function encodeScene(words, data) {
       const address = word(), format = word(), width = word(), height = word();
       const depthMode = word(), depthFormat = word(), depthLoad = word(), depthStore = word();
       const clearDepth = floats[cursor++], clearStencil = word();
-      const depthAddress = word(), stencilAddress = word(), snapshot = word(), scale = word();
-      target = targetFor(address, format, width, height, scale);
+      const depthAddress = word(), stencilAddress = word(), snapshot = word(), scale = word(), renderScale = word();
+      target = targetFor(address, format, width, height, scale, renderScale);
       if (snapshot) {
         // A draw samples this target: give it the contents from before the pass.
+        const width = target.width * target.renderScale, height = target.height * target.renderScale;
         if (!target.snapshot) {
-          const texture = device.createTexture({ size: [target.gpuWidth, target.gpuHeight], format: target.gpuFormat,
+          const texture = device.createTexture({ size: [width, height], format: target.gpuFormat,
             usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
           target.snapshot = { texture, view: texture.createView() };
+          textureGroups.clear();
         }
-        encoder.copyTextureToTexture({ texture: target.texture }, { texture: target.snapshot.texture },
-          [target.gpuWidth, target.gpuHeight]);
+        encoder.copyTextureToTexture({ texture: sampled(target).texture }, { texture: target.snapshot.texture },
+          [width, height]);
       }
       depth = depthMode ? depthAttachmentFor(target, depthMode, depthFormat, depthAddress, stencilAddress) : null;
       // Guest depth contents exist only once this surface was stored.
@@ -472,7 +559,7 @@ function encodeScene(words, data) {
       pass.setBindGroup(3, textureGroupFor(0));
       for (let i = 0; i < streamCount; ++i) pass.setVertexBuffer(i, sceneBuffer, streamOffsets[i], streamSizes[i]);
       pass.setIndexBuffer(sceneBuffer, indexSize === 2 ? 'uint16' : 'uint32', indexOffset, indexCount * indexSize);
-      const scale = target.scale;
+      const scale = target.renderScale; // viewport and scissor are render pixels
       pass.setViewport(vx * scale, vy * scale, Math.max(vw, 0) * scale, Math.max(vh, 0) * scale, 0, 1);
       pass.setScissorRect(sx * scale, sy * scale, sw * scale, sh * scale);
       pass.setStencilReference(stencilRef);
@@ -505,7 +592,8 @@ function encodeScene(words, data) {
       const id = word(), address = word(), x = word(), y = word(), width = word(), height = word();
       const source = targets.get(address);
       if (!source) { warnOnce('region of a render target that was never rendered'); break; }
-      const w = width * source.scale, h = height * source.scale;
+      const scale = source.renderScale;
+      const w = width * scale, h = height * scale;
       let entry = textures.get(id);
       if (!entry || entry.width !== w || entry.height !== h || entry.format !== source.gpuFormat) {
         entry?.texture.destroy();
@@ -515,39 +603,22 @@ function encodeScene(words, data) {
         textures.set(id, entry);
         textureGroups.clear();
       }
-      encoder.copyTextureToTexture({ texture: source.texture, origin: { x: x * source.scale, y: y * source.scale } },
+      encoder.copyTextureToTexture({ texture: sampled(source).texture, origin: { x: x * scale, y: y * scale } },
         { texture: entry.texture }, [w, h]);
       break;
     }
     case 4: // END_PASS
       pass.end(); pass = null;
+      if (target.resolved) resolveTarget(encoder, target);
       break;
-    case 5: { // CLEAR_TARGET: address, x, y, width, height, A8B8G8R8 color
-      const address = word(), x = word(), y = word(), width = word(), height = word(), color = word();
-      const cleared = targets.get(address);
-      if (!cleared) break; // guest memory already holds the fill
-      const rgba = [color & 255, (color >>> 8) & 255, (color >>> 16) & 255, color >>> 24];
-      if (x === 0 && y === 0 && width >= cleared.width && height >= cleared.height) {
-        encoder.beginRenderPass({ colorAttachments: [{ view: cleared.view, loadOp: 'clear', storeOp: 'store',
-          clearValue: rgba.map(v => v / 255) }] }).end();
-      } else {
-        const w = Math.min(width, cleared.width - Math.min(x, cleared.width)) * cleared.scale;
-        const h = Math.min(height, cleared.height - Math.min(y, cleared.height)) * cleared.scale;
-        if (w > 0 && h > 0) {
-          // Through the encoder, so the fill stays ordered with this stream's passes.
-          const texel = packColor(cleared.gpuFormat, rgba);
-          const bytesPerRow = Math.ceil(w * texel.length / 256) * 256;
-          const staging = device.createBuffer({ size: bytesPerRow * h, usage: GPUBufferUsage.COPY_SRC, mappedAtCreation: true });
-          const bytes = new Uint8Array(staging.getMappedRange());
-          for (let row = 0; row < h; ++row)
-            for (let i = 0; i < w; ++i) bytes.set(texel, row * bytesPerRow + i * texel.length);
-          staging.unmap();
-          encoder.copyBufferToTexture({ buffer: staging, bytesPerRow },
-            { texture: cleared.texture, origin: { x: x * cleared.scale, y: y * cleared.scale } }, [w, h]);
-          stagingBuffers.push(staging);
-        }
-      }
-      cleared.fresh = false;
+    case 7: { // WRITE_TEXELS: address, x, y, width, height, data offset, mask offset
+      // Guest texels of a rendered target that a transfer wrote, in the
+      // target's texel format, row by row; the mask (one byte per texel,
+      // 0xffffffff = none) selects the texels to replace.
+      const address = word(), x = word(), y = word(), width = word(), height = word();
+      const dataOffset = word(), maskOffset = word();
+      const written = targets.get(address);
+      if (written) writeTexels(encoder, written, x, y, width, height, data, dataOffset, maskOffset);
       break;
     }
     default:
@@ -557,12 +628,13 @@ function encodeScene(words, data) {
   if (pass) pass.end();
   device.queue.submit([encoder.finish()]);
   for (const buffer of stagingBuffers.splice(0)) buffer.destroy();
+  for (const texture of transientTextures.splice(0)) texture.destroy();
   ++stats.scenes;
 }
 
 export function hasTarget(address) { return targets.has(address); }
 
-function blit(texture, viewTarget, format) {
+function blit(target, viewTarget, format) {
   if (!blitPipeline || blitPipeline.format !== format) {
     const module = device.createShaderModule({ code: `
       @group(0) @binding(0) var image: texture_2d<f32>;
@@ -581,11 +653,14 @@ function blit(texture, viewTarget, format) {
     blitPipeline.format = format;
     blitSampler = device.createSampler({ minFilter: 'linear', magFilter: 'linear' });
   }
+  // One group per target and blit pipeline, not one per presented frame.
+  if (target.blitGroup?.pipeline !== blitPipeline)
+    target.blitGroup = { pipeline: blitPipeline, group: device.createBindGroup({ layout: blitPipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: target.view }, { binding: 1, resource: blitSampler }] }) };
   const encoder = device.createCommandEncoder();
   const pass = encoder.beginRenderPass({ colorAttachments: [{ view: viewTarget, loadOp: 'clear', storeOp: 'store' }] });
   pass.setPipeline(blitPipeline);
-  pass.setBindGroup(0, device.createBindGroup({ layout: blitPipeline.getBindGroupLayout(0),
-    entries: [{ binding: 0, resource: texture.createView() }, { binding: 1, resource: blitSampler }] }));
+  pass.setBindGroup(0, target.blitGroup.group);
   pass.draw(3);
   pass.end();
   device.queue.submit([encoder.finish()]);
@@ -600,18 +675,20 @@ export function presentTarget(address, onFrame, readbackEvery) {
   if (!target) return false;
   const generation = ++presentGeneration;
   ++stats.presents;
+  // Shown at its render scale: a downscaled surface's double-size render is
+  // filtered to it (the linear blit samples each 2x2 block at its center).
+  const width = target.width * target.renderScale, height = target.height * target.renderScale;
   if (canvasContext) {
-    if (canvas.width !== target.gpuWidth || canvas.height !== target.gpuHeight) {
-      canvas.width = target.gpuWidth; canvas.height = target.gpuHeight;
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width; canvas.height = height;
     }
-    blit(target.texture, canvasContext.getCurrentTexture().createView(), canvasFormat);
+    blit(target, canvasContext.getCurrentTexture().createView(), canvasFormat);
   }
   if (readbackEvery > 0 && generation % readbackEvery === 1 % readbackEvery) {
     // RGBA8 copy of the displayed target, asynchronously; never blocks the guest.
-    const width = target.gpuWidth, height = target.gpuHeight;
     const copy = device.createTexture({ size: [width, height], format: 'rgba8unorm',
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
-    blit(target.texture, copy.createView(), 'rgba8unorm');
+    blit(target, copy.createView(), 'rgba8unorm');
     const bytesPerRow = Math.ceil(width * 4 / 256) * 256;
     const buffer = device.createBuffer({ size: bytesPerRow * height,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -627,18 +704,17 @@ export function presentTarget(address, onFrame, readbackEvery) {
       onFrame(generation, width, height, pixels);
     }, error => warnOnce(`frame readback failed: ${error}`));
   } else {
-    onFrame(generation, target.gpuWidth, target.gpuHeight, null);
+    onFrame(generation, width, height, null);
   }
   return true;
 }
 
 // Surface sync (producer: VITA3K_SURFACE_SYNC=1). The target's texels already
-// have the guest's byte layout (the shaders write components in memory order;
-// rgba8unorm, rgb10a2unorm and rgba16float match the U8x4, U2U10U10U10 and
-// F16x4 surfaces bit for bit), so a scaled target is only box-filtered back to
-// its guest size, in its own format. `write(mapped, bytesPerRow)` receives the
-// rows while the copy is mapped.
-const texelBytes = { rgba8unorm: 4, rgb10a2unorm: 4, rgba16float: 8 };
+// have the guest's texel bytes (see colorFormats), so a scaled target (and a
+// downscaled surface's double-size render) is only box-filtered back to its
+// guest size, in its own format. `write(mapped, bytesPerRow)` receives the
+// rows while the copy is mapped; the producer stores them in the surface's
+// memory layout.
 const downscalePipelines = new Map(); // `${format}:${scale}` -> pipeline
 const readbackBuffers = new Map();    // size -> idle MAP_READ buffer
 function downscalePipeline(format, scale) {

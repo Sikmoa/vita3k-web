@@ -44,34 +44,68 @@ const hot = new Map([
   ['renderer::set_vertex_stream(renderer::State&, renderer::Context*, unsigned long, unsigned long, Ptr<void const>)', 0],
   ['gxmSetUniformBuffers(renderer::State&, GxmState&, SceGxmContext*, SceGxmProgram const&, std::__2::span<Ptr<void const>, 18446744073709551615ul>, std::__2::array<unsigned int, 15ul> const&, MemState const&)', 0],
 ]);
+// Functions whose invoke_* calls may only reach container growth inside
+// inlined standard-library code (an unordered_map rehash when a key is first
+// inserted); every call a scene makes per command must be direct. The browser
+// GXM consumer's command loop (gxm_webgpu_bridge.cpp) runs once per command.
+const growthOnly = new Map([
+  ['renderer::consume_commands(renderer::State&, renderer::Context*, renderer::Command*&, MemState&, renderer::scene::Writer&, renderer::Submission&)',
+    /^(?:std::__2::__next_prime\(|void std::__2::__hash_table<.*>::__do_rehash<|void std::__2::__hash_table<.*>::__rehash<)/],
+]);
 // call_import may keep invokes on its cold paths (debug watch, missing NID),
 // but the HLE body itself must be a direct call_indirect after resolve_import.
 const callImport = 'call_import(EmuEnvState&, CPUState&, unsigned int, int)';
 
+// Table index -> function name, to name the callee of an invoke_* call.
+const tableNames = new Map();
+{
+  const elements = spawn(process.env.WASM_OBJDUMP || 'wasm-objdump', ['-x', '-j', 'Elem', wasm], { stdio: ['ignore', 'pipe', 'inherit'] });
+  for await (const line of createInterface({ input: elements.stdout })) {
+    const element = /^\s*- elem\[(\d+)\] = (?:ref\.func:|func\[)(\d+)/.exec(line);
+    if (element) tableNames.set(Number(element[1]), symbols.get(Number(element[2])) ?? `func ${element[2]}`);
+  }
+  if (await new Promise((done) => elements.on('close', done)) !== 0) throw new Error(`wasm-objdump -x failed on ${wasm}`);
+}
 const objdump = spawn(process.env.WASM_OBJDUMP || 'wasm-objdump', ['-d', wasm], { stdio: ['ignore', 'pipe', 'inherit'] });
 const found = new Map();
-let current = null, callImportLines = null;
+let current = null, callImportLines = null, recent = [];
 for await (const line of createInterface({ input: objdump.stdout })) {
   const header = /^[0-9a-f]+ func\[(\d+)\](?: <(.*)>)?:$/.exec(line);
   if (header) {
     current = header[2] ?? symbols.get(Number(header[1])) ?? null;
-    if (hot.has(current)) found.set(current, []);
+    if (hot.has(current) || growthOnly.has(current)) found.set(current, []);
     if (current === callImport) callImportLines = [];
+    recent = [];
     continue;
   }
   if (!current) continue;
+  const instruction = line.split('|').pop().trim();
+  if (growthOnly.has(current)) { recent.push(instruction); if (recent.length > 32) recent.shift(); }
   let call = /\|\s+(call(?:_indirect)? .*)$/.exec(line)?.[1];
   if (!call) continue;
   const callee = /^call (\d+)$/.exec(call);
   if (callee && symbols.has(Number(callee[1]))) call += ` <${symbols.get(Number(callee[1]))}>`;
   // wasm32 disassembly labels imports with their module (<env.invoke_vii>).
   if (hot.has(current) && /<(?:env\.)?invoke_/.test(call)) found.get(current).push(call);
+  if (growthOnly.has(current) && /<(?:env\.)?invoke_/.test(call)) {
+    // Asyncify guards each call site with `if`; the first constant after it
+    // is the invoke's table index (a callee not known statically fails).
+    const guard = recent.lastIndexOf('if', recent.length - 2);
+    const index = /^i(?:32|64)\.const (\d+)$/.exec(recent[guard + 1] ?? '')?.[1];
+    const callee = index === undefined ? undefined : tableNames.get(Number(index));
+    if (!callee || !growthOnly.get(current).test(callee)) found.get(current).push(`${call} -> ${callee ?? 'unknown callee'}`);
+  }
   if (current === callImport) callImportLines.push(call);
 }
 const exitCode = await new Promise((done) => objdump.on('close', done));
 if (exitCode !== 0) throw new Error(`wasm-objdump failed (${exitCode}) on ${wasm}`);
 
 const failures = [];
+for (const name of growthOnly.keys()) {
+  const calls = found.get(name);
+  if (!calls) failures.push(`${name}: not found in ${wasm} (renamed or fully inlined?)`);
+  else if (calls.length) failures.push(`${name}: ${calls.length} invoke_* calls outside container growth:\n    ${calls.join('\n    ')}`);
+}
 for (const [name, allowed] of hot) {
   const calls = found.get(name);
   if (!calls) failures.push(`${name}: not found in ${wasm} (renamed or fully inlined?)`);
@@ -89,4 +123,4 @@ if (failures.length) {
   console.error(`hot path invoke check failed:\n  ${failures.join('\n  ')}`);
   process.exit(1);
 }
-console.log(`hot path invoke check passed (${hot.size} functions, call_import HLE call direct)`);
+console.log(`hot path invoke check passed (${hot.size + growthOnly.size} functions, call_import HLE call direct)`);

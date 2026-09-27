@@ -6,7 +6,7 @@
 // state, and the vertex/index/uniform/texture bytes the draws reference, all
 // copied at submission so the guest may reuse its buffers immediately. The
 // stream is submitted synchronously: render targets live on the GPU, sampled
-// directly when a texture aliases one, and are presented from there.
+// when a texture covers their texels, and are presented from there.
 // Command-list completion (notifications, sync objects) is published as soon
 // as the scene is submitted. Opt-in surface sync (VITA3K_SURFACE_SYNC=1, like
 // desktop's disable-surface-sync=false) also reads each rendered target back
@@ -88,20 +88,20 @@ EM_JS(int, web_gxm_submit, (const uint32_t *words, uint32_t count, const uint8_t
     }
 });
 
-// Surface sync: copies the render target at `address` (downscaled to its guest
-// size, in the guest's texel layout) into the guest rows at `dest`. The guest
-// thread suspends until the GPU copy is mapped.
+// Surface sync: copies the render target at `address`, box-filtered to its
+// guest size, as tight rows of guest texels into the host buffer `dest`
+// (the caller stores them in the surface's layout). The guest thread
+// suspends until the GPU copy is mapped.
 EM_ASYNC_JS(int, web_gxm_sync_surface, (uint32_t address, uint8_t *dest, uint32_t width, uint32_t height,
-    uint32_t stride_bytes, uint32_t pixel_bytes), {
+    uint32_t pixel_bytes), {
     const scene = Module['vita3kGxm'];
     if (!scene) return 0;
     try {
         await scene.readTarget(address >>> 0, width, height, pixel_bytes, (mapped, bytesPerRow) => {
-            // Only the surface's pixels: bytes past `width` in a row belong to the guest.
             const row = width * pixel_bytes;
-            const guest = Module['vita3kHostBytes'](dest, (height - 1) * stride_bytes + row);
+            const rows = Module['vita3kHostBytes'](dest, height * row);
             for (let y = 0; y < height; ++y)
-                guest.set(mapped.subarray(y * bytesPerRow, y * bytesPerRow + row), y * stride_bytes);
+                rows.set(mapped.subarray(y * bytesPerRow, y * bytesPerRow + row), y * row);
         });
         return 0;
     } catch (error) {
@@ -140,9 +140,10 @@ struct Timing {
 };
 // VITA3K_TEXTURE_VERIFY=1: hash every bound texture even when no write was
 // tracked, and report changes the write tracking missed.
-// Internal resolution: surfaces at least the display size are rendered at
-// VITA3K_RESOLUTION_SCALE times their guest size in each dimension (default
-// 2: 960x544 -> 1920x1088). Smaller intermediate surfaces (blur and bloom
+// Internal resolution: surfaces whose render pixels (their size, doubled when
+// downscaled) are at least the display size are rendered at
+// VITA3K_RESOLUTION_SCALE times that in each dimension (default 2: 960x544 ->
+// 1920x1088). Smaller intermediate surfaces (blur and bloom
 // chains) stay at guest resolution: titles sample them with offsets of one
 // guest texel, which upscaled would skip rows (Limbo's blur atlas streaks).
 // gxm_scene.js scales the GPU resources; shaders divide gl_FragCoord by the
@@ -155,8 +156,12 @@ uint32_t resolution_scale() {
     }();
     return scale;
 }
+// `width` x `height`: the surface's render pixels. The GPU texture (render
+// pixels times the scale) stays within WebGPU's default 8192 texel limit.
 uint32_t surface_scale(uint32_t width, uint32_t height) {
-    return width >= 960 && height >= 544 ? resolution_scale() : 1;
+    if (width < 960 || height < 544)
+        return 1;
+    return std::max<uint32_t>(1, std::min({resolution_scale(), 8192 / width, 8192 / height}));
 }
 // VITA3K_SURFACE_SYNC=1: every scene that drew into a color surface reads the
 // target back into guest memory before its completions are published, for
@@ -190,12 +195,77 @@ std::map<std::string, uint64_t> &survey_counts() {
 }
 // A draw the consumer cannot represent yet is skipped and reported once per
 // reason (the scene and the guest thread continue), like the desktop backends.
-void skip_draw(const std::string &why) {
-    auto &count = survey_counts()[why];
+// Out of line with a C string: the draw path then holds no std::string whose
+// cleanup would route its calls through invoke_* wrappers.
+[[gnu::noinline]] void skip_draw(const char *why, const char *detail = "") {
+    static std::string reason;
+    reason.assign(why).append(detail);
+    auto &count = survey_counts()[reason];
     if (count++ == 0)
-        std::printf("[gxm-skip] %s\n", why.c_str());
+        std::printf("[gxm-skip] %s%s\n", why, detail);
 }
 
+// --- Surfaces in guest memory ---------------------------------------------------
+// Where a color surface's texels live in guest memory. Rendering on the GPU
+// is layout-independent; everything that touches guest memory (surface sync,
+// textures aliasing a target, transfers) addresses texels through this.
+enum class Layout : uint32_t { Linear, Tiled, Swizzled };
+struct SurfaceGeometry {
+    uint32_t width = 0, height = 0, stride_px = 0, pixel_bytes = 0;
+    Layout layout = Layout::Linear;
+    // Tiled: 32x32-texel tiles of 1024 contiguous texels, tile rows
+    // stride_px / 32 tiles wide (renderer/src/transfer.cpp compute_offset).
+    // Swizzled: Morton order over the power-of-two surface (encode_morton).
+    uint64_t texel_index(uint32_t x, uint32_t y) const {
+        switch (layout) {
+        case Layout::Tiled:
+            return (uint64_t((y >> 5) * (stride_px >> 5) + (x >> 5)) << 10) | ((y & 31) << 5) | (x & 31);
+        case Layout::Swizzled:
+            return renderer::texture::encode_morton(uint16_t(x), uint16_t(y), uint16_t(width), uint16_t(height));
+        default:
+            return uint64_t(y) * stride_px + x;
+        }
+    }
+    uint64_t byte_offset(uint32_t x, uint32_t y) const { return texel_index(x, y) * pixel_bytes; }
+    // Bytes from the surface base to the end of its last texel.
+    uint64_t footprint() const {
+        switch (layout) {
+        case Layout::Tiled: return uint64_t((height + 31) >> 5) * (stride_px >> 5) * 1024 * pixel_bytes;
+        case Layout::Swizzled: return uint64_t(width) * height * pixel_bytes;
+        default: return (uint64_t(height) - 1) * stride_px * pixel_bytes + uint64_t(width) * pixel_bytes;
+        }
+    }
+    // Texel of a byte offset inside the footprint; false for padding (a
+    // stride gap, tile texels past the width or height).
+    bool texel_at(uint64_t offset, uint32_t &x, uint32_t &y) const {
+        if (offset % pixel_bytes)
+            return false;
+        const uint64_t index = offset / pixel_bytes;
+        switch (layout) {
+        case Layout::Tiled: {
+            const uint64_t tile = index >> 10, row_tiles = stride_px >> 5;
+            if (!row_tiles) return false;
+            x = uint32_t((tile % row_tiles) * 32 + (index & 31));
+            y = uint32_t((tile / row_tiles) * 32 + ((index >> 5) & 31));
+            break;
+        }
+        case Layout::Swizzled: {
+            // As renderer/src/texture/format.cpp swizzled_texture_to_linear_texture.
+            const uint32_t min = std::min(width, height), k = std::bit_width(min) - 1;
+            x = renderer::texture::decode_morton2_x(uint32_t(index)) & (min - 1);
+            y = renderer::texture::decode_morton2_y(uint32_t(index)) & (min - 1);
+            const uint32_t upper = uint32_t(index >> (2 * k)) << k;
+            (width >= height ? x : y) |= upper;
+            break;
+        }
+        default:
+            x = uint32_t(index % stride_px);
+            y = uint32_t(index / stride_px);
+            break;
+        }
+        return x < width && y < height;
+    }
+};
 struct TextureUnit {
     bool bound = false;
     SceGxmTexture texture{};
@@ -210,6 +280,14 @@ struct WebContext final : renderer::Context {
     std::array<TextureUnit, 16> vertex_textures{};
     SceGxmDepthStencilSurface depth{};
     bool has_depth_surface = false;
+    // The open scene's pixel spaces (renderer/src/state_set.cpp viewport and
+    // region_clip): guest coordinates times `samples` are render pixels (2
+    // with a multisampled render target, whose samples each get a pixel);
+    // render pixels are `downscale` times the surface's pixels (2 with
+    // SCE_GXM_COLOR_SURFACE_SCALE_MSAA_DOWNSCALE, box-filtered into memory).
+    SurfaceGeometry geometry;
+    uint32_t samples = 1, downscale = 1, internal_scale = 1;
+    std::array<uint32_t, 4> region_clip{}; // guest x_min, x_max, y_min, y_max
 };
 
 struct WebState final : renderer::State {
@@ -336,6 +414,14 @@ void destroy_command_payload(Command &cmd) {
     } else if (cmd.opcode == CommandOpcode::TransferFill) {
         CommandHelper h(&cmd); h.pop<uint32_t>();
         delete h.pop<const SceGxmTransferImage *>();
+    } else if (cmd.opcode == CommandOpcode::TransferCopy) {
+        // renderer.cpp transfer_copy: key value, key mask, key mode, images[2].
+        CommandHelper h(&cmd); h.pop<uint32_t>(); h.pop<uint32_t>(); h.pop<SceGxmTransferColorKeyMode>();
+        delete[] h.pop<const SceGxmTransferImage *>();
+    } else if (cmd.opcode == CommandOpcode::TransferDownscale) {
+        CommandHelper h(&cmd);
+        delete h.pop<const SceGxmTransferImage *>();
+        delete h.pop<const SceGxmTransferImage *>();
     }
     // NewFrame owns a host DisplayFrameInfo*, released in-handler exactly like
     // sync.cpp new_frame (copied into display state, then deleted). No guest
@@ -348,8 +434,10 @@ bool create_context(State &s, std::unique_ptr<Context> &ctx) {
 }
 void destroy_context_during_shutdown(State &s, std::unique_ptr<Context> &ctx) { if (s.context == ctx.get()) s.context = nullptr; ctx.reset(); }
 void destroy_context(State &s, std::unique_ptr<Context> &ctx) { destroy_context_during_shutdown(s, ctx); }
+// Multisampled targets render one pixel per sample (see WebContext::samples),
+// as the desktop renderers do.
 bool create_render_target(State &, std::unique_ptr<RenderTarget> &rt, const SceGxmRenderTargetParams *p) {
-    if (p->multisampleMode != SCE_GXM_MULTISAMPLE_NONE || !p->width || !p->height || p->width > 4096 || p->height > 4096) return false;
+    if (p->multisampleMode > SCE_GXM_MULTISAMPLE_4X || !p->width || !p->height || p->width > 4096 || p->height > 4096) return false;
     rt = std::make_unique<RenderTarget>(); rt->multisample_mode = p->multisampleMode;
     return true;
 }
@@ -469,7 +557,7 @@ static void require_guest(MemState &mem, Address address, size_t size) {
 // --- GXS1 scene stream (browser/web/gxm_scene.js is the only consumer) -------
 namespace scene {
 constexpr uint32_t kMagic = 0x31535847; // "GXS1"
-enum Command : uint32_t { BeginPass = 1, Draw = 2, Texture = 3, EndPass = 4, ClearTarget = 5, Region = 6 };
+enum Command : uint32_t { BeginPass = 1, Draw = 2, Texture = 3, EndPass = 4, Region = 6, WriteTexels = 7 };
 // Dynamic uniform/storage offsets must honour WebGPU's 256-byte minimum.
 constexpr size_t kUniformAlign = 256;
 
@@ -486,7 +574,7 @@ struct Writer {
         void clear() { used = 0; }
         // Extends to offset + size (zero-filling the alignment gap) and
         // returns the bytes at offset.
-        uint8_t *extend(size_t offset, size_t size) noexcept {
+        uint8_t *extend(size_t offset, size_t size) {
             if (offset + size > capacity)
                 grow(offset + size);
             std::memset(buffer.get() + used, 0, offset - used);
@@ -510,9 +598,9 @@ struct Writer {
     // Commands that must run before the open pass begins (target region copies).
     void insert_before_pass(std::initializer_list<uint32_t> command) {
         words.insert(words.begin() + pass_begin_word, command);
-        for (auto &[site, base] : stream_sites)
-            if (site >= pass_begin_word)
-                site += static_cast<uint32_t>(command.size());
+        for (auto &stream : stream_sites)
+            if (stream.site >= pass_begin_word)
+                stream.site += static_cast<uint32_t>(command.size());
         pass_begin_word += command.size();
         pass_snapshot_word += command.size();
     }
@@ -524,39 +612,43 @@ struct Writer {
     // that read the same base share one copy of the largest range, taken when
     // the submission is sent (the guest is stopped until then) or before the
     // bridge itself writes guest memory.
-    struct StreamSpan { uint32_t size = 0, offset = 0; };
-    std::unordered_map<Address, StreamSpan> streams;
-    std::vector<std::pair<uint32_t, Address>> stream_sites; // offset word, base
+    // A flat list, grouped by base when copied: a hash map would allocate a
+    // node per base and submission.
+    struct StreamSite { uint32_t site; Address base; uint32_t size; }; // site: offset word
+    std::vector<StreamSite> stream_sites;
     void reset() {
         words.assign(1, kMagic);
         data.clear();
         pass_open = false;
         draws = 0;
-        streams.clear();
         stream_sites.clear();
     }
     // Emits the scene-data offset of guest bytes [base, base + size) as a
     // word filled in by copy_streams().
     void stream(Address base, uint32_t size) {
-        auto &span = streams[base];
-        span.size = std::max(span.size, size);
-        stream_sites.emplace_back(static_cast<uint32_t>(words.size()), base);
+        stream_sites.push_back({static_cast<uint32_t>(words.size()), base, size});
         words.push_back(0);
     }
     void copy_streams(MemState &mem) {
-        for (auto &[base, span] : streams)
-            span.offset = bytes(Ptr<const uint8_t>(base).get(mem), span.size, 4);
-        for (const auto &[site, base] : stream_sites)
-            words[site] = streams.find(base)->second.offset;
-        streams.clear();
+        std::sort(stream_sites.begin(), stream_sites.end(),
+            [](const StreamSite &a, const StreamSite &b) { return a.base < b.base; });
+        for (size_t first = 0; first < stream_sites.size();) {
+            size_t last = first;
+            uint32_t size = 0;
+            for (; last < stream_sites.size() && stream_sites[last].base == stream_sites[first].base; ++last)
+                size = std::max(size, stream_sites[last].size);
+            const uint32_t offset = bytes(Ptr<const uint8_t>(stream_sites[first].base).get(mem), size, 4);
+            for (; first < last; ++first)
+                words[stream_sites[first].site] = offset;
+        }
         stream_sites.clear();
     }
-    // noexcept: allocation failure is fatal anyway, and it lets callers with
-    // cleanups call these directly instead of through an invoke_* wrapper;
-    // only the rare growth calls inside them go through one.
-    void word(uint32_t value) noexcept { words.push_back(value); }
-    void real(float value) noexcept { words.push_back(std::bit_cast<uint32_t>(value)); }
-    uint32_t bytes(const void *source, size_t size, size_t alignment) noexcept {
+    // Not noexcept: the draw path holds no locals with destructors, so these
+    // are direct calls, and noexcept would add a terminate landing pad (an
+    // invoke_* wrapper) around their growth calls.
+    void word(uint32_t value) { words.push_back(value); }
+    void real(float value) { words.push_back(std::bit_cast<uint32_t>(value)); }
+    uint32_t bytes(const void *source, size_t size, size_t alignment) {
         const size_t offset = align(data.size(), alignment);
         uint8_t *dest = data.extend(offset, size);
         if (size)
@@ -564,7 +656,7 @@ struct Writer {
         return static_cast<uint32_t>(offset);
     }
     // Reserve `size` bytes and return a pointer the caller fills in place.
-    uint8_t *reserve(size_t size, size_t alignment, uint32_t &offset) noexcept {
+    uint8_t *reserve(size_t size, size_t alignment, uint32_t &offset) {
         offset = static_cast<uint32_t>(align(data.size(), alignment));
         return data.extend(offset, size);
     }
@@ -596,11 +688,44 @@ static int program_id(MemState &mem, const renderer::ShaderProgram &program, Ptr
     return registry.ready[id] ? int(id) : -1;
 }
 
+// The layout of a color surface, or false with a reason when the consumer
+// cannot address it.
+static bool surface_geometry(const SceGxmColorSurface &color, SurfaceGeometry &g, const char *&why) {
+    g.width = color.width;
+    g.height = color.height;
+    g.stride_px = color.strideInPixels;
+    g.pixel_bytes = uint32_t(gxm::bits_per_pixel(
+        static_cast<SceGxmColorBaseFormat>(color.colorFormat & SCE_GXM_COLOR_BASE_FORMAT_MASK)) / 8);
+    switch (color.surfaceType) {
+    case SCE_GXM_COLOR_SURFACE_LINEAR: g.layout = Layout::Linear; break;
+    case SCE_GXM_COLOR_SURFACE_TILED:
+        g.layout = Layout::Tiled;
+        if (g.stride_px % 32) { why = "tiled color surface whose stride is not whole tiles"; return false; }
+        break;
+    case SCE_GXM_COLOR_SURFACE_SWIZZLED:
+        g.layout = Layout::Swizzled;
+        if (!std::has_single_bit(g.width) || !std::has_single_bit(g.height)) {
+            why = "swizzled color surface without power-of-two size";
+            return false;
+        }
+        break;
+    default: why = "color surface type"; return false;
+    }
+    if (!g.pixel_bytes) { why = "color surface format"; return false; }
+    return true;
+}
+
 // --- Textures -----------------------------------------------------------------
 // Render targets the scene stream has rendered, by guest color address. A
-// texture whose data aliases one samples the GPU target instead of memory.
+// texture whose texels are one's texels samples the GPU target (or a copy of
+// the rectangle it covers) instead of memory.
 struct RenderedTarget {
-    uint32_t width = 0, height = 0, stride_bytes = 0, pixel_bytes = 0;
+    SurfaceGeometry geometry;
+    SceGxmColorBaseFormat format = SCE_GXM_COLOR_BASE_FORMAT_U8U8U8U8;
+    // Guest writes from this write epoch on are not the GPU's: rendering
+    // starts it, and the bridge's own writes of target texels (surface sync,
+    // transfers) move it past themselves.
+    uint32_t rendered_epoch = 0;
 };
 std::unordered_map<Address, RenderedTarget> &rendered_targets() {
     static std::unordered_map<Address, RenderedTarget> targets;
@@ -624,6 +749,11 @@ struct TextureCache {
 TextureCache &texture_cache() {
     static TextureCache cache;
     return cache;
+}
+// After the bridge itself wrote guest memory: later writes get a new epoch,
+// which rendered targets and texture checks compare against.
+static uint32_t advance_write_epoch(MemState &mem) {
+    return texture_cache().epoch = mem_next_write_epoch(mem);
 }
 
 // Output channel sources: 0..3 = decoded component, 4 = zero, 5 = one.
@@ -706,7 +836,7 @@ struct DecodedTexture {
     Address source = 0;     // guest bytes the chain is decoded from
     uint32_t footprint = 0;
     uint32_t width = 0, height = 0, levels = 0;
-    std::vector<std::pair<uint32_t, uint32_t>> level_bytes; // offset, size in the scene data
+    std::array<std::pair<uint32_t, uint32_t>, 13> level_bytes; // offset, size in the scene data (4096 = 13 levels)
 };
 // `known_hash`: source hash of the copy the GPU already has; when the guest
 // bytes still hash to it, nothing is decoded and `decoded.levels` stays 0.
@@ -776,7 +906,8 @@ static bool decode_texture(MemState &mem, const SceGxmTexture &t, scene::Writer 
     decoded.width = width;
     decoded.height = height;
     decoded.levels = levels;
-    std::vector<uint8_t> linear;
+    // Kept across calls: the draw path holds no locals with destructors (skip_draw).
+    static std::vector<uint8_t> linear;
     uint64_t level_source = 0;
     uint32_t lw = layout_width, lh = layout_height, w = width, h = height;
     for (uint32_t level = 0; level < levels; ++level) {
@@ -806,7 +937,7 @@ static bool decode_texture(MemState &mem, const SceGxmTexture &t, scene::Writer 
                     texel[i] = map[i] == Z ? 0 : map[i] == O ? 255 : c[map[i]];
             }
         }
-        decoded.level_bytes.emplace_back(offset, w * h * 4);
+        decoded.level_bytes[level] = {offset, w * h * 4};
         level_source += uint64_t(align(lw, align_width)) * align(lh, align_height) * bytes_per_pixel;
         lw = std::max(lw / 2, 1u); lh = std::max(lh / 2, 1u); w = std::max(w / 2, 1u); h = std::max(h / 2, 1u);
     }
@@ -820,40 +951,127 @@ struct BoundTexture {
     uint32_t id = 0;
     uint32_t min = 0, mag = 0, mip = 0, u = 0, v = 0, lod_max = 0;
 };
-// A linear-strided texture inside a rendered target (same pixel size and
-// stride) samples a GPU copy of that rectangle, taken before the open pass
-// begins: what a tile-based GPU reads from memory during the scene.
-static bool bind_target_region(const SceGxmTexture &t, scene::Writer &out, BoundTexture &bound) {
-    if (t.texture_type() != SCE_GXM_TEXTURE_LINEAR_STRIDED || !out.pass_open)
-        return false;
+// The texels of a texture that lie in a rendered target, when they are the
+// target's texels: same memory layout and texel format, a whole rectangle
+// inside the surface, and not written by the guest since it was rendered
+// (memory reused for other data). `overlaps` reports a texture that starts
+// inside a target without matching it: like desktop Vita3K it reads guest
+// memory, which holds the rendered texels only with surface sync.
+struct TargetTexels {
+    Address base = 0;
+    uint32_t x = 0, y = 0;
+    bool whole = false;
+};
+static bool texels_in_target(const MemState &mem, const SceGxmTexture &t, TargetTexels &at, bool &overlaps) {
+    overlaps = false;
     const Address address = t.data_addr << 2;
+    const auto type = t.texture_type();
+    const auto format = gxm::get_format(t);
     const uint32_t width = gxm::get_width(t), height = gxm::get_height(t);
-    const uint32_t pixel_bytes = gxm::bits_per_pixel(gxm::get_base_format(gxm::get_format(t))) / 8;
     for (const auto &[base, target] : rendered_targets()) {
-        const uint64_t size = uint64_t(target.stride_bytes) * target.height;
-        if (address <= base || address >= base + size || target.pixel_bytes != pixel_bytes
-            || gxm::get_stride_in_bytes(t) != target.stride_bytes)
+        const auto &g = target.geometry;
+        if (address < base || address - base >= g.footprint())
             continue;
-        const uint32_t offset = address - base, column = offset % target.stride_bytes;
-        const uint32_t x = column / pixel_bytes, y = offset / target.stride_bytes;
-        if (column % pixel_bytes || x + width > target.width || y + height > target.height)
-            return false;
-        auto &cache = texture_cache();
-        const uint32_t identity[4] = {address, width, height, 0x52474e52u /* region */};
-        auto &entry = cache.entries[XXH3_64bits(identity, sizeof(identity))];
-        if (!entry.id)
-            entry.id = cache.next_id++;
-        if (std::find(out.pass_regions.begin(), out.pass_regions.end(), entry.id) == out.pass_regions.end()) {
-            out.pass_regions.push_back(entry.id);
-            out.insert_before_pass({scene::Region, entry.id, base, x, y, width, height});
+        overlaps = true;
+        // Texel format: the GPU target holds the surface's components in
+        // memory order, which a texture reads unswizzled only in the same
+        // base format with the identity (ABGR) component order.
+        SceGxmTextureBaseFormat expected;
+        switch (target.format) {
+        case SCE_GXM_COLOR_BASE_FORMAT_U8U8U8U8: expected = SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8; break;
+        case SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10: expected = SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10; break;
+        case SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16: expected = SCE_GXM_TEXTURE_BASE_FORMAT_F16F16F16F16; break;
+        default: return false;
         }
-        bound.id = entry.id;
-        bound.lod_max = 0;
+        if (gxm::get_base_format(format) != expected || (format & SCE_GXM_TEXTURE_SWIZZLE_MASK) != 0)
+            return false;
+        // Layout: the texture's texel (u, v) must be the surface's texel
+        // (x + u, y + v) for every texel.
+        const uint64_t offset = address - base;
+        uint32_t x = 0, y = 0;
+        if (!g.texel_at(offset, x, y))
+            return false;
+        switch (g.layout) {
+        case Layout::Linear: {
+            const uint32_t stride = type == SCE_GXM_TEXTURE_LINEAR_STRIDED ? gxm::get_stride_in_bytes(t)
+                : type == SCE_GXM_TEXTURE_LINEAR ? align(width, 8) * g.pixel_bytes : 0;
+            if (stride != g.stride_px * g.pixel_bytes)
+                return false;
+            break;
+        }
+        case Layout::Tiled:
+            // Whole tile rows of the same width, starting at a row of tiles.
+            if (type != SCE_GXM_TEXTURE_TILED || align(width, 32) != g.stride_px || x || y % 32)
+                return false;
+            break;
+        case Layout::Swizzled:
+            // The surface itself, or an aligned square block of its Morton order.
+            if (type != SCE_GXM_TEXTURE_SWIZZLED
+                || !(width == g.width && height == g.height)
+                && !(width == height && width <= std::min(g.width, g.height) && offset % (uint64_t(width) * height * g.pixel_bytes) == 0))
+                return false;
+            break;
+        }
+        if (x + width > g.width || y + height > g.height)
+            return false;
+        // Bytes the texture covers: to its last row, tile row or Morton block.
+        const uint64_t span = g.layout == Layout::Linear
+            ? (uint64_t(height) - 1) * g.stride_px * g.pixel_bytes + uint64_t(width) * g.pixel_bytes
+            : g.layout == Layout::Tiled ? uint64_t((height + 31) / 32) * g.stride_px * 32 * g.pixel_bytes
+                                        : uint64_t(width) * height * g.pixel_bytes;
+        if (mem_written_epoch(mem, address, span) >= target.rendered_epoch) {
+            overlaps = false; // the guest's own bytes now
+            return false;
+        }
+        at = {base, x, y, x == 0 && y == 0 && width == g.width && height == g.height};
         return true;
     }
     return false;
 }
-static bool bind_texture(MemState &mem, const SceGxmTexture &t, scene::Writer &out, BoundTexture &bound, std::string &why) {
+// Reported once per texture format and layout: sampled from guest memory,
+// which does not hold the render target's texels without surface sync.
+[[gnu::noinline]] static void note_stale_texture(const SceGxmTexture &t) {
+    // Plain arrays: this is inlined into the command loop, which must hold
+    // no container whose cleanup would route calls through invoke_* wrappers.
+    static std::array<std::array<uint32_t, 4>, 32> noted;
+    static size_t count = 0;
+    const std::array<uint32_t, 4> key = {uint32_t(gxm::get_format(t)), uint32_t(t.texture_type()), gxm::get_width(t), gxm::get_height(t)};
+    if (std::find(noted.begin(), noted.begin() + count, key) != noted.begin() + count || count == noted.size())
+        return;
+    noted[count++] = key;
+    std::printf("[gxm-note] texture over a render target in another layout or texel format reads guest memory "
+                "(texture format %#010x type %#010x %ux%u)\n", key[0], key[1], key[2], key[3]);
+}
+// A texture on a target's texels samples the target itself when it covers
+// the whole surface (bit 31; bit 30 selects the pre-pass snapshot of the open
+// pass's own target), else a copy of its rectangle taken before the open
+// pass: what a tile-based GPU reads from memory during the scene.
+static void bind_target_texels(const SceGxmTexture &t, const TargetTexels &at, scene::Writer &out, BoundTexture &bound) {
+    bound.lod_max = 0;
+    if (at.whole) {
+        bound.id = 0x80000000u | (at.base >> 2);
+        if (out.pass_open && at.base == out.pass_address) {
+            out.words[out.pass_snapshot_word] = 1;
+            bound.id |= 0x40000000u;
+        }
+        return;
+    }
+    const Address address = t.data_addr << 2;
+    const uint32_t width = gxm::get_width(t), height = gxm::get_height(t);
+    auto &cache = texture_cache();
+    const uint32_t identity[4] = {address, width, height, 0x52474e52u /* region */};
+    auto &entry = cache.entries[XXH3_64bits(identity, sizeof(identity))];
+    if (!entry.id)
+        entry.id = cache.next_id++;
+    if (std::find(out.pass_regions.begin(), out.pass_regions.end(), entry.id) == out.pass_regions.end()) {
+        out.pass_regions.push_back(entry.id);
+        out.insert_before_pass({scene::Region, entry.id, at.base, at.x, at.y, width, height});
+    }
+    bound.id = entry.id;
+}
+static bool upload_texture(MemState &mem, const SceGxmTexture &t, scene::Writer &out, CachedTexture &entry, bool unwritten,
+    const char *&why);
+static bool bind_texture(MemState &mem, const SceGxmTexture &t, scene::Writer &out, BoundTexture &bound, const char *&why) {
     const Address address = t.data_addr << 2;
     // Linear-strided descriptors keep the pitch where the min/mip filters
     // live: min follows mag and there are no mips (sceGxmTextureGetMinFilter).
@@ -864,19 +1082,15 @@ static bool bind_texture(MemState &mem, const SceGxmTexture &t, scene::Writer &o
     bound.u = t.uaddr_mode;
     bound.v = t.vaddr_mode;
     bound.lod_max = std::max<uint32_t>(t.true_mip_count(), 1) - 1;
-    if (rendered_targets().contains(address)) {
-        // Bit 31: render-target alias; bit 30: its pre-pass snapshot.
-        bound.id = 0x80000000u | (address >> 2);
-        if (out.pass_open && address == out.pass_address) {
-            out.words[out.pass_snapshot_word] = 1;
-            bound.id |= 0x40000000u;
-        }
-        bound.lod_max = 0;
+    TargetTexels at;
+    bool overlaps = false;
+    if (texels_in_target(mem, t, at, overlaps)) {
+        bind_target_texels(t, at, out, bound);
         return true;
     }
+    if (overlaps && !surface_sync())
+        note_stale_texture(t);
     auto &cache = texture_cache();
-    if (bind_target_region(t, out, bound))
-        return true;
     // Identity of the guest image: address, format, size, layout and mips
     // (sampler fields do not change the uploaded texels).
     const uint32_t identity[7] = {address, uint32_t(gxm::get_format(t)), gxm::get_width(t), gxm::get_height(t),
@@ -892,18 +1106,21 @@ static bool bind_texture(MemState &mem, const SceGxmTexture &t, scene::Writer &o
         ++timing().clean;
         return true;
     }
-    // Written (or never seen): one hash of its guest bytes, decoded only if changed.
-    scene::Writer scratch;
+    return upload_texture(mem, t, out, entry, unwritten, why);
+}
+// Written (or never seen): one hash of its guest bytes, decoded only if changed.
+[[gnu::noinline]] static bool upload_texture(MemState &mem, const SceGxmTexture &t, scene::Writer &out, CachedTexture &entry,
+    bool unwritten, const char *&why) {
+    auto &cache = texture_cache();
+    static scene::Writer scratch; // reused: no locals with destructors (skip_draw)
+    scratch.data.clear();
     DecodedTexture decoded;
     uint64_t hash = 0;
-    const char *reason = "";
     const double decode_started = emscripten_get_now();
-    const bool decoded_ok = decode_texture(mem, t, scratch, decoded, entry.hash, hash, reason);
+    const bool decoded_ok = decode_texture(mem, t, scratch, decoded, entry.hash, hash, why);
     timing().decode += emscripten_get_now() - decode_started;
-    if (!decoded_ok) {
-        why = reason;
+    if (!decoded_ok)
         return false;
-    }
     ++timing().hashes;
     entry.checked_epoch = cache.epoch;
     entry.source = decoded.source;
@@ -922,7 +1139,8 @@ static bool bind_texture(MemState &mem, const SceGxmTexture &t, scene::Writer &o
     out.word(decoded.width);
     out.word(decoded.height);
     out.word(decoded.levels);
-    for (const auto &[offset, size] : decoded.level_bytes) {
+    for (uint32_t level = 0; level < decoded.levels; ++level) {
+        const auto [offset, size] = decoded.level_bytes[level];
         out.word(out.bytes(scratch.data.data() + offset, size, 4));
         out.word(size);
     }
@@ -933,14 +1151,11 @@ static bool bind_texture(MemState &mem, const SceGxmTexture &t, scene::Writer &o
 static void consume_state(WebContext &ctx, CommandHelper &h, MemState &mem) {
     switch (h.pop<GXMState>()) {
     case GXMState::RegionClip: {
-        // state_set.cpp region_clip: bounds snap to the tile grid.
+        // Snapped to the tile grid in render pixels at the draw (the scene's
+        // sample factor comes with SetContext).
         ctx.record.region_clip_mode = h.pop<SceGxmRegionClipMode>();
-        const uint32_t x_min = h.pop<uint32_t>(), x_max = h.pop<uint32_t>();
-        const uint32_t y_min = h.pop<uint32_t>(), y_max = h.pop<uint32_t>();
-        ctx.record.region_clip_min.x = static_cast<SceInt>(align_down(x_min, SCE_GXM_TILE_SIZEX));
-        ctx.record.region_clip_min.y = static_cast<SceInt>(align_down(y_min, SCE_GXM_TILE_SIZEY));
-        ctx.record.region_clip_max.x = static_cast<SceInt>(align(x_max, SCE_GXM_TILE_SIZEX)) - 1;
-        ctx.record.region_clip_max.y = static_cast<SceInt>(align(y_max, SCE_GXM_TILE_SIZEY)) - 1;
+        for (auto &bound : ctx.region_clip)
+            bound = h.pop<uint32_t>();
         break;
     }
     case GXMState::Viewport:
@@ -1122,13 +1337,14 @@ static void begin_pass(WebContext &ctx, scene::Writer &out) {
     // target: the tile-based GPU reads what memory held before the scene.
     out.pass_snapshot_word = out.words.size();
     out.word(0);
-    out.word(surface_scale(color.width, color.height));
+    // GPU texels per surface texel, and per render pixel (viewport, scissor).
+    out.word(ctx.internal_scale * ctx.downscale);
+    out.word(ctx.internal_scale);
     out.pass_address = color.data.address();
     out.pass_first_draw = out.draws;
     out.pass_open = true;
-    const uint32_t pixel_bytes = uint32_t(gxm::bits_per_pixel(
-        static_cast<SceGxmColorBaseFormat>(color.colorFormat & SCE_GXM_COLOR_BASE_FORMAT_MASK)) / 8);
-    rendered_targets()[color.data.address()] = { color.width, color.height, color.strideInPixels * pixel_bytes, pixel_bytes };
+    rendered_targets()[color.data.address()] = { ctx.geometry,
+        static_cast<SceGxmColorBaseFormat>(color.colorFormat & SCE_GXM_COLOR_BASE_FORMAT_MASK), texture_cache().epoch };
 }
 
 // --- Draws -----------------------------------------------------------------
@@ -1142,6 +1358,11 @@ static uint32_t topology_index(SceGxmPrimitiveType primitive) {
     }
 }
 
+[[gnu::noinline]] static void skip_attribute(uint32_t format, uint32_t components) {
+    char detail[32];
+    std::snprintf(detail, sizeof(detail), "%ux%u", format, components);
+    skip_draw("vertex attribute format ", detail);
+}
 static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene::Writer &out) {
     const auto primitive = h.pop<SceGxmPrimitiveType>();
     const auto format = h.pop<SceGxmIndexFormat>();
@@ -1170,8 +1391,10 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
     }
 
     // Textures first: their upload commands precede the draw that samples them.
+    // Fixed arrays: the draw path keeps no locals with destructors (see skip_draw).
     struct UnitBinding { uint32_t unit; BoundTexture bound; };
-    std::vector<UnitBinding> units;
+    std::array<UnitBinding, 32> units;
+    uint32_t unit_count = 0;
     for (int stage = 0; stage < 2; ++stage) {
         const auto used = stage == 0 ? fp->renderer_data->textures_used : vp->renderer_data->textures_used;
         auto &bound_units = stage == 0 ? ctx.fragment_textures : ctx.vertex_textures;
@@ -1181,10 +1404,10 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
             if (!bound_units[unit].bound)
                 return skip_draw("sampled texture unit without a texture");
             BoundTexture bound;
-            std::string why;
+            const char *why = "";
             if (!bind_texture(mem, bound_units[unit].texture, out, bound, why))
-                return skip_draw("texture: " + why);
-            units.push_back({unit | (stage == 1 ? 16u : 0u), bound});
+                return skip_draw("texture: ", why);
+            units[unit_count++] = {unit | (stage == 1 ? 16u : 0u), bound};
         }
     }
 
@@ -1203,15 +1426,18 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
         stream_size[i] = static_cast<uint32_t>(stream.size);
     }
     struct Attribute { uint32_t location, stream, offset, format, components; };
-    std::vector<Attribute> attributes;
+    std::array<Attribute, 16> attributes; // SCE_GXM_MAX_VERTEX_ATTRIBUTES
+    uint32_t attribute_count = 0;
     for (const auto &a : vp->attributes) {
         const auto info = vp->renderer_data->attribute_infos.find(a.regIndex);
         if (info == vp->renderer_data->attribute_infos.end())
             continue; // stripped symbol: the shader does not read it
         const bool small = a.format <= SCE_GXM_ATTRIBUTE_FORMAT_F16 && a.componentCount != 2 && a.componentCount != 4;
         if (small || a.format > SCE_GXM_ATTRIBUTE_FORMAT_F32 || a.streamIndex >= stream_count)
-            return skip_draw("vertex attribute format " + std::to_string(a.format) + "x" + std::to_string(a.componentCount));
-        attributes.push_back({info->second.location, a.streamIndex, a.offset, uint32_t(a.format), a.componentCount});
+            return skip_attribute(a.format, a.componentCount);
+        if (attribute_count == attributes.size())
+            unsupported("more vertex attributes than GXM allows");
+        attributes[attribute_count++] = {info->second.location, a.streamIndex, a.offset, uint32_t(a.format), a.componentCount};
     }
 
     // Indices; fans become lists with the same provoking vertex.
@@ -1233,41 +1459,50 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
         index_offset = out.bytes(indices.get(mem), size_t(count) * index_size, 4);
     }
 
-    // Render info blocks (see renderer/src/vulkan/scene.cpp).
-    const auto &surface = ctx.record.color_surface;
+    // Render info blocks (see renderer/src/vulkan/scene.cpp). Render pixels:
+    // the surface times its downscale; the shaders see guest coordinates,
+    // render pixels / samples (screen size, gl_FragCoord / res_multiplier).
+    const int32_t render_width = int32_t(ctx.geometry.width * ctx.downscale);
+    const int32_t render_height = int32_t(ctx.geometry.height * ctx.downscale);
+    const float samples = float(ctx.samples);
     const float vs_info[12] = {ctx.record.viewport_flip[0], ctx.record.viewport_flip[1],
         ctx.record.viewport_flip[2], ctx.record.viewport_flip[3], ctx.record.viewport_flat ? 0.0f : 1.0f,
-        float(surface.width), float(surface.height), ctx.record.z_offset, ctx.record.z_scale, 0, 0, 0};
+        render_width / samples, render_height / samples, ctx.record.z_offset, ctx.record.z_scale, 0, 0, 0};
     const float fs_info[8] = {
         ctx.record.back_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED ? 1.0f : 0.0f,
         ctx.record.front_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED ? 1.0f : 0.0f,
-        ctx.record.writing_mask, 0.0f, float(surface_scale(surface.width, surface.height)), 0, 0, 0}; // [4] res_multiplier
+        ctx.record.writing_mask, 0.0f, float(ctx.internal_scale * ctx.samples), 0, 0, 0}; // [4] res_multiplier
     const uint32_t vs_info_offset = out.bytes(vs_info, sizeof(vs_info), scene::kUniformAlign);
     const uint32_t fs_info_offset = out.bytes(fs_info, sizeof(fs_info), scene::kUniformAlign);
     const uint32_t vs_uniforms = out.bytes(ctx.uniforms[0].data(), ctx.uniforms[0].size(), scene::kUniformAlign);
     const uint32_t fs_uniforms = out.bytes(ctx.uniforms[1].data(), ctx.uniforms[1].size(), scene::kUniformAlign);
 
-    // Viewport rect (vulkan sync_viewport_real, positive height) and scissor.
-    float vx = 0, vy = 0, vw = float(surface.width), vh = float(surface.height);
+    // Viewport rect (vulkan sync_viewport_real, positive height) and scissor,
+    // in render pixels.
+    float vx = 0, vy = 0, vw = float(render_width), vh = float(render_height);
     if (!ctx.record.viewport_flat && ctx.has_viewport) {
-        vw = std::abs(2 * ctx.viewport[3]);
-        vh = 2 * ctx.viewport[4];
-        vy = ctx.viewport[1] - ctx.viewport[4];
-        vx = ctx.viewport[0] - std::abs(ctx.viewport[3]);
+        vw = std::abs(2 * ctx.viewport[3]) * samples;
+        vh = 2 * ctx.viewport[4] * samples;
+        vy = (ctx.viewport[1] - ctx.viewport[4]) * samples;
+        vx = (ctx.viewport[0] - std::abs(ctx.viewport[3])) * samples;
         if (vh < 0) { vy += vh; vh = -vh; }
     }
-    int32_t sx = 0, sy = 0, sw = int32_t(surface.width), sh = int32_t(surface.height);
+    int32_t sx = 0, sy = 0, sw = render_width, sh = render_height;
     switch (ctx.record.region_clip_mode) {
     case SCE_GXM_REGION_CLIP_ALL: sw = sh = 0; break;
-    case SCE_GXM_REGION_CLIP_OUTSIDE:
-        sx = ctx.record.region_clip_min.x; sy = ctx.record.region_clip_min.y;
-        sw = std::max(ctx.record.region_clip_max.x - ctx.record.region_clip_min.x + 1, 0);
-        sh = std::max(ctx.record.region_clip_max.y - ctx.record.region_clip_min.y + 1, 0);
+    case SCE_GXM_REGION_CLIP_OUTSIDE: {
+        // state_set.cpp region_clip: render-pixel bounds snap to the tile grid.
+        const auto &clip = ctx.region_clip;
+        sx = int32_t(align_down(clip[0] * ctx.samples, SCE_GXM_TILE_SIZEX));
+        sy = int32_t(align_down(clip[2] * ctx.samples, SCE_GXM_TILE_SIZEY));
+        sw = std::max(int32_t(align(clip[1] * ctx.samples, SCE_GXM_TILE_SIZEX)) - sx, 0);
+        sh = std::max(int32_t(align(clip[3] * ctx.samples, SCE_GXM_TILE_SIZEY)) - sy, 0);
         break;
+    }
     default: break; // NONE, and INSIDE (unimplemented upstream as well)
     }
-    sx = std::clamp(sx, 0, int32_t(surface.width)); sy = std::clamp(sy, 0, int32_t(surface.height));
-    sw = std::clamp(sw, 0, int32_t(surface.width) - sx); sh = std::clamp(sh, 0, int32_t(surface.height) - sy);
+    sx = std::clamp(sx, 0, render_width); sy = std::clamp(sy, 0, render_height);
+    sw = std::clamp(sw, 0, render_width - sx); sh = std::clamp(sh, 0, render_height - sy);
 
     const auto *webgpu_fp = static_cast<const browser::WebGPUFragmentProgram *>(fp->renderer_data.get());
     const auto &blend = webgpu_fp->blend;
@@ -1304,10 +1539,12 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
         out.stream(stream_base[i], stream_size[i]);
         out.word(stream_size[i]);
     }
-    out.word(uint32_t(attributes.size()));
-    for (const auto &a : attributes)
+    out.word(attribute_count);
+    for (uint32_t i = 0; i < attribute_count; ++i) {
+        const auto &a = attributes[i];
         for (const uint32_t value : {a.location, a.stream, a.offset, a.format, a.components})
             out.word(value);
+    }
     out.word(uint32_t(index_size));
     out.word(index_count);
     out.word(index_offset);
@@ -1319,10 +1556,12 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
     out.word(uint32_t(ctx.uniforms[0].size()));
     out.word(fs_uniforms);
     out.word(uint32_t(ctx.uniforms[1].size()));
-    out.word(uint32_t(units.size()));
-    for (const auto &[unit, bound] : units)
+    out.word(unit_count);
+    for (uint32_t i = 0; i < unit_count; ++i) {
+        const auto &[unit, bound] = units[i];
         for (const uint32_t value : {unit, bound.id, bound.min, bound.mag, bound.mip, bound.u, bound.v, bound.lod_max})
             out.word(value);
+    }
     ++out.draws;
 }
 
@@ -1341,102 +1580,348 @@ static bool submit_scene(scene::Writer &out, MemState &mem) {
 }
 
 // Surface sync (VITA3K_SURFACE_SYNC=1) of one color surface a submitted scene
-// drew into: its GPU target is copied into the guest bytes the surface
-// describes, and the write is tracked so textures cached from those bytes are
-// checked again.
+// drew into: its GPU target is copied into the guest texels the surface
+// describes, in its layout, and the write is tracked so textures cached from
+// those bytes are checked again.
 struct SurfaceReadback {
     Address address = 0;
-    uint32_t width = 0, height = 0, stride_bytes = 0, pixel_bytes = 0;
+    SurfaceGeometry geometry;
 };
-static bool surface_readback(const SceGxmColorSurface &color, SurfaceReadback &readback) {
-    // The consumer renders every surface linearly (see SetContext); its bytes
-    // only match guest memory for linear, full-size surfaces.
-    if (color.surfaceType != SCE_GXM_COLOR_SURFACE_LINEAR || color.downscale) {
-        skip_draw("surface sync of a tiled/swizzled or downscaled color surface");
-        return false;
-    }
-    const uint32_t pixel_bytes = uint32_t(gxm::bits_per_pixel(
-        static_cast<SceGxmColorBaseFormat>(color.colorFormat & SCE_GXM_COLOR_BASE_FORMAT_MASK)) / 8);
-    readback = { color.data.address(), color.width, color.height, color.strideInPixels * pixel_bytes, pixel_bytes };
-    return true;
-}
 static void sync_surface(MemState &mem, const SurfaceReadback &r) {
-    const size_t size = size_t(r.height - 1) * r.stride_bytes + size_t(r.width) * r.pixel_bytes;
-    require_guest(mem, r.address, size);
+    const auto &g = r.geometry;
+    const uint64_t footprint = g.footprint();
+    require_guest(mem, r.address, footprint);
     const double started = emscripten_get_now();
-    if (web_gxm_sync_surface(r.address, Ptr<uint8_t>(r.address).get(mem), r.width, r.height, r.stride_bytes, r.pixel_bytes) != 0)
+    static std::vector<uint8_t> rows; // kept: no locals with destructors on the command path
+    const size_t row = size_t(g.width) * g.pixel_bytes;
+    rows.resize(row * g.height);
+    if (web_gxm_sync_surface(r.address, rows.data(), g.width, g.height, g.pixel_bytes) != 0)
         unsupported("surface sync failed (see browser log)");
-    mem_mark_written(mem, r.address, size);
+    uint8_t *guest = Ptr<uint8_t>(r.address).get(mem);
+    for (uint32_t y = 0; y < g.height; ++y) {
+        const uint8_t *source = rows.data() + y * row;
+        if (g.layout == Layout::Linear) {
+            std::memcpy(guest + g.byte_offset(0, y), source, row);
+            continue;
+        }
+        for (uint32_t x = 0; x < g.width; ++x)
+            std::memcpy(guest + g.byte_offset(x, y), source + size_t(x) * g.pixel_bytes, g.pixel_bytes);
+    }
+    mem_mark_written(mem, r.address, footprint);
+    // The GPU target and these bytes now agree (texels_in_target).
+    rendered_targets()[r.address].rendered_epoch = advance_write_epoch(mem);
     timing().sync += emscripten_get_now() - started;
     ++timing().syncs;
 }
 
-// Fill guest memory (the CPU view) and the GPU target living there, if any.
-static int transfer_fill(MemState &mem, uint32_t color, const SceGxmTransferImage &d, scene::Writer &out) {
-    const uint64_t start = uint64_t(d.address.address()) + uint64_t(d.y) * d.stride + uint64_t(d.x) * 4;
-    const uint64_t end = start + uint64_t(d.height ? d.height - 1 : 0) * d.stride + uint64_t(d.width) * 4;
-    if (d.format != SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR || !d.width || !d.height
-        || d.width > 4096 || d.height > 4096 || d.stride <= 0
-        || uint64_t(d.stride) < (uint64_t(d.x) + d.width) * 4
-        || start > UINT32_MAX || end > uint64_t(UINT32_MAX) + 1
-        || !is_valid_addr_range(mem, static_cast<Address>(start), end))
-        return -1;
-    out.copy_streams(mem); // pending draws read guest memory from before the fill
-    auto *base = Ptr<uint8_t>(static_cast<Address>(start)).get(mem);
-    for (uint32_t y = 0; y < d.height; ++y) {
-        auto *row = reinterpret_cast<uint32_t *>(base + size_t(y) * d.stride);
-        std::fill(row, row + d.width, color);
+// --- Transfers ----------------------------------------------------------------
+// Transfers run on the CPU over guest memory, as renderer/src/transfer.cpp
+// does. A source inside a rendered target is first read back (its GPU texels
+// are the truth unless surface sync already keeps memory current), and every
+// rendered target whose texels a transfer wrote gets them from memory again,
+// in stream order with the scenes around it.
+struct TransferImage {
+    Address address = 0;
+    SurfaceGeometry geometry; // texel addressing of the image
+    uint32_t x = 0, y = 0, width = 0, height = 0;
+    uint64_t begin = 0, end = 0; // byte range of the rectangle, relative to address
+};
+// Addressing of a transfer image (transfer.cpp compute_offset: tiled rows of
+// stride / 32 tiles, swizzled Morton order over the transfer size), or false
+// for an image the guest cannot have meant.
+static bool transfer_image(MemState &mem, const SceGxmTransferImage &image, SceGxmTransferType type,
+    uint32_t width, uint32_t height, TransferImage &out) {
+    const uint32_t bits = gxm::get_bits_per_pixel(image.format);
+    if (!bits || bits % 8 || !width || !height || width > 4096 || height > 4096 || image.x > 4096 || image.y > 4096)
+        return false;
+    auto &g = out.geometry;
+    g.pixel_bytes = bits / 8;
+    switch (type) {
+    case SCE_GXM_TRANSFER_LINEAR: g.layout = Layout::Linear; break;
+    case SCE_GXM_TRANSFER_TILED: g.layout = Layout::Tiled; break;
+    case SCE_GXM_TRANSFER_SWIZZLED: g.layout = Layout::Swizzled; break;
+    default: return false;
     }
-    mem_mark_written(mem, static_cast<Address>(start), static_cast<size_t>(end - start));
-    // The GPU copy of a rendered target at this address gets the same
-    // rectangle (gxm_scene.js clears or writes it, keeping the target size).
-    const Address target = d.address.address();
-    if (rendered_targets().contains(target)) {
-        // In stream order with the scenes of this command list.
-        if (out.pass_open)
-            unsupported("transfer fill of a render target inside a scene");
-        for (const uint32_t value : {uint32_t(scene::ClearTarget), target, d.x, d.y, d.width, d.height, color})
+    if (g.layout == Layout::Swizzled) {
+        if (!std::has_single_bit(width) || !std::has_single_bit(height) || image.x || image.y)
+            return false;
+        g.width = width;
+        g.height = height;
+        g.stride_px = width;
+    } else {
+        if (image.stride <= 0 || image.stride % g.pixel_bytes)
+            return false;
+        g.stride_px = uint32_t(image.stride) / g.pixel_bytes;
+        g.width = image.x + width;
+        g.height = image.y + height;
+        if (g.width > g.stride_px || (g.layout == Layout::Tiled && g.stride_px % 32))
+            return false;
+    }
+    out.address = image.address.address();
+    out.x = image.x;
+    out.y = image.y;
+    out.width = width;
+    out.height = height;
+    out.begin = g.byte_offset(image.x, image.y);
+    out.end = g.footprint();
+    if (!out.address || uint64_t(out.address) + out.end > (uint64_t(1) << 32)
+        || !is_valid_addr_range(mem, out.address, uint64_t(out.address) + out.end))
+        return false;
+    return true;
+}
+static bool overlaps(Address a, uint64_t a_size, Address b, uint64_t b_size) {
+    return uint64_t(a) < uint64_t(b) + b_size && uint64_t(b) < uint64_t(a) + a_size;
+}
+// Before a transfer reads guest bytes: pending draws read memory from before
+// it, and rendered targets under the source are copied back into memory.
+static void prepare_transfer(MemState &mem, scene::Writer &out, const TransferImage *source) {
+    if (out.pass_open)
+        unsupported("transfer inside a scene");
+    out.copy_streams(mem);
+    if (!source || surface_sync())
+        return;
+    for (const auto &[base, target] : rendered_targets()) {
+        if (!overlaps(base, target.geometry.footprint(), source->address, source->end))
+            continue;
+        if (!submit_scene(out, mem)) // the scenes rendering it, before the read
+            unsupported("scene submission failed (see browser log)");
+        sync_surface(mem, {base, target.geometry});
+    }
+}
+// After a transfer wrote `dest`'s rectangle (`written`: which of its texels,
+// row by row, when not all): each rendered target over those bytes gets the
+// written texels from memory (WRITE_TEXELS: the rectangle around them in the
+// target's texel bytes and, unless all of it was written, a mask).
+static void refresh_targets(MemState &mem, scene::Writer &out, const TransferImage &dest,
+    const uint8_t *written_texels = nullptr) {
+    mem_mark_written(mem, dest.address, dest.end);
+    const auto &d = dest.geometry;
+    for (auto &[base, target] : rendered_targets()) {
+        const auto &g = target.geometry;
+        if (!overlaps(base, g.footprint(), dest.address + dest.begin, dest.end - dest.begin))
+            continue;
+        // Texels of the target whose first byte the transfer wrote.
+        static std::vector<uint8_t> written; // kept: no locals with destructors on the command path
+        uint32_t x0 = g.width, y0 = g.height, x1 = 0, y1 = 0, count = 0;
+        const uint8_t *guest = Ptr<const uint8_t>(base).get(mem);
+        uint32_t tx, ty;
+        if (!written_texels && g.layout == Layout::Linear && d.layout == Layout::Linear && d.pixel_bytes == g.pixel_bytes
+            && d.stride_px == g.stride_px && dest.address + dest.begin >= base
+            && g.texel_at(dest.address + dest.begin - base, tx, ty)) {
+            // Same rows (a clear of a linear target): the rectangle itself.
+            x0 = tx; y0 = ty;
+            x1 = std::min(tx + dest.width, g.width) - 1;
+            y1 = std::min(ty + dest.height, g.height) - 1;
+            count = (x1 - x0 + 1) * (y1 - y0 + 1);
+        } else {
+            written.assign(size_t(g.width) * g.height, 0);
+            for (uint32_t y = 0; y < g.height; ++y) {
+                for (uint32_t x = 0; x < g.width; ++x) {
+                    const uint64_t address = uint64_t(base) + g.byte_offset(x, y);
+                    if (address < dest.address)
+                        continue;
+                    uint32_t dx, dy;
+                    if (!d.texel_at(address - dest.address, dx, dy) || dx < dest.x || dy < dest.y
+                        || dx >= dest.x + dest.width || dy >= dest.y + dest.height
+                        || (written_texels && !written_texels[size_t(dy - dest.y) * dest.width + (dx - dest.x)]))
+                        continue;
+                    written[size_t(y) * g.width + x] = 1;
+                    x0 = std::min(x0, x); y0 = std::min(y0, y); x1 = std::max(x1, x); y1 = std::max(y1, y);
+                    ++count;
+                }
+            }
+        }
+        if (!count)
+            continue;
+        const uint32_t w = x1 - x0 + 1, h = y1 - y0 + 1;
+        uint32_t data_offset = 0, mask_offset = 0xffffffffu;
+        uint8_t *texels = out.reserve(size_t(w) * h * g.pixel_bytes, 4, data_offset);
+        for (uint32_t y = 0; y < h; ++y)
+            for (uint32_t x = 0; x < w; ++x)
+                std::memcpy(texels + (size_t(y) * w + x) * g.pixel_bytes, guest + g.byte_offset(x0 + x, y0 + y), g.pixel_bytes);
+        if (count != w * h) {
+            uint8_t *mask = out.reserve(size_t(w) * h, 4, mask_offset);
+            for (uint32_t y = 0; y < h; ++y)
+                std::memcpy(mask + size_t(y) * w, written.data() + size_t(y0 + y) * g.width + x0, w);
+            for (size_t i = 0; i < size_t(w) * h; ++i)
+                mask[i] = mask[i] ? 0xff : 0;
+        }
+        for (const uint32_t value : {uint32_t(scene::WriteTexels), base, x0, y0, w, h, data_offset, mask_offset})
             out.word(value);
+        target.rendered_epoch = advance_write_epoch(mem);
     }
+}
+
+// renderer/src/transfer.cpp handle_transfer_fill: the fill color's low bytes
+// in every texel of the linear rectangle.
+static int transfer_fill(MemState &mem, uint32_t color, const SceGxmTransferImage &image, scene::Writer &out) {
+    TransferImage dest;
+    if (!transfer_image(mem, image, SCE_GXM_TRANSFER_LINEAR, image.width, image.height, dest) || dest.geometry.pixel_bytes > 4)
+        return -1;
+    prepare_transfer(mem, out, nullptr);
+    uint8_t *base = Ptr<uint8_t>(dest.address).get(mem);
+    for (uint32_t y = dest.y; y < dest.y + dest.height; ++y)
+        for (uint32_t x = dest.x; x < dest.x + dest.width; ++x)
+            std::memcpy(base + dest.geometry.byte_offset(x, y), &color, dest.geometry.pixel_bytes);
+    refresh_targets(mem, out, dest);
     return 0;
 }
 
-void submit_command_list(State &state, Context *ctx, CommandList &list) {
-    const double started = emscripten_get_now();
-    struct Charge { double started; ~Charge() { timing().build += emscripten_get_now() - started; } } charge{started};
-    auto &web_state = static_cast<WebState &>(state);
-    auto &mem = web_state.mem;
-    if (!list.first) return;
-    // Writes after this point (the guest's next scene, stream-ordered
-    // transfer fills) belong to a new epoch the next check will see.
-    texture_cache().epoch = mem_next_write_epoch(mem);
-    auto &out = scene::writer();
-    out.reset();
-    int result = 0;
-    std::exception_ptr failure;
-    // Guest-visible completion (notifications, sync signals, command
-    // statuses) is published only once the scene stream was accepted and,
-    // with surface sync, its rendered surfaces are back in guest memory.
-    std::vector<std::function<void()>> completions;
+// renderer/src/transfer.cpp perform_transfer_copy_impl, with its color keys.
+static int transfer_copy(MemState &mem, uint32_t key_value, uint32_t key_mask, SceGxmTransferColorKeyMode mode,
+    const SceGxmTransferImage *images, SceGxmTransferType source_type, SceGxmTransferType dest_type, scene::Writer &out) {
+    TransferImage source, dest;
+    if (images[0].format != images[1].format
+        || !transfer_image(mem, images[0], source_type, images[0].width, images[0].height, source)
+        || !transfer_image(mem, images[1], dest_type, images[0].width, images[0].height, dest))
+        return -1;
+    const uint32_t bytes = source.geometry.pixel_bytes;
+    if (mode != SCE_GXM_TRANSFER_COLORKEY_NONE && bytes != 4)
+        return -1; // desktop keys only 32-bit texels
+    prepare_transfer(mem, out, &source);
+    const uint8_t *from = Ptr<const uint8_t>(source.address).get(mem);
+    uint8_t *to = Ptr<uint8_t>(dest.address).get(mem);
+    // Through a copy: the rectangles may overlap in guest memory.
+    static std::vector<uint8_t> texels, copied;
+    texels.resize(size_t(source.width) * source.height * bytes);
+    copied.assign(mode == SCE_GXM_TRANSFER_COLORKEY_NONE ? 0 : size_t(source.width) * source.height, 0);
+    for (uint32_t y = 0; y < source.height; ++y)
+        for (uint32_t x = 0; x < source.width; ++x)
+            std::memcpy(texels.data() + (size_t(y) * source.width + x) * bytes,
+                from + source.geometry.byte_offset(source.x + x, source.y + y), bytes);
+    for (uint32_t y = 0; y < source.height; ++y) {
+        for (uint32_t x = 0; x < source.width; ++x) {
+            const uint8_t *texel = texels.data() + (size_t(y) * source.width + x) * bytes;
+            if (mode != SCE_GXM_TRANSFER_COLORKEY_NONE) {
+                uint32_t value;
+                std::memcpy(&value, texel, 4);
+                const bool keyed = (value & key_mask) == key_value;
+                if (mode == SCE_GXM_TRANSFER_COLORKEY_PASS ? !keyed : keyed)
+                    continue;
+                copied[size_t(y) * source.width + x] = 1;
+            }
+            std::memcpy(to + dest.geometry.byte_offset(dest.x + x, dest.y + y), texel, bytes);
+        }
+    }
+    // Keyed-out texels keep what the target holds, which memory may not.
+    refresh_targets(mem, out, dest, copied.empty() ? nullptr : copied.data());
+    return 0;
+}
+
+// renderer/src/transfer.cpp handle_transfer_downscale: each destination texel
+// is the average of a 2x2 source block (its SWS_AREA filter), per 8-bit
+// channel for U8U8U8U8/U8U8U8 and per 5/6-bit field for U5U6U5.
+static int transfer_downscale(MemState &mem, const SceGxmTransferImage &source_image,
+    const SceGxmTransferImage &dest_image, scene::Writer &out) {
+    TransferImage source, dest;
+    const auto format = source_image.format;
+    if (format != dest_image.format || source_image.width < 2 || source_image.height < 2
+        || (format != SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR && format != SCE_GXM_TRANSFER_FORMAT_U8U8U8_BGR
+            && format != SCE_GXM_TRANSFER_FORMAT_U5U6U5_BGR)
+        || !transfer_image(mem, source_image, SCE_GXM_TRANSFER_LINEAR, source_image.width / 2 * 2, source_image.height / 2 * 2, source)
+        || !transfer_image(mem, dest_image, SCE_GXM_TRANSFER_LINEAR, source_image.width / 2, source_image.height / 2, dest))
+        return -1;
+    prepare_transfer(mem, out, &source);
+    const uint32_t bytes = source.geometry.pixel_bytes;
+    const uint8_t *from = Ptr<const uint8_t>(source.address).get(mem);
+    uint8_t *to = Ptr<uint8_t>(dest.address).get(mem);
+    const auto texel = [&](uint32_t x, uint32_t y) { return from + source.geometry.byte_offset(source.x + x, source.y + y); };
+    for (uint32_t y = 0; y < dest.height; ++y) {
+        for (uint32_t x = 0; x < dest.width; ++x) {
+            const uint8_t *block[4] = {texel(2 * x, 2 * y), texel(2 * x + 1, 2 * y), texel(2 * x, 2 * y + 1), texel(2 * x + 1, 2 * y + 1)};
+            uint8_t *target = to + dest.geometry.byte_offset(dest.x + x, dest.y + y);
+            if (format == SCE_GXM_TRANSFER_FORMAT_U5U6U5_BGR) {
+                uint32_t sums[3] = {};
+                for (const uint8_t *b : block) {
+                    const uint16_t v = uint16_t(b[0] | b[1] << 8);
+                    sums[0] += v & 31; sums[1] += (v >> 5) & 63; sums[2] += v >> 11;
+                }
+                const uint16_t v = uint16_t(((sums[0] + 2) / 4) | ((sums[1] + 2) / 4) << 5 | ((sums[2] + 2) / 4) << 11);
+                target[0] = uint8_t(v); target[1] = uint8_t(v >> 8);
+            } else {
+                for (uint32_t c = 0; c < bytes; ++c)
+                    target[c] = uint8_t((block[0][c] + block[1][c] + block[2][c] + block[3][c] + 2) / 4);
+            }
+        }
+    }
+    refresh_targets(mem, out, dest);
+    return 0;
+}
+
+// NewFrame owns a host DisplayFrameInfo*, released here exactly like sync.cpp
+// new_frame (copied into display state, then deleted).
+[[gnu::noinline]] static void new_frame(State &state, DisplayState &display, DisplayFrameInfo *frame) {
+    const std::lock_guard<std::mutex> guard(display.display_info_mutex);
+    display.next_rendered_frame = *frame;
+    delete frame;
+    state.should_display = true;
+}
+[[noreturn, gnu::noinline]] static void unknown_opcode(Command *cmd, MemState &mem) {
+    CommandList rest;
+    rest.first = cmd;
+    trace_scene(rest, mem);
+    unsupported("command opcode not implemented");
+}
+// Guest-visible results of a command list (notifications, sync signals,
+// command statuses), published in order once its scene stream was accepted
+// and, with surface sync, its rendered surfaces are back in guest memory.
+struct Completion {
+    enum Kind : uint32_t { Notification, SyncSignal, Status } kind;
+    Address address; // notification word or sync object
+    uint32_t value;  // notification value or sync timestamp
+    int *status;
+};
+struct Submission {
+    std::vector<Completion> completions;
     std::vector<SurfaceReadback> readbacks;
-    const auto publish = [&] {
-        if (!submit_scene(out, mem))
-            unsupported("scene submission failed (see browser log)");
-        for (const auto &readback : readbacks)
-            sync_surface(mem, readback);
-        readbacks.clear();
-        for (const auto &complete : completions)
-            complete();
-        completions.clear();
-    };
-    Command *cmd = list.first;
-    reset_command_list(list);
-    while (cmd) {
-        Command *next = cmd->next;
+    int result = 0;
+};
+Submission &submission() {
+    static Submission instance;
+    return instance;
+}
+[[gnu::noinline]] static void publish(State &state, MemState &mem, scene::Writer &out, Submission &sub) {
+    if (!submit_scene(out, mem))
+        unsupported("scene submission failed (see browser log)");
+    for (const auto &readback : sub.readbacks)
+        sync_surface(mem, readback);
+    sub.readbacks.clear();
+    bool notified = false;
+    {
+        std::unique_lock<std::mutex> lock(state.notification_mutex);
+        for (const auto &c : sub.completions) {
+            if (c.kind == Completion::Notification) {
+                *Ptr<uint32_t>(c.address).get(mem) = c.value;
+                notified = true;
+            }
+        }
+    }
+    for (const auto &c : sub.completions) {
+        if (c.kind == Completion::SyncSignal)
+            subject_done(Ptr<SceGxmSyncObject>(c.address).get(mem), c.value);
+        else if (c.kind == Completion::Status)
+            *c.status = static_cast<int>(c.value);
+    }
+    sub.completions.clear();
+    if (notified)
+        state.notification_ready.notify_all();
+}
+static void release_command(Context *ctx, Command *cmd) {
+    destroy_command_payload(*cmd);
+    if (ctx) ctx->free_func(cmd);
+    else generic_command_free(cmd);
+}
+// Consumes the commands from `cursor` on. It holds no locals with
+// destructors and no try: under Emscripten's JS exceptions either would send
+// every call below through an invoke_* wrapper, whose 64-bit arguments are
+// BigInts allocated per call (the worker's largest garbage source in Limbo).
+// An exception leaves `cursor` at the failing command for the caller.
+static void consume_commands(State &state, Context *ctx, Command *&cursor, MemState &mem, scene::Writer &out,
+    Submission &sub) {
+    while (Command *cmd = cursor) {
         CommandHelper helper(cmd);
         int code = 0;
-        try {
-        if (result == 0) switch (cmd->opcode) {
+        if (sub.result == 0) switch (cmd->opcode) {
         case CommandOpcode::SetContext: {
             if (!ctx) unsupported("scene without context");
             auto &web = static_cast<WebContext &>(*ctx);
@@ -1445,14 +1930,17 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
             const auto *depth = helper.pop<SceGxmDepthStencilSurface *>();
             ctx->current_render_target = target;
             web.has_surface = false;
+            const char *why = "scene without a usable color surface";
             if (!target || !color || color->disabled || !color->width || !color->height
-                || color->width > 4096 || color->height > 4096) {
-                skip_draw("scene without a usable color surface");
+                || color->width > 4096 || color->height > 4096
+                || !surface_geometry(*color, web.geometry, why)) {
+                skip_draw(why);
                 end_pass(out);
                 break;
             }
-            if (color->surfaceType != SCE_GXM_COLOR_SURFACE_LINEAR || color->downscale)
-                skip_draw("tiled/swizzled or downscaled color surface rendered as linear");
+            web.samples = target->multisample_mode != SCE_GXM_MULTISAMPLE_NONE ? 2 : 1;
+            web.downscale = color->downscale ? 2 : 1;
+            web.internal_scale = surface_scale(color->width * web.downscale, color->height * web.downscale);
             web.record.color_surface = *color;
             web.has_surface = true;
             web.has_depth_surface = depth && !depth->disabled();
@@ -1478,19 +1966,11 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
                 require_guest(mem, n.address.address(), sizeof(uint32_t));
             // Surface sync (desktop sync_surface_data): the scene's surface,
             // when it drew anything, is read back before these notifications.
-            SurfaceReadback readback;
             if (!state.disable_surface_sync && ctx && static_cast<WebContext &>(*ctx).has_surface
-                && out.pass_open && out.draws > out.pass_first_draw
-                && surface_readback(ctx->record.color_surface, readback))
-                readbacks.push_back(readback);
-            if (vertex.address || fragment.address) {
-                completions.push_back([&state, &mem, vertex, fragment] {
-                    std::unique_lock<std::mutex> lock(state.notification_mutex);
-                    for (const auto &n : {vertex, fragment}) if (n.address) *n.address.get(mem) = n.value;
-                    lock.unlock();
-                    state.notification_ready.notify_all();
-                });
-            }
+                && out.pass_open && out.draws > out.pass_first_draw)
+                sub.readbacks.push_back({ctx->record.color_surface.data.address(), static_cast<WebContext &>(*ctx).geometry});
+            for (const auto &n : {vertex, fragment}) if (n.address)
+                sub.completions.push_back({Completion::Notification, n.address.address(), n.value, nullptr});
             break;
         }
         case CommandOpcode::SignalSyncObject: {
@@ -1498,7 +1978,7 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
             const auto timestamp = helper.pop<uint32_t>();
             if (!sync) unsupported("sync signal without object");
             require_guest(mem, sync.address(), sizeof(SceGxmSyncObject));
-            completions.push_back([&mem, sync, timestamp] { subject_done(sync.get(mem), timestamp); });
+            sub.completions.push_back({Completion::SyncSignal, sync.address(), timestamp, nullptr});
             break;
         }
         case CommandOpcode::WaitSyncObject: {
@@ -1507,10 +1987,10 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
             if (!sync) unsupported("sync wait without object");
             require_guest(mem, sync.address(), sizeof(SceGxmSyncObject));
             // A signal earlier in this list must be visible to the wait.
-            if (!completions.empty() && !out.pass_open)
-                publish();
+            if (!sub.completions.empty() && !out.pass_open)
+                publish(state, mem, out, sub);
             if (wishlist(sync.get(mem), timestamp) != SyncWaitResult::Ready)
-                result = -1;
+                sub.result = -1;
             break;
         }
         case CommandOpcode::NewFrame: {
@@ -1518,12 +1998,8 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
             auto *display = helper.pop<DisplayState *>();
             helper.pop<Context *>();
             if (!display) unsupported("new frame without display state");
-            if (frame) {
-                const std::lock_guard<std::mutex> guard(display->display_info_mutex);
-                display->next_rendered_frame = *frame;
-                delete frame;
-                state.should_display = true;
-            }
+            if (frame)
+                new_frame(state, *display, frame);
             break;
         }
         case CommandOpcode::Nop:
@@ -1534,51 +2010,90 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
         case CommandOpcode::TransferFill: {
             const uint32_t color = helper.pop<uint32_t>();
             const auto *d = helper.pop<const SceGxmTransferImage *>();
-            result = transfer_fill(mem, color, *d, out);
+            sub.result = transfer_fill(mem, color, *d, out);
+            break;
+        }
+        case CommandOpcode::TransferCopy: {
+            const uint32_t key_value = helper.pop<uint32_t>(), key_mask = helper.pop<uint32_t>();
+            const auto key_mode = helper.pop<SceGxmTransferColorKeyMode>();
+            const auto *images = helper.pop<const SceGxmTransferImage *>();
+            const auto source_type = helper.pop<SceGxmTransferType>(), dest_type = helper.pop<SceGxmTransferType>();
+            sub.result = transfer_copy(mem, key_value, key_mask, key_mode, images, source_type, dest_type, out);
+            break;
+        }
+        case CommandOpcode::TransferDownscale: {
+            const auto *source = helper.pop<const SceGxmTransferImage *>();
+            const auto *dest = helper.pop<const SceGxmTransferImage *>();
+            sub.result = transfer_downscale(mem, *source, *dest, out);
             break;
         }
         case CommandOpcode::SignalNotification: {
             const auto n = helper.pop<SceGxmNotification>();
             if (n.address) {
                 if (!is_valid_addr_range(mem, n.address.address(), uint64_t(n.address.address()) + sizeof(uint32_t)))
-                    result = -1;
-                else {
-                    completions.push_back([&state, &mem, n] {
-                        std::unique_lock<std::mutex> lock(state.notification_mutex);
-                        *n.address.get(mem) = n.value;
-                        lock.unlock();
-                        state.notification_ready.notify_all();
-                    });
-                }
+                    sub.result = -1;
+                else
+                    sub.completions.push_back({Completion::Notification, n.address.address(), n.value, nullptr});
             }
             break;
         }
         default:
-            trace_scene(list, mem);
-            unsupported("command opcode not implemented");
+            unknown_opcode(cmd, mem);
         }
+        if (cmd->status)
+            sub.completions.push_back({Completion::Status, 0, uint32_t(sub.result == 0 ? code : -1), cmd->status});
+        cursor = cmd->next;
+        release_command(ctx, cmd);
+    }
+}
+
+void submit_command_list(State &state, Context *ctx, CommandList &list) {
+    const double started = emscripten_get_now();
+    auto &web_state = static_cast<WebState &>(state);
+    auto &mem = web_state.mem;
+    if (!list.first) return;
+    // Writes after this point (the guest's next scene, stream-ordered
+    // transfer fills) belong to a new epoch the next check will see.
+    texture_cache().epoch = mem_next_write_epoch(mem);
+    auto &out = scene::writer();
+    out.reset();
+    auto &sub = submission();
+    sub.completions.clear();
+    sub.readbacks.clear();
+    sub.result = 0;
+    Command *cursor = list.first;
+    reset_command_list(list);
+    std::exception_ptr failure;
+    while (cursor) {
+        try {
+            consume_commands(state, ctx, cursor, mem, out, sub);
         } catch (const std::exception &error) {
+            // `cursor` is the command that threw.
+            Command *failed = cursor;
+            cursor = failed->next;
             if (survey_mode()) {
                 if (++survey_counts()[error.what()] == 1)
                     std::printf("[gxm-survey] first: %s\n", error.what());
-            } else {
-                // No later notification/status may acknowledge a failed batch.
-                failure = std::current_exception();
-                result = -1;
+                if (failed->status)
+                    sub.completions.push_back({Completion::Status, 0, uint32_t(sub.result == 0 ? 0 : -1), failed->status});
+                release_command(ctx, failed);
+                continue;
+            }
+            // No later notification/status may acknowledge a failed batch.
+            failure = std::current_exception();
+            release_command(ctx, failed);
+            while (cursor) {
+                Command *next = cursor->next;
+                release_command(ctx, cursor);
+                cursor = next;
             }
         }
-        if (int *status = cmd->status) {
-            const int value = result == 0 ? code : -1;
-            completions.push_back([status, value] { *status = value; });
-        }
-        destroy_command_payload(*cmd);
-        if (ctx) ctx->free_func(cmd);
-        else generic_command_free(cmd);
-        cmd = next;
     }
+    if (!failure)
+        publish(state, mem, out, sub);
+    timing().build += emscripten_get_now() - started;
     if (failure) std::rethrow_exception(failure);
-    publish();
-    if (result != 0 && !survey_mode())
+    if (sub.result != 0 && !survey_mode())
         unsupported("GXM command failed (see browser log)");
 }
 int wait_for_status(State &, int *status, int signal, bool equal) {

@@ -3,7 +3,7 @@
 The runtime renders GXM on the GPU through one GXS1 scene stream per command
 list. `browser/src/gxm_webgpu_bridge.cpp` walks the production
 `renderer::Command` list and the recorded guest state and encodes passes,
-draws, fixed-function state, textures and fills into the stream;
+draws, fixed-function state, textures and transfer writes into the stream;
 `browser/web/gxm_scene.js`, running in the Worker, is its only consumer. It owns
 the WebGPU device (acquired in `sceGxmInitialize`), translates GXP programs
 in-browser through `browser/web/gxp_shader_adapter.js` (see
@@ -29,13 +29,26 @@ its command list. Nothing is rendered implicitly.
   `sceGxmFinish` returns at once: nothing guest-visible waits on the GPU.
 - Surface sync is opt-in (`VITA3K_SURFACE_SYNC=1`; Worker `?surfaceSync=1`,
   `limbo_serve.mjs` `?surfaceSync=1`, probe `LIMBO_SURFACE_SYNC=1`): a scene
-  that drew into a linear, full-size color surface is read back into guest
-  memory before its completions are published, for code that reads rendered
-  pixels with the CPU. Other surfaces are skipped with a `[gxm-skip]` reason.
+  that drew into a color surface is read back into guest memory, in the
+  surface's layout (linear, tiled or swizzled), before its completions are
+  published, for code that reads rendered pixels with the CPU.
+- GPU rendering is layout-independent; what touches guest memory goes through
+  the surface's layout: surface sync, textures over a rendered surface (the
+  surface itself, or a pre-pass copy of the rectangle a texture covers, when
+  layout, pitch and texel format match; otherwise guest memory, like desktop),
+  and transfers (fill, copy, downscale), which run on the CPU, read a rendered
+  source back first and write the texels they changed into the GPU copy.
+- A downscaled surface (`SCE_GXM_COLOR_SURFACE_SCALE_MSAA_DOWNSCALE`) renders
+  at twice its size and is box-filtered wherever its texels are read. A
+  multisampled render target renders one pixel per sample, as on desktop.
 - `sceGxmDisplayQueueAddEntry` drains the queue inline (`display_entry_thread`
   on the display queue thread, which runs the guest callback). Its
   `sceDisplaySetFrameBuf` leads to `vita3k_web_present_frame`;
   `vita_display_bridge.cpp` presents the GPU target at the frame buffer
   address, or the guest rows for a CPU-drawn frame.
+
+`browser/tests/gxm_surface_chromium.mjs` runs the VitaSDK fixture
+`vita_gxm_surface_fixture` (tiled, swizzled, downscaled and multisampled
+surfaces, textures over them, transfers) with and without surface sync.
 
 Not covered by a test: viewport sub-rects and negative viewport x scale.
