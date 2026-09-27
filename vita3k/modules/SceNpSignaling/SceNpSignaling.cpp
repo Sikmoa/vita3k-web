@@ -381,7 +381,7 @@ EXPORT(int, sceNpSignalingInit, SceSize pool_size, SceInt32 thread_priority, Sce
     if (started < 0) {
         if (thread)
             thread->exit_delete(false);
-        semaphore_delete(emuenv.kernel, export_name, thread_id, sema);
+        semaphore_close(emuenv.kernel, export_name, thread_id, sema, HandleClose::Delete);
         free(emuenv.mem, code);
         return started;
     }
@@ -424,7 +424,7 @@ EXPORT(int, sceNpSignalingTerm) {
         push_signaling_event(emuenv, export_name, thread_id, stop);
         CALL_EXPORT(sceKernelWaitThreadEnd, np.signaling_main_thread, nullptr, nullptr);
     }
-    semaphore_delete(emuenv.kernel, export_name, thread_id, np.signaling_sema);
+    semaphore_close(emuenv.kernel, export_name, thread_id, np.signaling_sema, HandleClose::Delete);
     if (thread_id != np.signaling_main_thread) {
         if (const ThreadStatePtr main_thread = emuenv.kernel.get_thread(np.signaling_main_thread))
             main_thread->exit_delete(false);

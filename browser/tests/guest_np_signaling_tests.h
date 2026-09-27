@@ -239,7 +239,7 @@ inline void test_guest_np_signaling(EmuEnvState &env, vita3k::web::GuestThreadRu
     REQUIRE(word(0x2c) == 0 && word(0x34) == 0 && word(0x3c0) == 0 && word(0x3c) == 1);
     const std::set<uint32_t> waited_ids{ word(0x24), word(0x28), word(0x38) };
     REQUIRE(waited_ids.size() == 3);
-    REQUIRE(semaphore_delete(env.kernel, "fixture", host->id, hold) == 0);
+    REQUIRE(semaphore_close(env.kernel, "fixture", host->id, hold, HandleClose::Delete) == 0);
     // A context without a handler is attached once, however often it
     // activates; a context with one activating the same peer then gets it.
     REQUIRE(call(create_ctx, { own, 0, 0, ctx_out }) == 0);
