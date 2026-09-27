@@ -282,10 +282,8 @@ static void adhoc_thread(EmuEnvState &emuenv, int thread_id) {
             .isValidNpId = 1,
         };
 
-        std::vector<int8_t> username(SCE_SYSTEM_PARAM_USERNAME_MAXSIZE);
-        CALL_EXPORT(sceAppUtilSystemParamGetString, SCE_SYSTEM_PARAM_ID_USER_NAME, username.data(), sizeof(selfInfo.username));
         CALL_EXPORT(sceNpManagerGetNpId, &selfInfo.npId);
-        std::strncpy(selfInfo.username, reinterpret_cast<const char *>(username.data()), sizeof(selfInfo.username) - 1);
+        std::strncpy(selfInfo.username, app_util_user_name(emuenv).c_str(), sizeof(selfInfo.username) - 1);
         selfInfo.username[sizeof(selfInfo.username) - 1] = '\0';
 
         // Notify the common dialog that the adhoc connection is established

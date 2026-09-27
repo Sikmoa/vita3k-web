@@ -68,7 +68,9 @@ struct SceRtcTick {
 
 #if defined(_WIN32)
 inline time_t rtc_timegm(struct tm *tm) { return _mkgmtime(tm); }
-#elif (defined(__GLIBC__) && !defined(__ANDROID__))
+#elif (defined(__GLIBC__) && !defined(__ANDROID__)) || defined(__EMSCRIPTEN__)
+// Emscripten's timegm is UTC (Date.UTC); its mktime ignores TZ, which the
+// fallback below relies on.
 #define rtc_timegm timegm
 #else
 inline time_t rtc_timegm(struct tm *tm) {

@@ -19,4 +19,8 @@
 
 #include <module/module.h>
 
-DECL_EXPORT(int, sceAppUtilSystemParamGetString, unsigned int paramId, SceChar8 *buf, SceSize bufSize);
+#include <string>
+
+// The user name SCE_SYSTEM_PARAM_ID_USER_NAME reports, also for host-side
+// callers that do not go through AppUtil's initialization.
+std::string app_util_user_name(EmuEnvState &emuenv);
