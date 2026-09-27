@@ -100,6 +100,15 @@ struct NpState {
     bool basic_inited = false; // SceNpBasic
     bool signaling_inited = false; // SceNpSignaling
     bool auth_inited = false; // SceNpCommon sceNpAuthInit
+    // np_common's 16 ticket-request slots (sceNpAuthInit clears them). A slot
+    // is taken once its ticket callback is stored and stays taken when the
+    // shell refuses the request; only an accepted request gets an id.
+    struct AuthRequestSlot {
+        int32_t id;
+        Address callback;
+        Address arg;
+    };
+    std::array<AuthRequestSlot, 16> auth_requests{};
     bool commerce2_inited = false; // SceNpCommerce2
     std::map<int, Address> signaling_ctxs; // context id (1..8) -> handler
 

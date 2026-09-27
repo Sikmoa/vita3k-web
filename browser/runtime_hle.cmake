@@ -396,11 +396,12 @@ set(_hle_exports
     # field (ime_bridge.cpp) and sceImeUpdate runs the guest's event handler
     # on the calling thread (run_callback), as on desktop.
     sceImeOpen sceImeUpdate sceImeClose
-    # NP while signed out, as firmware 3.74 answers it (np_basic,
+    # NP without a PSN server, as firmware 3.74 answers it (np_basic,
     # np_signaling, np_activity_sdk, np_common, np_manager and the shell's NP
-    # service): friend/block lists need sign-in, presence the online state,
-    # there is no cached ticket for the content rating; signaling contexts
-    # are local and no connection ever exists.
+    # service): friend/block lists need sign-in and are never fetched,
+    # presence needs the online state, there is no ticket for the content
+    # rating, a ticket request is refused without a stored PSN login;
+    # signaling contexts are local and no connection ever exists.
     sceNpBasicGetFriendListEntryCount sceNpBasicGetFriendListEntries
     sceNpBasicGetBlockListEntryCount sceNpBasicGetBlockListEntries
     sceNpBasicCheckIfPlayerIsBlocked sceNpBasicGetFriendOnlineStatus
@@ -408,6 +409,7 @@ set(_hle_exports
     sceNpSignalingCreateCtx sceNpSignalingDestroyCtx sceNpSignalingSetCtxOpt
     sceNpSignalingTerminateConnection sceNpSignalingGetConnectionInfo
     sceNpActivityPostStatus sceNpGetPlatformType sceNpManagerGetContentRatingFlag
+    sceNpAuthCreateStartRequest sceNpAuthGetTicket
     # Firmware 3.74 apputil/livearea_util checks; the background-download
     # queue is empty and the browser has no LiveArea (a valid update
     # completes at once).

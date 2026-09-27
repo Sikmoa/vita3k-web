@@ -23,7 +23,7 @@ inline void test_guest_np_offline(EmuEnvState &env, ThreadState &thread) {
                        set_ctx_opt = 0x0B48FADB, conn_info = 0x51883EAE, post_status = 0xBC7FDC77,
                        platform_type = 0xE9A003DE, get_np_id = 0x3C94B4B4;
     REQUIRE(!env.cfg.current_config.psn_signed_in);
-    const Address block = alloc(env.mem, 256, "np fixture");
+    const Address block = alloc(env.mem, 512, "np fixture");
     REQUIRE(block);
     const Address out = block, out2 = block + 4, np_id = block + 0x40;
     auto *word = Ptr<uint32_t>(out).get(env.mem);
@@ -48,6 +48,30 @@ inline void test_guest_np_offline(EmuEnvState &env, ThreadState &thread) {
     *word = 0xcccccccc;
     REQUIRE(call(friend_count, { out }) == 0x80551d06 && *word == 0xcccccccc);
     REQUIRE(call(online_status, { np_id, out }) == 0x80551d07 && *word == 0);
+    constexpr uint32_t friend_entries = 0xFF07E787, block_count = 0x407E1E6F, block_entries = 0x1211AE8E,
+                       is_blocked = 0xF51545D8;
+    const Address entries = block + 0x80;
+    auto *entry_word = Ptr<uint32_t>(entries).get(env.mem);
+    REQUIRE(call(friend_entries, { 0, entries, 0, out }) == 0x80551d02);
+    REQUIRE(call(friend_entries, { 100, entries, 1, out }) == 0x80551d02);
+    *word = 0xcccccccc;
+    REQUIRE(call(friend_entries, { 0, entries, 1, out }) == 0x80551d06 && *word == 0xcccccccc);
+    REQUIRE(call(block_entries, { 0, entries, 1, out }) == 0x80551d06);
+    REQUIRE(call(block_count, { out }) == 0x80551d06 && call(is_blocked, { np_id, out }) == 0x80551d06);
+    // Signed in, the lists were never fetched from a server: counts and the
+    // blocked flag (one byte) are written, entries and retrieved are not.
+    env.cfg.current_config.psn_signed_in = true;
+    REQUIRE(call(friend_count, { out }) == 0x80551d0d && *word == 0);
+    *word = 0xcccccccc;
+    REQUIRE(call(block_count, { out }) == 0x80551d0d && *word == 0);
+    *word = 0xcccccccc;
+    *entry_word = 0xdddddddd;
+    REQUIRE(call(friend_entries, { 0, entries, 1, out }) == 0x80551d0d);
+    REQUIRE(call(block_entries, { 0, entries, 1, out }) == 0x80551d0d);
+    REQUIRE(*word == 0xcccccccc && *entry_word == 0xdddddddd);
+    REQUIRE(call(is_blocked, { np_id, out }) == 0x80551d0d && *word == 0xcccccc00);
+    REQUIRE(call(rating, { out, out2 }) == 0x8055050B); // no ticket signed in either
+    env.cfg.current_config.psn_signed_in = false;
     REQUIRE(call(basic_term, {}) == 0 && call(basic_term, {}) == 0x80551d04);
 
     REQUIRE(call(get_np_id, { np_id }) == 0);
@@ -69,6 +93,44 @@ inline void test_guest_np_offline(EmuEnvState &env, ThreadState &thread) {
                        commerce_term = 0xB99958AE;
     REQUIRE(call(auth_init, {}) == 0 && call(auth_init, {}) == 0x80550301);
     REQUIRE(call(auth_term, {}) == 0 && call(auth_term, {}) == 0 && call(auth_init, {}) == 0);
+    REQUIRE(call(auth_term, {}) == 0);
+    // A ticket request: np_common's checks and slots, then the shell refuses
+    // it without a stored PSN login; the callback never runs.
+    constexpr uint32_t start_request = 0xED42079F, get_ticket = 0x59608D1C;
+    const Address param = block + 0xc0, service_id = block + 0xf0;
+    auto *request = Ptr<uint32_t>(param).get(env.mem);
+    std::memset(request, 0, 0x24);
+    request[0] = 0x24; // size
+    request[2] = service_id;
+    request[7] = 0x81000001; // ticketCb
+    std::strcpy(Ptr<char>(service_id).get(env.mem), "IV0000-NPXS00005_00");
+    REQUIRE(call(start_request, { param }) == 0x80550302 && call(get_ticket, { 0, out, 4 }) == 0x80550302);
+    REQUIRE(call(auth_init, {}) == 0);
+    REQUIRE(call(start_request, { 0 }) == 0x80550303);
+    request[7] = 0;
+    REQUIRE(call(start_request, { param }) == 0x80550303);
+    request[7] = 0x81000001;
+    request[4] = 1025; // cookieSize
+    REQUIRE(call(start_request, { param }) == 0x80550303);
+    request[4] = 0;
+    REQUIRE(call(get_ticket, { 0, 0, 4 }) == 0x80550303 && call(get_ticket, { 0, out, 0 }) == 0x80550303);
+    REQUIRE(call(get_ticket, { 1, out, 4 }) == 0x80550305);
+    *word = 0xcccccccc;
+    REQUIRE(call(get_ticket, { 0, out, 4 }) == 0 && *word == 0xcccccccc); // a slot with id 0, no result
+    request[0] = 0x20;
+    REQUIRE(call(start_request, { param }) == 0x80550303); // the shell checks the size
+    request[0] = 0x24;
+    std::strcpy(Ptr<char>(service_id).get(env.mem), "IV0000-NPXS00005_00-TOOLONG");
+    REQUIRE(call(start_request, { param }) == 0x80550308);
+    Ptr<char>(service_id).get(env.mem)[0] = 0;
+    REQUIRE(call(start_request, { param }) == 0x80550308);
+    std::strcpy(Ptr<char>(service_id).get(env.mem), "IV0000-NPXS00005_00");
+    for (int i = 3; i < 16; ++i)
+        REQUIRE(call(start_request, { param }) == 0x80550309);
+    // Each refused request keeps its slot until sceNpAuthInit clears them.
+    REQUIRE(call(start_request, { param }) == 0x80550306);
+    REQUIRE(call(auth_term, {}) == 0 && call(auth_init, {}) == 0);
+    REQUIRE(call(start_request, { param }) == 0x80550309);
     REQUIRE(call(auth_term, {}) == 0);
     REQUIRE(call(commerce_init, {}) == 0 && call(commerce_init, {}) == 0x80550f02);
     REQUIRE(call(commerce_term, {}) == 0 && call(commerce_term, {}) == 0 && call(commerce_init, {}) == 0);
@@ -110,5 +172,5 @@ inline void test_guest_np_offline(EmuEnvState &env, ThreadState &thread) {
         call(netctl_term, {});
     call(np_term, {});
     free(env.mem, block);
-    std::puts("Guest NP offline: service state, rating, NpBasic, signaling, platform, activity, NpAuth, Commerce2, trophy handles and NetCtl passed");
+    std::puts("Guest NP offline: service state, rating, NpBasic signed out and in, signaling, platform, activity, NpAuth requests, Commerce2, trophy handles and NetCtl passed");
 }

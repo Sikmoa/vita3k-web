@@ -47,6 +47,7 @@ void reset_process(NpState &state) {
     state.signaling_inited = false;
     state.signaling_ctxs.clear();
     state.auth_inited = false;
+    state.auth_requests = {};
     state.commerce2_inited = false;
     state.near = {};
 }

@@ -31,10 +31,14 @@ enum SceNpBasicError : uint32_t {
     // the service), presence needs the online state (0x80551a09).
     SCE_NP_BASIC_ERROR_NOT_SIGNED_IN = 0x80551d06,
     SCE_NP_BASIC_ERROR_NOT_ONLINE = 0x80551d07,
+    // Signed in, the service's list was never fetched from the server
+    // (np_basic 0x8100024c: the service answers 0 with its loaded flag clear).
+    SCE_NP_BASIC_ERROR_LIST_NOT_LOADED = 0x80551d0d, // name unknown
 };
 
 // Friend and block lists and presence come from the NP service in the
-// shell; what they answer while signed out is fixed by firmware 3.74.
+// shell. It keeps the lists in memory only, filled from the PSN server; no
+// server ever answers here, so signed in they stay unloaded.
 static bool signed_in(EmuEnvState &emuenv) {
     return emuenv.cfg.current_config.psn_signed_in;
 }
@@ -50,8 +54,9 @@ EXPORT(int, sceNpBasicCheckIfPlayerIsBlocked, Ptr<const void> np_id, SceInt32 *r
         return RET_ERROR(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
     if (!signed_in(emuenv))
         return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_SIGNED_IN);
-    *result = 0;
-    return STUBBED("Nobody blocked");
+    // The service writes one result byte even with the list unloaded.
+    *reinterpret_cast<uint8_t *>(result) = 0;
+    return RET_ERROR(SCE_NP_BASIC_ERROR_LIST_NOT_LOADED);
 }
 
 EXPORT(int, sceNpBasicGetBlockListEntries, SceUInt32 start, Ptr<void> entries, SceUInt32 num, SceSize *retrieved) {
@@ -61,8 +66,7 @@ EXPORT(int, sceNpBasicGetBlockListEntries, SceUInt32 start, Ptr<void> entries, S
         return RET_ERROR(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
     if (!signed_in(emuenv))
         return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_SIGNED_IN);
-    *retrieved = 0;
-    return STUBBED("Nobody blocked");
+    return RET_ERROR(SCE_NP_BASIC_ERROR_LIST_NOT_LOADED);
 }
 
 EXPORT(int, sceNpBasicGetBlockListEntryCount, SceSize *count) {
@@ -73,7 +77,7 @@ EXPORT(int, sceNpBasicGetBlockListEntryCount, SceSize *count) {
     if (!signed_in(emuenv))
         return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_SIGNED_IN);
     *count = 0;
-    return STUBBED("Nobody blocked");
+    return RET_ERROR(SCE_NP_BASIC_ERROR_LIST_NOT_LOADED);
 }
 
 EXPORT(int, sceNpBasicGetFriendContextState) {
@@ -87,8 +91,7 @@ EXPORT(int, sceNpBasicGetFriendListEntries, SceUInt32 start, Ptr<void> entries, 
         return RET_ERROR(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
     if (!signed_in(emuenv))
         return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_SIGNED_IN);
-    *retrieved = 0;
-    return STUBBED("No friends");
+    return RET_ERROR(SCE_NP_BASIC_ERROR_LIST_NOT_LOADED);
 }
 
 EXPORT(int, sceNpBasicGetFriendListEntryCount, SceSize *count) {
@@ -98,9 +101,8 @@ EXPORT(int, sceNpBasicGetFriendListEntryCount, SceSize *count) {
         return RET_ERROR(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
     if (!signed_in(emuenv))
         return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_SIGNED_IN);
-    STUBBED("No friends");
     *count = 0;
-    return 0;
+    return RET_ERROR(SCE_NP_BASIC_ERROR_LIST_NOT_LOADED);
 }
 
 EXPORT(int, sceNpBasicGetFriendOnlineStatus, Ptr<const void> np_id, SceInt32 *status) {

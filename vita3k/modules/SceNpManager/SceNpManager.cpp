@@ -135,13 +135,9 @@ EXPORT(int, sceNpManagerGetContentRatingFlag, SceInt *isRestricted, SceInt *age)
     TRACY_FUNC(sceNpManagerGetContentRatingFlag, isRestricted, age);
     if (!isRestricted || !age)
         return RET_ERROR(SCE_NP_MANAGER_ERROR_INVALID_ARGUMENT);
-    // Firmware 3.74 reads the rating from the ticket cached at PSN sign-in;
-    // signed out there is none.
-    if (!emuenv.cfg.current_config.psn_signed_in)
-        return RET_ERROR(SCE_NP_MANAGER_ERROR_NO_TICKET);
-    *isRestricted = 0; // User is never restricted
-    *age = 21; // Assume user is 21 years old
-    return STUBBED("isRestricted = 0; age = 21; return 0;");
+    // The shell's NP manager reads both from the ticket the PSN server issues
+    // at sign-in; no server issues one here, signed in or not.
+    return RET_ERROR(SCE_NP_MANAGER_ERROR_NO_TICKET);
 }
 
 EXPORT(int, sceNpManagerGetNpId, np::SceNpId *id) {

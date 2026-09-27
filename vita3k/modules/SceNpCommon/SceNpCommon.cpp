@@ -17,6 +17,9 @@
 
 #include <module/module.h>
 
+#include <algorithm>
+#include <cstring>
+
 #include <io/state.h>
 #include <kernel/state.h>
 #include <np/common.h>
@@ -27,6 +30,13 @@ TRACY_MODULE_NAME(SceNpCommon);
 
 enum SceNpAuthErrorCode {
     SCE_NP_AUTH_ERROR_ALREADY_INITIALIZED = 0x80550301,
+    SCE_NP_AUTH_ERROR_NOT_INITIALIZED = 0x80550302,
+    SCE_NP_AUTH_ERROR_INVALID_ARGUMENT = 0x80550303,
+    // Names unknown below.
+    SCE_NP_AUTH_ERROR_REQUEST_NOT_FOUND = 0x80550305,
+    SCE_NP_AUTH_ERROR_REQUEST_MAX = 0x80550306,
+    SCE_NP_AUTH_ERROR_INVALID_SERVICE_ID = 0x80550308,
+    SCE_NP_AUTH_ERROR_NO_LOGIN = 0x80550309, // no PSN login id or password stored
 };
 
 enum SceNpUtilErrorCode {
@@ -52,14 +62,30 @@ struct SceNpAuthRequestParameter {
     Ptr<void> ticketCb; // int (*ticketCb)(SceNpAuthRequestId, int, void *);
     Ptr<void> cbArg;
 };
+static_assert(sizeof(SceNpAuthRequestParameter) == 0x24);
 
+// np_common 0x81004d85 checks the arguments, stores the callback in a free
+// slot and hands the request to the shell's NP auth service (0x81324b80),
+// which refuses it at once while no PSN login is stored (0x813252b8). The
+// callback never runs and the slot stays taken.
 EXPORT(int, sceNpAuthCreateStartRequest, const SceNpAuthRequestParameter *param) {
     TRACY_FUNC(sceNpAuthCreateStartRequest, param);
-    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
-    // todo: this callback function should be called from sceNpCheckCallback
-    STUBBED("Immediately call ticket callback");
-    thread->run_callback(param->ticketCb.address(), { 1, 1, param->cbArg.address() });
-    return 1;
+    if (!emuenv.np.auth_inited)
+        return RET_ERROR(SCE_NP_AUTH_ERROR_NOT_INITIALIZED);
+    if (!param || !param->ticketCb || param->cookieSize > 1024)
+        return RET_ERROR(SCE_NP_AUTH_ERROR_INVALID_ARGUMENT);
+    auto &slots = emuenv.np.auth_requests;
+    const auto slot = std::find_if(slots.begin(), slots.end(), [](const auto &s) { return !s.callback; });
+    if (slot == slots.end())
+        return RET_ERROR(SCE_NP_AUTH_ERROR_REQUEST_MAX);
+    slot->callback = param->ticketCb.address();
+    slot->arg = param->cbArg.address();
+    if (param->size != sizeof(SceNpAuthRequestParameter))
+        return RET_ERROR(SCE_NP_AUTH_ERROR_INVALID_ARGUMENT);
+    const char *service_id = param->serviceId.get(emuenv.mem);
+    if (!service_id || !*service_id || strnlen(service_id, 24) >= 24)
+        return RET_ERROR(SCE_NP_AUTH_ERROR_INVALID_SERVICE_ID);
+    return RET_ERROR(SCE_NP_AUTH_ERROR_NO_LOGIN);
 }
 
 EXPORT(int, sceNpAuthDestroyRequest) {
@@ -82,9 +108,19 @@ EXPORT(int, sceNpAuthGetEntitlementIdList) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNpAuthGetTicket) {
-    TRACY_FUNC(sceNpAuthGetTicket);
-    return UNIMPLEMENTED();
+// np_common 0x81004ea1: a slot is found by its request id; a result not yet
+// delivered by sceNpCheckCallback is 0 and copies nothing. Refused requests
+// keep id 0, so id 0 finds such a slot (or a free one).
+EXPORT(int, sceNpAuthGetTicket, SceInt32 req_id, Ptr<void> buf, SceSize len) {
+    TRACY_FUNC(sceNpAuthGetTicket, req_id, buf, len);
+    if (!emuenv.np.auth_inited)
+        return RET_ERROR(SCE_NP_AUTH_ERROR_NOT_INITIALIZED);
+    if (!buf || !len)
+        return RET_ERROR(SCE_NP_AUTH_ERROR_INVALID_ARGUMENT);
+    const auto &slots = emuenv.np.auth_requests;
+    if (std::none_of(slots.begin(), slots.end(), [&](const auto &s) { return s.id == req_id; }))
+        return RET_ERROR(SCE_NP_AUTH_ERROR_REQUEST_NOT_FOUND);
+    return 0;
 }
 
 EXPORT(int, sceNpAuthGetTicketParam) {
@@ -99,6 +135,7 @@ EXPORT(int, sceNpAuthInit) {
     if (emuenv.np.auth_inited)
         return RET_ERROR(SCE_NP_AUTH_ERROR_ALREADY_INITIALIZED);
     emuenv.np.auth_inited = true;
+    emuenv.np.auth_requests = {};
     return 0;
 }
 
