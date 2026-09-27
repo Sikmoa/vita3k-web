@@ -1,9 +1,29 @@
-# Vita3K WebAssembly Port — M0 Architecture Map
+# Vita3K WebAssembly Port — Architecture Map
 
-> Current experimental JIT work: [M14a implementation and validation](browser/M14_JIT.md).
-> The working homebrew/display runtime remains on InterpreterCPU; the new
-> Dynarmic-IR → Wasm backend is opt-in and currently limited to register-only
-> blocks. The sections below retain the historical survey/milestone record.
+## Where things live now
+
+- **Build**: `browser/CMakeLists.txt` and `browser/runtime_*.cmake` define the
+  browser graph. `vita3k_web` runs the Vita CPU on InterpreterCPU,
+  `vita3k_web_jit` on the Dynarmic IR → Wasm JIT
+  ([M14_JIT.md](browser/M14_JIT.md)); the primary build is Memory64
+  (`build/web64`, [MEMORY64.md](browser/MEMORY64.md)). Guest threads are
+  Asyncify fibers on one Worker (`browser/src/guest_fiber_scheduler.cpp`,
+  `guest_thread_runtime.cpp`); the app launch path is `browser/src/vita_app.cpp`.
+- **Page and Worker**: `browser/web/worker.js` loads the module, stages Vita
+  content (`stage-files`), launches an app (`run-app`) and forwards frames,
+  audio and input. Every file in `browser/web` is staged into `dist/`.
+- **Renderer**: each GXM command list becomes a GXS1 scene stream
+  (`browser/src/gxm_webgpu_bridge.cpp`) executed by `browser/web/gxm_scene.js`
+  in the Worker, with GXP translated in-browser by `gxp_shader_adapter.js`.
+  Render targets stay on the GPU at an internal resolution scale (`?scale=N`,
+  default 2) and are presented to a canvas the page transfers; see
+  [GXM_WEBGPU.md](browser/tests/GXM_WEBGPU.md).
+- **AOT**: a whole-app Wasm module built offline from the loaded modules;
+  see [AOT.md](vita3k/cpu/src/wasmjit/AOT.md).
+- **Commands**: builds, tests, the Limbo dev server and probes, and the AOT
+  workflow are in [SCRIPTS.md](SCRIPTS.md).
+
+The rest of this document is the original survey and milestone record.
 
 This document records the first repository survey for the browser port. It is deliberately a map and decision record, not an implementation plan disguised as a rewrite.
 

@@ -12,6 +12,12 @@ Vita3K is an experimental PlayStation Vita emulator for Windows, Linux, macOS an
 * [Wiki](https://github.com/Vita3K/Vita3K/wiki) (information for developers)
 * [Discord server](https://discord.gg/MaWhJVH) (recommended)
 
+## Browser port
+
+This repository also carries a WebAssembly/WebGPU port under `browser/`.
+[ARCHITECTURE.md](./ARCHITECTURE.md) maps where its parts live and
+[SCRIPTS.md](./SCRIPTS.md) has the build, test and run commands.
+
 ## Compatibility
 
 The emulator currently runs most homebrew programs and commercial games.

@@ -47,28 +47,30 @@ use the retail ablation below for a disabled-path performance comparison.
 ## Emitter fixture suite (real Dynarmic IR → Wasm modules, run in Node)
 
 ```sh
+cmake -S external/dynarmic -B build/native-dynarmic -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DDYNARMIC_FRONTENDS=A32 -DDYNARMIC_TESTS=OFF -DDYNARMIC_USE_BUNDLED_EXTERNALS=ON
+cmake --build build/native-dynarmic
 c++ -std=c++20 -O1 -Wall -Wextra -Werror \
   -Ivita3k/cpu/include -Ivita3k/mem/include \
   -Iexternal/dynarmic/src \
   -Iexternal/dynarmic/externals/mcl/include \
-  -Iexternal/fmt/include -Iexternal/boost \
+  -Iexternal/dynarmic/externals/fmt/include -Iexternal/boost \
   vita3k/cpu/src/wasmjit/emit_wasm.cpp \
   vita3k/cpu/tests/wasmjit_emitter_test.cpp \
-  build/native/external/dynarmic/src/dynarmic/libdynarmic.a \
-  build/native/external/dynarmic/externals/mcl/src/libmcl.a \
-  build/native/external/fmt/libfmtd.a \
+  build/native-dynarmic/src/dynarmic/libdynarmic.a \
+  build/native-dynarmic/externals/mcl/src/libmcl.a \
+  build/native-dynarmic/externals/fmt/libfmt.a \
   -o /tmp/wasmjit-emitter-test
 /tmp/wasmjit-emitter-test /tmp/wasmjit-emitter-fixtures
 node vita3k/cpu/tests/wasmjit_emitter_test.mjs /tmp/wasmjit-emitter-fixtures
 ```
 
-Step 1 builds the native fixture generator (no CMake target exists for it —
-recipe from `vita3k/cpu/tests/wasmjit_emitter_README.md`). Step 2 translates
-real ARM/Thumb and emits `.wasm` fixtures + expected-state JSON. Step 3 executes
-every module in Node. Expected: 432 reference + 1308 candidate modules,
-~59k cases, "Wasm execution passed" (P/K/PK x fast-bases variants plus
-the shifts_imm immediate-count suite and the 27-case vitaslop conformance
-import; counts grow with coverage).
+The first two commands build a standalone native Dynarmic with its bundled
+fmt; the headers must be that fmt (`external/fmt` is a different version and
+does not link). Then the native fixture generator is built (no CMake target
+exists for it; see `vita3k/cpu/tests/wasmjit_emitter_README.md`), translates
+real ARM/Thumb into `.wasm` fixtures with expected-state JSON, and Node executes
+every module. Expected last line: `Wasm execution passed: ...`.
 
 ## Audio audibility probe (square-wave homebrew through the Worker path)
 
@@ -188,67 +190,101 @@ SharedArrayBuffer). The Worker's console prints the JIT profile line ending in
 ## Retail app (Limbo) in a browser
 
 ```sh
-env EM_CACHE=/home/user/.vscratch/emcache cmake --build build/web64 --target vita3k_web_jit -j2
+cmake --build build/web64 --target vita3k_web_jit
 HOST=0.0.0.0 PORT=5173 node browser/tests/limbo_serve.mjs
 ```
 
-Open the printed URL (`HOST=0.0.0.0` lists the machine's addresses; add
-`?auto=1` to start on load). The page stages `.limbo_work/stage`
-(`LIMBO_STAGE`, `LIMBO_TITLE`, `LIMBO_APP`), boots the retail app through the
-same Worker messages the headless probe uses, and draws every presented frame
-to a canvas next to a live guest log. Query parameters: `?memory=w64|w32|auto`
-(auto probes Memory64 and falls back), `?backend=jit|interp`, `?inlineMutex=0`
-(disables the default-on inline lock/unlock paths for comparison). Start a new
-Worker/reload to change the selection. After changing the page's inline HTML,
-restart the **Node dev server**: it constructs that HTML once at startup.
-Static worker/JS/Wasm assets are read from disk per request.
+Open the printed URL (add `?auto=1` to start on load). The page stages
+`.limbo_work/stage` (`LIMBO_STAGE`, `LIMBO_TITLE`, `LIMBO_APP`) into the Worker
+and boots the app with the same Worker messages the headless probe uses. The
+runtime files come from `browser/tests/runtime_routes.mjs`, shared with the
+probes: `browser/web` from source, the module from `GXM_RUNTIME_DIST` (default
+`build/web64/browser`) and the shader compiler assets from `GXM_SHADER_ASSETS`
+(default `.limbo_work/gxm`: the compiler from `browser/tests/build_gxp_compiler.sh
+wasm`, Naga and the WASI shim from the npm packages `naga-wasi-cli` and
+`@bjorn3/browser_wasi_shim` installed there).
+`LIMBO_AOT=<file>` supplies an AOT module (below). The option list is the
+header of `limbo_serve.mjs`; the ones that change what is measured:
 
-**WebGPU needs a secure origin.** `navigator.gpu` is exposed only to secure
-contexts, so a page served over plain HTTP from a non-loopback address reaches
-`Vita import #NNNN` lines and then fails at the first draw with "WebGPU
-unavailable". Either put a TLS reverse proxy (e.g. Caddy) in front and open
-`https://<name>/`, or forward the port and open `http://localhost:<PORT>/`
-(loopback is a secure context). The page and the bridge both name this reason
-when it applies. A Chromium without a usable GPU additionally needs
-`--enable-unsafe-webgpu --enable-unsafe-swiftshader`. The wasm32 fallback is a
-separate target (`vita3k_web`) and only presents frames when it was built from
-the same tree as the wasm64 module.
+- vblank runs at real 60 Hz by default; `?fastvblank=1` free-runs it (headroom,
+  not real-time speed), `?fpsHack=1` is Vita3K's fps-hack (display waits use
+  one vblank).
+- `?scale=N` sets the internal resolution (1-4, default 2).
+- `?memory=w64|w32|auto`, `?backend=jit|interp`, `?inlineMutex=0`.
+- `?present=readback` reads every frame back to a page canvas (for
+  `limbo_watch.mjs`); by default the Worker presents to a transferred
+  OffscreenCanvas.
 
-Headless equivalent that mirrors frames into the workspace as they arrive (use
-it when the page's port is not reachable from this machine):
+Restart the Node server after editing its inline page or the staged content;
+runtime files are read per request.
+
+Rendering: the runtime encodes each GXM command list as a GXS1 scene stream
+(`browser/src/gxm_webgpu_bridge.cpp`) that `browser/web/gxm_scene.js` executes
+in the Worker. Render targets stay on the GPU and are presented from there; see
+`browser/tests/GXM_WEBGPU.md`.
+
+**WebGPU needs a secure origin.** `navigator.gpu` exists only in secure
+contexts: serve through a TLS reverse proxy or open `http://localhost:<PORT>/`
+over a forwarded port. The page names this reason when it applies. A Chromium
+without a usable GPU needs `--enable-unsafe-webgpu --enable-unsafe-swiftshader`.
+
+`browser/tests/limbo_watch.mjs` runs the same page headless and mirrors frames
+to `.limbo_work/live/` (`latest.png`, `frame_NNNNN.png`, `status.json`).
+
+### Headless probe
 
 ```sh
 PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index.mjs \
-  LIMBO_DEADLINE_MS=300000 node browser/tests/limbo_watch.mjs      # -> .limbo_work/live/
+  LIMBO_DEADLINE_MS=90000 node browser/tests/limbo_app_chromium.mjs
 ```
 
-`latest.png` is rewritten on every poll and each new generation is also kept as
-`frame_NNNNN.png`; `status.json` carries the current status, frame count and the
-guest log. The headless browser uses SwiftShader (`--use-angle=swiftshader`,
-`--enable-unsafe-webgpu`); set `LIMBO_GPU=1` on a machine with a real GPU.
+Exit 0 requires at least one presented frame; `LIMBO_DEADLINE_MS` bounds the
+observation window. The JSON reports frames, exit and errors separately, plus
+the renderer's `gxmSceneStats`, `gxmFailures` and `gxmSkips`. The option list
+is the file header; commonly used:
 
-`browser/tests/limbo_app_chromium.mjs` is the assertion probe (exit 0 requires
-at least one presented frame; `LIMBO_DEADLINE_MS` bounds the observation window,
-not the emulated game). Inspect `exit`, `timedOut` and error arrays separately;
-one presented frame is not proof of a clean guest exit.
+- `LIMBO_GPU=1 LIMBO_HEADED=1` (with `PLAYWRIGHT_CHROMIUM_EXECUTABLE`) uses the
+  hardware adapter; headless Chrome only has SwiftShader.
+- `LIMBO_FAST_VBLANK=0` paces vblank at 60 Hz (the probe free-runs by default).
+- `LIMBO_FPS_HACK=1`, `LIMBO_SCALE=N`: as `?fpsHack=1`, `?scale=N`.
+- `LIMBO_TEXTURE_VERIFY=1` checks cached textures and vertex streams against
+  guest memory and logs writes the tracking missed (`[gxm-verify]`).
+- `LIMBO_INPUT="<ms>:<input>[+<input>]:<hold ms>,..."` scripts pad input.
+- `LIMBO_MEASURE=1` runs the fixed loading/gameplay measurement scenario with a
+  Worker CPU profile per window; `LIMBO_PROFILE=0` keeps the windows without the
+  profiler, `LIMBO_PROFILE=alloc` samples allocations instead;
+  `LIMBO_PROFILE_OUT=<prefix>` writes the raw profiles.
+- `LIMBO_LOG_OUT=<file>` keeps the worker log tail; `LIMBO_INLINE_MUTEX=0` is
+  the inline-mutex ablation (see
+  [`INLINE_MUTEX.md`](vita3k/cpu/src/wasmjit/INLINE_MUTEX.md)).
 
-For a sequential inline-mutex comparison using the same binary:
+Raw assets, frames and logs stay in the ignored `.limbo_work/`.
+
+## Ahead-of-time module (AOT) for a retail app
+
+The Node app bench (`vita3k_web_app_bench`, no GPU: `VITA3K_NULL_GPU=1`) loads
+the app like the browser does and builds, records seeds for, or runs an AOT
+module. Format and policy: [`AOT.md`](vita3k/cpu/src/wasmjit/AOT.md).
 
 ```sh
-for enabled in 1 0; do
-  env PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index.mjs \
-    LIMBO_INLINE_MUTEX=$enabled LIMBO_DEADLINE_MS=180000 LIMBO_FRAME_EVERY=10 \
-    LIMBO_FRAME_OUT=.limbo_work/inline-$enabled \
-    node browser/tests/limbo_app_chromium.mjs > .limbo_work/inline-$enabled.log 2>&1
-done
+cmake --build build/web64 --target vita3k_web_app_bench
+mkdir -p .limbo_work/aot
+# 1. Record the blocks the lazy JIT executes, driving the title into gameplay.
+VITA3K_NULL_GPU=1 VITA3K_BENCH_SECONDS=120 VITA3K_AOT_SEEDS_OUT=.limbo_work/aot/seeds.txt \
+  VITA3K_BENCH_INPUT="30000:cross:200,40000:lstick-right:5000" \
+  node build/web64/browser/vita3k_web_app_bench.js .limbo_work/stage PCSE00268
+# 2. Build the module from the loaded modules plus those seeds.
+VITA3K_NULL_GPU=1 VITA3K_AOT_BUILD=.limbo_work/aot/limbo.aot.wasm VITA3K_AOT_SEEDS=.limbo_work/aot/seeds.txt \
+  node build/web64/browser/vita3k_web_app_bench.js .limbo_work/stage PCSE00268
+# 3. Use it in Node (VITA3K_AOT), or in the probe and the dev server (LIMBO_AOT).
+VITA3K_NULL_GPU=1 VITA3K_AOT=.limbo_work/aot/limbo.aot.wasm \
+  node build/web64/browser/vita3k_web_app_bench.js .limbo_work/stage PCSE00268
+LIMBO_AOT=.limbo_work/aot/limbo.aot.wasm node browser/tests/limbo_serve.mjs
 ```
 
-The JSON retains full-run draw counts (not just a truncated log tail), the
-latest live progress/per-thread profiles and first-frame `sinceRunMs`, excluding
-staging time. Raw assets/images/logs stay in ignored `.limbo_work/`. See
-[`INLINE_MUTEX.md`](vita3k/cpu/src/wasmjit/INLINE_MUTEX.md) for the coherence
-contract, regression coverage and the initial measured comparison. Do not infer
-per-import nanoseconds or steady FPS from cumulative MIPS/frame counts.
+`VITA3K_BENCH_INPUT` uses the probe's `LIMBO_INPUT` syntax. Every run logs
+`AOT on`, `off` or `REJECTED` with the reason: a module built from other game
+code or an older AOT format version is refused and has to be rebuilt.
 
 ## Debugging generated Wasm
 
