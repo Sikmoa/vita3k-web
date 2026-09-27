@@ -310,6 +310,11 @@ set(_hle_exports
     # Save data and trophies (host-filesystem backed):
     sceAppUtilSaveDataDataSave sceAppUtilSaveDataDataRemove sceAppUtilSaveDataSlotGetParam
     sceAppUtilReceiveAppEvent
+    # App-event text parsers of firmware 3.74 apputil (app_event_parse.h,
+    # checked against the firmware code under emulation).
+    sceAppUtilAppEventParseNpInviteMessage sceAppUtilAppEventParseNpAppDataMessage
+    sceAppUtilAppEventParseNpBasicJoinablePresence sceAppUtilAppEventParseNearGift
+    sceAppUtilAppEventParseLiveArea
     sceNpTrophyUnlockTrophy
     # Files and directories:
     sceIoDopen sceIoDread sceIoDclose sceIoMkdir sceIoRmdir sceIoRemove sceIoRename

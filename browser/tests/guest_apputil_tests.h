@@ -3,6 +3,7 @@
 #pragma once
 #include <gxm/state.h>
 #include <cstring>
+#include <string>
 
 inline void test_guest_apputil(EmuEnvState &env, ThreadState &thread) {
     auto &cpu = *thread.cpu;
@@ -46,7 +47,41 @@ inline void test_guest_apputil(EmuEnvState &env, ThreadState &thread) {
     status[0] = 1;
     status[1] = status[2] = status[3] = 7;
     REQUIRE(call(bgdl_status, { bgdl }) == 0 && status[1] == 0 && status[2] == 0 && status[3] == 0);
+    // App-event parsers (firmware 3.74): URL-decoded key=value text.
+    constexpr uint32_t parse_invite = 0xA2496814, parse_presence = 0x28C7D4F6, parse_gift = 0x77380601,
+                       parse_live_area = 0x0F4EE55F;
+    auto *event_type = Ptr<uint32_t>(event).get(env.mem);
+    auto *event_text = Ptr<char>(event + 4).get(env.mem);
+    const Address parsed = block + 0x500; // up to 0x41b bytes, over the config and text areas
+    auto *out = Ptr<uint8_t>(parsed).get(env.mem);
+    const auto set_event = [&](uint32_t type, const char *text) {
+        std::memset(Ptr<uint8_t>(event).get(env.mem), 0, 0x404);
+        *event_type = type;
+        std::strcpy(event_text, text);
+    };
+    set_event(1, "npcommid=NPWR00001_02&uid=12%33x&type=INVITATION_MESSAGE");
+    REQUIRE(call(parse_invite, { event, parsed }) == 0);
+    REQUIRE(std::memcmp(out, "NPWR00001\0\2", 11) == 0 && std::string(reinterpret_cast<char *>(out + 12)) == "123x");
+    REQUIRE(call(parse_presence, { event, parsed }) == 0x80100600); // another event type
+    set_event(1, "npcommid=NPWR0001_02&uid=1");
+    REQUIRE(call(parse_invite, { event, parsed }) == 0x80100620);
+    set_event(3, "npcommid=NPWR00001_00&jid=player_1@ab.cd.np.playstation.net/xyz");
+    REQUIRE(call(parse_presence, { event, parsed }) == 0);
+    REQUIRE(std::string(reinterpret_cast<char *>(out + 12)) == "player_1" && std::memcmp(out + 32, "abcdxyz", 7) == 0 && out[40] == 1);
+    set_event(3, "npcommid=NPWR00001_00&jid=player_1@ab.cd.np.example.com");
+    REQUIRE(call(parse_presence, { event, parsed }) == 0x80100620);
+    set_event(4, "npcommid=NPWR00001_00&jid=p@ab.cd.x.playstation.net&giftid=0x10&version=3&param=hi");
+    REQUIRE(call(parse_gift, { event, parsed }) == 0);
+    REQUIRE(*Ptr<uint32_t>(parsed + 12).get(env.mem) == 16 && *Ptr<uint32_t>(parsed + 52).get(env.mem) == 3);
+    REQUIRE(std::string(reinterpret_cast<char *>(out + 56)) == "hi" && out[16] == 'p');
+    set_event(5, "psla:%2Fdetail%3F100%");
+    REQUIRE(call(parse_live_area, { event, parsed }) == 0 && std::string(reinterpret_cast<char *>(out)) == "/detail?100%");
+    set_event(5, "psl:x");
+    REQUIRE(call(parse_live_area, { event, parsed }) == 0x80100620);
+    REQUIRE(call(parse_live_area, { event, 0 }) == 0x80100600);
+
     REQUIRE(call(shutdown, {}) == 0 && call(shutdown, {}) == 0x80100601);
+    REQUIRE(call(parse_live_area, { event, parsed }) == 0x80100601); // after sceAppUtilShutdown
 
     const auto put = [&](Address at, const char *value) { std::strcpy(Ptr<char>(at).get(env.mem), value); return at; };
     const Address version = put(text, "01.00"), bad_version = put(text + 8, "02.00"), xml = put(text + 16, "<frame/>"),
@@ -76,5 +111,5 @@ inline void test_guest_apputil(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(dialog_update, { 0 }) == 0x80020406);
     env.gxm.display_queue_thread = saved_display_thread;
     free(env.mem, block);
-    std::puts("Guest AppUtil: init/shutdown, app event, bgdl, LiveArea update and dialog config checks passed");
+    std::puts("Guest AppUtil: init/shutdown, app event and its parsers, bgdl, LiveArea update and dialog config checks passed");
 }

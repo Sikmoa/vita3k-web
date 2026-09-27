@@ -16,6 +16,7 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include "SceAppUtil.h"
+#include "app_event_parse.h"
 #include "../SceProcessmgr/SceProcessmgr.h"
 
 #include <emuenv/app_util.h>
@@ -88,6 +89,19 @@ EXPORT(int, sceAppUtilAddcontUmount) {
     return UNIMPLEMENTED();
 }
 
+// The sceAppUtilAppEventParse* entry checks of firmware 3.74, then the
+// text parser (app_event_parse.h). The text is read as the 1024 bytes of
+// dat followed by NULs.
+static int parse_app_event(EmuEnvState &emuenv, const char *export_name, const SceAppUtilAppEventParam *event, void *out, uint32_t type,
+    int (*parse)(const char *, uint8_t *)) {
+    REQUIRE_APPUTIL_INIT();
+    if (!event || !out || event->type != type)
+        return RET_ERROR(SCE_APPUTIL_ERROR_PARAMETER);
+    char text[sizeof(event->dat) + 4] = {};
+    memcpy(text, event->dat, sizeof(event->dat));
+    return parse(text, static_cast<uint8_t *>(out));
+}
+
 EXPORT(int, sceAppUtilAppEventParseGameCustomData) {
     TRACY_FUNC(sceAppUtilAppEventParseGameCustomData);
     return UNIMPLEMENTED();
@@ -98,14 +112,14 @@ EXPORT(int, sceAppUtilAppEventParseIncomingDialog) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceAppUtilAppEventParseLiveArea) {
-    TRACY_FUNC(sceAppUtilAppEventParseLiveArea);
-    return UNIMPLEMENTED();
+EXPORT(int, sceAppUtilAppEventParseLiveArea, const SceAppUtilAppEventParam *event, void *param) {
+    TRACY_FUNC(sceAppUtilAppEventParseLiveArea, event, param);
+    return parse_app_event(emuenv, export_name, event, param, apputil::APPEVENT_LIVE_AREA, apputil::parse_live_area);
 }
 
-EXPORT(int, sceAppUtilAppEventParseNearGift) {
-    TRACY_FUNC(sceAppUtilAppEventParseNearGift);
-    return UNIMPLEMENTED();
+EXPORT(int, sceAppUtilAppEventParseNearGift, const SceAppUtilAppEventParam *event, void *param) {
+    TRACY_FUNC(sceAppUtilAppEventParseNearGift, event, param);
+    return parse_app_event(emuenv, export_name, event, param, apputil::APPEVENT_NEAR_GIFT, apputil::parse_near_gift);
 }
 
 EXPORT(int, sceAppUtilAppEventParseNpActivity) {
@@ -113,19 +127,19 @@ EXPORT(int, sceAppUtilAppEventParseNpActivity) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceAppUtilAppEventParseNpAppDataMessage) {
-    TRACY_FUNC(sceAppUtilAppEventParseNpAppDataMessage);
-    return UNIMPLEMENTED();
+EXPORT(int, sceAppUtilAppEventParseNpAppDataMessage, const SceAppUtilAppEventParam *event, void *param) {
+    TRACY_FUNC(sceAppUtilAppEventParseNpAppDataMessage, event, param);
+    return parse_app_event(emuenv, export_name, event, param, apputil::APPEVENT_NP_APP_DATA_MESSAGE, apputil::parse_np_message);
 }
 
-EXPORT(int, sceAppUtilAppEventParseNpBasicJoinablePresence) {
-    TRACY_FUNC(sceAppUtilAppEventParseNpBasicJoinablePresence);
-    return UNIMPLEMENTED();
+EXPORT(int, sceAppUtilAppEventParseNpBasicJoinablePresence, const SceAppUtilAppEventParam *event, void *param) {
+    TRACY_FUNC(sceAppUtilAppEventParseNpBasicJoinablePresence, event, param);
+    return parse_app_event(emuenv, export_name, event, param, apputil::APPEVENT_NP_BASIC_JOINABLE_PRESENCE, apputil::parse_joinable_presence);
 }
 
-EXPORT(int, sceAppUtilAppEventParseNpInviteMessage) {
-    TRACY_FUNC(sceAppUtilAppEventParseNpInviteMessage);
-    return UNIMPLEMENTED();
+EXPORT(int, sceAppUtilAppEventParseNpInviteMessage, const SceAppUtilAppEventParam *event, void *param) {
+    TRACY_FUNC(sceAppUtilAppEventParseNpInviteMessage, event, param);
+    return parse_app_event(emuenv, export_name, event, param, apputil::APPEVENT_NP_INVITE_MESSAGE, apputil::parse_np_message);
 }
 
 EXPORT(int, sceAppUtilAppEventParseScreenShotNotification) {
