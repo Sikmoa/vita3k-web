@@ -133,11 +133,16 @@ inline void test_guest_np_signaling(EmuEnvState &env, vita3k::web::GuestThreadRu
     REQUIRE(word(0x60) == ctx && word(0x64) == 3 && word(0x70) == 0x1234);
     REQUIRE(word(0x80) == ctx2 && word(0x84) == 3 && word(0x90) == 0x5678);
     // A context destroyed before the event is handled gets nothing, even if
-    // its id is given to a new context.
+    // its id is given to a new context; that one, activating the peer again
+    // before the event is handled, gets it once.
     REQUIRE(call(activate, { ctx2, peer2, conn_out }) == 0 && word(0x14) == 4);
     REQUIRE(call(destroy_ctx, { ctx2 }) == 0 && call(create_ctx, { own, handler, 0x9abc, ctx_out }) == 0 && word(0x10) == ctx2);
+    REQUIRE(call(activate, { ctx2, peer2, conn_out }) == 0 && word(0x14) == 4);
+    REQUIRE(call(activate, { ctx2, peer2, conn_out }) == 0 && word(0x14) == 4);
+    run_until([&] { return word(0x3c) == 4 && main_waiting(); });
+    REQUIRE(word(0xa0) == ctx2 && word(0xa4) == 4 && word(0xb0) == 0x9abc);
     run_until(main_waiting);
-    REQUIRE(word(0x3c) == 3);
+    REQUIRE(word(0x3c) == 4);
     // Before sceNetCtlInit the error is NetCtl's NOT_INITIALIZED.
     env.netctl.inited = false;
     word(0x3c) = 0;
@@ -152,14 +157,36 @@ inline void test_guest_np_signaling(EmuEnvState &env, vita3k::web::GuestThreadRu
     run_until(main_waiting);
     REQUIRE(word(0x3c) == 0);
 
-    // Term handles the queued messages first, then ends the thread.
-    word(0x3c) = 1;
-    REQUIRE(call(activate, { ctx, peer3, conn_out }) == 0 && word(0x14) == 8);
+    // Term handles the queued messages first, then ends the thread; with the
+    // pipe full it waits for room for its own.
+    const Address counter = code + 0x600, peers = alloc(env.mem, 64 * sizeof(np::SceNpId), "signaling peers");
+    REQUIRE(peers);
+    {
+        guest_thread_fixture::Arm c(counter);
+        c.constant(0, data + 0x30);
+        c.emit(0xe5901000); // ldr r1, [r0]
+        c.emit(0xe2811001); // add r1, r1, #1
+        c.emit(0xe5801000); // str r1, [r0]
+        c.constant(0, 0);
+        c.emit(0xe12fff1e); // bx lr
+        c.finish(env.mem);
+    }
+    REQUIRE(call(create_ctx, { own, counter, 0, ctx_out }) == 0);
+    const uint32_t counting = word(0x10);
+    word(0x30) = 0;
+    for (uint32_t i = 0; i < 64; ++i) {
+        const std::string peer_name = "many" + std::to_string(i);
+        set_id(peers + i * sizeof(np::SceNpId), peer_name.c_str(), 1);
+        REQUIRE(call(activate, { counting, peers + i * uint32_t(sizeof(np::SceNpId)), conn_out }) == 0);
+    }
+    REQUIRE(call(activate, { ctx, peer3, conn_out }) == 0x800201b3); // full, and a host call cannot wait
+    REQUIRE(word(0x30) == 0);
     guest_sync_delete::build_call(env.mem, code, sig_term, { 0, 0, 0, 0, 0 }, data + 0x20);
     word(0x20) = 0xcccccccc;
     REQUIRE(caller->start(0, Ptr<void>{}, false) == 0);
     run_until([&] { return caller->status == ThreadStatus::dormant && !env.kernel.threads.contains(main_thread); });
-    REQUIRE(word(0x20) == 0 && word(0x3c) == 2 && word(0x64) == 8 && !env.np.signaling_inited);
+    REQUIRE(word(0x20) == 0 && word(0x30) == 64 && !env.np.signaling_inited);
+    free(env.mem, peers);
     REQUIRE(call(destroy_ctx, { ctx }) == 0x80552701);
     REQUIRE(runtime.shutdown());
     REQUIRE(env.kernel.threads.empty());

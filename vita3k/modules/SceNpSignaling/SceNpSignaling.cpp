@@ -55,6 +55,7 @@ DECL_EXPORT(int, sceNpCmpNpId, np::SceNpId *npid1, np::SceNpId *npid2);
 DECL_EXPORT(SceUID, sceKernelCreateThread, const char *name, SceKernelThreadEntry entry, int init_priority, int stack_size, SceUInt attr, int cpu_affinity_mask, Ptr<SceKernelThreadOptParam> option);
 
 DECL_EXPORT(int, sceKernelWaitThreadEnd, SceUID thid, int *stat, SceUInt *timeout);
+DECL_EXPORT(int, sceKernelDelayThread, SceUInt delay);
 
 #ifdef __EMSCRIPTEN__
 // SceNpSignalingMain's message pipe and the connections the messages name
@@ -158,12 +159,18 @@ static SignalingRing &signaling_ring(EmuEnvState &emuenv) {
     return *Ptr<SignalingRing>(emuenv.np.signaling_code + signaling_code_words * 4).get(emuenv.mem);
 }
 
-// Posts an event to SceNpSignalingMain: false when its ring is full.
+// Posts an event to SceNpSignalingMain. While its ring is full a running
+// caller waits, as sceKernelSendMsgPipe does; false when it cannot wait
+// (SceNpSignalingMain itself, or a host-side call).
 static bool post_signaling_event(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, const SignalingEvent &event) {
     auto &np = emuenv.np;
     auto &ring = signaling_ring(emuenv);
-    if (np.signaling_queued - ring.read >= signaling_ring_events)
-        return false;
+    const ThreadStatePtr caller = emuenv.kernel.get_thread(thread_id);
+    while (np.signaling_queued - ring.read >= signaling_ring_events) {
+        if (thread_id == np.signaling_main_thread || !caller || caller->status != ThreadStatus::run
+            || CALL_EXPORT(sceKernelDelayThread, 1000) < 0)
+            return false;
+    }
     ring.events[np.signaling_queued % signaling_ring_events] = event;
     ++np.signaling_queued;
     return semaphore_signal(emuenv.kernel, export_name, thread_id, np.signaling_sema, 1) == 0;
@@ -206,7 +213,10 @@ EXPORT(int, sceNpSignalingActivateConnection, SceInt32 ctx_id, np::SceNpId *peer
         // Attached before its event is handled, the context gets it too;
         // while it is being handled, no longer.
         auto &event = ring.events[live.seq % signaling_ring_events];
-        const bool attached = std::any_of(event.contexts, event.contexts + event.count, [&](const auto &c) { return c.ctx_id == uint32_t(ctx_id); });
+        // A destroyed context's entry (no handler) is not this context,
+        // even when a new one took its id.
+        const bool attached = std::any_of(event.contexts, event.contexts + event.count,
+            [&](const auto &c) { return c.ctx_id == uint32_t(ctx_id) && c.handler; });
         if (!attached && event.count < signaling_event_contexts)
             event.contexts[event.count++] = { ctx->second.handler, static_cast<uint32_t>(ctx_id), ctx->second.arg };
         *conn_id = live.id;
@@ -221,7 +231,7 @@ EXPORT(int, sceNpSignalingActivateConnection, SceInt32 ctx_id, np::SceNpId *peer
     event.contexts[0] = { ctx->second.handler, static_cast<uint32_t>(ctx_id), ctx->second.arg };
     const uint32_t seq = np.signaling_queued;
     if (!post_signaling_event(emuenv, export_name, thread_id, event))
-        return RET_ERROR(SCE_KERNEL_ERROR_MPP_FULL); // the pipe's 64 messages; the console would wait
+        return RET_ERROR(SCE_KERNEL_ERROR_MPP_FULL); // nothing can wait for room
     np.signaling_last_conn_id = id;
     np.signaling_pending.push_back({ seq, id, own_id, *peer_id });
     *conn_id = id;

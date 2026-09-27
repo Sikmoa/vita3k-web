@@ -4,6 +4,8 @@
 #pragma once
 #include "guest_sync_delete_tests.h"
 #include <kernel/callback.h>
+#include <display/functions.h>
+#include <display/state.h>
 #include <net/state.h>
 
 DECL_EXPORT(SceInt32, sceKernelNotifyCallback, SceUID callbackId, SceInt32 notifyArg);
@@ -185,6 +187,25 @@ inline void test_guest_net_offline(EmuEnvState &env, vita3k::web::GuestThreadRun
         run_until([&] { return waiter->status == ThreadStatus::dormant; });
         REQUIRE(word(0x48) == 1 && word(0x40) == 9 && word(0x44) == 5);
         env.kernel.callbacks.erase(late_id);
+        REQUIRE(call(recv_nid, { first, data + 0x3c0, 16, SCE_NET_MSG_DONTWAIT }) == 5);
+    }
+    // So does a vblank notification of a callback the waiter registered.
+    {
+        guest_sync_delete::build_call(env.mem, code, epoll_wait_cb, { eid, events, 1, 2000000, 0 }, data + 0x48);
+        word(0x40) = word(0x44) = word(0x48) = 0xcccccccc;
+        auto waiter = env.kernel.create_thread(env.mem, "net waiter", Ptr<const void>(code), SCE_KERNEL_DEFAULT_PRIORITY_USER,
+            SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
+        REQUIRE(waiter);
+        auto vblank = std::make_shared<Callback>(waiter->id, callback_name, Ptr<SceKernelCallbackFunction>(callback), Ptr<void>(data));
+        constexpr SceUID vblank_id = 0x7ffe0003;
+        waiter->callbacks.push_back(vblank);
+        env.display.vblank_callbacks.emplace(vblank_id, vblank);
+        REQUIRE(waiter->start(0, Ptr<void>{}, false) == 0);
+        run_until([&] { return waiter->status == ThreadStatus::wait; });
+        advance_vblank(env);
+        run_until([&] { return waiter->status == ThreadStatus::dormant; });
+        env.display.vblank_callbacks.erase(vblank_id);
+        REQUIRE(word(0x48) == 1 && word(0x44) == 5);
         REQUIRE(call(recv_nid, { first, data + 0x3c0, 16, SCE_NET_MSG_DONTWAIT }) == 5);
     }
     // A callback deleted by one that ran before it in the same pass does not run.

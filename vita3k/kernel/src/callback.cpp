@@ -49,6 +49,15 @@ uint32_t process_callbacks(KernelState &kernel, SceUID thread_id) {
     return num_callbacks_processed;
 }
 
+void wake_callback_wait(KernelState &kernel, SceUID thread_id) {
+    const ThreadStatePtr thread = kernel.get_thread(thread_id);
+    if (!thread)
+        return;
+    const std::lock_guard lock(thread->mutex);
+    if (thread->in_callback_wait && thread->status == ThreadStatus::wait)
+        thread->update_status(ThreadStatus::run);
+}
+
 void Callback::notify(SceUID notifier_id, SceInt32 notify_arg) {
     std::lock_guard lock(this->_mutex);
     this->notifier_id = notifier_id;

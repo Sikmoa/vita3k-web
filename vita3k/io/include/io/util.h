@@ -102,6 +102,12 @@ public:
         file_info.open_mode |= flags;
     }
 
+    // A rename moved the open file.
+    void move(const std::string &vita, const fs::path &file) {
+        file_info.vita_loc = vita;
+        file_info.sys_loc = file;
+    }
+
     // Reset to only allow reading
     void remove_perms() {
         file_info.open_mode = SCE_O_RDONLY;

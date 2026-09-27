@@ -66,6 +66,18 @@ static int io_error_impl(const int retval, const char *export_name, const char *
 #define IO_ERROR(retval) io_error_impl(retval, export_name, __func__)
 #define IO_ERROR_UNK() IO_ERROR(-1)
 
+// A host path as the key of IOState's per-path state.
+static std::string path_key(const fs::path &path) {
+    std::string key = path.generic_path().string();
+    while (key.size() > 1 && key.ends_with('/'))
+        key.pop_back();
+    return key;
+}
+
+static bool is_under(const std::string &key, const std::string &root) {
+    return key == root || key.starts_with(root + "/");
+}
+
 constexpr bool log_file_op = true;
 constexpr bool log_file_read = false;
 constexpr bool log_file_seek = false;
@@ -652,7 +664,7 @@ int stat_file(IOState &io, const char *file_in, SceIoStat *statp, const fs::path
         statp->st_mode |= SCE_S_IFDIR | SCE_S_IXUSR | SCE_S_IXGRP | SCE_S_IXOTH;
     }
 
-    if (const auto set = io.chstat_times.find(file_path.generic_path().string()); set != io.chstat_times.end()) {
+    if (const auto set = io.chstat_times.find(path_key(file_path)); set != io.chstat_times.end()) {
         if (set->second.created)
             creation_time_ticks = RTC_OFFSET + static_cast<uint64_t>(*set->second.created) * VITA_CLOCKS_PER_SEC;
         if (set->second.accessed)
@@ -731,6 +743,18 @@ int lookup_path(IOState &io, const char *path_in, const fs::path &vita_fs_path, 
     return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
 }
 
+// Writes out the host's buffers for the open files at a path (or, for a
+// directory, under it): false if one fails.
+static bool flush_host_files(IOState &io, const fs::path &host_path, bool tree) {
+    const std::string target = path_key(host_path);
+    for (const auto &[fd, file] : io.std_files) {
+        const std::string location = path_key(file.get_system_location());
+        if ((location == target || (tree && is_under(location, target))) && std::fflush(file.get_file_pointer()) != 0)
+            return false;
+    }
+    return true;
+}
+
 // Seconds since the epoch of a SceDateTime, as stat_file reads them back.
 static time_t io_time(const SceDateTime &time) {
     return static_cast<time_t>((__RtcPspTimeToTicks(&time) - RTC_OFFSET) / VITA_CLOCKS_PER_SEC);
@@ -773,6 +797,9 @@ int chstat_path(IOState &io, const char *path, const SceIoStat *stat, SceUInt32 
 
     boost::system::error_code error;
     if (bits & SCE_CST_SIZE) {
+        // Writes still buffered come first, as the guest made them.
+        if (!flush_host_files(io, host_path, false))
+            return IO_ERROR(SCE_ERROR_ERRNO_EIO);
         fs::resize_file(host_path, static_cast<uintmax_t>(stat->st_size), error);
         if (error)
             return IO_ERROR(SCE_ERROR_ERRNO_ENOSPC);
@@ -806,7 +833,7 @@ int chstat_path(IOState &io, const char *path, const SceIoStat *stat, SceUInt32 
 #endif
     }
     if (bits & (SCE_CST_CT | SCE_CST_AT)) {
-        auto &times = io.chstat_times[host_path.generic_path().string()];
+        auto &times = io.chstat_times[path_key(host_path)];
         if (bits & SCE_CST_CT)
             times.created = io_time(stat->st_ctime);
         if (bits & SCE_CST_AT)
@@ -827,16 +854,8 @@ int sync_path(IOState &io, const char *path, const fs::path &vita_fs_path, const
     if (error && !(error == SCE_ERROR_ERRNO_ENOENT && volume_root))
         return error;
     // What the host still buffers for the file, or every file on the volume.
-    std::string target = host_path.generic_path().string();
-    while (target.size() > 1 && target.ends_with('/'))
-        target.pop_back();
-    for (const auto &[fd, file] : io.std_files) {
-        const std::string location = file.get_system_location().generic_path().string();
-        if (location == target || (volume_root && location.starts_with(target + "/"))) {
-            if (std::fflush(file.get_file_pointer()) != 0)
-                return IO_ERROR(SCE_ERROR_ERRNO_EIO);
-        }
-    }
+    if (!flush_host_files(io, host_path, volume_root))
+        return IO_ERROR(SCE_ERROR_ERRNO_EIO);
     return 0;
 }
 
@@ -890,7 +909,8 @@ int remove_file(IOState &io, const char *file_in, const fs::path &vita_fs_path, 
         LOG_ERROR("Error code: {} ({})", error_code.value(), error_code.message());
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
-    io.chstat_times.erase(emulated_path.generic_path().string());
+    io.chstat_times.erase(path_key(emulated_path));
+    io.buffer_caches.erase(path_key(emulated_path));
 
     return 0;
 }
@@ -942,21 +962,41 @@ int rename(IOState &io, const char *old_name_in, const char *new_name_in, const 
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
     // Dates set on the renamed file, or on everything under a renamed
-    // directory, move with it; whatever the new name replaced is gone.
-    const std::string old_key = emulated_old_path.generic_path().string(), new_key = emulated_new_path.generic_path().string();
-    const auto under = [](const std::string &key, const std::string &root) {
-        return key == root || key.starts_with(root + "/");
-    };
-    std::erase_if(io.chstat_times, [&](const auto &entry) { return under(entry.first, new_key); });
-    std::vector<std::pair<std::string, IOState::ChstatTimes>> moved;
-    for (auto it = io.chstat_times.begin(); it != io.chstat_times.end();) {
-        if (under(it->first, old_key)) {
-            moved.emplace_back(new_key + it->first.substr(old_key.size()), it->second);
-            it = io.chstat_times.erase(it);
-        } else
-            ++it;
+    // directory, and its open files move with it; whatever the new name
+    // replaced is gone.
+    const std::string old_key = path_key(emulated_old_path), new_key = path_key(emulated_new_path);
+    if (old_key != new_key) {
+        std::erase_if(io.chstat_times, [&](const auto &entry) { return is_under(entry.first, new_key); });
+        std::vector<std::pair<std::string, IOState::ChstatTimes>> moved;
+        for (auto it = io.chstat_times.begin(); it != io.chstat_times.end();) {
+            if (is_under(it->first, old_key)) {
+                moved.emplace_back(new_key + it->first.substr(old_key.size()), it->second);
+                it = io.chstat_times.erase(it);
+            } else
+                ++it;
+        }
+        io.chstat_times.insert(moved.begin(), moved.end());
+        // A file keeps its buffer cache under its new name.
+        std::erase_if(io.buffer_caches, [&](const auto &entry) { return is_under(entry.first, new_key); });
+        std::vector<std::pair<std::string, SceIoBufferCache>> caches;
+        for (auto it = io.buffer_caches.begin(); it != io.buffer_caches.end();) {
+            if (is_under(it->first, old_key)) {
+                caches.emplace_back(new_key + it->first.substr(old_key.size()), it->second);
+                it = io.buffer_caches.erase(it);
+            } else
+                ++it;
+        }
+        io.buffer_caches.insert(caches.begin(), caches.end());
+        const std::string old_vita = old_name, new_vita = new_name;
+        for (auto &[fd, file] : io.std_files) {
+            const std::string location = path_key(file.get_system_location());
+            if (!is_under(location, old_key))
+                continue;
+            const std::string vita = file.get_vita_loc();
+            const std::string rest = location.substr(old_key.size());
+            file.move(vita.starts_with(old_vita) ? new_vita + vita.substr(old_vita.size()) : vita, fs::path(new_key + rest));
+        }
     }
-    io.chstat_times.insert(moved.begin(), moved.end());
 
     return 0;
 }
@@ -1119,7 +1159,10 @@ int remove_dir(IOState &io, const char *dir_in, const fs::path &vita_fs_path, co
 
     LOG_TRACE_IF(log_file_op, "{}: Removing dir {} ({})", export_name, dir, device::construct_normalized_path(device, translated_path));
 
-    if (!fs::remove_all(device::construct_emulated_path(device, translated_path, vita_fs_path, io.redirect_stdio))) {
+    const auto emulated_dir = device::construct_emulated_path(device, translated_path, vita_fs_path, io.redirect_stdio);
+    std::erase_if(io.chstat_times, [&](const auto &entry) { return is_under(entry.first, path_key(emulated_dir)); });
+    std::erase_if(io.buffer_caches, [&](const auto &entry) { return is_under(entry.first, path_key(emulated_dir)); });
+    if (!fs::remove_all(emulated_dir)) {
         LOG_ERROR("Cannot remove dir: {} ({})", dir, device::construct_normalized_path(device, translated_path));
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }

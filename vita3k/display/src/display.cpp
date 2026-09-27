@@ -26,6 +26,7 @@
 #endif
 #include <display/state.h>
 #include <emuenv/state.h>
+#include <kernel/callback.h>
 #include <kernel/state.h>
 #include <renderer/state.h>
 
@@ -76,8 +77,10 @@ void advance_vblank(EmuEnvState &emuenv) {
 #endif
 
     // Notify Vblank callback in each VBLANK start
-    for (auto &[_, cb] : display.vblank_callbacks)
+    for (auto &[_, cb] : display.vblank_callbacks) {
         cb->event_notify(cb->get_notifier_id());
+        wake_callback_wait(emuenv.kernel, cb->get_owner_thread_id());
+    }
 
     for (std::size_t i = 0; i < display.vblank_wait_infos.size();) {
         auto &vblank_wait_info = display.vblank_wait_infos[i];

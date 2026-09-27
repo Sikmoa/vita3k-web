@@ -151,7 +151,38 @@ inline void test_guest_io_control(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(io_sync, { put("savedata0:"), 0 }) == 0 && fs::file_size(save / "buffered.bin") == 8);
     REQUIRE(call(io_write, { writer, block + 0x780, 4 }) == 4);
     REQUIRE(call(io_sync_by_fd, { writer, 0 }) == 0 && fs::file_size(save / "buffered.bin") == 12);
-    REQUIRE(call(io_close, { writer }) == 0);
+    // A resize comes after the writes still buffered.
+    std::memcpy(Ptr<char>(block + 0x780).get(env.mem), "abcd", 4);
+    REQUIRE(call(io_write, { writer, block + 0x780, 4 }) == 4);
+    st->st_size = 14;
+    REQUIRE(call(io_chstat, { put("savedata0:buffered.bin"), stat, SCE_CST_SIZE }) == 0);
+    // An open file follows a rename: syncing the new name writes it out.
+    REQUIRE(call(io_write, { writer, block + 0x780, 2 }) == 2);
+    std::strcpy(Ptr<char>(new_name).get(env.mem), "savedata0:renamed.bin");
+    REQUIRE(call(io_rename, { put("savedata0:buffered.bin"), new_name }) == 0);
+    // The descriptor still writes at 16: the file becomes 18 bytes long.
+    REQUIRE(call(io_sync, { new_name, 0 }) == 0 && fs::file_size(save / "renamed.bin") == 18);
+    REQUIRE(call(io_close, { writer }) == 0 && fs::file_size(save / "renamed.bin") == 18);
+    {
+        FILE *file = std::fopen((save / "renamed.bin").string().c_str(), "rb");
+        REQUIRE(file);
+        char tail[6] = {};
+        std::fseek(file, 12, SEEK_SET);
+        REQUIRE(std::fread(tail, 1, 6, file) == 6 && std::memcmp(tail, "ab\0\0ab", 6) == 0);
+        std::fclose(file);
+    }
+    // Renaming a path to itself keeps its dates; removing a directory drops
+    // the dates set under it.
+    REQUIRE(call(io_chstat, { put("savedata0:save.bin"), stat, SCE_CST_CT }) == 0);
+    std::strcpy(Ptr<char>(new_name).get(env.mem), "savedata0:save.bin");
+    REQUIRE(call(io_rename, { put("savedata0:save.bin"), new_name }) == 0);
+    REQUIRE(call(io_getstat, { new_name, got }) == 0 && same_second(got_stat->st_ctime, created));
+    constexpr uint32_t io_rmdir = 0xE9F91EC8;
+    REQUIRE(call(io_chstat, { put("savedata0:moved/inner.bin"), stat, SCE_CST_CT }) == 0);
+    REQUIRE(call(io_rmdir, { put("savedata0:moved") }) == 0);
+    fs::create_directories(save / "moved");
+    make_file(save / "moved/inner.bin", 1);
+    REQUIRE(call(io_getstat, { put("savedata0:moved/inner.bin"), got }) == 0 && !same_second(got_stat->st_ctime, created));
 
     // sceIoDevctl: capacity of the volume behind ux0:, 32 MiB kept back.
     VolumeInfo volume{};

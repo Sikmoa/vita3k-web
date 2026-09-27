@@ -128,3 +128,6 @@ private:
 
 typedef std::shared_ptr<Callback> CallbackPtr;
 uint32_t process_callbacks(KernelState &kernel, SceUID thread_id);
+// After a notification: a thread parked in a wait that runs callbacks
+// resumes so that they run.
+void wake_callback_wait(KernelState &kernel, SceUID thread_id);
