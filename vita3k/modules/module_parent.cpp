@@ -159,31 +159,39 @@ static void log_import_call(char emulation_level, uint32_t nid, SceUID thread_id
     }
 }
 
+// The debug and missing-NID paths own objects with destructors. Kept out of
+// line, they leave call_import without cleanups, so the HLE call below is a
+// direct call rather than (under Emscripten's JS exceptions) an invoke_* JS
+// round trip on every import.
+[[gnu::noinline]] static void watch_hle_call(CPUState &cpu, uint32_t nid, SceUID thread_id) {
+    const std::unordered_set<uint32_t> hle_nid_blacklist = {
+        0xB295EB61, // sceKernelGetTLSAddr
+        0x46E7BE7B, // sceKernelLockLwMutex
+        0x91FA6614, // sceKernelUnlockLwMutex
+    };
+    log_import_call('H', nid, thread_id, hle_nid_blacklist, read_lr(cpu));
+}
+
+[[gnu::noinline]] static void missing_import(EmuEnvState &emuenv, uint32_t nid, SceUID thread_id) {
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    // make the function return 0
+    write_reg(*thread->cpu, 0, 0);
+
+    if (!emuenv.missing_nids.contains(nid) || LOG_UNK_NIDS_ALWAYS) {
+        LOG_ERROR("Import function for NID {} not found (thread name: {}, thread ID: {})", log_hex(nid), thread->name, thread_id);
+        if (!LOG_UNK_NIDS_ALWAYS)
+            emuenv.missing_nids.insert(nid);
+    }
+}
+
 void call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread_id) {
     // HLE - call our C++ function
-    if (emuenv.kernel.debugger.watch_import_calls) {
-        const std::unordered_set<uint32_t> hle_nid_blacklist = {
-            0xB295EB61, // sceKernelGetTLSAddr
-            0x46E7BE7B, // sceKernelLockLwMutex
-            0x91FA6614, // sceKernelUnlockLwMutex
-        };
-        auto lr = read_lr(cpu);
-        log_import_call('H', nid, thread_id, hle_nid_blacklist, lr);
-    }
-    const ImportFn *fn = resolve_import(nid);
-    if (fn) {
+    if (emuenv.kernel.debugger.watch_import_calls)
+        watch_hle_call(cpu, nid, thread_id);
+    if (const ImportFn *fn = resolve_import(nid))
         (*fn)(emuenv, cpu, thread_id);
-    } else {
-        const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
-        // make the function return 0
-        write_reg(*thread->cpu, 0, 0);
-
-        if (!emuenv.missing_nids.contains(nid) || LOG_UNK_NIDS_ALWAYS) {
-            LOG_ERROR("Import function for NID {} not found (thread name: {}, thread ID: {})", log_hex(nid), thread->name, thread_id);
-            if (!LOG_UNK_NIDS_ALWAYS)
-                emuenv.missing_nids.insert(nid);
-        }
-    }
+    else
+        missing_import(emuenv, nid, thread_id);
 }
 
 struct SceKernelBootimageModules {
