@@ -66,7 +66,9 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
     } else {
         priority = init_priority;
     }
+    this->init_priority = priority;
     this->affinity_mask = affinity_mask;
+    this->init_affinity_mask = affinity_mask;
     this->stack_size = stack_size;
     start_tick = rtc_get_ticks(kernel.base_tick.tick);
     last_vblank_waited = 0;
@@ -95,7 +97,7 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
 
     int *tls_array = tls.get_ptr<int>().get(mem);
 
-    tls_array[TLS_PROCESS_ID] = 1; // stubbed. unused
+    tls_array[TLS_PROCESS_ID] = KernelState::process_id;
     tls_array[TLS_THREAD_ID] = id;
     tls_array[TLS_SP_TOP] = stack.get();
     tls_array[TLS_SP_BOTTOM] = stack.get() + stack_size;
@@ -143,6 +145,7 @@ int ThreadState::start(SceSize arglen, const Ptr<void> argp, bool run_entry_call
         return SCE_KERNEL_ERROR_RUNNING;
 
     run_start_callback = run_entry_callback;
+    started = true;
     load_context(*cpu, init_cpu_ctx);
     write_pc(*cpu, entry_point);
     write_lr(*cpu, kernel.halt_instruction_pc);

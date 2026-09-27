@@ -69,7 +69,15 @@ struct ThreadState {
     Block tls;
 
     int priority;
+    int init_priority;
     SceInt32 affinity_mask;
+    SceInt32 init_affinity_mask;
+    // Firmware marks every thread created for user mode with bit 31.
+    SceUInt32 attr = SCE_KERNEL_THREAD_ATTR_USER;
+    // Value swapped by ksceKernelSetPermission.
+    SceInt32 permission = 0;
+    // A dormant thread that never ran reports DORMANT instead of an exit status.
+    bool started = false;
     uint64_t start_tick;
     uint64_t last_vblank_waited;
     // set to true if thread is processing kernel callbacks

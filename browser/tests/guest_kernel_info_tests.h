@@ -1,0 +1,172 @@
+// Firmware (SceKernelThreadMgr and SceSysmem 3.74) process, thread and driver
+// queries under the fiber runtime.
+#pragma once
+#include "guest_sync_delete_tests.h"
+
+DECL_EXPORT(SceUID, sceKernelGetProcessId);
+DECL_EXPORT(SceInt32, _sceKernelGetThreadInfo, SceUID threadId, Ptr<SceKernelThreadInfo> pInfo, const SceSize *pSize);
+DECL_EXPORT(int, sceKernelCreateThreadForUser, const char *name, SceKernelThreadEntry entry, int init_priority, SceKernelCreateThread_opt *options);
+DECL_EXPORT(SceInt32, sceKernelChangeThreadPriority, SceUID thid, SceInt32 priority);
+DECL_EXPORT(SceInt32, ksceKernelSetPermission, SceInt32 permission);
+DECL_EXPORT(int, SceThreadmgrForDriver_20C228E4);
+DECL_EXPORT(int, SceQafMgrForDriver_B9770A13);
+
+namespace guest_kernel_info {
+constexpr uint32_t kGetThreadId = 0x0fb972f9;
+constexpr uint32_t kGetThreadInfo = 0x8d9c5461;
+constexpr uint32_t kWaitSema = 0x0c7b834b;
+} // namespace guest_kernel_info
+
+inline void test_guest_kernel_info(EmuEnvState &env, vita3k::web::GuestThreadRuntime &runtime) {
+    using namespace guest_kernel_info;
+    const Address code = alloc(env.mem, 0x1000, "kernel info code");
+    const Address data = alloc(env.mem, 0x1000, "kernel info data");
+    REQUIRE(code && data);
+    const auto word = [&](Address offset) -> uint32_t & { return *Ptr<uint32_t>(data + offset).get(env.mem); };
+    env.kernel.call_import = [&](CPUState &cpu, uint32_t nid, SceUID tid) {
+        call_import(env, cpu, nid, tid);
+        REQUIRE(env.missing_nids.empty());
+    };
+    const auto run_until = [&](auto done) {
+        const auto limit = vita3k::web::GuestThreadRuntime::now_us() + 2000000;
+        while (!done()) {
+            REQUIRE(runtime.resume(64).failed == 0);
+            REQUIRE(vita3k::web::GuestThreadRuntime::now_us() < limit);
+        }
+    };
+    REQUIRE(runtime.attach(env));
+    auto caller = env.kernel.create_thread(env.mem, "info caller", Ptr<const void>(code), SCE_KERNEL_DEFAULT_PRIORITY_USER,
+        SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
+    REQUIRE(caller);
+
+    // sceKernelGetProcessId (SceKernelThreadMgr 0x810008a8) reports the calling
+    // thread's process: one uid that no other kernel object gets.
+    REQUIRE(export_sceKernelGetProcessId(env, caller->id, "fixture") == KernelState::process_id);
+    REQUIRE(caller->tls.get_ptr<int>().get(env.mem)[TLS_PROCESS_ID] == KernelState::process_id);
+    const SceUID sema = semaphore_create(env.kernel, "fixture", "info sema", 0, 0, 0, 1);
+    REQUIRE(caller->id > KernelState::process_id && sema > KernelState::process_id);
+
+    // GetThreadInfo (SceLibKernel 0x8100a790, syscall 0x81029c0c, record
+    // 0x810059cc): a zeroed record carrying its own size; as many bytes as the
+    // caller's size word says travel in and back out.
+    const Address info_addr = data + 0x200, entry = code + 0x400;
+    auto *info = Ptr<SceKernelThreadInfo>(info_addr).get(env.mem);
+    const Ptr<SceKernelThreadInfo> info_ptr(info_addr);
+    const auto reset = [&](SceSize size) {
+        std::memset(info, 0xcc, sizeof(*info) + 8);
+        info->size = size;
+    };
+    const auto untouched_from = [&](size_t offset) {
+        const auto *bytes = reinterpret_cast<const uint8_t *>(info);
+        for (size_t i = offset; i < sizeof(*info) + 8; ++i)
+            if (bytes[i] != 0xcc)
+                return false;
+        return true;
+    };
+    const auto untracked_zero = [&] {
+        return info->currentCpuId == 0 && info->lastExecutedCpuId == 0 && info->waitType == 0 && info->waitId == 0
+            && info->runClocks == 0 && info->intrPreemptCount == 0 && info->threadPreemptCount == 0
+            && info->threadReleaseCount == 0 && info->changeCpuCount == 0 && info->fNotifyCallback == 0 && info->reserved == 0;
+    };
+    const auto get_info = [&](SceUID calling, SceUID thid, SceSize size) {
+        return export__sceKernelGetThreadInfo(env, calling, "fixture", thid, info_ptr, &size);
+    };
+    guest_sync_delete::build_call(env.mem, entry, kGetThreadId, { 0, 0, 0, 0, 0 }, data);
+    SceKernelCreateThread_opt options{};
+    options.stack_size = 0x4000;
+    options.attr = SCE_KERNEL_ATTR_TH_PRIO;
+    options.cpu_affinity_mask = 0x20000;
+    const SceUID target_id = export_sceKernelCreateThreadForUser(env, caller->id, "fixture", "info target",
+        SceKernelThreadEntry(entry), 0x50, &options);
+    REQUIRE(target_id > 0);
+    const auto target = env.kernel.get_thread(target_id);
+    REQUIRE(export_sceKernelChangeThreadPriority(env, caller->id, "fixture", target_id, 0x60) == 0);
+    reset(sizeof(*info));
+    REQUIRE(get_info(caller->id, target_id, sizeof(*info)) == 0);
+    REQUIRE(info->size == 0x80 && info->processId == KernelState::process_id && std::strcmp(info->name, "info target") == 0);
+    REQUIRE(info->attr == (SCE_KERNEL_THREAD_ATTR_USER | SCE_KERNEL_ATTR_TH_PRIO) && info->status == SCE_THREAD_DORMANT);
+    REQUIRE(info->entry.address() == entry && info->stack.address() == target->stack.get() && info->stackSize == 0x4000);
+    REQUIRE(info->initPriority == 0x50 && info->currentPriority == 0x60);
+    REQUIRE(info->initCpuAffinityMask == 0x20000 && info->currentCpuAffinityMask == 0x20000);
+    REQUIRE(info->exitStatus == SCE_KERNEL_ERROR_DORMANT && untracked_zero() && untouched_from(sizeof(*info)));
+    // A short record gets its prefix only.
+    reset(0x10);
+    REQUIRE(get_info(caller->id, target_id, 0x10) == 0);
+    REQUIRE(info->size == 0x80 && info->processId == KernelState::process_id && std::memcmp(info->name, "info tar", 8) == 0);
+    REQUIRE(untouched_from(0x10));
+    // The record's own size limits it even when the syscall moves more.
+    reset(0x10);
+    REQUIRE(get_info(caller->id, target_id, sizeof(*info)) == 0);
+    REQUIRE(info->size == 0x80 && untouched_from(0x10));
+    // Errors in firmware order; a failed call writes the caller's bytes back.
+    REQUIRE(export__sceKernelGetThreadInfo(env, caller->id, "fixture", target_id, info_ptr, nullptr) == SCE_KERNEL_ERROR_INVALID_MEMORY_ACCESS);
+    reset(sizeof(*info));
+    REQUIRE(get_info(caller->id, 0x7ffffff0, sizeof(*info) + 1) == SCE_KERNEL_ERROR_NO_MEMORY);
+    REQUIRE(untouched_from(4));
+    REQUIRE(get_info(caller->id, 0x7ffffff0, sizeof(*info)) == SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+    reset(sizeof(*info) + 1);
+    REQUIRE(get_info(caller->id, target_id, sizeof(*info)) == SCE_KERNEL_ERROR_ILLEGAL_SIZE);
+    REQUIRE(info->size == sizeof(*info) + 1 && untouched_from(4));
+    SceSize size = sizeof(*info);
+    REQUIRE(export__sceKernelGetThreadInfo(env, caller->id, "fixture", 0x7ffffff0, Ptr<SceKernelThreadInfo>(), &size) == SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+    REQUIRE(export__sceKernelGetThreadInfo(env, caller->id, "fixture", target_id, Ptr<SceKernelThreadInfo>(), &size) == SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+    reset(sizeof(*info));
+    REQUIRE(get_info(0, 0, sizeof(*info)) == SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
+    // The exit status: DORMANT before the first start, the returned value after.
+    REQUIRE(target->start(0, Ptr<void>{}, false) == 0);
+    run_until([&] { return target->status == ThreadStatus::dormant; });
+    reset(sizeof(*info));
+    REQUIRE(get_info(caller->id, target_id, sizeof(*info)) == 0);
+    REQUIRE(info->status == SCE_THREAD_DORMANT && info->exitStatus == target_id && word(0) == uint32_t(target_id));
+
+    // A running guest asks about itself through SceLibKernel (thid 0).
+    const Address self_info = data + 0x300;
+    Ptr<SceKernelThreadInfo>(self_info).get(env.mem)->size = sizeof(SceKernelThreadInfo);
+    guest_sync_delete::build_call(env.mem, code + 0x600, kGetThreadInfo, { 0, self_info, 0, 0, 0 }, data + 4);
+    auto self = env.kernel.create_thread(env.mem, "info self", Ptr<const void>(code + 0x600), SCE_KERNEL_DEFAULT_PRIORITY_USER,
+        SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
+    REQUIRE(self && self->start(0, Ptr<void>{}, false) == 0);
+    run_until([&] { return self->status == ThreadStatus::dormant; });
+    const auto *mine = Ptr<SceKernelThreadInfo>(self_info).get(env.mem);
+    REQUIRE(word(4) == 0 && std::strcmp(mine->name, "info self") == 0);
+    REQUIRE(mine->status == SCE_THREAD_RUNNING && mine->exitStatus == SCE_KERNEL_ERROR_NOT_DORMANT);
+
+    // Waiting, then woken but not yet running.
+    guest_sync_delete::build_call(env.mem, code + 0x800, kWaitSema, { uint32_t(sema), 1, 0, 0, 0 }, data + 8);
+    auto waiter = env.kernel.create_thread(env.mem, "info waiter", Ptr<const void>(code + 0x800), SCE_KERNEL_DEFAULT_PRIORITY_USER,
+        SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
+    REQUIRE(waiter && waiter->start(0, Ptr<void>{}, false) == 0);
+    run_until([&] { return waiter->status == ThreadStatus::wait; });
+    reset(sizeof(*info));
+    REQUIRE(get_info(caller->id, waiter->id, sizeof(*info)) == 0);
+    REQUIRE(info->status == SCE_THREAD_WAITING && info->exitStatus == SCE_KERNEL_ERROR_NOT_DORMANT);
+    REQUIRE(semaphore_signal(env.kernel, "fixture", 0, sema, 1) == 0);
+    REQUIRE(get_info(caller->id, waiter->id, sizeof(*info)) == 0);
+    REQUIRE(info->status == SCE_THREAD_READY);
+    run_until([&] { return waiter->status == ThreadStatus::dormant; });
+    REQUIRE(word(8) == 0);
+    std::puts("GetThreadInfo and GetProcessId passed");
+
+    // ksceKernelSetPermission (0x81008940) swaps the calling thread's value.
+    REQUIRE(export_ksceKernelSetPermission(env, caller->id, "fixture", 0x80) == 0);
+    REQUIRE(export_ksceKernelSetPermission(env, caller->id, "fixture", -1) == SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    REQUIRE(export_ksceKernelSetPermission(env, caller->id, "fixture", 0x10) == 0x80);
+    REQUIRE(export_ksceKernelSetPermission(env, target_id, "fixture", 0x20) == 0);
+    REQUIRE(export_ksceKernelSetPermission(env, caller->id, "fixture", 0) == 0x10);
+    REQUIRE(export_ksceKernelSetPermission(env, 0, "fixture", 0x80) == SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
+    // SceThreadmgrForDriver_20C228E4 (0x810083f4): whether the calling thread
+    // runs its callbacks; SceQafMgrForDriver_B9770A13 (0x8101f064): a QA flag.
+    REQUIRE(export_SceThreadmgrForDriver_20C228E4(env, caller->id, "fixture") == 0);
+    caller->is_processing_callbacks = true;
+    REQUIRE(export_SceThreadmgrForDriver_20C228E4(env, caller->id, "fixture") == 1);
+    REQUIRE(export_SceThreadmgrForDriver_20C228E4(env, 0, "fixture") == 0);
+    caller->is_processing_callbacks = false;
+    REQUIRE(export_SceQafMgrForDriver_B9770A13(env, caller->id, "fixture") == 0);
+    std::puts("Driver thread permission, callback state and QA flag passed");
+
+    REQUIRE(semaphore_delete(env.kernel, "fixture", 0, sema) == 0);
+    REQUIRE(runtime.shutdown());
+    REQUIRE(env.kernel.threads.empty());
+    REQUIRE(get_current_cpu_state() == nullptr);
+    env.kernel.call_import = {};
+}

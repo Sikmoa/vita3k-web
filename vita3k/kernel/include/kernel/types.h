@@ -50,6 +50,15 @@
 #define SCE_KERNEL_ATTR_TH_FIFO 0x00000000U
 #define SCE_KERNEL_ATTR_TH_PRIO 0x00002000U
 
+#define SCE_KERNEL_THREAD_ATTR_USER 0x80000000U
+
+// SceKernelThreadInfo::status
+#define SCE_THREAD_RUNNING 0x1U
+#define SCE_THREAD_READY 0x2U
+#define SCE_THREAD_WAITING 0x8U
+#define SCE_THREAD_DORMANT 0x10U
+#define SCE_THREAD_SUSPENDED 0x100U
+
 #define SCE_KERNEL_EVENT_ATTR_MANUAL_RESET 0x00000000U
 #define SCE_KERNEL_EVENT_ATTR_AUTO_RESET 0x00000100U
 
@@ -876,6 +885,7 @@ struct SceKernelThreadInfo {
     /** Reserved */
     SceInt32 reserved;
 };
+static_assert(sizeof(SceKernelThreadInfo) == 0x80);
 
 struct SceKernelThreadCpuRegisterInfo {
     SceSize size;

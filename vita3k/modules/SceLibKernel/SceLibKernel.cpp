@@ -1499,9 +1499,11 @@ EXPORT(int, sceKernelGetThreadId) {
     return thread_id;
 }
 
+// SceLibKernel 3.74 passes the syscall the record's size word (0 without a record).
 EXPORT(SceInt32, sceKernelGetThreadInfo, SceUID threadId, Ptr<SceKernelThreadInfo> pInfo) {
     TRACY_FUNC(sceKernelGetThreadInfo, threadId, pInfo);
-    return CALL_EXPORT(_sceKernelGetThreadInfo, threadId, pInfo);
+    const SceSize size = pInfo ? pInfo.get(emuenv.mem)->size : 0;
+    return CALL_EXPORT(_sceKernelGetThreadInfo, threadId, pInfo, &size);
 }
 
 EXPORT(int, sceKernelGetThreadRunStatus) {

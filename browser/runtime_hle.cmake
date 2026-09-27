@@ -87,17 +87,14 @@ set(_hle_exports
     sceKernelCallAbortHandler
     sceIoWrite
     sceKernelUnlockLwMutex2 sceKernelRegisterThreadEventHandler
-    # Firmware import: retain the upstream UNIMPLEMENTED warning/return value.
-    # Identity and semantics remain unknown; this is stub parity, not support.
-    SceThreadmgrForDriver_20C228E4
-    # Observed next firmware import; also an upstream warning-producing stub.
-    # No QAF semantics are implemented or inferred from its return value.
-    SceQafMgrForDriver_B9770A13
+    # SceSysmodule imports: whether the calling thread runs its callbacks, a
+    # QA flag (clear on retail) and the per-thread permission swap.
+    SceThreadmgrForDriver_20C228E4 SceQafMgrForDriver_B9770A13 ksceKernelSetPermission
     # Remaining SceSysmodule static imports, resolved by one-pass enumeration
     # (VITA3K_TRACE_MODULE_IMPORTS). Named exports reuse the upstream bodies:
     # UNIMPLEMENTED() warning stubs below are stub parity with desktop Vita3K,
     # not implemented semantics; production bodies are noted per name.
-    ksceKernelSetPermission ksceKernelGetThreadId
+    ksceKernelGetThreadId
     __kstack_chk_fail
     ksceKernelMemcpyKernelToUser ksceKernelMemcpyUserToKernel
     ksceKernelCheckDipsw

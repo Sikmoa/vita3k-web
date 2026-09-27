@@ -17,6 +17,8 @@
 
 #include <module/module.h>
 
+// Reports one QA flag bit (bit 1 of QA flag byte 13 in the KBL parameters);
+// every QA flag is clear on a retail console.
 EXPORT(int, SceQafMgrForDriver_B9770A13) {
-    return UNIMPLEMENTED();
+    return 0;
 }

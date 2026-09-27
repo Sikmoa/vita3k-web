@@ -596,35 +596,77 @@ EXPORT(int, _sceKernelGetThreadExitStatus, SceUID thid, SceInt32 *pExitStatus) {
     return 0;
 }
 
-EXPORT(SceInt32, _sceKernelGetThreadInfo, SceUID threadId, Ptr<SceKernelThreadInfo> pInfo) {
-    TRACY_FUNC(_sceKernelGetThreadInfo, threadId, pInfo);
-    STUBBED("STUB");
+static SceUInt32 thread_info_status(const ThreadState &thread, SceUID caller) {
+    switch (thread.status) {
+    case ThreadStatus::run:
+        // The browser runtime executes one guest thread at a time: any other
+        // runnable thread is ready, not running.
+        return thread.id == caller ? SCE_THREAD_RUNNING : SCE_THREAD_READY;
+    case ThreadStatus::wait: return SCE_THREAD_WAITING;
+    case ThreadStatus::dormant: return SCE_THREAD_DORMANT;
+    case ThreadStatus::suspend: return SCE_THREAD_SUSPENDED;
+    }
+    return 0;
+}
 
-    const ThreadStatePtr thread = emuenv.kernel.get_thread(threadId ? threadId : thread_id);
+// SceKernelThreadMgr 3.74: a zeroed record carrying its own size, of which the
+// first info->size bytes reach the caller. Wait state, run clocks, preemption
+// counters and CPU ids are not tracked here and stay zero.
+static SceInt32 get_thread_info(EmuEnvState &emuenv, const char *export_name, SceUID caller, SceUID thid, SceKernelThreadInfo *info) {
+    if (!info)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+    if (thid == 0 && !emuenv.kernel.get_thread(caller))
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
+    if (info->size > sizeof(SceKernelThreadInfo))
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_SIZE);
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thid ? thid : caller);
     if (!thread)
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
 
-    SceKernelThreadInfo *info = pInfo.get(emuenv.mem);
-    if (!info)
-        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
-
-    if (info->size != sizeof(*info))
-        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT_SIZE);
-
-    // TODO: SCE_KERNEL_ERROR_ILLEGAL_CONTEXT check
-
-    strncpy(info->name, thread->name.c_str(), KERNELOBJECT_MAX_NAME_LENGTH);
-    info->stack = Ptr<void>(thread->stack.get());
-    info->stackSize = thread->stack_size;
-    info->initPriority = thread->priority; // Todo Give only current priority
-    info->currentPriority = thread->priority;
-    info->initCpuAffinityMask = thread->affinity_mask; // Todo Give init affinity
-    info->currentCpuAffinityMask = thread->affinity_mask;
-    info->entry = SceKernelThreadEntry(thread->entry_point);
-    if (thread->status == ThreadStatus::dormant) {
-        info->exitStatus = thread->returned_value;
+    SceKernelThreadInfo record{};
+    record.size = sizeof(record);
+    record.processId = KernelState::process_id;
+    strncpy(record.name, thread->name.c_str(), KERNELOBJECT_MAX_NAME_LENGTH);
+    {
+        const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+        record.attr = thread->attr;
+        record.status = thread_info_status(*thread, caller);
+        record.entry = SceKernelThreadEntry(thread->entry_point);
+        record.stack = Ptr<void>(thread->stack.get());
+        record.stackSize = thread->stack_size;
+        record.initPriority = thread->init_priority;
+        record.currentPriority = thread->priority;
+        record.initCpuAffinityMask = thread->init_affinity_mask;
+        record.currentCpuAffinityMask = thread->affinity_mask;
+        if (thread->status != ThreadStatus::dormant)
+            record.exitStatus = SCE_KERNEL_ERROR_NOT_DORMANT;
+        else
+            record.exitStatus = thread->started ? static_cast<SceInt32>(thread->returned_value) : SCE_KERNEL_ERROR_DORMANT;
     }
+    memcpy(info, &record, info->size);
     return SCE_KERNEL_OK;
+}
+
+EXPORT(SceInt32, _sceKernelGetThreadInfo, SceUID threadId, Ptr<SceKernelThreadInfo> pInfo, const SceSize *pSize) {
+    TRACY_FUNC(_sceKernelGetThreadInfo, threadId, pInfo, pSize);
+    // The syscall copies the caller's size word in first, then that many
+    // bytes of the record in and back out.
+    if (!pSize)
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_MEMORY_ACCESS);
+    SceKernelThreadInfo *info = pInfo.get(emuenv.mem);
+    const SceSize size = *pSize;
+    if (info && size > sizeof(SceKernelThreadInfo))
+        return RET_ERROR(SCE_KERNEL_ERROR_NO_MEMORY);
+    if (threadId != 0 && !emuenv.kernel.get_thread(threadId))
+        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+    if (!info)
+        return get_thread_info(emuenv, export_name, thread_id, threadId, nullptr);
+
+    SceKernelThreadInfo copy{};
+    memcpy(&copy, info, size);
+    const SceInt32 result = get_thread_info(emuenv, export_name, thread_id, threadId, &copy);
+    memcpy(info, &copy, size);
+    return result;
 }
 
 EXPORT(int, _sceKernelGetThreadRunStatus) {
@@ -1223,6 +1265,10 @@ EXPORT(int, sceKernelCreateThreadForUser, const char *name, SceKernelThreadEntry
     const ThreadStatePtr thread = emuenv.kernel.create_thread(emuenv.mem, name, entry.cast<void>(), init_priority, options->cpu_affinity_mask, options->stack_size, options->option.get(emuenv.mem));
     if (!thread)
         return RET_ERROR(SCE_KERNEL_ERROR_ERROR);
+    {
+        const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+        thread->attr = options->attr | SCE_KERNEL_THREAD_ATTR_USER;
+    }
     return thread->id;
 }
 
@@ -1388,10 +1434,9 @@ EXPORT(int, sceKernelGetMsgPipeCreatorId) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceKernelGetProcessId) {
+EXPORT(SceUID, sceKernelGetProcessId) {
     TRACY_FUNC(sceKernelGetProcessId);
-    STUBBED("pid: 1");
-    return 1;
+    return KernelState::process_id;
 }
 
 EXPORT(uint64_t, sceKernelGetSystemTimeWide) {

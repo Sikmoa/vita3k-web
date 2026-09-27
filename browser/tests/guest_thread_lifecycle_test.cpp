@@ -21,6 +21,7 @@
 #include "guest_clib_tests.h"
 #include "inline_mutex_fixture.h"
 #include "guest_sync_delete_tests.h"
+#include "guest_kernel_info_tests.h"
 
 DECL_EXPORT(int, sceKernelDeleteLwCond, Ptr<SceKernelLwCondWork> workarea);
 DECL_EXPORT(int, sceKernelSignalLwCondTo, Ptr<SceKernelLwCondWork> workarea, SceUID thread_target);
@@ -793,6 +794,7 @@ int main() {
         REQUIRE(export_sceKernelWaitLwCond(*env, 0, "fixture", null_work, nullptr) == SCE_KERNEL_ERROR_ILLEGAL_ADDR);
     }
     test_guest_sync_deletion(*env, runtime);
+    test_guest_kernel_info(*env, runtime);
     // A throwing HLE import must be diagnosed at the fiber boundary, counted
     // once, and reaped without executing guest writeback or acknowledging it
     // as success. Exercise standard and non-standard C++ exceptions alike.

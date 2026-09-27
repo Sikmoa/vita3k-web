@@ -24,6 +24,9 @@ TRACY_MODULE_NAME(SceThreadmgrForDriver);
 
 #include <kernel/state.h>
 #include <kernel/sync_primitives.h>
+#include <kernel/thread/thread_state.h>
+
+#include <utility>
 
 EXPORT(int, ksceKernelCancelCallback) {
     return UNIMPLEMENTED();
@@ -268,8 +271,16 @@ EXPORT(int, ksceKernelSetEventFlag) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, ksceKernelSetPermission) {
-    return UNIMPLEMENTED();
+// Swaps the calling thread's permission and returns the previous one.
+EXPORT(SceInt32, ksceKernelSetPermission, SceInt32 permission) {
+    TRACY_FUNC(ksceKernelSetPermission, permission);
+    if (permission < 0)
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    if (!thread)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
+    const std::lock_guard<std::mutex> thread_lock(thread->mutex);
+    return std::exchange(thread->permission, permission);
 }
 
 EXPORT(int, ksceKernelSetProcessId) {
@@ -385,6 +396,11 @@ EXPORT(int, ksceKernelWaitThreadEndCB) {
     return UNIMPLEMENTED();
 }
 
+// Whether the calling thread is running its callbacks (SceKernelThreadMgr 3.74
+// sets that thread state bit when it diverts a thread into its callbacks and
+// clears it in _sceKernelExitCallback); 0 without a calling thread.
 EXPORT(int, SceThreadmgrForDriver_20C228E4) {
-    return UNIMPLEMENTED();
+    TRACY_FUNC(SceThreadmgrForDriver_20C228E4);
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    return thread && thread->is_processing_callbacks;
 }
