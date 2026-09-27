@@ -1642,44 +1642,33 @@ static void write_texels(MemState &mem, scene::Writer &out, Address base, const 
     for (const uint32_t value : {uint32_t(scene::WriteTexels), base, marked.x0, marked.y0, w, h, data_offset, mask_offset})
         out.word(value);
 }
-// `reconcile` (a transfer's read-back, surface sync off): texels in pages
-// the guest wrote since the target was rendered are newer in memory; they
-// keep their bytes, which go to the GPU copy instead, so the two agree at
-// page granularity afterwards.
-static void sync_surface(MemState &mem, const SurfaceReadback &r, scene::Writer *reconcile = nullptr) {
+// The GPU texels of a rendered target, box-filtered to its guest size, as
+// tight rows. Its own buffer: the guest thread suspends until the copy
+// arrives, and another thread may read a surface meanwhile.
+static std::vector<uint8_t> read_target(MemState &mem, const SurfaceReadback &r) {
     const auto &g = r.geometry;
-    const uint64_t footprint = g.footprint();
-    require_guest(mem, r.address, footprint);
-    const double started = emscripten_get_now();
-    // Its own buffer: the guest thread suspends until the copy arrives, and
-    // another thread may sync a surface meanwhile.
-    const size_t row = size_t(g.width) * g.pixel_bytes;
-    std::vector<uint8_t> rows(row * g.height);
-    const uint32_t rendered = rendered_targets()[r.address].rendered_epoch;
+    require_guest(mem, r.address, g.footprint());
+    std::vector<uint8_t> rows(size_t(g.width) * g.pixel_bytes * g.height);
     if (web_gxm_sync_surface(r.address, rows.data(), g.width, g.height, g.pixel_bytes) != 0)
         unsupported("surface sync failed (see browser log)");
+    return rows;
+}
+static void sync_surface(MemState &mem, const SurfaceReadback &r) {
+    const auto &g = r.geometry;
+    const double started = emscripten_get_now();
+    const auto rows = read_target(mem, r);
+    const size_t row = size_t(g.width) * g.pixel_bytes;
     uint8_t *guest = Ptr<uint8_t>(r.address).get(mem);
-    std::vector<uint8_t> kept(reconcile ? size_t(g.width) * g.height : 0);
-    TexelMarks guest_newer;
     for (uint32_t y = 0; y < g.height; ++y) {
         const uint8_t *source = rows.data() + y * row;
-        if (g.layout == Layout::Linear && !reconcile) {
+        if (g.layout == Layout::Linear) {
             std::memcpy(guest + g.byte_offset(0, y), source, row);
             continue;
         }
-        for (uint32_t x = 0; x < g.width; ++x) {
-            const uint64_t offset = g.byte_offset(x, y);
-            if (reconcile && mem_written_epoch(mem, Address(r.address + offset), g.pixel_bytes) >= rendered) {
-                kept[size_t(y) * g.width + x] = 1;
-                guest_newer.add(x, y);
-                continue;
-            }
-            std::memcpy(guest + offset, source + size_t(x) * g.pixel_bytes, g.pixel_bytes);
-        }
+        for (uint32_t x = 0; x < g.width; ++x)
+            std::memcpy(guest + g.byte_offset(x, y), source + size_t(x) * g.pixel_bytes, g.pixel_bytes);
     }
-    if (guest_newer.count)
-        write_texels(mem, *reconcile, r.address, g, guest_newer, kept.data());
-    mem_mark_written(mem, r.address, footprint);
+    mem_mark_written(mem, r.address, g.footprint());
     // The GPU target and these bytes now agree (texels_in_target).
     rendered_targets()[r.address].rendered_epoch = advance_write_epoch(mem);
     timing().sync += emscripten_get_now() - started;
@@ -1756,26 +1745,61 @@ static void prepare_transfer(MemState &mem, scene::Writer &out, const TransferIm
     out.copy_streams(mem);
     if (surface_sync())
         return;
-    // A local list: sync_surface suspends the thread, and another thread's
+    // Local state: read_target suspends the thread, and another thread's
     // transfer may run meanwhile.
-    std::vector<std::pair<uint64_t, Address>> read; // render order, base
+    struct Read { uint64_t order; Address base; SurfaceGeometry geometry; uint32_t rendered; };
+    std::vector<Read> reads;
+    uint64_t low = UINT64_MAX, high = 0;
     for (const auto &[base, target] : rendered_targets()) {
         const auto &g = target.geometry;
         const bool under_source = source && overlaps(base, g.footprint(), source->address + source->begin, source->end - source->begin);
         const bool split_texels = overlaps(base, g.footprint(), dest.address + dest.begin, dest.end - dest.begin)
             && (dest.geometry.pixel_bytes != g.pixel_bytes || (dest.address - base) % g.pixel_bytes);
-        if (under_source || split_texels)
-            read.emplace_back(target.render_order, base);
+        if (!under_source && !split_texels)
+            continue;
+        reads.push_back({target.render_order, base, g, target.rendered_epoch});
+        low = std::min<uint64_t>(low, base);
+        high = std::max<uint64_t>(high, uint64_t(base) + g.footprint());
     }
-    // Newest first: an older target over the same bytes then finds them
-    // written after its render and keeps them (and takes them into its GPU
-    // copy), so the last render wins as it does in memory.
-    std::sort(read.begin(), read.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
-    for (const auto &[order, base] : read) {
+    if (reads.empty())
+        return;
+    // Newest first. A texel keeps the bytes memory has when the guest wrote
+    // its page since the target was rendered, or when a newer target of this
+    // transfer already stored them (`claimed`, per byte); those bytes go to
+    // the GPU copy instead, so memory and every target agree afterwards.
+    std::sort(reads.begin(), reads.end(), [](const Read &a, const Read &b) { return a.order > b.order; });
+    std::vector<uint8_t> claimed(size_t(high - low), 0);
+    for (const auto &read : reads) {
         if (!submit_scene(out, mem)) // the scenes rendering it, before the read
             unsupported("scene submission failed (see browser log)");
-        sync_surface(mem, {base, rendered_targets()[base].geometry}, &out);
+        const auto &g = read.geometry;
+        const auto rows = read_target(mem, {read.base, g});
+        uint8_t *guest = Ptr<uint8_t>(read.base).get(mem);
+        std::vector<uint8_t> kept(size_t(g.width) * g.height, 0);
+        TexelMarks memory_newer;
+        for (uint32_t y = 0; y < g.height; ++y) {
+            for (uint32_t x = 0; x < g.width; ++x) {
+                const uint64_t offset = g.byte_offset(x, y);
+                uint8_t *claim = claimed.data() + (read.base + offset - low);
+                if (claim[0] || mem_written_epoch(mem, Address(read.base + offset), g.pixel_bytes) >= read.rendered) {
+                    kept[size_t(y) * g.width + x] = 1;
+                    memory_newer.add(x, y);
+                } else {
+                    std::memcpy(guest + offset, rows.data() + (size_t(y) * g.width + x) * g.pixel_bytes, g.pixel_bytes);
+                }
+                std::memset(claim, 1, g.pixel_bytes);
+            }
+        }
+        if (memory_newer.count)
+            write_texels(mem, out, read.base, g, memory_newer, kept.data());
+        ++timing().syncs;
     }
+    // Marked only now: the page epochs above had to show the guest's writes alone.
+    for (const auto &read : reads)
+        mem_mark_written(mem, read.base, read.geometry.footprint());
+    const uint32_t epoch = advance_write_epoch(mem);
+    for (const auto &read : reads)
+        rendered_targets()[read.base].rendered_epoch = epoch;
 }
 // After a transfer wrote `dest`'s rectangle (`written`: which of its texels,
 // row by row, when not all): each rendered target over those bytes gets the

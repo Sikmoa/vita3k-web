@@ -209,6 +209,7 @@ static unsigned int all_cyan(unsigned x, unsigned y) { (void)x; (void)y; return 
 static unsigned int p64_cyan_top(unsigned x, unsigned y) { return y < 16 ? CYAN : pattern(64, 64, x, y); }
 static unsigned int green_split(unsigned x, unsigned y) { return x == 0 && y == 0 ? (GREEN & 0xffff0000u) | 0xabcd : GREEN; }
 static unsigned int blue_marked(unsigned x, unsigned y) { return x == 0 && y == 8 ? YELLOW : BLUE; }
+static unsigned int blue_middle(unsigned x, unsigned y) { (void)x; return y >= 8 && y < 40 ? BLUE : RED; }
 // The downscaled surface: the pattern at 64x64 plus a two-pixel blue column
 // at render x 31..32, box-filtered to 32x32: texels 15 and 16 mix it with
 // their other render column.
@@ -472,6 +473,18 @@ int main(void) {
     begin(rt6432, &s_linear64b); texture_quad(64, 32, &t); end();
     read_surface(linear64b, SCE_GXM_TRANSFER_LINEAR, 0, 0, 64, 32, 64);
     if (check(64, 32, blue_marked, 88)) return failed;
+    // The same with the later target starting mid-page (row 8): only its
+    // rows turn blue, in memory and in the earlier target's GPU copy.
+    begin(rt64, &s_linear64); color_rect(64, 64, 0, 0, 64, 64, RED, 0); end();
+    SceGxmColorSurface s_middle;
+    surface(&s_middle, SCE_GXM_COLOR_SURFACE_LINEAR, SCE_GXM_COLOR_SURFACE_SCALE_NONE, 64, 32, 64, linear64 + 8 * 64);
+    begin(rt6432, &s_middle); color_rect(64, 32, 0, 0, 64, 32, BLUE, 0); end();
+    read_surface(linear64, SCE_GXM_TRANSFER_LINEAR, 0, 0, 64, 64, 64);
+    if (check(64, 64, blue_middle, 89)) return failed;
+    if (sceGxmTextureInitLinear(&t, linear64, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, 64, 64, 1)) return 90;
+    begin(rt64, &s_scratch64); texture_quad(64, 64, &t); end();
+    read_surface(msaa_full, SCE_GXM_TRANSFER_LINEAR, 0, 0, 64, 64, 64);
+    if (check(64, 64, blue_middle, 91)) return failed;
 
     // 7. sceCommonDialogUpdate: the host draws dialogs, so any frame is fine.
     if (sceCommonDialogUpdate(0) != (int)SCE_COMMON_DIALOG_ERROR_NULL) return 80;
