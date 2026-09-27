@@ -34,6 +34,7 @@
 #include <packages/pkg.h>
 #include <packages/sfo.h>
 #include <packages/vci.h>
+#include <regmgr/functions.h>
 #include <renderer/state.h>
 #include <renderer/texture_cache.h>
 
@@ -455,6 +456,8 @@ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const
 
     init_device_paths(emuenv.io);
     init_savedata_app_path(emuenv.io, emuenv.vita_fs_path);
+    // SceRegMgr values: firmware template defaults, then vd0/registry/system.dreg.
+    regmgr::init_regmgr(emuenv.regmgr, emuenv.vita_fs_path);
 
     // Load param.sfo
     vfs::FileBuffer param_sfo;
