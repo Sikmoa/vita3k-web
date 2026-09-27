@@ -1557,7 +1557,9 @@ int semaphore_cancel(KernelState &kernel, const char *export_name, SceUID thread
     const std::lock_guard<std::mutex> semaphore_lock(semaphore->mutex);
     if (semaphore->deleted)
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID);
-    if (kernel.execution_host && setCount > semaphore->max)
+    // SceKernelThreadMgr 3.74 CancelSema (0x81012768) rejects a count above
+    // the maximum before waking anyone; a negative count restores the initial one.
+    if (setCount > semaphore->max)
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_COUNT);
     while (!semaphore->waiting_threads->empty()) {
         const auto &waiting_thread_data = *semaphore->waiting_threads->begin();
@@ -1575,9 +1577,6 @@ int semaphore_cancel(KernelState &kernel, const char *export_name, SceUID thread
         nb_threads++;
     }
 
-    if (!kernel.execution_host && semaphore->val < setCount) {
-        return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
-    }
     if (setCount < 0) {
         semaphore->val = semaphore->init_val;
     } else {

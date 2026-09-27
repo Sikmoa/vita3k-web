@@ -263,6 +263,11 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
         REQUIRE(a->status == ThreadStatus::run);
         REQUIRE(semaphore_wait(env.kernel, "fixture", a->id, sema, 1, nullptr) == SCE_KERNEL_ERROR_WAIT_CANCEL);
         REQUIRE(env.kernel.semaphores.at(sema)->waiting_threads->empty());
+        // CancelSema: above the maximum fails first; otherwise the count is set.
+        SceUInt32 cancelled = 0xcccccccc;
+        REQUIRE(semaphore_cancel(env.kernel, "fixture", 0, sema, 2, &cancelled) == SCE_KERNEL_ERROR_ILLEGAL_COUNT);
+        REQUIRE(semaphore_cancel(env.kernel, "fixture", 0, sema, 1, &cancelled) == 0);
+        REQUIRE(cancelled == 0 && env.kernel.semaphores.at(sema)->val == 1);
         REQUIRE(semaphore_delete(env.kernel, "fixture", 0, sema) == 0);
         a->status = ThreadStatus::dormant;
         env.kernel.execution_host = host;
