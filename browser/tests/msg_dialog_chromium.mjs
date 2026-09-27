@@ -22,6 +22,8 @@ const fixture = resolve(process.env.MSG_DIALOG_FIXTURE
   || 'build/web64/browser/tests/vita_msg_dialog_fixture/eboot.bin');
 const title = 'MSGDLG001';
 const message = 'Message dialog fixture: continue?';
+// The fixture's second dialog is polled without presenting frames.
+const polled = 'Message dialog fixture: polled without frames?';
 const stage = await mkdtemp(join(tmpdir(), 'msg-dialog-'));
 await mkdir(join(stage, 'ux0/app', title), { recursive: true });
 await copyFile(fixture, join(stage, 'ux0/app', title, 'eboot.bin'));
@@ -45,10 +47,11 @@ try {
     const code = await probe.exited;
     const report = JSON.parse(probe.output.slice(probe.output.indexOf('{'), probe.output.lastIndexOf('}') + 1));
     assert.equal(code, 0, probe.output.slice(-4000));
-    assert.deepEqual(report.exit, { exitCode: 100 + buttonId, ok: true }, `LIMBO_DIALOG=${answer}`);
+    assert.deepEqual(report.exit, { exitCode: 100 + 11 * buttonId, ok: true }, `LIMBO_DIALOG=${answer}`);
     assert.deepEqual(report.dialogs.map(({ id, message, buttons, answer, buttonId, result }) =>
       ({ id, message, buttons, answer, buttonId, result })),
-    [{ id: 1, message, buttons: ['Yes', 'No'], answer, buttonId, result: 0 }]);
+    [{ id: 1, message, buttons: ['Yes', 'No'], answer, buttonId, result: 0 },
+      { id: 2, message: polled, buttons: ['Yes', 'No'], answer, buttonId, result: 0 }]);
     console.log(`probe LIMBO_DIALOG=${answer}: exit ${report.exit.exitCode}, dialog ${JSON.stringify(report.dialogs[0])}`);
   }
 
@@ -79,13 +82,16 @@ try {
   await page.keyboard.press('ArrowRight');
   assert.deepEqual(await buttons.evaluateAll((all) => all.map((b) => b.className)), ['', 'selected']);
   await page.keyboard.press('KeyX');
+  // Second dialog (guest spinning without frames): X answers the highlighted Yes.
+  await page.waitForFunction((text) => document.querySelector('#dialog-message')?.textContent === text, polled, { timeout: 60000 });
+  await page.keyboard.press('KeyX');
   await page.waitForFunction(() => document.querySelector('#status').textContent.startsWith('exit '), null, { timeout: 60000 });
   const status = await page.locator('#status').textContent();
   const log = await page.locator('#log').textContent();
-  assert.equal(status, 'exit 102 (ok)', log.slice(-3000));
+  assert.equal(status, 'exit 121 (ok)', log.slice(-3000));
   assert.equal(await dialog.isHidden(), true);
   assert.deepEqual(pageErrors, []);
-  console.log(`page: right arrow + X -> ${status}`);
+  console.log(`page: right arrow + X, then X -> ${status}`);
 } finally {
   await browser?.close();
   server?.kill();

@@ -39,6 +39,17 @@ int main(void) {
     if (sceMsgDialogGetResult(&result) != 0) return 6;
     if (result.result != SCE_COMMON_DIALOG_RESULT_OK || result.mode != SCE_MSG_DIALOG_MODE_USER_MSG) return 7;
     if (sceMsgDialogTerm() != 0 || sceMsgDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_NONE) return 8;
+    const int first = (int)result.buttonId;
+
+    // A second dialog polled in a tight loop, without presenting or sleeping:
+    // the runtime must still take the page's answer while the guest spins.
+    user.msg = (const SceChar8 *)"Message dialog fixture: polled without frames?";
+    if (sceMsgDialogInit(&param) != 0) return 9;
+    while (sceMsgDialogGetStatus() == SCE_COMMON_DIALOG_STATUS_RUNNING) {
+    }
+    if (sceMsgDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_FINISHED) return 10;
+    if (sceMsgDialogGetResult(&result) != 0 || result.result != SCE_COMMON_DIALOG_RESULT_OK) return 11;
+    if (sceMsgDialogTerm() != 0) return 12;
     sceKernelFreeMemBlock(fb_uid);
-    return 100 + (int)result.buttonId;
+    return 100 + 10 * first + (int)result.buttonId;
 }

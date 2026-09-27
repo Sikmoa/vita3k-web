@@ -663,6 +663,7 @@ static int run_app_impl() {
         std::uint32_t scripted_buttons = 0;
         std::array<float, 4> scripted_axes{};
         unsigned frames_yielded = 0;
+        double last_yield_ms = emscripten_get_now();
         do {
             if (!input_script.empty()) {
                 const double now_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - jit_started).count();
@@ -701,11 +702,15 @@ static int run_app_impl() {
             }
             progress = runtime.resume(256);
             dispatched += progress.dispatches;
-            if (frames_presented != frames_yielded) {
+            // Page messages (pad input, dialog answers) arrive only in event
+            // loop turns: take one per presented frame, and at least every
+            // 50 ms for a guest that runs without presenting.
+            const double now_ms = emscripten_get_now();
+            if (frames_presented != frames_yielded || now_ms - last_yield_ms >= 50.0) {
                 frames_yielded = frames_presented;
-                const double started = emscripten_get_now();
                 web_yield_to_event_loop();
-                yield_ms += emscripten_get_now() - started;
+                last_yield_ms = emscripten_get_now();
+                yield_ms += last_yield_ms - now_ms;
             }
             if (pc_sample_every && dispatched >= pc_sample_next) {
                 pc_sample_next = dispatched + pc_sample_every;
