@@ -204,6 +204,8 @@ static unsigned int p3264_keyed(unsigned x, unsigned y) {
     return x >= 8 && x < 16 && y >= 40 && y < 48 ? CYAN : pattern(32, 64, x, y);
 }
 static unsigned int p64_halved(unsigned x, unsigned y) { return pattern(64, 64, 2 * x, 2 * y); }
+static unsigned int p64_raw64(unsigned x, unsigned y) { return x < 32 && y < 32 ? YELLOW : pattern(64, 64, x, y); }
+static unsigned int all_cyan(unsigned x, unsigned y) { (void)x; (void)y; return CYAN; }
 // The downscaled surface: the pattern at 64x64 plus a two-pixel blue column
 // at render x 31..32, box-filtered to 32x32: texels 15 and 16 mix it with
 // their other render column.
@@ -403,6 +405,27 @@ int main(void) {
             SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR, readback, 0, 0, 32 * 4, 0, 0, 0)) return 70;
     sceGxmTransferFinish();
     if (check(32, 32, p64_halved, 71)) return failed;
+
+    // A RAW64 copy (16x32 texels: 32x32 RGBA8 texels) over the rendered
+    // surface: every texel it covers, not every other column, reaches the
+    // GPU copy, sampled into a second 64x64 surface.
+    fill(keyed, 32 * 64, YELLOW);
+    if (sceGxmTransferCopy(16, 32, 0, 0, SCE_GXM_TRANSFER_COLORKEY_NONE,
+            SCE_GXM_TRANSFER_FORMAT_RAW64, SCE_GXM_TRANSFER_LINEAR, keyed, 0, 0, 16 * 8,
+            SCE_GXM_TRANSFER_FORMAT_RAW64, SCE_GXM_TRANSFER_LINEAR, linear64, 0, 0, 64 * 4, 0, 0, 0)) return 72;
+    sceGxmTransferFinish();
+    SceGxmColorSurface s_scratch64;
+    surface(&s_scratch64, SCE_GXM_COLOR_SURFACE_LINEAR, SCE_GXM_COLOR_SURFACE_SCALE_NONE, 64, 64, 64, msaa_full);
+    if (sceGxmTextureInitLinear(&t, linear64, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, 64, 64, 1)) return 73;
+    begin(rt64, &s_scratch64); texture_quad(64, 64, &t); end();
+    read_surface(msaa_full, SCE_GXM_TRANSFER_LINEAR, 0, 0, 64, 64, 64);
+    if (check(64, 64, p64_raw64, 74)) return failed;
+    // Guest writes after rendering are newer than the GPU copy: a transfer
+    // reads them, not the rendered pixels.
+    begin(rt64, &s_linear64); draw_pattern(64, 64, 0); end();
+    fill(linear64, 64 * 64, CYAN);
+    read_surface(linear64, SCE_GXM_TRANSFER_LINEAR, 0, 0, 64, 64, 64);
+    if (check(64, 64, all_cyan, 75)) return failed;
 
     // 7. sceCommonDialogUpdate: the host draws dialogs, so any frame is fine.
     if (sceCommonDialogUpdate(0) != (int)SCE_COMMON_DIALOG_ERROR_NULL) return 80;

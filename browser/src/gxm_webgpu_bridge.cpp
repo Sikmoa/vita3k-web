@@ -962,70 +962,93 @@ struct TargetTexels {
     uint32_t x = 0, y = 0;
     bool whole = false;
 };
-static bool texels_in_target(const MemState &mem, const SceGxmTexture &t, TargetTexels &at, bool &overlaps) {
-    overlaps = false;
+enum class TargetMatch { None, Mismatch, Written, Texels };
+static TargetMatch match_target(const MemState &mem, const SceGxmTexture &t, Address base, const RenderedTarget &target,
+    TargetTexels &at) {
     const Address address = t.data_addr << 2;
+    const auto &g = target.geometry;
+    if (address < base || address - base >= g.footprint())
+        return TargetMatch::None;
     const auto type = t.texture_type();
     const auto format = gxm::get_format(t);
     const uint32_t width = gxm::get_width(t), height = gxm::get_height(t);
-    for (const auto &[base, target] : rendered_targets()) {
-        const auto &g = target.geometry;
-        if (address < base || address - base >= g.footprint())
-            continue;
-        overlaps = true;
-        // Texel format: the GPU target holds the surface's components in
-        // memory order, which a texture reads unswizzled only in the same
-        // base format with the identity (ABGR) component order.
-        SceGxmTextureBaseFormat expected;
-        switch (target.format) {
-        case SCE_GXM_COLOR_BASE_FORMAT_U8U8U8U8: expected = SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8; break;
-        case SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10: expected = SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10; break;
-        case SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16: expected = SCE_GXM_TEXTURE_BASE_FORMAT_F16F16F16F16; break;
-        default: return false;
-        }
-        if (gxm::get_base_format(format) != expected || (format & SCE_GXM_TEXTURE_SWIZZLE_MASK) != 0)
-            return false;
-        // Layout: the texture's texel (u, v) must be the surface's texel
-        // (x + u, y + v) for every texel.
-        const uint64_t offset = address - base;
-        uint32_t x = 0, y = 0;
-        if (!g.texel_at(offset, x, y))
-            return false;
-        switch (g.layout) {
-        case Layout::Linear: {
-            const uint32_t stride = type == SCE_GXM_TEXTURE_LINEAR_STRIDED ? gxm::get_stride_in_bytes(t)
-                : type == SCE_GXM_TEXTURE_LINEAR ? align(width, 8) * g.pixel_bytes : 0;
-            if (stride != g.stride_px * g.pixel_bytes)
-                return false;
-            break;
-        }
-        case Layout::Tiled:
-            // Whole tile rows of the same width, starting at a row of tiles.
-            if (type != SCE_GXM_TEXTURE_TILED || align(width, 32) != g.stride_px || x || y % 32)
-                return false;
-            break;
-        case Layout::Swizzled:
-            // The surface itself, or an aligned square block of its Morton order.
-            if (type != SCE_GXM_TEXTURE_SWIZZLED
-                || !(width == g.width && height == g.height)
-                && !(width == height && width <= std::min(g.width, g.height) && offset % (uint64_t(width) * height * g.pixel_bytes) == 0))
-                return false;
-            break;
-        }
-        if (x + width > g.width || y + height > g.height)
-            return false;
-        // Bytes the texture covers: to its last row, tile row or Morton block.
-        const uint64_t span = g.layout == Layout::Linear
-            ? (uint64_t(height) - 1) * g.stride_px * g.pixel_bytes + uint64_t(width) * g.pixel_bytes
-            : g.layout == Layout::Tiled ? uint64_t((height + 31) / 32) * g.stride_px * 32 * g.pixel_bytes
-                                        : uint64_t(width) * height * g.pixel_bytes;
-        if (mem_written_epoch(mem, address, span) >= target.rendered_epoch) {
-            overlaps = false; // the guest's own bytes now
-            return false;
-        }
-        at = {base, x, y, x == 0 && y == 0 && width == g.width && height == g.height};
-        return true;
+    // Texel format: the GPU target holds the surface's components in
+    // memory order, which a texture reads unswizzled only in the same
+    // base format with the identity (ABGR) component order.
+    SceGxmTextureBaseFormat expected;
+    switch (target.format) {
+    case SCE_GXM_COLOR_BASE_FORMAT_U8U8U8U8: expected = SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8; break;
+    case SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10: expected = SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10; break;
+    case SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16: expected = SCE_GXM_TEXTURE_BASE_FORMAT_F16F16F16F16; break;
+    default: return TargetMatch::Mismatch;
     }
+    if (gxm::get_base_format(format) != expected || (format & SCE_GXM_TEXTURE_SWIZZLE_MASK) != 0)
+        return TargetMatch::Mismatch;
+    // Layout: the texture's texel (u, v) must be the surface's texel
+    // (x + u, y + v) for every texel.
+    const uint64_t offset = address - base;
+    uint32_t x = 0, y = 0;
+    if (!g.texel_at(offset, x, y))
+        return TargetMatch::Mismatch;
+    switch (g.layout) {
+    case Layout::Linear: {
+        const uint32_t stride = type == SCE_GXM_TEXTURE_LINEAR_STRIDED ? gxm::get_stride_in_bytes(t)
+            : type == SCE_GXM_TEXTURE_LINEAR ? align(width, 8) * g.pixel_bytes : 0;
+        if (stride != g.stride_px * g.pixel_bytes)
+            return TargetMatch::Mismatch;
+        break;
+    }
+    case Layout::Tiled:
+        // Whole tile rows of the same width, starting at a row of tiles.
+        if (type != SCE_GXM_TEXTURE_TILED || align(width, 32) != g.stride_px || x || y % 32)
+            return TargetMatch::Mismatch;
+        break;
+    case Layout::Swizzled:
+        // The surface itself, or an aligned square block of its Morton order.
+        if (type != SCE_GXM_TEXTURE_SWIZZLED
+            || !(width == g.width && height == g.height)
+            && !(width == height && width <= std::min(g.width, g.height) && offset % (uint64_t(width) * height * g.pixel_bytes) == 0))
+            return TargetMatch::Mismatch;
+        break;
+    }
+    if (x + width > g.width || y + height > g.height)
+        return TargetMatch::Mismatch;
+    // Bytes the texture covers: to its last row, tile row or Morton block.
+    const uint64_t span = g.layout == Layout::Linear
+        ? (uint64_t(height) - 1) * g.stride_px * g.pixel_bytes + uint64_t(width) * g.pixel_bytes
+        : g.layout == Layout::Tiled ? uint64_t((height + 31) / 32) * g.stride_px * 32 * g.pixel_bytes
+                                    : uint64_t(width) * height * g.pixel_bytes;
+    if (mem_written_epoch(mem, address, span) >= target.rendered_epoch)
+        return TargetMatch::Written;
+    at = {base, x, y, x == 0 && y == 0 && width == g.width && height == g.height};
+    return TargetMatch::Texels;
+}
+// Targets are never forgotten, so memory rendered long ago may lie under
+// newer ones. A match whose texels were not written since it was rendered
+// is newer than any guest write there; the most recent such match wins.
+static bool texels_in_target(const MemState &mem, const SceGxmTexture &t, TargetTexels &at, bool &overlaps) {
+    overlaps = false;
+    bool found = false, written = false;
+    uint32_t newest = 0;
+    for (const auto &[base, target] : rendered_targets()) {
+        TargetTexels candidate;
+        switch (match_target(mem, t, base, target, candidate)) {
+        case TargetMatch::None: break;
+        case TargetMatch::Mismatch: overlaps = true; break;
+        case TargetMatch::Written: written = true; break;
+        case TargetMatch::Texels:
+            if (!found || target.rendered_epoch > newest) {
+                at = candidate;
+                newest = target.rendered_epoch;
+                found = true;
+            }
+            break;
+        }
+    }
+    if (found)
+        return true;
+    if (written)
+        overlaps = false; // the guest's own bytes now
     return false;
 }
 // Reported once per texture format and layout: sampled from guest memory,
@@ -1592,9 +1615,10 @@ static void sync_surface(MemState &mem, const SurfaceReadback &r) {
     const uint64_t footprint = g.footprint();
     require_guest(mem, r.address, footprint);
     const double started = emscripten_get_now();
-    static std::vector<uint8_t> rows; // kept: no locals with destructors on the command path
+    // Its own buffer: the guest thread suspends until the copy arrives, and
+    // another thread may sync a surface meanwhile.
     const size_t row = size_t(g.width) * g.pixel_bytes;
-    rows.resize(row * g.height);
+    std::vector<uint8_t> rows(row * g.height);
     if (web_gxm_sync_surface(r.address, rows.data(), g.width, g.height, g.pixel_bytes) != 0)
         unsupported("surface sync failed (see browser log)");
     uint8_t *guest = Ptr<uint8_t>(r.address).get(mem);
@@ -1673,19 +1697,29 @@ static bool overlaps(Address a, uint64_t a_size, Address b, uint64_t b_size) {
     return uint64_t(a) < uint64_t(b) + b_size && uint64_t(b) < uint64_t(a) + a_size;
 }
 // Before a transfer reads guest bytes: pending draws read memory from before
-// it, and rendered targets under the source are copied back into memory.
+// it, and rendered targets under the source are copied back into memory,
+// oldest first, unless the guest wrote those bytes since the target was
+// rendered (then memory is newer, as in texels_in_target).
 static void prepare_transfer(MemState &mem, scene::Writer &out, const TransferImage *source) {
     if (out.pass_open)
         unsupported("transfer inside a scene");
     out.copy_streams(mem);
     if (!source || surface_sync())
         return;
+    // A local list: sync_surface suspends the thread, and another thread's
+    // transfer may run meanwhile.
+    std::vector<std::pair<uint32_t, Address>> stale; // rendered epoch, base
     for (const auto &[base, target] : rendered_targets()) {
-        if (!overlaps(base, target.geometry.footprint(), source->address, source->end))
-            continue;
+        const uint64_t begin = std::max<uint64_t>(base, source->address);
+        const uint64_t end = std::min<uint64_t>(uint64_t(base) + target.geometry.footprint(), uint64_t(source->address) + source->end);
+        if (begin < end && mem_written_epoch(mem, Address(begin), size_t(end - begin)) < target.rendered_epoch)
+            stale.emplace_back(target.rendered_epoch, base);
+    }
+    std::sort(stale.begin(), stale.end());
+    for (const auto &[epoch, base] : stale) {
         if (!submit_scene(out, mem)) // the scenes rendering it, before the read
             unsupported("scene submission failed (see browser log)");
-        sync_surface(mem, {base, target.geometry});
+        sync_surface(mem, {base, rendered_targets()[base].geometry});
     }
 }
 // After a transfer wrote `dest`'s rectangle (`written`: which of its texels,
@@ -1718,12 +1752,19 @@ static void refresh_targets(MemState &mem, scene::Writer &out, const TransferIma
             for (uint32_t y = 0; y < g.height; ++y) {
                 for (uint32_t x = 0; x < g.width; ++x) {
                     const uint64_t address = uint64_t(base) + g.byte_offset(x, y);
-                    if (address < dest.address)
-                        continue;
-                    uint32_t dx, dy;
-                    if (!d.texel_at(address - dest.address, dx, dy) || dx < dest.x || dy < dest.y
-                        || dx >= dest.x + dest.width || dy >= dest.y + dest.height
-                        || (written_texels && !written_texels[size_t(dy - dest.y) * dest.width + (dx - dest.x)]))
+                    // Written when any of its bytes lies in a written
+                    // transfer texel (their sizes may differ: RAW64 over RGBA8).
+                    bool hit = false;
+                    for (uint32_t byte = 0; byte < g.pixel_bytes && !hit; byte += std::min(g.pixel_bytes, d.pixel_bytes)) {
+                        if (address + byte < dest.address)
+                            continue;
+                        const uint64_t offset = address + byte - dest.address;
+                        uint32_t dx, dy;
+                        hit = d.texel_at(offset - offset % d.pixel_bytes, dx, dy) && dx >= dest.x && dy >= dest.y
+                            && dx < dest.x + dest.width && dy < dest.y + dest.height
+                            && (!written_texels || written_texels[size_t(dy - dest.y) * dest.width + (dx - dest.x)]);
+                    }
+                    if (!hit)
                         continue;
                     written[size_t(y) * g.width + x] = 1;
                     x0 = std::min(x0, x); y0 = std::min(y0, y); x1 = std::max(x1, x); y1 = std::max(y1, y);
@@ -1871,15 +1912,13 @@ struct Completion {
     uint32_t value;  // notification value or sync timestamp
     int *status;
 };
+// One per submit_command_list call: a surface sync or a sync-object wait
+// suspends the guest thread, and another thread may submit meanwhile.
 struct Submission {
     std::vector<Completion> completions;
     std::vector<SurfaceReadback> readbacks;
     int result = 0;
 };
-Submission &submission() {
-    static Submission instance;
-    return instance;
-}
 [[gnu::noinline]] static void publish(State &state, MemState &mem, scene::Writer &out, Submission &sub) {
     if (!submit_scene(out, mem))
         unsupported("scene submission failed (see browser log)");
@@ -1986,8 +2025,10 @@ static void consume_commands(State &state, Context *ctx, Command *&cursor, MemSt
             const auto timestamp = helper.pop<uint32_t>();
             if (!sync) unsupported("sync wait without object");
             require_guest(mem, sync.address(), sizeof(SceGxmSyncObject));
-            // A signal earlier in this list must be visible to the wait.
-            if (!sub.completions.empty() && !out.pass_open)
+            // A signal earlier in this list must be visible to the wait, and
+            // the shared stream must be sent before the thread may suspend
+            // (another thread's submission would reset it).
+            if ((!sub.completions.empty() || out.words.size() > 1) && !out.pass_open)
                 publish(state, mem, out, sub);
             if (wishlist(sync.get(mem), timestamp) != SyncWaitResult::Ready)
                 sub.result = -1;
@@ -2057,10 +2098,7 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
     texture_cache().epoch = mem_next_write_epoch(mem);
     auto &out = scene::writer();
     out.reset();
-    auto &sub = submission();
-    sub.completions.clear();
-    sub.readbacks.clear();
-    sub.result = 0;
+    Submission sub;
     Command *cursor = list.first;
     reset_command_list(list);
     std::exception_ptr failure;
