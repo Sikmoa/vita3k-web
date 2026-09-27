@@ -150,7 +150,7 @@ inline void test_guest_kernel_handles(EmuEnvState &env, vita3k::web::GuestThread
     REQUIRE(runtime.attach(env));
     const Address param = data + 0x800;
     auto &kernel = env.kernel;
-    const auto gone = [](const SyncPrimitive &object) { return object.deleted; };
+    const auto gone = [](const SyncPrimitive &object) { return object.deleted.load(); };
 
     check_handles(env, param, kernel.semaphores,
         [&](const char *name) { return semaphore_create(kernel, "fixture", name, 0, 0, 0, 1); },
@@ -210,7 +210,14 @@ inline void test_guest_kernel_handles(EmuEnvState &env, vita3k::web::GuestThread
         REQUIRE(timer > 0);
         const auto object = kernel.timers.at(timer);
         REQUIRE(export_sceKernelOpenTimer(env, 0, "fixture", nullptr) == SCE_KERNEL_ERROR_ILLEGAL_ADDR);
-        const SceUID opened = export_sceKernelOpenTimer(env, 0, "fixture", "handle timer");
+        SceUID opened;
+        {
+            // A desktop waiter holds the timer's mutex while it waits; opening
+            // and looking the timer up must not need it.
+            const std::lock_guard<std::mutex> waiter_holds(object->mutex);
+            opened = export_sceKernelOpenTimer(env, 0, "fixture", "handle timer");
+            REQUIRE(timer_find(kernel, opened) == object);
+        }
         REQUIRE(opened > 0 && kernel.timers.at(opened) == object && object->handles == 2);
         REQUIRE(export_sceKernelStartTimer(env, 0, "fixture", opened) == 0 && object->is_started);
         REQUIRE(export_sceKernelDeleteTimer(env, 0, "fixture", timer) == 0);

@@ -21,6 +21,8 @@
 #include <kernel/types.h>
 #include <util/byte_ring_buffer.h>
 
+#include <atomic>
+
 struct KernelState;
 
 struct WaitingThreadData {
@@ -90,7 +92,9 @@ struct SyncPrimitive {
     std::mutex mutex;
     char name[KERNELOBJECT_MAX_NAME_LENGTH + 1];
     // Set under `mutex` on deletion: holders of a stale pointer must not use it.
-    bool deleted = false;
+    // Atomic so that a deleted timer, whose opened handles stay in the class
+    // map, is recognised without its mutex, which a desktop waiter holds.
+    std::atomic<bool> deleted = false;
     virtual ~SyncPrimitive() = default;
 };
 

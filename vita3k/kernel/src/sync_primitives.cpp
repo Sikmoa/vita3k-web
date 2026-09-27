@@ -27,7 +27,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
-#include <type_traits>
 #include <vector>
 
 static constexpr bool LOG_SYNC_PRIMITIVES = false;
@@ -121,11 +120,7 @@ static SceUID open_handle(KernelState &kernel, const char *export_name, std::map
     const auto it = std::find_if(objects.begin(), objects.end(), [&](const auto &entry) {
         if (strncmp(entry.second->name, name, KERNELOBJECT_MAX_NAME_LENGTH) != 0)
             return false;
-        if constexpr (std::is_same_v<T, Timer>) {
-            const std::lock_guard<std::mutex> timer_lock(entry.second->mutex);
-            return !entry.second->deleted;
-        }
-        return true;
+        return !entry.second->deleted;
     });
     if (it == objects.end())
         return RET_ERROR(SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_NAME);
@@ -510,10 +505,7 @@ SceUID timer_open(KernelState &kernel, const char *export_name, const char *pNam
 
 TimerPtr timer_find(KernelState &kernel, SceUID timer_handle) {
     const TimerPtr timer = lock_and_find(timer_handle, kernel.timers, kernel.mutex);
-    if (!timer)
-        return nullptr;
-    const std::lock_guard<std::mutex> timer_lock(timer->mutex);
-    return timer->deleted ? nullptr : timer;
+    return timer && !timer->deleted ? timer : nullptr;
 }
 
 // SceKernelThreadMgr 3.74 DeleteTimer stops and deletes the timer even while
