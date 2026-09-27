@@ -84,6 +84,17 @@ inline void test_guest_np_offline(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(set_ctx_opt, { 1, 1, 1 }) == 0 && call(set_ctx_opt, { 1, 2, 1 }) == 0x80552715);
     REQUIRE(call(set_ctx_opt, { 7, 1, 1 }) == 0x80552705);
     REQUIRE(call(conn_info, { 1, 1, 1, out }) == 0x8055270e); // no connection exists
+    // The context must exist only for titles built with SDK 2.00 or later.
+    REQUIRE(call(conn_info, { 7, 1, 1, out }) == 0x8055270e);
+    const auto saved_param = env.kernel.process_param;
+    auto *process_param = Ptr<SceProcessParam>(block + 0x180).get(env.mem);
+    *process_param = {};
+    process_param->magic = '2PSP';
+    process_param->version = 6;
+    process_param->fw_version = 0x02000000;
+    env.kernel.process_param = Ptr<SceProcessParam>(block + 0x180);
+    REQUIRE(call(conn_info, { 7, 1, 1, out }) == 0x80552705 && call(conn_info, { 1, 1, 1, out }) == 0x8055270e);
+    env.kernel.process_param = saved_param;
     REQUIRE(call(sig_term, {}) == 0);
 
     REQUIRE(call(post_status, { np_id, 0, 0 }) == 0x80552302); // sceNpActivityInit never ran
