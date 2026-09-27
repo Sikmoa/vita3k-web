@@ -216,12 +216,15 @@ header of `limbo_serve.mjs`; the ones that change what is measured:
   not real-time speed), `?fpsHack=1` is Vita3K's fps-hack (display waits use
   one vblank).
 - `?scale=N` sets the internal resolution (1-4, default 2).
+- `?surfaceSync=1` reads rendered surfaces back into guest memory (see
+  `browser/tests/GXM_WEBGPU.md`); off by default.
 - `?memory=w64|w32|auto`, `?backend=jit|interp`, `?inlineMutex=0`.
 - `?present=readback` reads every frame back to a page canvas (for
   `limbo_watch.mjs`); by default the Worker presents to a transferred
   OffscreenCanvas.
 
-Restart the Node server after editing its inline page or the staged content;
+A guest message dialog (`sceMsgDialog`) is drawn over the screen and answered
+with the keys. Restart the Node server after editing its inline page or the staged content;
 runtime files are read per request.
 
 Rendering: the runtime encodes each GXM command list as a GXS1 scene stream
@@ -252,7 +255,10 @@ is the file header; commonly used:
 - `LIMBO_GPU=1 LIMBO_HEADED=1` (with `PLAYWRIGHT_CHROMIUM_EXECUTABLE`) uses the
   hardware adapter; headless Chrome only has SwiftShader.
 - `LIMBO_FAST_VBLANK=0` paces vblank at 60 Hz (the probe free-runs by default).
-- `LIMBO_FPS_HACK=1`, `LIMBO_SCALE=N`: as `?fpsHack=1`, `?scale=N`.
+- `LIMBO_FPS_HACK=1`, `LIMBO_SCALE=N`, `LIMBO_SURFACE_SYNC=1`: as `?fpsHack=1`,
+  `?scale=N`, `?surfaceSync=1`.
+- `LIMBO_DIALOG=cross|circle|none` answers every guest message dialog
+  (default `cross`).
 - `LIMBO_TEXTURE_VERIFY=1` checks cached textures and vertex streams against
   guest memory and logs writes the tracking missed (`[gxm-verify]`).
 - `LIMBO_INPUT="<ms>:<input>[+<input>]:<hold ms>,..."` scripts pad input.
