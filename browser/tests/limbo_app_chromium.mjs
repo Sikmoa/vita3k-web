@@ -306,7 +306,8 @@ try {
     const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&revalidateAll=${revalidateAll ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}${textureVerify ? '&textureVerify=1' : ''}${scale ? '&scale=' + scale : ''}`, { type: 'module' });
     const state = { logs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
       backend: null, memory: null, workerErrors: [], ready: false, timedOut: false,
-      gxmDraws: 0, latestProgress: null, profiles: {}, jitThreads: {}, runStartedAt: null,
+      gxmSceneStats: null, gxmFailures: [], gxmSkips: [],
+      latestProgress: null, profiles: {}, jitThreads: {}, runStartedAt: null,
       phase: 'boot', phaseTrace: [], windows: {}, lastElapsed: 0, latestScene: null,
       audio: { chunks: 0, bytes: 0, peak: 0, nonzero: 0, scanned: 0, freqs: {}, channels: {}, first: null } };
     const hex = (bytes) => Array.from(bytes.slice(0, 64), (v) => v.toString(16).padStart(2, '0')).join(' ');
@@ -379,7 +380,12 @@ try {
           const message = String(data.message);
           state.logs.push(message);
           state.logCount += 1;
-          if (message.includes('GXM WebGPU GXP indexed draw readback completed')) ++state.gxmDraws;
+          // Renderer diagnostics are tracked here: the log keeps only its tail.
+          if (message.startsWith('[gxm-scene] stats '))
+            state.gxmSceneStats = JSON.parse(message.slice('[gxm-scene] stats '.length));
+          if (/^\[vita3k-web\] GX[MP] .* failed/.test(message))
+            state.gxmFailures = [...state.gxmFailures.slice(-2), message];
+          if (message.startsWith('[gxm-skip]')) state.gxmSkips.push(message);
           if (message.includes('[gxm] scene_ms')) state.latestScene = message;
           if (message.includes('jit profile')) state.latestJitProfile = message;
           if (message.includes('jit[progress]')) {
@@ -503,10 +509,10 @@ try {
     workerErrors: outcome.workerErrors,
     pageErrors,
     logCount: outcome.logCount,
-    gxmDraws: outcome.gxmDraws,
+    gxmSceneStats: outcome.gxmSceneStats,
     audio: outcome.audio,
-    gxmDrawFails: outcome.logs.filter((line) => line.includes('GXM WebGPU draw failed')).slice(-3),
-    gxmRejects: outcome.logs.filter((line) => line.includes('[gxm-reject]')).slice(-6),
+    gxmFailures: outcome.gxmFailures,
+    gxmSkips: outcome.gxmSkips,
     moduleLoads: outcome.logs.filter((line) => line.includes('load_module')).slice(-12),
     threadErrors: outcome.logs.filter((line) => line.includes('failed:')).slice(-6),
     scheduler: outcome.logs.filter((line) => line.includes('Guest scheduler')).slice(-3),
@@ -522,10 +528,10 @@ try {
     `every staged file must reach MEMFS (${outcome.staged?.files} of ${staged.length})`);
   assert.ok(outcome.frames.length > 0,
     `no frames presented; timedOut=${outcome.timedOut} exit=${JSON.stringify(outcome.exit)} ` +
-    `drawFails=${JSON.stringify(diagnostics.gxmDrawFails)} ` +
+    `gxmFailures=${JSON.stringify(diagnostics.gxmFailures)} ` +
     `threadErrors=${JSON.stringify(diagnostics.threadErrors)} ` +
     `scheduler=${JSON.stringify(diagnostics.scheduler)} ` +
-    `rejects=${JSON.stringify(diagnostics.gxmRejects)}`);
+    `gxmSkips=${JSON.stringify(diagnostics.gxmSkips)}`);
 } finally {
   await browser?.close();
   server.close();
