@@ -1562,6 +1562,10 @@ Case make_case(const VCase &c, const IR::Block &block, uint32_t ticks) {
     in.regs[13] = 0x5000;
     in.regs[15] = kBase;
     in.cpsr = c.thumb ? 0x30u : 0x10u;
+    // The goldens do not record FPSCR. A saturating NEON op sets the sticky
+    // QC bit, so it starts set and the unchanged expectation holds either
+    // way; the backend lane tests pin QC itself.
+    in.fpscr = 0x08000000u;
     in.svc = 0xbad;
     in.exit_reason = 99;
     in.executed = 99;
