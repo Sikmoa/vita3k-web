@@ -32,7 +32,13 @@
       <div id="display" tabindex="-1" aria-label="Vita game screen">
         <canvas id="gpu-screen" width="960" height="544" aria-label="Game video"></canvas>
         <canvas id="screen" width="960" height="544" hidden aria-label="Game video"></canvas>
-        <div id="welcome"><span class="welcome-symbol">▷</span><h2>Ready when you are.</h2><p>Press Play to launch the game.</p></div>
+        <div id="welcome"><span class="welcome-symbol">▷</span><h2>Ready when you are.</h2><p>Press Play to launch the game.</p>
+          <div id="launch-status" hidden>
+            <p id="launch-phase"></p>
+            <div id="launch-bar" hidden><span id="launch-fill"></span></div>
+            <p id="launch-detail"></p>
+          </div>
+        </div>
         <div id="touch-controls" hidden aria-label="Vita touch controller">
           <button class="pad-button shoulder shoulder-left" data-button="l" aria-label="L shoulder">L</button>
           <button class="pad-button shoulder shoulder-right" data-button="r" aria-label="R shoulder">R</button>
@@ -84,7 +90,7 @@
       </div>
     </details>
     <details id="diagnostics" class="panel">
-      <summary>Diagnostics <span>Runtime information &amp; logs</span></summary>
+      <summary>Debug <span>Runtime information &amp; logs</span></summary>
       <div class="diagnostic-toolbar"><span id="runtime-info"></span><button id="beep">Test sound</button></div>
       <p id="stats"></p><pre id="log" aria-label="Runtime log"></pre>
     </details>

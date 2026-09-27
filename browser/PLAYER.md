@@ -43,10 +43,15 @@ the touch overlay releases its touches. Guest dialogs have tappable response
 buttons, and the guest text-entry field uses the phone's keyboard. This is a
 virtual **controller**; it does not emulate Vita front/rear touch surfaces.
 
+While the game starts, the overlay reports its phase: the runtime module,
+then the file being staged with the file/byte counts, percentage and elapsed
+time behind a progress bar, then the launch (and the AOT compile when
+`LIMBO_AOT` is set). The UI has no borders; the rounded corners stay.
+
 **Sound on/off** mutes output without suspending guest audio. **Fullscreen**
 keeps the toolbar and controls with the display; browsers without element
 fullscreen support use an expanded in-page player. **Exit full** leaves either
-mode. Diagnostics and the sound test are collapsed by default. Runtime logs
+mode. Debug and the sound test are collapsed by default. Runtime logs
 retain their last 200 messages and update in batches.
 
 ## Validation

@@ -26,6 +26,32 @@ const stopButton = document.querySelector('#stop'), warningBox = document.queryS
 const beepButton = document.querySelector('#beep');
 const display = document.querySelector('#display'), shell = document.querySelector('#player-shell');
 const welcome = document.querySelector('#welcome'), fpsLabel = document.querySelector('#fps');
+// Launch status under the "Starting your game…" overlay: the phase, a
+// byte-progress bar and counts/percentage/elapsed time while content is
+// staged into the worker (see the worker's 'stage-progress' message).
+const launchStatus = document.querySelector('#launch-status'), launchPhase = document.querySelector('#launch-phase');
+const launchBar = document.querySelector('#launch-bar'), launchFill = document.querySelector('#launch-fill');
+const launchDetail = document.querySelector('#launch-detail');
+let launchStartedAt = 0, stageTotals = { files: 0, bytes: 0 };
+const mib = (bytes) => (bytes / 1048576).toFixed(1);
+const elapsed = () => (launchStartedAt ? Math.max(0, Math.round((performance.now() - launchStartedAt) / 1000)) : 0) + 's';
+function launch(phase, detail, fraction) {
+  launchStatus.hidden = !phase;
+  if (!phase) return;
+  launchPhase.textContent = phase;
+  launchDetail.textContent = detail || '';
+  const measured = Number.isFinite(fraction);
+  launchBar.hidden = !measured;
+  if (measured) launchFill.style.width = Math.round(Math.min(1, Math.max(0, fraction)) * 100) + '%';
+}
+function stagingDetail(index, bytes) {
+  const parts = [];
+  if (stageTotals.files) parts.push(`${Math.min(index, stageTotals.files)}/${stageTotals.files} files`);
+  if (stageTotals.bytes) parts.push(`${mib(bytes)}/${mib(stageTotals.bytes)} MiB`,
+    `${Math.floor(Math.min(1, bytes / stageTotals.bytes) * 100)}%`);
+  parts.push(elapsed());
+  return parts.join(' · ');
+}
 document.querySelector('#game-title').textContent = TITLE === 'PCSE00268' ? 'Limbo' : TITLE;
 document.title = 'Vita3K Web — ' + document.querySelector('#game-title').textContent;
 document.querySelector('#runtime-info').textContent = TITLE + ' · ' + backend.toUpperCase() + ' · ' + memory + (AOT ? ' · AOT' : '');
@@ -351,6 +377,7 @@ function stop(keepsStatus) {
   ime = null; imeBox.hidden = true;
   runButton.disabled = false; stopButton.disabled = true;
   updateTouchVisibility();
+  launch(null);
   if (!frames) {
     welcome.querySelector('h2').textContent = 'Ready when you are.';
     welcome.querySelector('p').textContent = 'Press Play to launch the game.';
@@ -372,6 +399,9 @@ async function run() {
   welcome.hidden = false;
   welcome.querySelector('h2').textContent = 'Starting your game…';
   welcome.querySelector('p').textContent = 'The first launch can take a little while.';
+  launchStartedAt = performance.now();
+  stageTotals = { files: 0, bytes: 0 };
+  launch('Loading the WebAssembly runtime…', `${backend === 'jit' ? 'JIT' : 'interpreter'} backend`, undefined);
   display.focus({ preventScroll: true });
   screen.hidden = true;
   document.querySelector('#gpu-screen').hidden = !presentToCanvas;
@@ -388,6 +418,7 @@ async function run() {
       case 'lifecycle': log('lifecycle: ' + data.state); break;
       case 'ready':
         status.textContent = 'staging content…';
+        launch('Reading the file manifest…', `${data.diagnostics?.backend || backend} · ${data.diagnostics?.memoryModel || memory}`, undefined);
         log(`ready (backend=${data.diagnostics?.backend} memory=${data.diagnostics?.memoryModel} inlineMutex=${data.diagnostics?.inlineMutex})`);
         if (presentToCanvas) {
           try { attachCanvas(); } catch (error) {
@@ -399,13 +430,32 @@ async function run() {
           if (!response.ok) throw new Error('HTTP ' + response.status);
           const files = await response.json();
           if (worker !== currentWorker) return;
+          const staged = files.filter((file) => params.get('patches') !== '0' || !file.path.startsWith('patch/'));
+          stageTotals = { files: staged.length, bytes: staged.reduce((sum, file) => sum + (file.size || 0), 0) };
+          launch('Staging game files…', stagingDetail(0, 0), stageTotals.bytes ? 0 : undefined);
           worker.postMessage({ type: 'stage-files', root: '/vita',
-            files: files.filter((file) => params.get('patches') !== '0' || !file.path.startsWith('patch/'))
-              .map((file) => ({ ...file, url: `/stage/${file.path}` })) });
+            files: staged.map((file) => ({ ...file, url: `/stage/${file.path}` })) });
         } catch (error) { if (worker !== currentWorker) return; log('manifest failed: ' + error); status.textContent = 'Staging failed'; notice(error.message); stop(true); }
+        break;
+      case 'stage-progress':
+        // Live download status while the overlay reads "Starting your game…".
+        if (data.phase === 'aot') {
+          launch('Compiling the AOT module…', `${String(data.path || '').replace(/^.*\//, '')} · ${elapsed()}`, undefined);
+          break;
+        }
+        if (data.total) stageTotals.files = data.total;
+        if (data.totalBytes) stageTotals.bytes = data.totalBytes;
+        {
+          const bytes = data.bytes || 0;
+          const filePct = data.pathSize >= 1048576 && data.pathBytes > 0
+            ? Math.min(99, Math.floor(data.pathBytes / data.pathSize * 100)) : null;
+          launch((data.path ? `Downloading ${data.path}` : 'Staging game files…') + (filePct === null ? '' : ` — ${filePct}%`),
+            stagingDetail(data.index || 0, bytes), stageTotals.bytes ? bytes / stageTotals.bytes : undefined);
+        }
         break;
       case 'staged':
         status.textContent = 'running';
+        launch('Launching the game…', `${data.files} files · ${mib(data.bytes)} MiB staged · ${elapsed()}`, 1);
         log(`staged ${data.files} files (${(data.bytes / 1048576).toFixed(1)} MiB) — launching`);
         worker.postMessage({ type: 'run-app', vitaFs: data.root, title: TITLE, app: APP, fastVblank,
           ...(AOT ? { aotUrl: '/aot.wasm' } : {}) });

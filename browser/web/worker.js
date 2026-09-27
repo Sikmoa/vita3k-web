@@ -140,6 +140,32 @@ try {
   post({ type: 'error', state: lifecycle, message: String(error) });
 }
 
+// Staged download with live byte counts: the page's launch status shows the
+// file being fetched and how many bytes have arrived (report() is throttled in
+// the caller), so a slow link reports progress instead of one name per file.
+async function readStagedFile(response, onProgress) {
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    const payload = new Uint8Array(await response.arrayBuffer());
+    onProgress(payload.byteLength);
+    return payload;
+  }
+  const chunks = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value?.byteLength) continue;
+    chunks.push(value);
+    received += value.byteLength;
+    onProgress(received);
+  }
+  const payload = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) { payload.set(chunk, offset); offset += chunk.byteLength; }
+  return payload;
+}
+
 self.onmessage = async ({ data }) => {
   if (!data || lifecycle === 'error') return;
   switch (data.type) {
@@ -213,14 +239,28 @@ self.onmessage = async ({ data }) => {
       const fs = module?.FS;
       if (!fs) throw new Error('filesystem runtime is not exported by this module');
       const root = typeof data.root === 'string' && data.root.startsWith('/') ? data.root : '/vita';
-      let files = 0, bytes = 0;
-      for (const entry of data.files || []) {
+      const list = Array.isArray(data.files) ? data.files : [];
+      const sizeOf = (entry) => (Number.isSafeInteger(entry?.size) && entry.size >= 0 ? entry.size : 0);
+      const totalBytes = list.reduce((sum, entry) => sum + sizeOf(entry), 0);
+      let files = 0, bytes = 0, lastReport = 0;
+      // { path, index (1-based file being fetched), total, bytes (finished),
+      //   totalBytes, pathBytes, pathSize } — at most every 120 ms, plus the
+      //   forced first/last report of each file.
+      const report = (path, pathSize, pathBytes, force) => {
+        const now = performance.now();
+        if (!force && now - lastReport < 120) return;
+        lastReport = now;
+        post({ type: 'stage-progress', path, index: files + 1, total: list.length,
+          bytes, totalBytes, pathBytes, pathSize });
+      };
+      for (const entry of list) {
         const path = String(entry?.path ?? '');
         if (!path || path.startsWith('/') || path.split('/').includes('..'))
           throw new RangeError(`unsafe staged path: ${path}`);
+        report(path, sizeOf(entry), 0, true);
         const response = await fetch(entry.url, { credentials: 'same-origin' });
         if (!response.ok) throw new Error(`staged fetch failed (${response.status}): ${path}`);
-        const payload = new Uint8Array(await response.arrayBuffer());
+        const payload = await readStagedFile(response, (received) => report(path, sizeOf(entry), received));
         if (Number.isSafeInteger(entry.size) && entry.size >= 0 && payload.byteLength !== entry.size)
           throw new Error(`staged size mismatch for ${path}: ${payload.byteLength} != ${entry.size}`);
         const target = `${root}/${path}`;
@@ -272,6 +312,7 @@ self.onmessage = async ({ data }) => {
       // loaded code and falls back to the lazy JIT when it does not match.
       if (data.aotUrl) {
         const started = performance.now();
+        post({ type: 'stage-progress', phase: 'aot', path: data.aotUrl });
         const response = await fetch(data.aotUrl);
         if (!response.ok) throw new Error(`AOT module ${data.aotUrl}: HTTP ${response.status}`);
         module['vita3kAotModule'] = await WebAssembly.compileStreaming(response);
