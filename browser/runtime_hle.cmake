@@ -405,7 +405,8 @@ set(_hle_exports
     # service): friend/block lists need sign-in and are never fetched,
     # presence needs the online state, there is no ticket for the content
     # rating, a ticket request is refused without a stored PSN login;
-    # signaling contexts are local and no connection ever exists.
+    # signaling contexts are local and a connection is reported dead to its
+    # handler on SceNpSignalingMain, then freed.
     sceNpBasicGetFriendListEntryCount sceNpBasicGetFriendListEntries
     sceNpBasicGetBlockListEntryCount sceNpBasicGetBlockListEntries
     sceNpBasicCheckIfPlayerIsBlocked sceNpBasicGetFriendOnlineStatus
@@ -413,7 +414,7 @@ set(_hle_exports
     sceNpSignalingCreateCtx sceNpSignalingDestroyCtx sceNpSignalingSetCtxOpt
     sceNpSignalingTerminateConnection sceNpSignalingGetConnectionInfo
     sceNpActivityPostStatus sceNpGetPlatformType sceNpManagerGetContentRatingFlag
-    sceNpAuthCreateStartRequest sceNpAuthGetTicket
+    sceNpAuthCreateStartRequest sceNpAuthGetTicket sceNpSignalingActivateConnection
     # Firmware 3.74 apputil/livearea_util checks; the background-download
     # queue is empty and the browser has no LiveArea (a valid update
     # completes at once).

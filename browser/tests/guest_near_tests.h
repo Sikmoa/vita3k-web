@@ -130,7 +130,7 @@ inline void test_guest_near(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(initialize, { comm_id, param, 1 }) == 0);
     REQUIRE(call(set_gift, { 9, text, 16, thumbnail, 32, data, 3600, gift_param }) == 0);
     env.np.basic_inited = env.np.signaling_inited = env.np.auth_inited = env.np.commerce2_inited = true;
-    env.np.signaling_ctxs[1] = 0x81000001;
+    env.np.signaling_ctxs[1] = { {}, 0x81000001, 0 };
     reset_process(env.np);
     REQUIRE(!env.np.near.inited && !env.np.near.has_gift && !env.np.basic_inited && !env.np.signaling_inited);
     REQUIRE(!env.np.auth_inited && !env.np.commerce2_inited && env.np.signaling_ctxs.empty());
