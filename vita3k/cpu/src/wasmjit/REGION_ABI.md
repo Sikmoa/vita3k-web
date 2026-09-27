@@ -185,6 +185,7 @@ VFP/NEON data moves and memory accesses do not change CPSR/FPSCR.
 | SVC / HLE / host inspection / context save / process exit | Region returns through the common epilogue before the host or callback observes state |
 | Fault | Recover faulting T/E/IT, preserve current flags/IR effects, charge only earlier completed segments, then epilogue; host still sets regs[15]=fault_pc; next_pc keeps reference semantics |
 | Budget / Stop / Smc / true Miss / cached transfer | Original pending PC and reason, all enabled locals published by the common epilogue |
+| Exception (A32ExceptionRaised: UDF, BKPT, undefined/unpredictable encodings) | Store fault_pc, charge only earlier completed segments like Fault, then epilogue; the host sets regs[15]=fault_pc and fails exactly like an emission-time rejection |
 | Unsupported IR / invalid terminal | Reject the entire emission; no partially generated guest execution |
 
 Checked `mem_read`/`mem_write` imports are explicitly **non-observers**:
@@ -323,7 +324,7 @@ uint32_t smc_page;       // +412 code page that set smc_dirty
 ```
 
 ExitReason extended: Continue=0, Svc=1, Fault=2, Unsupported=3, Miss=4,
-Budget=5, Smc=6, Stop=7.
+Budget=5, Smc=6, Stop=7 (EntryMiss=9 is AOT-only; Exception=10, see above).
 
 ## Module export
 

@@ -39,6 +39,11 @@ enum class ExitReason : uint32_t {
     // AOT only: an AOT function was entered at a PC/mode it does not own.
     // next_pc is published; the host must resolve it without AOT.
     EntryMiss = 9,
+    // The guest executed an instruction Dynarmic translates to
+    // A32ExceptionRaised (UDF, BKPT, undefined or unpredictable encodings).
+    // fault_pc holds its address; instructions before it in the block have
+    // executed. There is no fallback: the host fails (fail closed).
+    Exception = 10,
 };
 
 // Shared with generated Wasm, not Dynarmic's native backend JitState.

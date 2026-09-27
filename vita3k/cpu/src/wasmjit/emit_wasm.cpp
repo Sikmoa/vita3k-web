@@ -3969,6 +3969,18 @@ private:
             get(0); value_word(inst.GetArg(1), 0); store(offsetof(JitState, fpu) + n * 2 * sizeof(uint32_t));
             get(0); value_word(inst.GetArg(1), 1); store(offsetof(JitState, fpu) + (n * 2 + 1) * sizeof(uint32_t)); return ok;
         }
+        case Op::A32ExceptionRaised:
+            // UDF, BKPT, undefined/unpredictable encodings. With no
+            // interpreter fallback the host must fail exactly as for an
+            // untranslatable block, but only if this point is reached: the
+            // instructions before it have executed. Ticks follow the memory
+            // fault contract (completed store segments only).
+            if (!inst.GetArg(0).IsImmediate() || inst.GetArg(0).GetType() != Type::U32) return false;
+            get(0); imm(inst.GetArg(0).GetU32()); store(offsetof(JitState, fault_pc));
+            if (!region) store_constant(offsetof(JitState, executed), 0);
+            else if (completed_store_ticks) add_ticks(completed_store_ticks);
+            ret(ExitReason::Exception);
+            return ok;
         case Op::A32CallSupervisor:
             if (!pc_written) return false;
             if (hot_nid) {

@@ -491,6 +491,16 @@ void frontend(Suite &suite) {
         in = initial(thumb); out = next(in, 1, thumb ? 0x1002 : 0x1004);
         out.svc = thumb ? 0xab : 0x123456; out.exit_reason = 1;
         suite.add(thumb ? "thumb_svc" : "arm_svc", svc, {{in, out}});
+        // UDF/BKPT exit with ExitReason::Exception (10) at the raising PC; the
+        // PC write before it has happened, nothing is counted.
+        for (bool breakpoint : {false, true}) {
+            auto raise = translate(thumb ? std::vector<uint32_t>{breakpoint ? 0xbe01u : 0xde00u}
+                                         : std::vector<uint32_t>{breakpoint ? 0xe1200071u : 0xe7f000f0u}, thumb);
+            in = initial(thumb); out = in;
+            out.regs[15] = thumb ? 0x1002 : 0x1004;
+            out.fault_pc = 0x1000; out.exit_reason = 10; out.executed = 0; out.svc = 0;
+            suite.add(std::string(thumb ? "thumb_" : "arm_") + (breakpoint ? "bkpt" : "udf"), raise, {{in, out}});
+        }
         auto bx = translate(thumb ? std::vector<uint32_t>{0x4770} : std::vector<uint32_t>{0xe12fff1e}, thumb);
         std::vector<Case> exchanges;
         for (uint32_t target : {0x2001u, 0x2002u, 0x2003u, 0xfffffffdu}) {
@@ -1010,7 +1020,6 @@ void rejects() {
     block = blank(); append(block, Opcode::A32CallSupervisor, {Value{uint32_t(1)}}); reject(block);
     block = translate({0xef000000}, false); append(block, Opcode::Void, {}); reject(block);
     block = translate({0xe5900000}, false); // actual LDR memory IR is helper-backed
-    block = translate({0xe7f000f0}, false); reject(block); // actual UDF exception IR
     block = blank();
     const auto x = append(block, Opcode::And32, {Value{uint32_t(1)}, Value{uint32_t(2)}});
     append(block, Opcode::GetCarryFromOp, {x}); reject(block); // invalid pseudo producer

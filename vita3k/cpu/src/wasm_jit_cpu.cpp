@@ -1471,6 +1471,18 @@ struct WasmJitCPU::Impl {
             Dynarmic::IR::DumpBlock(ir).c_str());
         return fail("unsupported Dynarmic IR or terminal (no fallback)");
     }
+    // ExitReason::Exception: the guest reached an instruction Dynarmic
+    // translates to A32ExceptionRaised. Report it exactly like a block the
+    // emitter rejected, at the raising instruction instead of the block entry.
+    int exception_exit() {
+        state.regs[15] = state.fault_pc;
+        try {
+            return reject(vita3k::wasmjit::translate_block(*parent->mem,
+                state.fault_pc, state.cpsr, 1, state.fpscr));
+        } catch (const std::exception &error) {
+            return fail(error.what());
+        }
+    }
     bool unchanged(const Block &block) const {
         // M14.0 conservative coherence policy: revalidate executable bytes on
         // EVERY entry. This catches even trusted Ptr/HLE writes, remapping, and
@@ -2078,6 +2090,8 @@ struct WasmJitCPU::Impl {
                 continue;
             case ExitReason::Stop:
                 return 1;
+            case ExitReason::Exception:
+                return exception_exit();
             case ExitReason::EntryMiss:
                 // An AOT function does not own next_pc in the current mode.
                 // regs[15] still equals next_pc; resolve it lazily once.
@@ -2220,6 +2234,8 @@ struct WasmJitCPU::Impl {
                 }
                 return fail(message);
             }
+            if (reason == static_cast<uint32_t>(vita3k::wasmjit::ExitReason::Exception))
+                return exception_exit();
             if (!state.executed || state.executed > found->second.instruction_limit)
                 return fail("invalid generated instruction count");
             executed += state.executed;

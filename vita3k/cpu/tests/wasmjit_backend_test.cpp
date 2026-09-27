@@ -109,6 +109,7 @@ void equal_context(const CPUContext &a, const CPUContext &b) {
 #include "wasmjit_fpsqrt_tests.inc"
 #include "wasmjit_exclusive_tests.inc"
 #include "wasmjit_inline_mutex_tests.inc"
+#include "wasmjit_exception_tests.inc"
 
 void tls_read(MemState &mem) {
     CPUState parent{};
@@ -1654,12 +1655,12 @@ void region_store_continuations(MemState &mem, vita3k::wasmjit::RegionStateOptio
     CHECK(before_cond.CycleCount() == 1 && points.empty());
     CHECK(Location(before_cond.EndLocation()).PC() == code + 4);
 
-    // Continuing into UDF must preserve the supported prefix rather than
-    // reducing its arithmetic instructions to separate one-tick blocks.
+    // UDF raises at run time (ExitReason::Exception), so the block keeps
+    // the whole store-continued prefix and the raising instruction.
     const std::array<uint32_t, 3> suffix{0xe2800001, 0xe5810000, 0xe7f000f0};
     CHECK(mem_write(mem, code, suffix.data(), sizeof(suffix)));
     CHECK(form_region(mem, code, 0x10, 0, region, ir));
-    CHECK(region.blocks.front().ticks == 2 && region.blocks.front().store_continuations.empty());
+    CHECK(region.blocks.front().ticks == 3 && region.blocks.front().store_continuations.size() == 1);
 
     // The default cap is 2: four stores yield two continuations and the block
     // ends after the third store-delimited segment. An explicit cap of 0
@@ -1908,6 +1909,8 @@ int main() {
     scalar_binary32_batch(mem);
     scalar_fp_mode_guards(mem);
     floating_compare_trap_guard(mem);
+    exception_tests::emitted(mem);
+    exception_tests::guest(mem);
     backend(mem);
     formation(mem);
     region_exec(mem);

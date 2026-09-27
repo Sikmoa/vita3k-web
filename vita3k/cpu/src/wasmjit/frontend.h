@@ -26,8 +26,9 @@ namespace vita3k::wasmjit {
 // fetches aligned little-endian 32-bit words even for Thumb16: all four bytes
 // must be executable. No partial IR is returned on fetch failure. Serialize
 // against memory allocation, writes and protection changes, as for mem_fetch.
-// Unsupported guest instructions may translate to ExceptionRaised/Interpret;
-// the emitter must reject unsupported IR/terminals rather than silently skip.
+// Unsupported guest instructions may translate to ExceptionRaised/Interpret.
+// The emitter lowers ExceptionRaised to a fail-closed Exception exit and must
+// reject other unsupported IR/terminals rather than silently skip them.
 // The budget is an upper bound; conditional instructions can split earlier.
 // With store_continuations, unconditional region blocks may continue after
 // stores, up to max_store_continuations boundaries per block. The output is

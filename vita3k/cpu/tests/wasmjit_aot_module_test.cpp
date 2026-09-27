@@ -53,6 +53,10 @@ constexpr uint8_t kProgram[] = {
     0x70, 0x47, 0x00, 0xdf, 0x00, 0x00, 0x01, 0x81,
 };
 constexpr uint32_t kDone = kCode + 0x62;
+// A second AOT range: movs r0,#7; udf #0 (Thumb). The UDF block translates
+// (A32ExceptionRaised) and must fail at run time exactly like the lazy JIT.
+constexpr uint32_t kTrap = 0x81050000;
+constexpr uint8_t kTrapProgram[] = {0x07, 0x20, 0x00, 0xde};
 // classify(7) + 3 * 49 + sum(i*i + (i > 50)) for i < 100
 constexpr uint32_t kResult = 26 + 147 + 328350 + 49;
 
@@ -72,6 +76,9 @@ struct Fixture {
         CHECK(alloc_at(mem, kStack, 0x1000, "aot-stack") == kStack);
         CHECK(mem_write(mem, kCode, kProgram, sizeof(kProgram)));
         CHECK(mem_set_permissions(mem, kCode, 0x1000, MemPerm::ReadExecute));
+        CHECK(alloc_at(mem, kTrap, 0x1000, "aot-trap") == kTrap);
+        CHECK(mem_write(mem, kTrap, kTrapProgram, sizeof(kTrapProgram)));
+        CHECK(mem_set_permissions(mem, kTrap, 0x1000, MemPerm::ReadExecute));
     }
     ~Fixture() { deinit_mem(mem); }
 };
@@ -179,6 +186,8 @@ void build_and_load() {
     WasmJitCPU::AotBuildSpec spec;
     spec.code.push_back({kCode, sizeof(kProgram) & ~1u});
     spec.function_roots.push_back(WasmJitCPU::aot_location(kCode | 1));
+    spec.code.push_back({kTrap, sizeof(kTrapProgram)});
+    spec.function_roots.push_back(WasmJitCPU::aot_location(kTrap | 1));
     std::vector<uint8_t> image;
     std::string report;
     CHECK(WasmJitCPU::build_aot(fixture.mem, spec, image, report));
@@ -315,6 +324,26 @@ void write_epochs_recorded(bool aot) {
     CHECK(fixture.mem.write_epochs[kCode >> 12] != 77);
     CHECK((cpu.regions_formed() == 0) == aot);
 }
+// Lazy (before the module loads) and AOT runs of the trap program must fail
+// the same way: the emission-time rejection error, PC on the UDF, and the
+// MOVS before it executed.
+struct TrapOutcome {
+    std::string error;
+    uint32_t pc = 0, r0 = 0;
+    size_t regions = 0;
+};
+TrapOutcome run_trap() {
+    Fixture fixture;
+    CPUState parent{};
+    parent.mem = &fixture.mem;
+    WasmJitCPU cpu(&parent, 0);
+    cpu.set_region_mode(true);
+    cpu.set_reg(0, 0);
+    cpu.set_pc(kTrap | 1);
+    cpu.set_cpsr(0x30);
+    CHECK(cpu.run() < 0);
+    return {cpu.get_last_error(), cpu.get_pc(), cpu.get_reg(0), cpu.regions_formed()};
+}
 } // namespace
 
 int main() {
@@ -324,7 +353,13 @@ int main() {
     for (const uint64_t slice : {0u, 64u, 65u, 71u, 97u, 128u})
         check_same(oracle, run_lazy(slice));
     write_epochs_recorded(false);
+    const TrapOutcome lazy_trap = run_trap();
+    CHECK(lazy_trap.error == "unsupported Dynarmic IR or terminal (no fallback)");
+    CHECK(lazy_trap.pc == kTrap + 2 && lazy_trap.r0 == 7 && lazy_trap.regions != 0);
     build_and_load();
+    const TrapOutcome aot_trap = run_trap();
+    CHECK(aot_trap.error == lazy_trap.error && aot_trap.pc == lazy_trap.pc && aot_trap.r0 == lazy_trap.r0);
+    CHECK(aot_trap.regions == 0); // the AOT function raised, not a lazy region
     check_same(oracle, run_aot(0));
     for (const uint64_t slice : {1u, 2u, 3u, 7u, 50u, 1000u})
         check_same(oracle, run_aot(slice));
@@ -332,6 +367,6 @@ int main() {
     vector_min_max_flags();
     tls_addr_intrinsic();
     invalidation_retires_aot();
-    std::printf("AOT module: %u checks passed (interpreter oracle, lazy JIT, AOT with slices, write epochs, invalidation, VMIN/VMAX flags, TLS intrinsic)\n", checks);
+    std::printf("AOT module: %u checks passed (interpreter oracle, lazy JIT, AOT with slices, write epochs, invalidation, VMIN/VMAX flags, TLS intrinsic, UDF trap)\n", checks);
     return 0;
 }
