@@ -4,6 +4,8 @@
 #pragma once
 #include "guest_sync_delete_tests.h"
 #include <np/state.h>
+#include <algorithm>
+#include <vector>
 
 inline void test_guest_np_signaling(EmuEnvState &env, vita3k::web::GuestThreadRuntime &runtime) {
     constexpr uint32_t sig_init = 0x4B6ACF47, sig_term = 0xBC892D18, create_ctx = 0xF77EF683, destroy_ctx = 0xEAA4B1F3,
@@ -181,11 +183,41 @@ inline void test_guest_np_signaling(EmuEnvState &env, vita3k::web::GuestThreadRu
     }
     REQUIRE(call(activate, { ctx, peer3, conn_out }) == 0x800201b3); // full, and a host call cannot wait
     REQUIRE(word(0x30) == 0);
+    // Two threads waiting for room get connections of their own.
+    const Address peer_a = data + 0x8f0, peer_b = data + 0x920, out_a = data + 0x24, out_b = data + 0x28;
+    set_id(peer_a, "waiting a", 1);
+    set_id(peer_b, "waiting b", 1);
+    guest_sync_delete::build_call(env.mem, code + 0x800, activate, { counting, peer_a, out_a, 0, 0 }, data + 0x2c);
+    guest_sync_delete::build_call(env.mem, code + 0xa00, activate, { counting, peer_b, out_b, 0, 0 }, data + 0x34);
+    word(0x2c) = word(0x34) = 0xcccccccc;
+    std::vector<ThreadStatePtr> waiting;
+    for (const Address entry : { code + 0x800, code + 0xa00 }) {
+        auto t = env.kernel.create_thread(env.mem, "signaling waiter", Ptr<const void>(entry), SCE_KERNEL_DEFAULT_PRIORITY_USER,
+            SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
+        REQUIRE(t && t->start(0, Ptr<void>{}, false) == 0);
+        waiting.push_back(t);
+    }
+    run_until([&] { return waiting[0]->status == ThreadStatus::dormant && waiting[1]->status == ThreadStatus::dormant && word(0x30) == 66; });
+    REQUIRE(word(0x2c) == 0 && word(0x34) == 0 && word(0x24) != word(0x28));
+    REQUIRE(std::min(word(0x24), word(0x28)) > 0 && std::max(word(0x24), word(0x28)) == std::min(word(0x24), word(0x28)) + 1);
+    // A context without a handler is attached once, however often it
+    // activates; a context with one activating the same peer then gets it.
+    REQUIRE(call(create_ctx, { own, 0, 0, ctx_out }) == 0);
+    const uint32_t silent = word(0x10);
+    word(0x3c) = 1;
+    for (int i = 0; i < 9; ++i)
+        REQUIRE(call(activate, { silent, peer_a, conn_out }) == 0);
+    const uint32_t shared_id = word(0x14);
+    REQUIRE(call(activate, { ctx, peer_a, conn_out }) == 0 && word(0x14) == shared_id);
+    run_until([&] { return word(0x3c) == 2 && main_waiting(); });
+    REQUIRE(word(0x60) == ctx && word(0x64) == shared_id);
+    word(0x30) = 0;
+    REQUIRE(call(activate, { counting, peer3, conn_out }) == 0); // queued when Term comes
     guest_sync_delete::build_call(env.mem, code, sig_term, { 0, 0, 0, 0, 0 }, data + 0x20);
     word(0x20) = 0xcccccccc;
     REQUIRE(caller->start(0, Ptr<void>{}, false) == 0);
     run_until([&] { return caller->status == ThreadStatus::dormant && !env.kernel.threads.contains(main_thread); });
-    REQUIRE(word(0x20) == 0 && word(0x30) == 64 && !env.np.signaling_inited);
+    REQUIRE(word(0x20) == 0 && word(0x30) == 1 && !env.np.signaling_inited);
     free(env.mem, peers);
     REQUIRE(call(destroy_ctx, { ctx }) == 0x80552701);
     REQUIRE(runtime.shutdown());

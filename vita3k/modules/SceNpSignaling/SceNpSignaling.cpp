@@ -159,21 +159,27 @@ static SignalingRing &signaling_ring(EmuEnvState &emuenv) {
     return *Ptr<SignalingRing>(emuenv.np.signaling_code + signaling_code_words * 4).get(emuenv.mem);
 }
 
-// Posts an event to SceNpSignalingMain. While its ring is full a running
-// caller waits, as sceKernelSendMsgPipe does; false when it cannot wait
-// (SceNpSignalingMain itself, or a host-side call).
-static bool post_signaling_event(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, const SignalingEvent &event) {
+// Waits for room for one message in SceNpSignalingMain's ring, as
+// sceKernelSendMsgPipe waits on a full pipe: false when the caller cannot
+// wait (SceNpSignalingMain itself, or a host-side call). Other threads run
+// meanwhile.
+static bool wait_for_signaling_room(EmuEnvState &emuenv, const char *export_name, SceUID thread_id) {
     auto &np = emuenv.np;
-    auto &ring = signaling_ring(emuenv);
     const ThreadStatePtr caller = emuenv.kernel.get_thread(thread_id);
-    while (np.signaling_queued - ring.read >= signaling_ring_events) {
+    while (np.signaling_code && np.signaling_queued - signaling_ring(emuenv).read >= signaling_ring_events) {
         if (thread_id == np.signaling_main_thread || !caller || caller->status != ThreadStatus::run
             || CALL_EXPORT(sceKernelDelayThread, 1000) < 0)
             return false;
     }
-    ring.events[np.signaling_queued % signaling_ring_events] = event;
+    return np.signaling_code != 0; // sceNpSignalingTerm may have ended the thread meanwhile
+}
+
+// Writes an event there is room for; nothing runs in between.
+static void push_signaling_event(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, const SignalingEvent &event) {
+    auto &np = emuenv.np;
+    signaling_ring(emuenv).events[np.signaling_queued % signaling_ring_events] = event;
     ++np.signaling_queued;
-    return semaphore_signal(emuenv.kernel, export_name, thread_id, np.signaling_sema, 1) == 0;
+    semaphore_signal(emuenv.kernel, export_name, thread_id, np.signaling_sema, 1);
 }
 #endif
 
@@ -197,28 +203,47 @@ EXPORT(int, sceNpSignalingActivateConnection, SceInt32 ctx_id, np::SceNpId *peer
         return RET_ERROR(SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT);
     if (peer_id->isIdValid != 1)
         return RET_ERROR(SCE_NP_ERROR_INVALID_NPID);
-    const auto ctx = np.signaling_ctxs.find(ctx_id);
-    if (ctx == np.signaling_ctxs.end())
+    const auto found = np.signaling_ctxs.find(ctx_id);
+    if (found == np.signaling_ctxs.end())
         return RET_ERROR(SCE_NP_SIGNALING_ERROR_CTX_NOT_FOUND);
-    const np::SceNpId own_id = ctx->second.own_id;
+    const np::SceNpId own_id = found->second.own_id;
     if (same_np_id(emuenv, export_name, thread_id, own_id, *peer_id))
         return RET_ERROR(SCE_NP_SIGNALING_ERROR_OWN_NP_ID);
+    // Every activation sends a message: wait for room first, then decide on
+    // the connection with what is queued by then.
+    const np::SceNpId peer = *peer_id;
+    if (!wait_for_signaling_room(emuenv, export_name, thread_id)) {
+        if (!np.signaling_inited)
+            return RET_ERROR(SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED); // terminated meanwhile
+        return RET_ERROR(SCE_KERNEL_ERROR_MPP_FULL); // nothing can wait for room
+    }
+    if (!np.signaling_inited) {
+        // Terminated meanwhile, with room left in the ring.
+        return RET_ERROR(SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED);
+    }
+    // The context holds a reference: destroyed meanwhile, it gets no event.
+    const auto ctx = np.signaling_ctxs.find(ctx_id);
+    const uint32_t handler = ctx != np.signaling_ctxs.end() ? ctx->second.handler : 0;
+    const uint32_t arg = ctx != np.signaling_ctxs.end() ? ctx->second.arg : 0;
     auto &ring = signaling_ring(emuenv);
     // Events the thread has finished free their connections.
     while (!np.signaling_pending.empty() && np.signaling_pending.front().seq < ring.read)
         np.signaling_pending.pop_front();
     for (const auto &live : np.signaling_pending) {
-        if (!same_np_id(emuenv, export_name, thread_id, live.own_id, own_id) || !same_np_id(emuenv, export_name, thread_id, live.peer_id, *peer_id))
+        if (!same_np_id(emuenv, export_name, thread_id, live.own_id, own_id) || !same_np_id(emuenv, export_name, thread_id, live.peer_id, peer))
             continue;
         // Attached before its event is handled, the context gets it too;
-        // while it is being handled, no longer.
+        // while it is being handled, no longer. A destroyed context's entry
+        // (id 0) frees its place.
         auto &event = ring.events[live.seq % signaling_ring_events];
-        // A destroyed context's entry (no handler) is not this context,
-        // even when a new one took its id.
-        const bool attached = std::any_of(event.contexts, event.contexts + event.count,
-            [&](const auto &c) { return c.ctx_id == uint32_t(ctx_id) && c.handler; });
-        if (!attached && event.count < signaling_event_contexts)
-            event.contexts[event.count++] = { ctx->second.handler, static_cast<uint32_t>(ctx_id), ctx->second.arg };
+        const auto contexts = event.contexts, end = event.contexts + event.count;
+        if (ctx != np.signaling_ctxs.end() && std::none_of(contexts, end, [&](const auto &c) { return c.ctx_id == uint32_t(ctx_id); })) {
+            const auto freed = std::find_if(contexts, end, [](const auto &c) { return c.ctx_id == 0; });
+            if (freed != end)
+                *freed = { handler, static_cast<uint32_t>(ctx_id), arg };
+            else if (event.count < signaling_event_contexts)
+                event.contexts[event.count++] = { handler, static_cast<uint32_t>(ctx_id), arg };
+        }
         *conn_id = live.id;
         return 0;
     }
@@ -228,12 +253,10 @@ EXPORT(int, sceNpSignalingActivateConnection, SceInt32 ctx_id, np::SceNpId *peer
     event.conn_id = id;
     event.error = emuenv.netctl.inited ? SCE_NET_CTL_ERROR_NOT_CONNECTED : SCE_NET_CTL_ERROR_NOT_INITIALIZED;
     event.count = 1;
-    event.contexts[0] = { ctx->second.handler, static_cast<uint32_t>(ctx_id), ctx->second.arg };
-    const uint32_t seq = np.signaling_queued;
-    if (!post_signaling_event(emuenv, export_name, thread_id, event))
-        return RET_ERROR(SCE_KERNEL_ERROR_MPP_FULL); // nothing can wait for room
+    event.contexts[0] = { handler, ctx != np.signaling_ctxs.end() ? static_cast<uint32_t>(ctx_id) : 0, arg };
     np.signaling_last_conn_id = id;
-    np.signaling_pending.push_back({ seq, id, own_id, *peer_id });
+    np.signaling_pending.push_back({ np.signaling_queued, id, own_id, peer });
+    push_signaling_event(emuenv, export_name, thread_id, event);
     *conn_id = id;
     return 0;
 #else
@@ -278,7 +301,7 @@ EXPORT(int, sceNpSignalingDestroyCtx, SceInt32 ctx_id) {
         auto &event = ring.events[live.seq % signaling_ring_events];
         for (uint32_t i = 0; i < event.count; ++i) {
             if (event.contexts[i].ctx_id == uint32_t(ctx_id))
-                event.contexts[i].handler = 0;
+                event.contexts[i] = {}; // detached: no handler, place free
         }
     }
 #endif
@@ -393,8 +416,10 @@ EXPORT(int, sceNpSignalingTerm) {
     // Only a running guest thread can wait (not a host-side call).
     const ThreadStatePtr caller = emuenv.kernel.get_thread(thread_id);
     if (caller && caller->status == ThreadStatus::run && thread_id != np.signaling_main_thread
-        && post_signaling_event(emuenv, export_name, thread_id, stop))
+        && wait_for_signaling_room(emuenv, export_name, thread_id)) {
+        push_signaling_event(emuenv, export_name, thread_id, stop);
         CALL_EXPORT(sceKernelWaitThreadEnd, np.signaling_main_thread, nullptr, nullptr);
+    }
     semaphore_delete(emuenv.kernel, export_name, thread_id, np.signaling_sema);
     if (thread_id != np.signaling_main_thread) {
         if (const ThreadStatePtr main_thread = emuenv.kernel.get_thread(np.signaling_main_thread))

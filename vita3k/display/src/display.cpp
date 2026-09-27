@@ -31,6 +31,7 @@
 #include <renderer/state.h>
 
 #include <chrono>
+#include <vector>
 
 // Code heavily influenced by PPSSSPP's SceDisplay.cpp
 
@@ -48,7 +49,7 @@ static constexpr int max_expected_swapchain_size = 6;
 void advance_vblank(EmuEnvState &emuenv) {
     DisplayState &display = emuenv.display;
 
-    const std::lock_guard<std::mutex> guard(display.mutex);
+    std::unique_lock<std::mutex> guard(display.mutex);
 
     {
         const std::lock_guard<std::mutex> guard_info(display.display_info_mutex);
@@ -77,9 +78,10 @@ void advance_vblank(EmuEnvState &emuenv) {
 #endif
 
     // Notify Vblank callback in each VBLANK start
+    std::vector<SceUID> notified;
     for (auto &[_, cb] : display.vblank_callbacks) {
         cb->event_notify(cb->get_notifier_id());
-        wake_callback_wait(emuenv.kernel, cb->get_owner_thread_id());
+        notified.push_back(cb->get_owner_thread_id());
     }
 
     for (std::size_t i = 0; i < display.vblank_wait_infos.size();) {
@@ -93,6 +95,11 @@ void advance_vblank(EmuEnvState &emuenv) {
             i++;
         }
     }
+    // Waking takes the thread's lock, which wait_vblank holds while it takes
+    // display.mutex.
+    guard.unlock();
+    for (const SceUID owner : notified)
+        wake_callback_wait(emuenv.kernel, owner);
 }
 
 static void vblank_sync_thread(EmuEnvState &emuenv) {
