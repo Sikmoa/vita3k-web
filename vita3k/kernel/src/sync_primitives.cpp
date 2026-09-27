@@ -841,6 +841,8 @@ SceUID mutex_find(KernelState &kernel, const char *export_name, const char *pNam
     return RET_ERROR(SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_NAME);
 }
 
+inline static void mutex_release_locked(KernelState &kernel, Mutex &mutex, int unlock_count);
+
 inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, int lock_count, MutexPtr &mutex, SyncWeight weight, SceUInt *timeout, bool only_try) {
     if (LOG_SYNC_PRIMITIVES) {
         LOG_DEBUG("{}: uid: {} thread_id: {} name: \"{}\" attr: {} lock_count: {} timeout: {} waiting_threads: {}",
@@ -918,17 +920,27 @@ inline static int mutex_lock_impl(KernelState &kernel, MemState &mem, const char
     const auto data_it = mutex->waiting_threads->push(data);
     thread_lock.unlock();
 
+    auto wait_result = KernelExecutionHost::WaitResult::ready;
     int res = kernel.execution_host
-        ? handle_cooperative_wait(kernel, thread, thread_lock, mutex_lock, mutex->waiting_threads, timeout)
+        ? handle_cooperative_wait(kernel, thread, thread_lock, mutex_lock, mutex->waiting_threads, timeout, &wait_result)
         : handle_timeout(kernel, thread, thread_lock, mutex_lock, mutex->waiting_threads, data_it, export_name, timeout);
     if (kernel.execution_host && was_canceled)
         res = SCE_KERNEL_ERROR_WAIT_CANCEL;
+    // Unlock may hand ownership to this waiter after it was deleted but
+    // before it resumed; a dying thread must not keep the mutex.
+    if (kernel.execution_host && wait_result == KernelExecutionHost::WaitResult::cancelled) {
+        if (mutex->owner == thread)
+            mutex_release_locked(kernel, *mutex, lock_count);
+        res = SCE_KERNEL_ERROR_WAIT_CANCEL;
+    }
 
     if (weight == SyncWeight::Light) {
-        mutex->workarea.get(mem)->lockCount = mutex->lock_count;
-        if (mutex->owner == thread) {
-            mutex->workarea.get(mem)->owner = thread_id;
-        }
+        auto *work = mutex->workarea.get(mem);
+        work->lockCount = mutex->lock_count;
+        if (mutex->owner == thread)
+            work->owner = thread_id;
+        else if (kernel.execution_host) // the release above may have handed it on
+            work->owner = mutex->owner ? static_cast<uint32_t>(mutex->owner->id) : static_cast<uint32_t>(-1);
     }
 
     return res;
@@ -954,6 +966,40 @@ int mutex_try_lock(KernelState &kernel, MemState &mem, const char *export_name, 
     return mutex_lock_impl(kernel, mem, export_name, thread_id, lock_count, mutex, weight, nullptr, true);
 }
 
+// The caller holds mutex.mutex and an InlineMutexAccessGuard, and has checked
+// that the count does not underflow.
+inline static void mutex_release_locked(KernelState &kernel, Mutex &mutex, int unlock_count) {
+    mutex.lock_count -= unlock_count;
+
+    if (mutex.lock_count == 0) {
+        mutex.owner = nullptr;
+
+        while (!mutex.waiting_threads->empty()) {
+            const auto waiting_thread_data = *mutex.waiting_threads->begin();
+            const auto waiting_thread = waiting_thread_data.thread;
+            const auto waiting_lock_count = waiting_thread_data.lock_count;
+
+            const std::lock_guard<std::mutex> waiting_thread_lock(waiting_thread->mutex);
+            // Deletion wakes a parked waiter before its HLE continuation
+            // unlinks itself. Skip it and keep searching: ownership must
+            // never be handed to a cancelled waiter, nor lost behind it.
+            if (kernel.execution_host && waiting_thread->status != ThreadStatus::wait) {
+                *waiting_thread_data.was_canceled = true;
+                mutex.waiting_threads->pop();
+                continue;
+            }
+            if (!kernel.execution_host)
+                waiting_thread->update_status(ThreadStatus::run, ThreadStatus::wait);
+            mutex.waiting_threads->pop();
+            mutex.lock_count += waiting_lock_count;
+            mutex.owner = waiting_thread;
+            if (kernel.execution_host)
+                waiting_thread->update_status(ThreadStatus::run, ThreadStatus::wait);
+            break;
+        }
+    }
+}
+
 inline static int mutex_unlock_impl(KernelState &kernel, const char *export_name, SceUID thread_id, int unlock_count, MutexPtr &mutex) {
     const ThreadStatePtr current_thread = kernel.get_thread(thread_id);
 
@@ -965,35 +1011,7 @@ inline static int mutex_unlock_impl(KernelState &kernel, const char *export_name
             return RET_ERROR(SCE_KERNEL_ERROR_LW_MUTEX_UNLOCK_UDF);
         }
 
-        mutex->lock_count -= unlock_count;
-
-        if (mutex->lock_count == 0) {
-            mutex->owner = nullptr;
-
-            while (!mutex->waiting_threads->empty()) {
-                const auto waiting_thread_data = *mutex->waiting_threads->begin();
-                const auto waiting_thread = waiting_thread_data.thread;
-                const auto waiting_lock_count = waiting_thread_data.lock_count;
-
-                const std::lock_guard<std::mutex> waiting_thread_lock(waiting_thread->mutex);
-                // Deletion wakes a parked waiter before its HLE continuation
-                // unlinks itself. Skip it and keep searching: ownership must
-                // never be handed to a cancelled waiter, nor lost behind it.
-                if (kernel.execution_host && waiting_thread->status != ThreadStatus::wait) {
-                    *waiting_thread_data.was_canceled = true;
-                    mutex->waiting_threads->pop();
-                    continue;
-                }
-                if (!kernel.execution_host)
-                    waiting_thread->update_status(ThreadStatus::run, ThreadStatus::wait);
-                mutex->waiting_threads->pop();
-                mutex->lock_count += waiting_lock_count;
-                mutex->owner = waiting_thread;
-                if (kernel.execution_host)
-                    waiting_thread->update_status(ThreadStatus::run, ThreadStatus::wait);
-                break;
-            }
-        }
+        mutex_release_locked(kernel, *mutex, unlock_count);
     }
 
     return SCE_KERNEL_OK;

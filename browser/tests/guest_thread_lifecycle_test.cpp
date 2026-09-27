@@ -461,7 +461,7 @@ int main() {
         lw::build(env->mem, lw_code, lw_data);
         const auto word = [&](Address offset) -> uint32_t & { return *Ptr<uint32_t>(lw_data + offset).get(env->mem); };
         const auto waiter_word = [&](unsigned slot, Address offset) -> uint32_t & { return word(lw::waiter_area(slot) + offset); };
-        for (unsigned scenario = 0; scenario < 7; ++scenario) {
+        for (unsigned scenario = 0; scenario < 8; ++scenario) {
             env->kernel.call_import = [&](CPUState &cpu, uint32_t nid, SceUID tid) {
                 call_import(*env, cpu, nid, tid);
                 REQUIRE(env->missing_nids.empty());
@@ -599,6 +599,20 @@ int main() {
                 REQUIRE(cond->waiting_threads->empty() && w[0]->status == ThreadStatus::run);
                 w[0]->exit_delete(false);
                 run_until([&] { return !env->kernel.threads.contains(w[0]->id); });
+                REQUIRE(waiter_word(0, 4) == 0xcccccccc);
+            } else if (scenario == 7) {
+                // Ownership handed to a waiter parked on the re-acquire, which
+                // is then deleted before it resumes: the mutex must not stay
+                // owned by the dead thread.
+                auto signaler = thread("lwcond signaler", lw_code + 0x400);
+                word(lw::kSignaler) = 1;
+                run_until([&] { return word(lw::kSignaler + 0xc) == 1; });
+                REQUIRE(mutex->owner == signaler && mutex->waiting_threads->size() == 1);
+                REQUIRE(mutex_unlock(env->kernel, "fixture", signaler->id, mutex_id, 1, SyncWeight::Light) == 0);
+                REQUIRE(mutex->owner == w[0] && w[0]->status == ThreadStatus::run);
+                w[0]->exit_delete(false);
+                word(lw::kSignaler + 0x10) = 1;
+                run_until([&] { return !env->kernel.threads.contains(w[0]->id) && signaler->status == ThreadStatus::dormant; });
                 REQUIRE(waiter_word(0, 4) == 0xcccccccc);
             }
             REQUIRE(mutex_free());
