@@ -55,6 +55,16 @@
 // Null audio sink (hle_audio_null.cpp): no device in the web runtime.
 void vita3k_web_install_null_audio(struct AudioState &audio);
 
+// One event-loop turn without setTimeout's clamping: a Worker only commits its
+// OffscreenCanvas frame and resolves GPU map requests between tasks.
+EM_ASYNC_JS(void, web_yield_to_event_loop, (), {
+    await new Promise(resolve => {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = () => { channel.port1.close(); resolve(); };
+        channel.port2.postMessage(0);
+    });
+});
+
 namespace {
 
 // Staged launch configuration. Plain POD + std::string; set from JS/bench
@@ -315,7 +325,12 @@ static int run_app_impl() {
 
     ThreadStatePtr thread;
 #ifdef VITA3K_USE_WASM_JIT
-    vita3k::web::GuestThreadRuntime runtime;
+    // The Vita gives applications three CPU cores. VITA3K_GUEST_CORES=1
+    // restores the single-core scheduler (A/B measurement).
+    unsigned guest_cores = 3;
+    if (const char *cores = std::getenv("VITA3K_GUEST_CORES"))
+        guest_cores = static_cast<unsigned>(std::strtoul(cores, nullptr, 10));
+    vita3k::web::GuestThreadRuntime runtime(32768, 256 * 1024, 256 * 1024, guest_cores);
 #endif
     // Same vblank headroom as run_vita: without it the guest spends real time
     // in frame pacing instead of executing.
@@ -327,6 +342,7 @@ static int run_app_impl() {
     // Subtracting it, the JIT phase counters and the wall clock separates
     // "import handling" from "JIT compile" and "JIT dispatch".
     double hle_ms = 0.0;
+    unsigned frames_presented = 0;
     std::unordered_map<std::uint32_t, std::pair<unsigned, double>> hle_nids;
     const char *trace_option = std::getenv("VITA3K_TRACE_HLE");
     const bool trace_hle = trace_option && std::strcmp(trace_option, "1") == 0;
@@ -433,8 +449,10 @@ static int run_app_impl() {
                     std::fflush(stderr);
                 }
                 if (nid == 0x7A410B64 /* sceDisplaySetFrameBuf */
-                    || nid == 0xF51523CB /* _sceDisplaySetFrameBuf */)
+                    || nid == 0xF51523CB /* _sceDisplaySetFrameBuf */) {
                     vita3k_web_present_frame(*env);
+                    ++frames_presented;
+                }
                 // Module-start imports run before the main thread exists.
                 // Stop the importing thread, not a possibly-null main thread.
                 if (!env->missing_nids.empty()) {
@@ -536,6 +554,7 @@ static int run_app_impl() {
         double aot_until = 0;
         if (const char *until = std::getenv("VITA3K_AOT_UNTIL"))
             aot_until = std::strtod(until, nullptr);
+        unsigned frames_yielded = 0;
         do {
             if (aot_until > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - jit_started).count() >= aot_until) {
                 WasmJitCPU::disable_aot();
@@ -544,6 +563,10 @@ static int run_app_impl() {
             }
             progress = runtime.resume(256);
             dispatched += progress.dispatches;
+            if (frames_presented != frames_yielded) {
+                frames_yielded = frames_presented;
+                web_yield_to_event_loop();
+            }
             if (pc_sample_every && dispatched >= pc_sample_next) {
                 pc_sample_next = dispatched + pc_sample_every;
                 std::fprintf(stderr, "[vita3k-web] pc-sample dispatched=%zu threads=", dispatched);
@@ -552,6 +575,14 @@ static int run_app_impl() {
                         std::fprintf(stderr, " %d:%08x", tid, read_pc(*t->cpu));
                 }
                 std::fprintf(stderr, "\n");
+            }
+            // Every thread is parked but one waits on a timeout: the guest is
+            // idle until then (e.g. sceKernelDelayThread), not finished.
+            if (progress.idle && progress.next_deadline_us && !exited && !progress.failed) {
+                const auto now = vita3k::web::GuestThreadRuntime::now_us();
+                if (*progress.next_deadline_us > now)
+                    emscripten_sleep(static_cast<unsigned>((*progress.next_deadline_us - now + 999) / 1000));
+                progress.idle = false;
             }
         } while (!exited && env->missing_nids.empty() && !progress.failed
             && !progress.idle);

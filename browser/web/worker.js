@@ -84,6 +84,8 @@ try {
         // Region-cache size: unset keeps the built-in default (currently
         // 4096); a number overrides it for cache-size A/B runs.
         VITA3K_WASMJIT_REGION_CACHE: workerParams.get('regionCache') || undefined,
+        // Emulated guest CPU cores (vita_app.cpp); unset keeps the default.
+        VITA3K_GUEST_CORES: workerParams.get('cores') ?? undefined,
       });
       break;
     } catch (error) {

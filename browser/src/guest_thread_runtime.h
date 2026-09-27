@@ -58,9 +58,11 @@ public:
         std::optional<std::uint64_t> next_deadline_us;
     };
 
+    // `cores`: emulated CPUs (GuestFiberScheduler); thread affinity masks
+    // (SCE_KERNEL_CPU_MASK_USER_0 << n) select among them.
     explicit GuestThreadRuntime(std::uint64_t instructions_per_slice = 32768,
         std::size_t c_stack_bytes = 256 * 1024,
-        std::size_t asyncify_stack_bytes = 256 * 1024);
+        std::size_t asyncify_stack_bytes = 256 * 1024, unsigned cores = 1);
     ~GuestThreadRuntime();
     GuestThreadRuntime(const GuestThreadRuntime &) = delete;
     GuestThreadRuntime &operator=(const GuestThreadRuntime &) = delete;

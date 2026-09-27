@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "guest_fiber_scheduler.h"
 
 #include <emscripten/fiber.h>
@@ -40,9 +41,15 @@ struct GuestFiberScheduler::Impl {
         Stack asyncify_stack;
         emscripten_fiber_t fiber{};
         Task *next = nullptr;
+        // Aging penalty added to the priority while the task keeps using up
+        // whole slices without blocking; cleared when it parks.
+        int penalty = 0;
+        int effective() const noexcept { return priority + penalty; }
+        unsigned core_mask = 0;
+        unsigned last_core = 0;
 
-        Task(Impl &owner, TaskId id, int priority, Function function, void *argument)
-            : owner(owner), id(id), priority(priority), function(function), argument(argument),
+        Task(Impl &owner, TaskId id, int priority, Function function, void *argument, unsigned core_mask)
+            : owner(owner), id(id), priority(priority), function(function), argument(argument), core_mask(core_mask),
               c_stack(owner.c_stack_bytes), asyncify_stack(owner.root_stack.bytes) {
             emscripten_fiber_init(&fiber, &Impl::entry, this,
                 c_stack.data.get(), c_stack.bytes, asyncify_stack.data.get(), asyncify_stack.bytes);
@@ -57,13 +64,83 @@ struct GuestFiberScheduler::Impl {
     Task *ready = nullptr;
     Task *active = nullptr;
     TaskId next_id = 1;
+    unsigned cores = 1;
+    unsigned next_core = 0; // rotation position
+    // One logical CPU stands in for the Vita's three cores: a task that keeps
+    // exhausting slices loses effective priority step by step, so a busy-wait
+    // cannot starve the lower-priority thread it is waiting for.
+    static constexpr int kAgingStep = 16, kAgingCap = 512;
     // Deliberately process-global: this implementation supports ONE OS thread.
     static Impl *dispatch_owner;
 
-    Impl(GuestFiberScheduler &api, std::size_t c_bytes, std::size_t a_bytes)
-        : api(api), c_stack_bytes(c_bytes), root_stack(a_bytes) {
+    Impl(GuestFiberScheduler &api, std::size_t c_bytes, std::size_t a_bytes, unsigned core_count)
+        : api(api), c_stack_bytes(c_bytes), root_stack(a_bytes), cores(core_count) {
         if (c_bytes < 1024 || c_bytes % sizeof(StackBlock) != 0)
             throw std::invalid_argument("fiber stack size must be >=1024 and a multiple of 16");
+        if (core_count == 0 || core_count > max_cores)
+            throw std::invalid_argument("fiber scheduler core count out of range");
+    }
+
+    unsigned allowed(const Task &task) const noexcept {
+        const unsigned all = (1u << cores) - 1;
+        return (task.core_mask & all) ? task.core_mask & all : all;
+    }
+
+    // Give `task` a free allowed core (its previous one first), or else move
+    // already placed tasks along a chain of their other allowed cores to free
+    // one (augmenting path; depth is bounded by the core count).
+    bool place(Task *task, unsigned &visited, Task *(&claimed)[max_cores]) noexcept {
+        const unsigned mask = allowed(*task);
+        const auto core_at = [&](unsigned i) { return i == 0 ? task->last_core : (i <= task->last_core ? i - 1 : i); };
+        for (unsigned i = 0; i < cores; ++i) {
+            const unsigned core = core_at(i);
+            if ((mask >> core & 1) && !claimed[core]) {
+                claimed[core] = task;
+                return true;
+            }
+        }
+        for (unsigned i = 0; i < cores; ++i) {
+            const unsigned core = core_at(i);
+            if (!(mask >> core & 1) || (visited >> core & 1))
+                continue;
+            visited |= 1u << core;
+            if (place(claimed[core], visited, claimed)) {
+                claimed[core] = task;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Next task to dispatch, unlinked from the ready list. Ready tasks claim
+    // cores in priority order, rearranging earlier claims when that lets a
+    // later task run on an otherwise idle core; the claimed cores are then
+    // served round-robin.
+    Task *take_next() noexcept {
+        Task *claimed[max_cores] = {};
+        unsigned filled = 0;
+        for (Task *task = ready; task && filled < cores; task = task->next) {
+            unsigned visited = 0;
+            if (place(task, visited, claimed))
+                ++filled;
+        }
+        for (unsigned i = 0; i < cores; ++i) {
+            const unsigned core = (next_core + i) % cores;
+            Task *task = claimed[core];
+            if (!task)
+                continue;
+            next_core = (core + 1) % cores;
+            task->last_core = core;
+            for (Task **position = &ready; *position; position = &(*position)->next) {
+                if (*position == task) {
+                    *position = task->next;
+                    break;
+                }
+            }
+            task->next = nullptr;
+            return task;
+        }
+        return nullptr;
     }
 
     Task *find(TaskId id) const noexcept {
@@ -76,7 +153,7 @@ struct GuestFiberScheduler::Impl {
     // Intrusive sorted FIFO: suspension and waking never allocate or throw.
     void queue(Task *task) noexcept {
         Task **position = &ready;
-        while (*position && (*position)->priority <= task->priority)
+        while (*position && (*position)->effective() <= task->effective())
             position = &(*position)->next;
         task->next = *position;
         *position = task;
@@ -96,9 +173,13 @@ struct GuestFiberScheduler::Impl {
         std::abort(); // A completed fiber must NEVER be resumed.
     }
 
-    bool suspend(State state) noexcept {
+    bool suspend(State state, bool aged = false) noexcept {
         if (dispatch_owner != this || !active || std::uncaught_exceptions() != 0)
             return false;
+        if (state == State::parked)
+            active->penalty = 0;
+        else if (aged)
+            active->penalty = std::min(active->penalty + kAgingStep, kAgingCap);
         active->status.state = state;
         emscripten_fiber_swap(&active->fiber, &root);
         return true;
@@ -107,20 +188,20 @@ struct GuestFiberScheduler::Impl {
 
 GuestFiberScheduler::Impl *GuestFiberScheduler::Impl::dispatch_owner = nullptr;
 
-GuestFiberScheduler::GuestFiberScheduler(std::size_t c_bytes, std::size_t a_bytes)
-    : impl_(std::make_unique<Impl>(*this, c_bytes, a_bytes)) {}
+GuestFiberScheduler::GuestFiberScheduler(std::size_t c_bytes, std::size_t a_bytes, unsigned cores)
+    : impl_(std::make_unique<Impl>(*this, c_bytes, a_bytes, cores)) {}
 
 GuestFiberScheduler::~GuestFiberScheduler() {
     if (!teardown())
         std::terminate(); // Refuse destruction before unique_ptr can free live stacks.
 }
 
-GuestFiberScheduler::TaskId GuestFiberScheduler::enqueue(int priority, Function function, void *argument) {
+GuestFiberScheduler::TaskId GuestFiberScheduler::enqueue(int priority, Function function, void *argument, unsigned core_mask) {
     if (!function)
         return invalid_task;
     if (impl_->next_id == std::numeric_limits<TaskId>::max())
         throw std::overflow_error("fiber task IDs exhausted");
-    auto task = std::make_unique<Impl::Task>(*impl_, impl_->next_id, priority, function, argument);
+    auto task = std::make_unique<Impl::Task>(*impl_, impl_->next_id, priority, function, argument, core_mask);
     auto *pointer = task.get();
     impl_->tasks.push_back(std::move(task));
     ++impl_->next_id;
@@ -144,9 +225,7 @@ std::size_t GuestFiberScheduler::resume(std::size_t max_swaps) noexcept {
     emscripten_fiber_init_from_current_context(&self.root, self.root_stack.data.get(), self.root_stack.bytes);
     std::size_t swaps = 0;
     while (swaps < max_swaps && self.ready) {
-        auto *task = self.ready;
-        self.ready = task->next;
-        task->next = nullptr;
+        auto *task = self.take_next();
         self.active = task;
         emscripten_fiber_swap(&self.root, &task->fiber);
         self.active = nullptr;
@@ -158,8 +237,42 @@ std::size_t GuestFiberScheduler::resume(std::size_t max_swaps) noexcept {
     return swaps;
 }
 
-bool GuestFiberScheduler::yield() noexcept { return impl_->suspend(State::runnable); }
+bool GuestFiberScheduler::yield(bool aged) noexcept { return impl_->suspend(State::runnable, aged); }
+bool GuestFiberScheduler::should_yield() const noexcept {
+    const auto &self = *impl_;
+    return self.active && self.ready && self.ready->effective() <= self.active->effective();
+}
 bool GuestFiberScheduler::park() noexcept { return impl_->suspend(State::parked); }
+
+bool GuestFiberScheduler::set_priority(TaskId id, int priority) noexcept {
+    auto &self = *impl_;
+    auto *task = self.find(id);
+    if (!task)
+        return false;
+    if (task->priority == priority)
+        return true;
+    bool ready = false;
+    for (Impl::Task **position = &self.ready; *position; position = &(*position)->next) {
+        if (*position == task) {
+            *position = task->next;
+            task->next = nullptr;
+            ready = true;
+            break;
+        }
+    }
+    task->priority = priority;
+    if (ready)
+        self.queue(task);
+    return true;
+}
+
+bool GuestFiberScheduler::set_core_mask(TaskId id, unsigned core_mask) noexcept {
+    auto *task = impl_->find(id);
+    if (!task)
+        return false;
+    task->core_mask = core_mask;
+    return true;
+}
 
 bool GuestFiberScheduler::wake(TaskId id) noexcept {
     auto *task = impl_->find(id);

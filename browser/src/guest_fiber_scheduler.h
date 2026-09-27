@@ -22,8 +22,13 @@ public:
         bool failed; // Callback threw; exception was caught on its own fiber.
     };
 
+    // `cores` > 1 emulates that many CPUs on the one OS thread: every dispatch
+    // assigns ready tasks to cores by priority (within each task's core mask)
+    // and serves the cores in rotation, so tasks on different cores make
+    // progress together as they would in parallel.
+    static constexpr unsigned max_cores = 8;
     explicit GuestFiberScheduler(std::size_t c_stack_bytes = 64 * 1024,
-        std::size_t asyncify_stack_bytes = 64 * 1024);
+        std::size_t asyncify_stack_bytes = 64 * 1024, unsigned cores = 1);
     // Fail-fast if live tasks remain; never implicitly cancel continuations.
     ~GuestFiberScheduler();
     GuestFiberScheduler(const GuestFiberScheduler &) = delete;
@@ -34,7 +39,8 @@ public:
     // Enqueue only. Lower numeric priority wins; equals rotate FIFO on dispatch.
     // Argument is borrowed until completion. Null function returns invalid_task.
     // Allocation/invalid stack size exceptions are ordinary caller-side errors.
-    TaskId enqueue(int priority, Function function, void *argument = nullptr);
+    // `core_mask` bit n allows core n; 0 allows every core.
+    TaskId enqueue(int priority, Function function, void *argument = nullptr, unsigned core_mask = 0);
     std::optional<Status> status(TaskId id) const noexcept;
 
     // Root only; nested dispatch (even of another scheduler) returns zero.
@@ -43,10 +49,20 @@ public:
     std::size_t resume(std::size_t max_swaps) noexcept;
     // Only the active callback can suspend. Root calls return false.
     // Active tasks count as runnable. Resumption returns true at the same frame.
-    bool yield() noexcept;
+    // `aged`: the task used up its slice without blocking; it loses
+    // effective priority until it next parks (see kAgingStep).
+    bool yield(bool aged = false) noexcept;
     bool park() noexcept;
+    // Active task only: a ready task has an effective priority at least as
+    // good as the active one, so yielding now would switch.
+    bool should_yield() const noexcept;
     // Only parked->runnable; append behind existing equals, never execute eagerly.
     bool wake(TaskId id) noexcept;
+    // Guest priority change (sceKernelChangeThreadPriority): takes effect for
+    // the next dispatch decision, reordering the task if it is ready.
+    bool set_priority(TaskId id, int priority) noexcept;
+    // Guest affinity change (sceKernelChangeThreadCpuAffinityMask).
+    bool set_core_mask(TaskId id, unsigned core_mask) noexcept;
 
     // Root only. False leaves everything intact if any task is live (including
     // never-started or parked). True frees only terminal, non-resumable tasks.

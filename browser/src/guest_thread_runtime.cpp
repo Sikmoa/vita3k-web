@@ -5,6 +5,7 @@
 #include <cpu/functions.h>
 #include <cpu/impl/wasm_jit_cpu.h>
 #include <display/functions.h>
+#include <display/state.h>
 #include <emuenv/state.h>
 #include <kernel/state.h>
 #include <kernel/sync_primitives.h>
@@ -61,6 +62,9 @@ bool unsupported_import(uint32_t nid) {
 
 struct GuestThreadRuntime::Impl final : KernelExecutionHost {
     using Scheduler = GuestFiberScheduler;
+    // Instructions charged per run_cpu return, so a thread that makes HLE
+    // calls every few instructions still reaches its slice.
+    static constexpr uint64_t kHleCharge = 256;
     struct Record {
         Impl &owner;
         ThreadStatePtr thread;
@@ -69,6 +73,11 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
         bool faulted = false;
         std::optional<uint64_t> deadline;
         ThreadStatePtr joining;
+        // Guest work since this thread last gave up the CPU (instructions
+        // plus a fixed charge per HLE call).
+        uint64_t since_yield = 0;
+        int priority = 0; // last priority handed to the scheduler
+        SceInt32 affinity = 0; // last affinity mask handed to the scheduler
         Record(Impl &owner, ThreadStatePtr thread) : owner(owner), thread(std::move(thread)) {}
     };
 
@@ -91,7 +100,7 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
     decltype(KernelState::run_module_entry) saved_module;
     static Impl *attached_owner;
 
-    Impl(uint64_t slice, std::size_t c, std::size_t a) : scheduler(c, a), slice(slice) {
+    Impl(uint64_t slice, std::size_t c, std::size_t a, unsigned cores) : scheduler(c, a, cores), slice(slice) {
         if (slice < 128)
             throw std::invalid_argument("guest slice must fit a conservative 128-tick block");
     }
@@ -117,7 +126,9 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
         if (!inserted)
             return false;
         try {
-            pointer->task = scheduler.enqueue(thread->priority, &entry, pointer);
+            pointer->priority = thread->priority;
+            pointer->affinity = thread->affinity_mask;
+            pointer->task = scheduler.enqueue(thread->priority, &entry, pointer, core_mask(thread->affinity_mask));
         } catch (...) {
             records.erase(it);
             return false;
@@ -202,17 +213,18 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
             scheduler.wake(r.task); // enqueue only, safe under production locks
     }
 
-    void suspend(bool parked) {
+    void suspend(bool parked, bool aged = false) {
         auto *r = active;
         if (!r || !dispatching)
             throw std::logic_error("guest continuation invoked outside its runtime fiber");
+        r->since_yield = 0;
         auto *cpu = get_current_cpu_state();
         clear_exclusive(*r->thread->cpu);
         // The dispatch map is per-core, so a switch needs no invalidation:
         // each core keeps its compiled state resident across suspensions.
         active = nullptr;
         set_current_cpu_state(root_cpu);
-        const bool switched = parked ? scheduler.park() : scheduler.yield();
+        const bool switched = parked ? scheduler.park() : scheduler.yield(aged);
         set_current_cpu_state(cpu);
         activate(*r);
         if (!switched)
@@ -236,14 +248,42 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
                 ~CommitInlineMutexes() noexcept { mutex_inline_commit(kernel, thread); }
             } commit{*kernel, active->thread};
             jit.set_inline_mutex_table(kernel->inline_mutex_table.get());
+            const uint64_t before = jit.instructions_executed();
             result = single_step ? jit.step() : jit.run_slice(slice);
+            active->since_yield += jit.instructions_executed() - before + kHleCharge;
         }
         if (result < 0 && !active->faulted) {
             active->faulted = true;
         }
         return result == WasmJitCPU::slice_yield ? 0 : result;
     }
-    void checkpoint(ThreadState &) override { suspend(false); }
+    // Called after every run_cpu return (slice end or serviced SVC). Switch
+    // only when the slice is used up (aging the thread) or a ready thread is
+    // at least as urgent, e.g. one this HLE call just woke. Otherwise keep
+    // running: each needless switch costs two Asyncify stack unwinds.
+    // The kernel changes ThreadState::priority in place; mirror it into the
+    // scheduler before any dispatch decision.
+    // SCE_KERNEL_CPU_MASK_USER_0..2 are bits 16..18; 0 (default) allows any core.
+    static unsigned core_mask(SceInt32 affinity) noexcept { return (static_cast<uint32_t>(affinity) >> 16) & 7; }
+    void sync_priorities() noexcept {
+        for (auto &[id, record] : records) {
+            if (record->priority != record->thread->priority) {
+                record->priority = record->thread->priority;
+                scheduler.set_priority(record->task, record->priority);
+            }
+            if (record->affinity != record->thread->affinity_mask) {
+                record->affinity = record->thread->affinity_mask;
+                scheduler.set_core_mask(record->task, core_mask(record->affinity));
+            }
+        }
+    }
+    void checkpoint(ThreadState &) override {
+        sync_priorities();
+        const bool exhausted = active && active->since_yield >= slice;
+        if (!exhausted && !scheduler.should_yield())
+            return;
+        suspend(false, exhausted);
+    }
     void park(ThreadState &) override { suspend(true); }
     bool stopping() const noexcept override { return stopping_; }
 
@@ -393,6 +433,14 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
             if (r.deadline && (!p.next_deadline_us || *r.deadline < *p.next_deadline_us))
                 p.next_deadline_us = r.deadline;
         }
+        // Vblank waiters have no deadline of their own; the next emulated
+        // vblank (service_vblank) is theirs.
+        if (env && !env->display.fast_vblank && !env->display.vblank_wait_infos.empty()) {
+            const uint64_t vblank = std::chrono::duration_cast<std::chrono::microseconds>(
+                env->display.next_vblank_time.time_since_epoch()).count();
+            if (!p.next_deadline_us || vblank < *p.next_deadline_us)
+                p.next_deadline_us = vblank;
+        }
         p.idle = p.runnable == 0;
         return p;
     }
@@ -413,8 +461,8 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
 };
 
 GuestThreadRuntime::Impl *GuestThreadRuntime::Impl::attached_owner = nullptr;
-GuestThreadRuntime::GuestThreadRuntime(uint64_t slice, std::size_t c, std::size_t a)
-    : impl_(std::make_unique<Impl>(slice, c, a)) {}
+GuestThreadRuntime::GuestThreadRuntime(uint64_t slice, std::size_t c, std::size_t a, unsigned cores)
+    : impl_(std::make_unique<Impl>(slice, c, a, cores)) {}
 GuestThreadRuntime::~GuestThreadRuntime() {
     if (!shutdown())
         std::terminate();

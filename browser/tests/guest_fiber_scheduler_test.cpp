@@ -1,5 +1,6 @@
 #include "../src/guest_fiber_scheduler.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -107,6 +108,49 @@ static void priority_test() {
     CHECK(s.resume(100) == 12);
     CHECK((trace == std::vector<int>{0, 0, 0, 1, 2, 1, 2, 1, 2, 9, 9, 9}));
     CHECK(s.teardown());
+}
+
+// Three emulated cores: ready tasks claim cores by priority within their
+// masks and the claimed cores run in rotation, so a lower-priority task on
+// another core interleaves with a higher-priority one instead of waiting.
+static void smp_test() {
+    Scheduler s(64 * 1024, 64 * 1024, 3);
+    std::vector<int> trace;
+    Rotation pinned{trace, 1}, any{trace, 0}, other{trace, 2}, waiting{trace, 3};
+    s.enqueue(0, rotating_task, &pinned, 0b010); // core 1 only
+    s.enqueue(10, rotating_task, &any);
+    s.enqueue(20, rotating_task, &other);
+    s.enqueue(30, rotating_task, &waiting); // every core is claimed by better tasks
+    CHECK(s.resume(100) == 12);
+    CHECK((trace == std::vector<int>{0, 1, 2, 0, 1, 2, 0, 1, 2, 3, 3, 3}));
+    CHECK(s.teardown());
+    // Two equal unrestricted tasks must not keep a lower-priority task pinned
+    // to core 0 off the machine while core 2 is free.
+    Scheduler relocate(64 * 1024, 64 * 1024, 3);
+    trace.clear();
+    Rotation first{trace, 0}, second{trace, 1}, pinned_low{trace, 2};
+    relocate.enqueue(100, rotating_task, &first);
+    relocate.enqueue(100, rotating_task, &second);
+    relocate.enqueue(101, rotating_task, &pinned_low, 0b001);
+    CHECK(relocate.resume(3) == 3);
+    CHECK(std::count(trace.begin(), trace.begin() + 3, 2) == 1);
+    CHECK(relocate.resume(100) == 6);
+    CHECK(relocate.teardown());
+    // A pinned task can need a chain of moves: A (cores 0,1) and B (cores
+    // 1,2) must shift to 1 and 2 so C, pinned to core 0, runs.
+    Scheduler chain(64 * 1024, 64 * 1024, 3);
+    trace.clear();
+    Rotation chain_a{trace, 0}, chain_b{trace, 1}, chain_c{trace, 2};
+    chain.enqueue(100, rotating_task, &chain_a, 0b011);
+    chain.enqueue(100, rotating_task, &chain_b, 0b110);
+    chain.enqueue(101, rotating_task, &chain_c, 0b001);
+    CHECK(chain.resume(3) == 3);
+    CHECK(std::count(trace.begin(), trace.begin() + 3, 2) == 1);
+    CHECK(chain.resume(100) == 6);
+    CHECK(chain.teardown());
+    bool rejected = false;
+    try { Scheduler invalid(64 * 1024, 64 * 1024, 0); } catch (const std::invalid_argument &) { rejected = true; }
+    CHECK(rejected);
 }
 
 struct Parked {
@@ -230,8 +274,9 @@ int main(int argc, char **argv) {
     park_wake_test();
     exception_test();
     reentrancy_test();
+    smp_test();
     bool rejected = false;
     try { Scheduler invalid(1025); } catch (const std::invalid_argument &) { rejected = true; }
     CHECK(rejected);
-    std::printf("guest_fiber_scheduler: 6 test groups passed (pointer bits=%zu)\n", sizeof(void *) * 8);
+    std::printf("guest_fiber_scheduler: 7 test groups passed (pointer bits=%zu)\n", sizeof(void *) * 8);
 }
