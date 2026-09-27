@@ -118,9 +118,17 @@ EXPORT(int, sceCommonDialogSetConfigParam) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceCommonDialogUpdate) {
-    TRACY_FUNC(sceCommonDialogUpdate);
-    return UNIMPLEMENTED();
+// The running dialog is drawn by the host (the desktop overlay, the browser
+// page), not into updateParam's render target, so an update only advances
+// the dialogs the host completes by time.
+EXPORT(int, sceCommonDialogUpdate, const SceCommonDialogUpdateParam *updateParam) {
+    TRACY_FUNC(sceCommonDialogUpdate, updateParam);
+    if (!updateParam)
+        return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NULL);
+    if (!emuenv.renderer)
+        return RET_ERROR(SCE_COMMON_DIALOG_ERROR_GXM_IS_UNINITIALIZED);
+    complete_trophy_setup_dialog(emuenv.common_dialog);
+    return 0;
 }
 
 EXPORT(int, sceCompanionUtilDialogAbort) {

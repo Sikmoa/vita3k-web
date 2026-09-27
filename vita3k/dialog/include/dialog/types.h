@@ -140,6 +140,27 @@ enum SceCommonDialogErrorCode : uint32_t {
     SCE_COMMON_DIALOG_ERROR_UNEXPECTED_FATAL = 0x8002047F
 };
 
+// sceCommonDialogUpdate: the frame the system would draw the running dialog
+// into. GXM enums are kept as their 32-bit values.
+struct SceCommonDialogRenderTargetInfo {
+    Ptr<void> depthSurfaceData;
+    Ptr<void> colorSurfaceData;
+    uint32_t surfaceType; // SceGxmColorSurfaceType
+    uint32_t colorFormat; // SceGxmColorFormat
+    uint32_t width;
+    uint32_t height;
+    uint32_t strideInPixels;
+    uint8_t reserved[32];
+};
+static_assert(sizeof(SceCommonDialogRenderTargetInfo) == 0x3C);
+
+struct SceCommonDialogUpdateParam {
+    SceCommonDialogRenderTargetInfo renderTarget;
+    Ptr<void> displaySyncObject; // SceGxmSyncObject
+    uint8_t reserved[32];
+};
+static_assert(sizeof(SceCommonDialogUpdateParam) == 0x60);
+
 #define SCE_IME_DIALOG_MAX_TITLE_LENGTH 128
 #define SCE_IME_DIALOG_MAX_TEXT_LENGTH 2048
 
