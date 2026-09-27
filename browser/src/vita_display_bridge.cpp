@@ -29,6 +29,7 @@
 #define EMSCRIPTEN_KEEPALIVE
 #endif
 
+#include "gxm_webgpu_bridge.h"
 #include "vita_runtime.h"
 
 namespace {
@@ -78,6 +79,15 @@ void vita3k_web_present_frame(EmuEnvState &emuenv) {
     if (info.pixelformat != SCE_DISPLAY_PIXELFORMAT_A8B8G8R8) {
         // The real HLE only accepts A8B8G8R8; anything else is a bug upstream
         // of this bridge. Refuse silently rather than presenting garbage.
+        return;
+    }
+
+    // GXM-rendered frames live on the GPU (gxm_webgpu_bridge.cpp): present
+    // the target there instead of reading guest memory, which never
+    // receives rendered pixels.
+    if (browser::gxm_present_gpu_target(info.base.address())) {
+        bridge.last_frame_instructions = guest_instructions_executed(emuenv);
+        ++bridge.posted_generation;
         return;
     }
 

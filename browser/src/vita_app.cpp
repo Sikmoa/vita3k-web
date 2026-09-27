@@ -24,6 +24,7 @@
 #ifdef VITA3K_USE_WASM_JIT
 #include <cpu/impl/wasm_jit_cpu.h>
 #include "guest_thread_runtime.h"
+#include "gxm_webgpu_bridge.h"
 #endif
 #include <ctrl/state.h>
 #include <display/state.h>
@@ -609,6 +610,7 @@ static int run_app_impl() {
 #endif
 #ifdef VITA3K_USE_WASM_JIT
         jit_report("final", true);
+        browser::gxm_survey_report();
         if (const char *seeds = std::getenv("VITA3K_AOT_SEEDS_OUT"))
             std::printf("[vita3k-web] AOT seeds -> %s: %s\n", seeds,
                 WasmJitCPU::dump_aot_seeds(seeds) ? "ok" : "FAILED");

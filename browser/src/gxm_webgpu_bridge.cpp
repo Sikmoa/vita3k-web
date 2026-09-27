@@ -1,5 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Browser-only consumer of the production renderer command ABI. No GL/Vulkan.
+//
+// Each GXM command list (one scene) becomes one GXS1 stream for
+// browser/web/gxm_scene.js: pass begin/end, draws with their fixed-function
+// state, and the vertex/index/uniform/texture bytes the draws reference, all
+// copied at submission so the guest may reuse its buffers immediately. The
+// stream is submitted synchronously and never read back: render targets live
+// on the GPU, sampled directly when a texture aliases one, and are presented
+// from there. Command-list completion (notifications, sync objects) is
+// therefore published as soon as the scene is submitted, as before.
 #include "gxm_webgpu_bridge.h"
 #include "gxm_webgpu_program.h"
 #include <display/state.h>
@@ -10,86 +19,134 @@
 #include <mem/functions.h>
 #include <renderer/functions.h>
 #include <renderer/state.h>
+#include <util/align.h>
 #include <emscripten.h>
-#include <mutex>
-#include <stdexcept>
+#define XXH_INLINE_ALL
+#include <xxhash.h>
+#include <fmt/format.h>
+#include <algorithm>
 #include <array>
-#include <vector>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <exception>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <stdexcept>
+#include <unordered_map>
+#include <vector>
 
-// Suspend only the host HLE stack: JIT regions have returned at the SVC boundary.
-// The imported module owns the device; rejection must never signal completion.
-EM_ASYNC_JS(int, web_gxm_fence, (), {
+// Device and GXP compiler: once, at sceGxmInitialize (the calling guest thread
+// may suspend). Benchmark-only VITA3K_NULL_GPU (see host_abi.js) keeps every
+// scene call a no-op so the CPU path runs under Node.
+EM_ASYNC_JS(int, web_gxm_init, (), {
+    if (Module['vita3kNullGpu']) return 0;
     try {
-        const bridge = await import(new URL('gxm_hle_bridge.js', globalThis.location.href).href);
-        await bridge.finishGuestQueue();
-        out('[vita3k-web] GXM WebGPU queue fence completed');
+        const scene = await import(new URL('gxm_scene.js', globalThis.location.href).href);
+        const base = globalThis.location.href;
+        await scene.init({
+            compilerURL: new URL('shaders/gxp_compiler.mjs', base).href,
+            nagaURL: new URL('shaders/naga.wasm', base).href,
+            wasiShimURL: new URL('shaders/wasi/index.js', base).href,
+            logger: message => err(message),
+        });
+        Module['vita3kGxm'] = scene;
+        if (globalThis.vita3kGxmReady) globalThis.vita3kGxmReady(scene);
         return 0;
     } catch (error) {
-        err('[vita3k-web] GXM WebGPU fence failed: ' + error);
+        err('[vita3k-web] GXM WebGPU initialization failed: ' + (error.stack || error));
+        return -1;
+    }
+});
+// GXP -> WGSL for one program, the first time a draw uses it.
+EM_ASYNC_JS(int, web_gxm_register_program, (uint32_t id, const void *gxp, uint32_t size, int fragment), {
+    const scene = Module['vita3kGxm'];
+    if (!scene) return 0;
+    try {
+        await scene.registerProgram(id, Module['vita3kHostBytes'](gxp, size).slice(), fragment !== 0);
+        return 0;
+    } catch (error) {
+        err('[vita3k-web] GXP program ' + id + ' translation failed: ' + (error.stack || error));
+        return -1;
+    }
+});
+EM_JS(int, web_gxm_submit, (const uint32_t *words, uint32_t count, const uint8_t *data, uint32_t size), {
+    const scene = Module['vita3kGxm'];
+    if (!scene) return 0;
+    try {
+        const offset = Module['vita3kHostOffset'](words, count * 4);
+        scene.submitScene(new Uint32Array(wasmMemory.buffer, offset, count),
+            Module['vita3kHostBytes'](data, size));
+        return 0;
+    } catch (error) {
+        err('[vita3k-web] GXM scene submission failed: ' + (error.stack || error));
         return -1;
     }
 });
 
-EM_ASYNC_JS(int, web_gxm_fill, (uint32_t color, uint32_t width, uint32_t height, uint32_t stride, void *dest), {
-    try {
-        const bridge = await import(new URL('gxm_hle_bridge.js', globalThis.location.href).href);
-        const pixels = await bridge.fillGuestSurface(color, width, height);
-        // Reacquire the memory view after suspension; never retain a heap view
-        // across device work or copy padded WebGPU rows into guest storage.
-        const bytes = Module['vita3kHostBytes'](dest, (height - 1) * stride + width * 4);
-        for (let y = 0; y < height; ++y)
-            bytes.set(pixels.subarray(y * width * 4, (y + 1) * width * 4), y * stride);
-        out('[vita3k-web] GXM WebGPU transfer fill readback completed');
-        return 0;
-    } catch (error) {
-        err('[vita3k-web] GXM WebGPU fill failed: ' + error + ' dest=' + dest
-            + ' byteLength=' + wasmMemory.buffer.byteLength);
-        return -1;
-    }
+// Presents the GPU render target at `address` (1) or reports that none exists
+// there (0). Frames go to the Worker's page hook; pixels are read back only
+// every Module.VITA3K_FRAME_READBACK frames (0 = never; default every frame
+// when the page attached no canvas, else never).
+EM_JS(int, web_gxm_present, (uint32_t address), {
+    const scene = Module['vita3kGxm'];
+    if (!scene) return 0;
+    const configured = Module['VITA3K_FRAME_READBACK'];
+    const every = configured !== undefined ? Number(configured) : (globalThis.vita3kHasCanvas ? 0 : 1);
+    return scene.presentTarget(address >>> 0, (generation, width, height, pixels) => {
+        if (globalThis.vita3kWebOnGpuFrame) globalThis.vita3kWebOnGpuFrame(generation, width, height, pixels);
+    }, every) ? 1 : 0;
 });
 
-EM_ASYNC_JS(int, web_gxm_draw, (const void *packet, uint32_t size, uint32_t width, uint32_t height, uint32_t stride, void *dest), {
-    try {
-        const owned = Module['vita3kHostBytes'](packet, size).slice();
-        const initial = new Uint8Array(width * height * 4);
-        const source = Module['vita3kHostBytes'](dest, (height - 1) * stride + width * 4);
-        for (let y = 0; y < height; ++y)
-            initial.set(source.subarray(y * stride, y * stride + width * 4), y * width * 4);
-        const bridge = await import(new URL('gxm_hle_bridge.js', globalThis.location.href).href);
-        const pixels = await bridge.drawGuestSurface(owned, initial, width, height);
-        const bytes = Module['vita3kHostBytes'](dest, (height - 1) * stride + width * 4);
-        for (let y = 0; y < height; ++y)
-            bytes.set(pixels.subarray(y * width * 4, (y + 1) * width * 4), y * stride);
-        out('[vita3k-web] GXM WebGPU GXP indexed draw readback completed');
-        return 0;
-    } catch (error) {
-        err('[vita3k-web] GXM WebGPU draw failed: ' + (error.stack || error));
-        return -1;
-    }
+// Benchmark survey (VITA3K_GXM_SURVEY=1 with VITA3K_NULL_GPU=1): a command the
+// consumer cannot represent is counted and skipped instead of failing the
+// guest thread, so one Node run lists every GXM feature a title needs.
+EM_JS(int, web_gxm_survey_enabled, (), {
+    return (Module['vita3kNullGpu'] && (Module['VITA3K_GXM_SURVEY'] === '1'
+        || (typeof process !== 'undefined' && process.env?.VITA3K_GXM_SURVEY === '1'))) ? 1 : 0;
 });
 
 namespace {
+// Host milliseconds per stage, reported with the run progress.
+struct Timing { double build = 0, decode = 0, submit = 0; unsigned decodes = 0; };
+Timing &timing() {
+    static Timing t;
+    return t;
+}
+bool survey_mode() {
+    static const bool enabled = web_gxm_survey_enabled() != 0;
+    return enabled;
+}
+std::map<std::string, uint64_t> &survey_counts() {
+    static std::map<std::string, uint64_t> counts;
+    return counts;
+}
 [[noreturn]] void unsupported(const char *what) {
     throw std::runtime_error(std::string("WebGPU GXM unsupported: ") + what);
 }
+// A draw the consumer cannot represent yet is skipped and reported once per
+// reason (the scene and the guest thread continue), like the desktop backends.
+void skip_draw(const std::string &why) {
+    auto &count = survey_counts()[why];
+    if (count++ == 0)
+        std::printf("[gxm-skip] %s\n", why.c_str());
+}
+
+struct TextureUnit {
+    bool bound = false;
+    SceGxmTexture texture{};
+};
+
 struct WebContext final : renderer::Context {
     bool has_surface = false;
-    // Recorded GXM viewport state: [xOffset, yOffset, zOffset, xScale, yScale, zScale].
-    // has_viewport tracks whether a Viewport command arrived; a draw without one
-    // is rejected rather than rendered with an implicit viewport.
-    std::array<float, 6> viewport{};
     bool has_viewport = false;
-    std::array<uint32_t, 4> clip{};
+    std::array<float, 6> viewport{};  // xOffset, yOffset, zOffset, xScale, yScale, zScale
     std::array<std::vector<uint8_t>, 2> uniforms;
-    bool has_fragment_texture = false;
-    SceGxmTexture fragment_texture{}; // Command-owned descriptor, not a guest pointer.
-    // Depth-stencil attachment presence. The descriptor itself stays in
-    // record.depth_stencil_surface; a null or disabled guest surface clears it
-    // exactly like scene.cpp handle_set_context.
-    bool has_depth = false;
+    std::array<TextureUnit, 16> fragment_textures{};
+    std::array<TextureUnit, 16> vertex_textures{};
+    SceGxmDepthStencilSurface depth{};
+    bool has_depth_surface = false;
 };
 
 struct WebState final : renderer::State {
@@ -115,10 +172,21 @@ struct WebState final : renderer::State {
     void precompile_shader(const renderer::ShadersHash &) override { unsupported("native shader cache"); }
     void preclose_action() override {}
 };
-}
+} // namespace
+
 namespace browser {
+void gxm_timing_report() {
+    const auto &t = timing();
+    std::printf("[gxm] scene_ms=%.0f (decode_ms=%.0f decodes=%u js_submit_ms=%.0f)\n", t.build, t.decode, t.decodes, t.submit);
+}
+void gxm_survey_report() {
+    for (const auto &[reason, count] : survey_counts())
+        std::printf("[gxm-%s] %8llu %s\n", survey_mode() ? "survey" : "skip",
+            static_cast<unsigned long long>(count), reason.c_str());
+}
 int gxm_initialize(EmuEnvState &env) {
     if (env.renderer) return SCE_GXM_ERROR_ALREADY_INITIALIZED;
+    if (web_gxm_init() != 0) return SCE_GXM_ERROR_DRIVER;
     env.renderer = std::make_unique<WebState>(env.mem);
     env.gxm.notification_region = Ptr<uint32_t>(alloc(env.mem, 1024 * 1024, "SceGxmNotificationRegion"));
     if (!env.gxm.notification_region) { env.renderer.reset(); return SCE_GXM_ERROR_DRIVER; }
@@ -163,6 +231,7 @@ int gxm_terminate(EmuEnvState &env) {
     return 0;
 }
 }
+
 namespace renderer {
 SyncWaitResult wishlist(SceGxmSyncObject *sync, uint32_t timestamp, int32_t timeout_micros) {
     const double start = emscripten_get_now();
@@ -328,175 +397,405 @@ static void require_guest(MemState &mem, Address address, size_t size) {
         unsupported("invalid guest draw range");
 }
 
-// Guest depth bytes per sample, mirroring vulkan surface_cache.
-static uint32_t depth_bytes_per_sample(SceGxmDepthStencilFormat format) {
-    switch (format) {
-    case SCE_GXM_DEPTH_STENCIL_FORMAT_S8:
-        return 1;
-    case SCE_GXM_DEPTH_STENCIL_FORMAT_D16:
-        return 2;
-    default:
-        return 4;
+// --- GXS1 scene stream (browser/web/gxm_scene.js is the only consumer) -------
+namespace scene {
+constexpr uint32_t kMagic = 0x31535847; // "GXS1"
+enum Command : uint32_t { BeginPass = 1, Draw = 2, Texture = 3, EndPass = 4, ClearTarget = 5, Region = 6 };
+// Dynamic uniform/storage offsets must honour WebGPU's 256-byte minimum.
+constexpr size_t kUniformAlign = 256;
+
+struct Writer {
+    std::vector<uint32_t> words;
+    std::vector<uint8_t> data;
+    bool pass_open = false;
+    // Open pass: its color address and the index of its snapshot flag word.
+    Address pass_address = 0;
+    size_t pass_begin_word = 0, pass_snapshot_word = 0;
+    std::vector<uint32_t> pass_regions; // region texture ids copied for the open pass
+    // Commands that must run before the open pass begins (target region copies).
+    void insert_before_pass(std::initializer_list<uint32_t> command) {
+        words.insert(words.begin() + pass_begin_word, command);
+        pass_begin_word += command.size();
+        pass_snapshot_word += command.size();
     }
+    uint32_t draws = 0;
+    void reset() {
+        words.assign(1, kMagic);
+        data.clear();
+        pass_open = false;
+        draws = 0;
+    }
+    void word(uint32_t value) { words.push_back(value); }
+    void real(float value) { words.push_back(std::bit_cast<uint32_t>(value)); }
+    uint32_t bytes(const void *source, size_t size, size_t alignment) {
+        const size_t offset = align(data.size(), alignment);
+        data.resize(offset + size);
+        if (size)
+            std::memcpy(data.data() + offset, source, size);
+        return static_cast<uint32_t>(offset);
+    }
+    // Reserve `size` bytes and return a pointer the caller fills in place.
+    uint8_t *reserve(size_t size, size_t alignment, uint32_t &offset) {
+        offset = static_cast<uint32_t>(align(data.size(), alignment));
+        data.resize(offset + size);
+        return data.data() + offset;
+    }
+};
+Writer &writer() {
+    static Writer instance;
+    return instance;
+}
+} // namespace scene
+
+// Program ids: one per distinct GXP (renderer_data hash). Translation happens
+// on first use; a failed translation disables only draws using that program.
+struct ProgramRegistry {
+    std::map<Sha256Hash, uint32_t> ids;
+    std::map<uint32_t, bool> ready; // id -> translated successfully
+};
+ProgramRegistry &programs() {
+    static ProgramRegistry registry;
+    return registry;
+}
+static int program_id(MemState &mem, const renderer::ShaderProgram &program, Ptr<const SceGxmProgram> gxp, bool fragment) {
+    auto &registry = programs();
+    auto [it, inserted] = registry.ids.emplace(program.hash, static_cast<uint32_t>(registry.ids.size() + 1));
+    const uint32_t id = it->second;
+    if (inserted) {
+        const auto *bytes = gxp.get(mem);
+        registry.ready[id] = web_gxm_register_program(id, bytes, bytes->size, fragment ? 1 : 0) == 0;
+    }
+    return registry.ready[id] ? int(id) : -1;
 }
 
-// Depth formats the WebGPU consumer represents exactly:
-//   D16   -> depth16unorm           (16-bit unorm guest depth)
-//   DF32  -> depth32float           (32-bit float guest depth)
-//   S8D24 -> depth24plus-stencil8   (24-bit unorm depth, 8-bit stencil)
-// S8, DF32M, DF32_S8 and DF32M_S8 have no matching WebGPU format; accepting
-// them would silently reinterpret guest depth values. All of them reject here,
-// before any packet is built.
-static bool supported_depth_format(SceGxmDepthStencilFormat format) {
-    switch (format) {
-    case SCE_GXM_DEPTH_STENCIL_FORMAT_D16:
-    case SCE_GXM_DEPTH_STENCIL_FORMAT_DF32:
-    case SCE_GXM_DEPTH_STENCIL_FORMAT_S8D24:
+// --- Textures -----------------------------------------------------------------
+// Render targets the scene stream has rendered, by guest color address. A
+// texture whose data aliases one samples the GPU target instead of memory.
+struct RenderedTarget {
+    uint32_t width = 0, height = 0, stride_bytes = 0, pixel_bytes = 0;
+};
+std::unordered_map<Address, RenderedTarget> &rendered_targets() {
+    static std::unordered_map<Address, RenderedTarget> targets;
+    return targets;
+}
+
+struct CachedTexture {
+    uint32_t id = 0;
+    uint64_t hash = 0;
+    uint64_t checked_frame = UINT64_MAX;
+};
+struct TextureCache {
+    std::unordered_map<uint64_t, CachedTexture> entries;
+    uint32_t next_id = 1;
+    uint64_t frame = 0; // advanced per submitted scene: guest pixels are rehashed once per scene
+};
+TextureCache &texture_cache() {
+    static TextureCache cache;
+    return cache;
+}
+
+// Output channel sources: 0..3 = decoded component, 4 = zero, 5 = one.
+using ChannelMap = std::array<uint8_t, 4>;
+constexpr uint8_t Z = 4, O = 5;
+static bool swizzle_map(SceGxmTextureBaseFormat base, uint32_t swizzle, ChannelMap &map) {
+    switch (base) {
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U8:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_S8: {
+        static constexpr ChannelMap one[8] = {{0, Z, Z, O}, {0, Z, Z, Z}, {0, O, O, O}, {0, 0, 0, 0},
+            {0, 0, 0, Z}, {0, 0, 0, O}, {Z, Z, Z, 0}, {O, O, O, 0}}; // R 000R 111R RRRR 0RRR 1RRR R000 R111
+        map = one[(swizzle >> 12) & 7];
         return true;
+    }
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U8U8:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_S8S8: {
+        static constexpr ChannelMap two[6] = {{0, 1, Z, O}, {0, 1, Z, Z}, {0, 0, 0, 1}, {1, 1, 1, 0},
+            {0, 1, 0, 1}, {1, 0, Z, Z}}; // GR 00GR GRRR RGGG GRGR 00RG
+        const uint32_t mode = (swizzle >> 12) & 7;
+        if (mode >= 6)
+            return false;
+        map = two[mode];
+        return true;
+    }
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U4U4U4U4:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5: {
+        // Components are decoded in memory order R(low) G B A(high).
+        static constexpr ChannelMap four[8] = {{0, 1, 2, 3}, {2, 1, 0, 3}, {3, 2, 1, 0}, {1, 2, 3, 0},
+            {0, 1, 2, O}, {2, 1, 0, O}, {3, 2, 1, O}, {1, 2, 3, O}}; // ABGR ARGB RGBA BGRA 1BGR 1RGB RGB1 BGR1
+        map = four[(swizzle >> 12) & 7];
+        return true;
+    }
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U5U6U5: {
+        static constexpr ChannelMap three[2] = {{0, 1, 2, O}, {2, 1, 0, O}}; // BGR RGB
+        const uint32_t mode = (swizzle >> 12) & 7;
+        if (mode >= 2)
+            return false;
+        map = three[mode];
+        return true;
+    }
     default:
         return false;
     }
 }
-
-// Guest attribute formats the WebGPU consumer can fetch exactly, and the byte
-// size of one element for each accepted shape (0 when no WebGPU vertex format
-// represents the shape). Normalized and float attributes are delivered to the
-// shader as floats, which is how the SPIR-V converter declares them. The
-// non-normalized U8/S8/U16/S16 are integer formats whose float form needs a
-// scaled vertex format WebGPU does not have, and UNTYPED needs an integer
-// shader input; both reject. WebGPU also has no 1- or 3-component 8/16-bit
-// vertex format, so those component counts reject at the accepted size.
-static uint32_t webgpu_vertex_element_size(SceGxmAttributeFormat format, uint32_t components) {
-    if (components < 1 || components > 4) return 0;
-    switch (format) {
-    case SCE_GXM_ATTRIBUTE_FORMAT_U8N:
-    case SCE_GXM_ATTRIBUTE_FORMAT_S8N:
-        return components == 2 || components == 4 ? components : 0;
-    case SCE_GXM_ATTRIBUTE_FORMAT_U16N:
-    case SCE_GXM_ATTRIBUTE_FORMAT_S16N:
-    case SCE_GXM_ATTRIBUTE_FORMAT_F16:
-        return components == 2 || components == 4 ? components * 2 : 0;
-    case SCE_GXM_ATTRIBUTE_FORMAT_F32:
-        return components * 4;
-    default:
-        return 0;
+// Decodes one texel of an uncompressed base format into 4 unorm8 components.
+static void decode_texel(SceGxmTextureBaseFormat base, const uint8_t *src, uint8_t out[4]) {
+    switch (base) {
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U8: out[0] = src[0]; break;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_S8: out[0] = uint8_t(int8_t(src[0]) + 128); break;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U8U8: out[0] = src[0]; out[1] = src[1]; break;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_S8S8: out[0] = uint8_t(int8_t(src[0]) + 128); out[1] = uint8_t(int8_t(src[1]) + 128); break;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8: std::memcpy(out, src, 4); break;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U4U4U4U4: {
+        const uint16_t v = uint16_t(src[0] | (src[1] << 8));
+        for (int i = 0; i < 4; ++i) out[i] = uint8_t(((v >> (4 * i)) & 15) * 17);
+        break;
+    }
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5: {
+        const uint16_t v = uint16_t(src[0] | (src[1] << 8));
+        for (int i = 0; i < 3; ++i) out[i] = uint8_t((((v >> (5 * i)) & 31) * 255 + 15) / 31);
+        out[3] = (v >> 15) ? 255 : 0;
+        break;
+    }
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U5U6U5: {
+        const uint16_t v = uint16_t(src[0] | (src[1] << 8));
+        out[0] = uint8_t(((v & 31) * 255 + 15) / 31);
+        out[1] = uint8_t((((v >> 5) & 63) * 255 + 31) / 63);
+        out[2] = uint8_t((((v >> 11) & 31) * 255 + 15) / 31);
+        break;
+    }
+    default: break;
     }
 }
 
-// Short guest-format label for rejection diagnostics.
-static const char *attribute_format_name(SceGxmAttributeFormat format) {
-    switch (format) {
-    case SCE_GXM_ATTRIBUTE_FORMAT_U8: return "U8";
-    case SCE_GXM_ATTRIBUTE_FORMAT_S8: return "S8";
-    case SCE_GXM_ATTRIBUTE_FORMAT_U16: return "U16";
-    case SCE_GXM_ATTRIBUTE_FORMAT_S16: return "S16";
-    case SCE_GXM_ATTRIBUTE_FORMAT_U8N: return "U8N";
-    case SCE_GXM_ATTRIBUTE_FORMAT_S8N: return "S8N";
-    case SCE_GXM_ATTRIBUTE_FORMAT_U16N: return "U16N";
-    case SCE_GXM_ATTRIBUTE_FORMAT_S16N: return "S16N";
-    case SCE_GXM_ATTRIBUTE_FORMAT_F16: return "F16";
-    case SCE_GXM_ATTRIBUTE_FORMAT_F32: return "F32";
-    default: return "UNTYPED/unknown";
-    }
-}
-
-// The only stencil state the consumer can honour: always pass, keep on every
-// outcome, full masks and zero reference. Anything else would need a stencil
-// stage (and stencil writes back into guest memory) that does not exist yet.
-static bool stencil_state_default(const GxmStencilStateOp &op, const GxmStencilStateValues &values) {
-    return op.func == SCE_GXM_STENCIL_FUNC_ALWAYS
-        && op.stencil_fail == SCE_GXM_STENCIL_OP_KEEP
-        && op.depth_fail == SCE_GXM_STENCIL_OP_KEEP
-        && op.depth_pass == SCE_GXM_STENCIL_OP_KEEP
-        && values.compare_mask == 0xff && values.write_mask == 0xff && values.ref == 0;
-}
-
-// Bounded reject diagnostic: print every descriptor field the validator reads
-// (plus the raw control words) so a rejected guest texture names itself instead
-// of leaving only the generic "unsupported" reason. Only runs on the rejecting
-// path, which aborts the draw anyway.
-static void dump_fragment_texture(const SceGxmTexture &t) {
-    uint32_t words[4];
-    memcpy(words, &t, sizeof(words));
-    printf("[gxm-reject] fragment texture words=%08x %08x %08x %08x type=%u format=%08x %ux%u "
-        "true_mips=%u mip_count=%u mip_filter=%u lod_bias=%u lod_min0=%u lod_min1=%u "
-        "gamma=%u normalize=%u format0=%u swizzle=%u palette=%08x addr=%08x "
-        "filters min=%u mag=%u uv=%u,%u unk=%u,%u,%u\n",
-        words[0], words[1], words[2], words[3], unsigned(t.texture_type()),
-        unsigned(gxm::get_format(t)), gxm::get_width(t), gxm::get_height(t),
-        t.true_mip_count(), t.mip_count, t.mip_filter, t.lod_bias, t.lod_min0, t.lod_min1,
-        t.gamma_mode, t.normalize_mode, t.format0, t.swizzle_format, t.palette_addr,
-        uint32_t(t.data_addr) << 2, t.min_filter, t.mag_filter, t.uaddr_mode, t.vaddr_mode,
-        t.unk0, t.unk1, t.unk2);
-}
-
-// Guest texel layouts the WebGPU consumer represents exactly. GXM's
-// two-component formats carry a component swizzle that a WebGPU texture cannot
-// express, so the guest texels are expanded to RGBA8 here with the same
-// component mapping the Vulkan and GL backends apply (translate_swizzle2).
-// `bytes_per_texel` is the guest texel size; `expand` writes `texels` RGBA8
-// pixels.
-struct FragmentTextureFormat {
-    SceGxmTextureFormat guest_format;
-    uint32_t bytes_per_texel;
-    void (*expand)(uint8_t *dst, const uint8_t *src, uint32_t texels);
+// RGBA8 mip chain of a 2D texture, laid out like renderer/src/texture/cache.cpp
+// upload_texture (levels, alignment and swizzle/tiled order), or false with a
+// reason when the layout/format is not supported yet.
+struct DecodedTexture {
+    uint32_t width = 0, height = 0, levels = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> level_bytes; // offset, size in the scene data
 };
-static void expand_u8u8u8u8_abgr(uint8_t *dst, const uint8_t *src, uint32_t texels) {
-    // Little-endian ABGR word: byte 0 is R through byte 3 is A, which is
-    // already rgba8unorm byte order.
-    memcpy(dst, src, size_t(texels) * 4);
-}
-// U8U8_GRRR: little-endian GR word (byte 0 = R, byte 1 = G) sampled through the
-// SWIZZLE2_GRRR mapping { R, R, R, G }, so RGB replicates the first byte and
-// alpha comes from the second.
-static void expand_u8u8_grrr(uint8_t *dst, const uint8_t *src, uint32_t texels) {
-    for (uint32_t i = 0; i < texels; ++i) {
-        const uint8_t r = src[i * 2], a = src[i * 2 + 1];
-        dst[i * 4 + 0] = r; dst[i * 4 + 1] = r; dst[i * 4 + 2] = r; dst[i * 4 + 3] = a;
+// `known_hash`: source hash of the copy the GPU already has; when the guest
+// bytes still hash to it, nothing is decoded and `decoded.levels` stays 0.
+static bool decode_texture(MemState &mem, const SceGxmTexture &t, scene::Writer &out, DecodedTexture &decoded,
+    uint64_t known_hash, uint64_t &source_hash, const char *&why) {
+    const auto type = t.texture_type();
+    const auto format = gxm::get_format(t);
+    const auto base = gxm::get_base_format(format);
+    ChannelMap map;
+    if (!swizzle_map(base, format & SCE_GXM_TEXTURE_SWIZZLE_MASK, map)) {
+        static std::map<uint32_t, std::string> reasons;
+        auto &reason = reasons[uint32_t(format)];
+        if (reason.empty())
+            reason = fmt::format("texture base format/swizzle {:#010x}", uint32_t(format));
+        why = reason.c_str();
+        return false;
     }
+    if (type == SCE_GXM_TEXTURE_CUBE || type == SCE_GXM_TEXTURE_CUBE_ARBITRARY) {
+        why = "cube texture";
+        return false;
+    }
+    const bool swizzled = type == SCE_GXM_TEXTURE_SWIZZLED || type == SCE_GXM_TEXTURE_SWIZZLED_ARBITRARY;
+    const uint32_t width = gxm::get_width(t), height = gxm::get_height(t);
+    const uint32_t bpp = gxm::bits_per_pixel(base), bytes_per_pixel = bpp / 8;
+    if (!width || !height || width > 4096 || height > 4096 || !bytes_per_pixel) {
+        why = "texture dimensions";
+        return false;
+    }
+    const uint32_t max_levels = std::bit_width(std::min(width, height));
+    const uint32_t levels = std::min<uint32_t>(std::max<uint32_t>(t.true_mip_count(), 1), max_levels);
+    uint32_t layout_width = width, layout_height = height;
+    if (!(t.mip_count == 0xF && type == SCE_GXM_TEXTURE_LINEAR)) {
+        layout_width = std::bit_ceil(width);
+        layout_height = std::bit_ceil(height);
+    }
+    uint32_t align_width = 1, align_height = 1;
+    if (type == SCE_GXM_TEXTURE_LINEAR)
+        align_width = 8;
+    else if (type == SCE_GXM_TEXTURE_TILED)
+        align_width = align_height = 32;
+    // Source footprint of the whole chain (hashing and bounds).
+    uint64_t footprint = 0;
+    {
+        uint32_t lw = layout_width, lh = layout_height, w = width, h = height;
+        for (uint32_t level = 0; level < levels; ++level) {
+            uint32_t stride = w, rows = h;
+            if (type == SCE_GXM_TEXTURE_SWIZZLED_ARBITRARY) { stride = std::bit_ceil(w); rows = std::bit_ceil(h); }
+            if (type == SCE_GXM_TEXTURE_LINEAR_STRIDED) stride = gxm::get_stride_in_bytes(t) / bytes_per_pixel;
+            stride = align(stride, align_width); rows = align(rows, align_height);
+            const uint64_t level_end = footprint + uint64_t(stride) * rows * bytes_per_pixel;
+            const uint64_t mip_size = uint64_t(align(lw, align_width)) * align(lh, align_height) * bytes_per_pixel;
+            footprint = std::max(level_end, footprint + mip_size);
+            lw = std::max(lw / 2, 1u); lh = std::max(lh / 2, 1u); w = std::max(w / 2, 1u); h = std::max(h / 2, 1u);
+        }
+    }
+    const Address address = t.data_addr << 2;
+    if (!address || footprint > (64u << 20) || !is_valid_addr_range(mem, address, uint64_t(address) + footprint)) {
+        why = "texture memory range";
+        return false;
+    }
+    const uint8_t *source = Ptr<const uint8_t>(address).get(mem);
+    source_hash = XXH3_64bits(source, footprint);
+    if (known_hash && source_hash == known_hash)
+        return true;
+    decoded.width = width;
+    decoded.height = height;
+    decoded.levels = levels;
+    std::vector<uint8_t> linear;
+    uint64_t level_source = 0;
+    uint32_t lw = layout_width, lh = layout_height, w = width, h = height;
+    for (uint32_t level = 0; level < levels; ++level) {
+        uint32_t stride = w, rows = h;
+        if (type == SCE_GXM_TEXTURE_SWIZZLED_ARBITRARY) { stride = std::bit_ceil(w); rows = std::bit_ceil(h); }
+        if (type == SCE_GXM_TEXTURE_LINEAR_STRIDED) stride = gxm::get_stride_in_bytes(t) / bytes_per_pixel;
+        stride = align(stride, align_width);
+        rows = align(rows, align_height);
+        const uint8_t *pixels = source + level_source;
+        if (swizzled || type == SCE_GXM_TEXTURE_TILED) {
+            linear.resize(size_t(stride) * rows * bytes_per_pixel);
+            if (swizzled)
+                renderer::texture::swizzled_texture_to_linear_texture(linear.data(), pixels, uint16_t(stride), uint16_t(rows), uint8_t(bpp));
+            else
+                renderer::texture::tiled_texture_to_linear_texture(linear.data(), pixels, uint16_t(stride), uint16_t(rows), uint8_t(bpp));
+            pixels = linear.data();
+        }
+        uint32_t offset = 0;
+        uint8_t *dest = out.reserve(size_t(w) * h * 4, 4, offset);
+        for (uint32_t y = 0; y < h; ++y) {
+            const uint8_t *row = pixels + size_t(y) * stride * bytes_per_pixel;
+            for (uint32_t x = 0; x < w; ++x) {
+                uint8_t c[4] = {0, 0, 0, 255};
+                decode_texel(base, row + size_t(x) * bytes_per_pixel, c);
+                uint8_t *texel = dest + (size_t(y) * w + x) * 4;
+                for (int i = 0; i < 4; ++i)
+                    texel[i] = map[i] == Z ? 0 : map[i] == O ? 255 : c[map[i]];
+            }
+        }
+        decoded.level_bytes.emplace_back(offset, w * h * 4);
+        level_source += uint64_t(align(lw, align_width)) * align(lh, align_height) * bytes_per_pixel;
+        lw = std::max(lw / 2, 1u); lh = std::max(lh / 2, 1u); w = std::max(w / 2, 1u); h = std::max(h / 2, 1u);
+    }
+    return true;
 }
-static const FragmentTextureFormat fragment_texture_formats[] = {
-    { SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, 4, expand_u8u8u8u8_abgr },
-    { SCE_GXM_TEXTURE_FORMAT_U8U8_GRRR, 2, expand_u8u8_grrr },
+
+// Texture binding for one unit: id (bit 31 = render-target alias, whose low
+// bits are the guest address / 4) plus sampler words, emitting an upload
+// when the guest bytes changed since the last check.
+struct BoundTexture {
+    uint32_t id = 0;
+    uint32_t min = 0, mag = 0, mip = 0, u = 0, v = 0, lod_max = 0;
 };
-static const FragmentTextureFormat *find_fragment_texture_format(SceGxmTextureFormat format) {
-    for (const auto &candidate : fragment_texture_formats)
-        if (candidate.guest_format == format) return &candidate;
-    return nullptr;
+// A linear-strided texture inside a rendered target (same pixel size and
+// stride) samples a GPU copy of that rectangle, taken before the open pass
+// begins: what a tile-based GPU reads from memory during the scene.
+static bool bind_target_region(const SceGxmTexture &t, scene::Writer &out, BoundTexture &bound) {
+    if (t.texture_type() != SCE_GXM_TEXTURE_LINEAR_STRIDED || !out.pass_open)
+        return false;
+    const Address address = t.data_addr << 2;
+    const uint32_t width = gxm::get_width(t), height = gxm::get_height(t);
+    const uint32_t pixel_bytes = gxm::bits_per_pixel(gxm::get_base_format(gxm::get_format(t))) / 8;
+    for (const auto &[base, target] : rendered_targets()) {
+        const uint64_t size = uint64_t(target.stride_bytes) * target.height;
+        if (address <= base || address >= base + size || target.pixel_bytes != pixel_bytes
+            || gxm::get_stride_in_bytes(t) != target.stride_bytes)
+            continue;
+        const uint32_t offset = address - base, column = offset % target.stride_bytes;
+        const uint32_t x = column / pixel_bytes, y = offset / target.stride_bytes;
+        if (column % pixel_bytes || x + width > target.width || y + height > target.height)
+            return false;
+        auto &cache = texture_cache();
+        const uint32_t identity[4] = {address, width, height, 0x52474e52u /* region */};
+        auto &entry = cache.entries[XXH3_64bits(identity, sizeof(identity))];
+        if (!entry.id)
+            entry.id = cache.next_id++;
+        if (std::find(out.pass_regions.begin(), out.pass_regions.end(), entry.id) == out.pass_regions.end()) {
+            out.pass_regions.push_back(entry.id);
+            out.insert_before_pass({scene::Region, entry.id, base, x, y, width, height});
+        }
+        bound.id = entry.id;
+        bound.lod_max = 0;
+        return true;
+    }
+    return false;
+}
+static bool bind_texture(MemState &mem, const SceGxmTexture &t, scene::Writer &out, BoundTexture &bound, std::string &why) {
+    const Address address = t.data_addr << 2;
+    // Linear-strided descriptors keep the pitch where the min/mip filters
+    // live: min follows mag and there are no mips (sceGxmTextureGetMinFilter).
+    const bool strided = t.texture_type() == SCE_GXM_TEXTURE_LINEAR_STRIDED;
+    bound.mag = t.mag_filter == SCE_GXM_TEXTURE_FILTER_LINEAR ? 1 : 0;
+    bound.min = strided ? bound.mag : t.min_filter == SCE_GXM_TEXTURE_FILTER_LINEAR ? 1 : 0;
+    bound.mip = !strided && t.mip_filter ? 1 : 0;
+    bound.u = t.uaddr_mode;
+    bound.v = t.vaddr_mode;
+    bound.lod_max = std::max<uint32_t>(t.true_mip_count(), 1) - 1;
+    if (rendered_targets().contains(address)) {
+        // Bit 31: render-target alias; bit 30: its pre-pass snapshot.
+        bound.id = 0x80000000u | (address >> 2);
+        if (out.pass_open && address == out.pass_address) {
+            out.words[out.pass_snapshot_word] = 1;
+            bound.id |= 0x40000000u;
+        }
+        bound.lod_max = 0;
+        return true;
+    }
+    auto &cache = texture_cache();
+    if (bind_target_region(t, out, bound))
+        return true;
+    // Identity of the guest image: address, format, size, layout and mips
+    // (sampler fields do not change the uploaded texels).
+    const uint32_t identity[7] = {address, uint32_t(gxm::get_format(t)), gxm::get_width(t), gxm::get_height(t),
+        uint32_t(t.texture_type()), t.true_mip_count(), strided ? uint32_t(gxm::get_stride_in_bytes(t)) : 0u};
+    const uint64_t key = XXH3_64bits(identity, sizeof(identity));
+    auto &entry = cache.entries[key];
+    if (!entry.id)
+        entry.id = cache.next_id++;
+    bound.id = entry.id;
+    if (entry.checked_frame == cache.frame)
+        return true;
+    // An unchanged texture costs one hash of its guest bytes.
+    scene::Writer scratch;
+    DecodedTexture decoded;
+    uint64_t hash = 0;
+    const char *reason = "";
+    const double decode_started = emscripten_get_now();
+    const bool decoded_ok = decode_texture(mem, t, scratch, decoded, entry.hash, hash, reason);
+    timing().decode += emscripten_get_now() - decode_started;
+    if (!decoded_ok) {
+        why = reason;
+        return false;
+    }
+    entry.checked_frame = cache.frame;
+    if (!decoded.levels)
+        return true;
+    ++timing().decodes;
+    entry.hash = hash;
+    out.word(scene::Texture);
+    out.word(entry.id);
+    out.word(decoded.width);
+    out.word(decoded.height);
+    out.word(decoded.levels);
+    for (const auto &[offset, size] : decoded.level_bytes) {
+        out.word(out.bytes(scratch.data.data() + offset, size, 4));
+        out.word(size);
+    }
+    return true;
 }
 
-// Match gxm/src/textures.cpp and SceGxm's accessors, not a tightly packed
-// interpretation of the guest descriptor. LINEAR_STRIDED has different packed
-// control fields and is deliberately NOT accepted here.
-static void validate_fragment_texture(const SceGxmTexture &t) {
-    // mip_filter only has an effect when the descriptor owns a mip chain: with
-    // a single level the hardware cannot blend levels, so the bit is inert and
-    // the one-level WebGPU texture matches it exactly.
-    if (t.texture_type() != SCE_GXM_TEXTURE_LINEAR
-        || !find_fragment_texture_format(gxm::get_format(t))
-        || (t.mip_filter && t.true_mip_count() != 1)
-        || !t.normalize_mode || t.gamma_mode || t.lod_bias != 31
-        || t.lod_min0 || t.lod_min1 || t.palette_addr || t.unk0 || t.unk1 || t.unk2) {
-        dump_fragment_texture(t);
-        unsupported("fragment texture layout/format/mips/LOD/normalization");
-    }
-    if ((t.min_filter != SCE_GXM_TEXTURE_FILTER_POINT && t.min_filter != SCE_GXM_TEXTURE_FILTER_LINEAR)
-        || (t.mag_filter != SCE_GXM_TEXTURE_FILTER_POINT && t.mag_filter != SCE_GXM_TEXTURE_FILTER_LINEAR)
-        || t.uaddr_mode > SCE_GXM_TEXTURE_ADDR_CLAMP || t.vaddr_mode > SCE_GXM_TEXTURE_ADDR_CLAMP) {
-        dump_fragment_texture(t);
-        unsupported("fragment texture sampler");
-    }
-}
-
+// --- State -----------------------------------------------------------------
 static void consume_state(WebContext &ctx, CommandHelper &h, MemState &mem) {
     switch (h.pop<GXMState>()) {
-    case GXMState::RegionClip:
+    case GXMState::RegionClip: {
+        // state_set.cpp region_clip: bounds snap to the tile grid.
         ctx.record.region_clip_mode = h.pop<SceGxmRegionClipMode>();
-        for (auto &n : ctx.clip) n = h.pop<uint32_t>();
+        const uint32_t x_min = h.pop<uint32_t>(), x_max = h.pop<uint32_t>();
+        const uint32_t y_min = h.pop<uint32_t>(), y_max = h.pop<uint32_t>();
+        ctx.record.region_clip_min.x = static_cast<SceInt>(align_down(x_min, SCE_GXM_TILE_SIZEX));
+        ctx.record.region_clip_min.y = static_cast<SceInt>(align_down(y_min, SCE_GXM_TILE_SIZEY));
+        ctx.record.region_clip_max.x = static_cast<SceInt>(align(x_max, SCE_GXM_TILE_SIZEX)) - 1;
+        ctx.record.region_clip_max.y = static_cast<SceInt>(align(y_max, SCE_GXM_TILE_SIZEY)) - 1;
         break;
+    }
     case GXMState::Viewport:
-        // Mirror state_set.cpp COMMAND_SET_STATE(viewport) record fields, minus
-        // the MSAA/downscale factor (unsupported render targets are rejected).
         ctx.record.viewport_flat = h.pop<bool>();
         ctx.has_viewport = true;
         if (!ctx.record.viewport_flat) {
@@ -518,6 +817,7 @@ static void consume_state(WebContext &ctx, CommandHelper &h, MemState &mem) {
         if (fragment) {
             require_guest(mem, ptr.address(), sizeof(SceGxmFragmentProgram));
             ctx.record.fragment_program = ptr.cast<SceGxmFragmentProgram>();
+            ctx.record.is_maskupdate = ctx.record.fragment_program.get(mem)->is_maskupdate;
             ctx.uniforms[1].clear();
         } else {
             require_guest(mem, ptr.address(), sizeof(SceGxmVertexProgram));
@@ -531,13 +831,13 @@ static void consume_state(WebContext &ctx, CommandHelper &h, MemState &mem) {
         const bool vertex = h.pop<bool>();
         const int block = h.pop<int>();
         const auto size = h.pop<uint32_t>();
-        ShaderProgram *program = nullptr;
+        const renderer::ShaderProgram *program = nullptr;
         if (vertex && ctx.record.vertex_program)
             program = ctx.record.vertex_program.get(mem)->renderer_data.get();
         if (!vertex && ctx.record.fragment_program)
             program = ctx.record.fragment_program.get(mem)->renderer_data.get();
         if (!program || block < 0 || size_t(block) >= program->uniform_buffer_sizes.size())
-            unsupported("uniform without valid program/block");
+            break;
         const auto offset = program->uniform_buffer_data_offsets[block];
         if (offset == UINT32_MAX) break;
         const size_t total = program->max_total_uniform_buffer_storage * 4;
@@ -547,330 +847,398 @@ static void consume_state(WebContext &ctx, CommandHelper &h, MemState &mem) {
         require_guest(mem, ptr.address(), copied);
         auto &bytes = ctx.uniforms[vertex ? 0 : 1];
         bytes.resize(total);
-        memcpy(bytes.data() + size_t(offset) * 4, ptr.get(mem), copied);
+        std::memcpy(bytes.data() + size_t(offset) * 4, ptr.get(mem), copied);
         break;
     }
     case GXMState::Texture: {
-        // renderer::set_texture sends uint32_t index then SceGxmTexture by
-        // value. Fragment indices start at 0; vertex indices start at 16.
+        // renderer::set_texture: fragment units 0..15, vertex units from 16.
         const auto index = h.pop<uint32_t>();
         const auto texture = h.pop<SceGxmTexture>();
-        if (index != 0) unsupported("only fragment texture unit zero supported");
-        validate_fragment_texture(texture);
-        ctx.fragment_texture = texture;
-        ctx.has_fragment_texture = true;
+        auto &units = index < 16 ? ctx.fragment_textures : ctx.vertex_textures;
+        units[index & 15] = { true, texture };
         break;
     }
     case GXMState::VertexStream: {
         const auto ptr = h.pop<Ptr<const uint8_t>>();
         const auto index = h.pop<size_t>(), size = h.pop<size_t>();
-        if (index != 0) unsupported("multiple vertex streams");
-        require_guest(mem, ptr.address(), size);
-        ctx.record.vertex_streams[index] = {ptr, size};
+        if (index < ctx.record.vertex_streams.size())
+            ctx.record.vertex_streams[index] = {ptr, size};
         break;
     }
     case GXMState::CullMode:
         ctx.record.cull_mode = h.pop<SceGxmCullMode>();
         break;
+    case GXMState::TwoSided:
+        ctx.record.two_sided = h.pop<SceGxmTwoSidedMode>();
+        break;
     case GXMState::PolygonMode: {
         const bool front = h.pop<bool>();
         const auto mode = h.pop<SceGxmPolygonMode>();
-        if (front) ctx.record.front_polygon_mode = mode;
-        else ctx.record.back_polygon_mode = mode;
+        (front ? ctx.record.front_polygon_mode : ctx.record.back_polygon_mode) = mode;
         break;
     }
     case GXMState::DepthFunc: {
         const bool front = h.pop<bool>();
         const auto func = h.pop<SceGxmDepthFunc>();
-        if (front) ctx.record.front_depth_func = func;
-        else ctx.record.back_depth_func = func;
+        (front ? ctx.record.front_depth_func : ctx.record.back_depth_func) = func;
         break;
     }
     case GXMState::DepthWriteEnable: {
         const bool front = h.pop<bool>();
         const auto mode = h.pop<SceGxmDepthWriteMode>();
-        if (front) ctx.record.front_depth_write_mode = mode;
-        else ctx.record.back_depth_write_mode = mode;
+        (front ? ctx.record.front_depth_write_mode : ctx.record.back_depth_write_mode) = mode;
         break;
     }
-    default: unsupported("render state not implemented");
+    case GXMState::DepthBias: {
+        h.pop<bool>();
+        ctx.record.depth_bias_slope = h.pop<int>();
+        ctx.record.depth_bias_unit = h.pop<int>();
+        break;
+    }
+    case GXMState::PointLineWidth: {
+        const bool front = h.pop<bool>();
+        const auto width = h.pop<uint32_t>();
+        if (front) ctx.record.line_width = width;
+        break;
+    }
+    case GXMState::StencilFunc: {
+        const bool front = h.pop<bool>();
+        auto &op = front ? ctx.record.front_stencil_state_op : ctx.record.back_stencil_state_op;
+        auto &values = front ? ctx.record.front_stencil_state_values : ctx.record.back_stencil_state_values;
+        op.func = h.pop<SceGxmStencilFunc>();
+        op.stencil_fail = h.pop<SceGxmStencilOp>();
+        op.depth_fail = h.pop<SceGxmStencilOp>();
+        op.depth_pass = h.pop<SceGxmStencilOp>();
+        values.compare_mask = h.pop<uint8_t>();
+        values.write_mask = h.pop<uint8_t>();
+        if (ctx.record.is_maskupdate)
+            ctx.record.writing_mask = op.func == SCE_GXM_STENCIL_FUNC_NEVER ? 0.0f : 1.0f;
+        break;
+    }
+    case GXMState::StencilRef: {
+        const bool front = h.pop<bool>();
+        const uint8_t ref = h.pop<unsigned char>();
+        (front ? ctx.record.front_stencil_state_values : ctx.record.back_stencil_state_values).ref = ref;
+        break;
+    }
+    case GXMState::FragmentProgramEnable: {
+        const bool front = h.pop<bool>();
+        const auto mode = h.pop<SceGxmFragmentProgramMode>();
+        (front ? ctx.record.front_side_fragment_program_mode : ctx.record.back_side_fragment_program_mode) = mode;
+        break;
+    }
+    case GXMState::VisibilityBuffer:
+        h.pop<Ptr<uint32_t>>(); h.pop<uint32_t>();
+        break;
+    case GXMState::VisibilityIndex:
+        h.pop<uint32_t>(); h.pop<bool>(); h.pop<bool>();
+        break;
+    default:
+        unsupported("render state not implemented");
     }
 }
 
-static int consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem) {
+// --- Passes ----------------------------------------------------------------
+static uint32_t webgpu_color_format(SceGxmColorFormat format) {
+    return static_cast<uint32_t>(format);
+}
+static void end_pass(scene::Writer &out) {
+    if (out.pass_open) {
+        out.word(scene::EndPass);
+        out.pass_open = false;
+    }
+}
+static void begin_pass(WebContext &ctx, scene::Writer &out) {
+    end_pass(out);
+    const auto &color = ctx.record.color_surface;
+    out.pass_begin_word = out.words.size();
+    out.pass_regions.clear();
+    out.word(scene::BeginPass);
+    out.word(color.data.address());
+    out.word(webgpu_color_format(color.colorFormat));
+    out.word(color.width);
+    out.word(color.height);
+    // Depth: a guest surface (2) keeps its contents on the GPU across scenes;
+    // without one the tile's on-chip buffer (1) is cleared per scene.
+    const auto &depth = ctx.depth;
+    out.word(ctx.has_depth_surface ? 2 : 1);
+    out.word(ctx.has_depth_surface ? static_cast<uint32_t>(depth.get_format()) : 0);
+    out.word(ctx.has_depth_surface && depth.force_load ? 1 : 0);
+    out.word(ctx.has_depth_surface && depth.force_store ? 1 : 0);
+    out.real(ctx.has_depth_surface ? depth.background_depth : 1.0f);
+    out.word(ctx.has_depth_surface ? depth.stencil : 0);
+    // A guest depth/stencil surface keeps its GPU copy by its own addresses.
+    out.word(ctx.has_depth_surface ? depth.depth_data.address() : 0);
+    out.word(ctx.has_depth_surface ? depth.stencil_data.address() : 0);
+    // Snapshot flag, set by bind_texture when a draw samples this pass's own
+    // target: the tile-based GPU reads what memory held before the scene.
+    out.pass_snapshot_word = out.words.size();
+    out.word(0);
+    out.pass_address = color.data.address();
+    out.pass_open = true;
+    const uint32_t pixel_bytes = uint32_t(gxm::bits_per_pixel(
+        static_cast<SceGxmColorBaseFormat>(color.colorFormat & SCE_GXM_COLOR_BASE_FORMAT_MASK)) / 8);
+    rendered_targets()[color.data.address()] = { color.width, color.height, color.strideInPixels * pixel_bytes, pixel_bytes };
+}
+
+// --- Draws -----------------------------------------------------------------
+static uint32_t topology_index(SceGxmPrimitiveType primitive) {
+    switch (primitive) {
+    case SCE_GXM_PRIMITIVE_TRIANGLES: return 0;
+    case SCE_GXM_PRIMITIVE_TRIANGLE_STRIP: return 1;
+    case SCE_GXM_PRIMITIVE_LINES: return 2;
+    case SCE_GXM_PRIMITIVE_POINTS: return 4;
+    default: return 0; // fans are expanded to lists by the caller
+    }
+}
+
+static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene::Writer &out) {
     const auto primitive = h.pop<SceGxmPrimitiveType>();
     const auto format = h.pop<SceGxmIndexFormat>();
     const auto indices = h.pop<Ptr<const uint8_t>>();
     const auto count = h.pop<uint32_t>(), instances = h.pop<uint32_t>();
-    // The first draw headers of a run describe the draw stream shape
-    // (primitive/index format/instancing); bounded so a long run stays quiet.
-    static unsigned draw_headers = 0;
-    if (draw_headers < 16) {
-        ++draw_headers;
-        printf("[gxm-decode] draw primitive=%u indexformat=%u count=%u instances=%u indices=%08x\n",
-            unsigned(primitive), unsigned(format), count, instances, indices.address());
-    }
-    if ((primitive != SCE_GXM_PRIMITIVE_TRIANGLES && primitive != SCE_GXM_PRIMITIVE_TRIANGLE_FAN)
-        || instances != 1 || count < 3
-        || (primitive == SCE_GXM_PRIMITIVE_TRIANGLES && count % 3)
-        || (format != SCE_GXM_INDEX_FORMAT_U16 && format != SCE_GXM_INDEX_FORMAT_U32)) {
-        printf("[gxm-reject] draw header primitive=%u indexformat=%u count=%u instances=%u count%%3=%u\n",
-            unsigned(primitive), unsigned(format), count, instances, count % 3);
-        unsupported("only non-instanced indexed triangles or triangle fans supported");
-    }
-    if (!ctx.has_surface || !ctx.record.vertex_program || !ctx.record.fragment_program)
-        unsupported("draw without surface/programs");
-    if (!ctx.has_viewport)
-        unsupported("draw without viewport state");
-    const auto &surface = ctx.record.color_surface;
-    const auto w = surface.width, height = surface.height;
-    // Arbitrary GXM viewports are forwarded to the WebGPU viewport (GXM3).
-    // Non-default region clip (scissor) stays rejected: no scissor stage exists.
-    if (ctx.record.region_clip_mode != SCE_GXM_REGION_CLIP_OUTSIDE
-        || ctx.clip != std::array<uint32_t, 4>{0, w - 1, 0, height - 1})
-        unsupported("non-default region clip");
-    // Fixed-function state the consumer cannot express yet. Draws proceed
-    // only on default state; anything else fails loudly naming the state
-    // instead of rendering incorrectly.
-    if (ctx.record.cull_mode != SCE_GXM_CULL_NONE)
-        unsupported("cull mode not implemented");
-    if (ctx.record.front_polygon_mode != SCE_GXM_POLYGON_MODE_TRIANGLE_FILL
-        || ctx.record.back_polygon_mode != SCE_GXM_POLYGON_MODE_TRIANGLE_FILL)
-        unsupported("polygon mode not implemented");
-    // GXM records front and back depth state separately, but no modern API can
-    // express that: Vita3K's own backends collapse it to the front face
-    // (vulkan/pipeline_cache.cpp:857-858, gl/sync_state.cpp:205-213), and this
-    // consumer follows the reference renderer instead of rejecting the draw.
-    // The approximation is never silent: the first mismatch is reported, which
-    // matters because cull mode is restricted to NONE, so the state applies to
-    // every rasterized face.
-    if (ctx.record.front_depth_func != ctx.record.back_depth_func
-        || ctx.record.front_depth_write_mode != ctx.record.back_depth_write_mode) {
-        static bool two_sided_depth_reported = false;
-        if (!two_sided_depth_reported) {
-            two_sided_depth_reported = true;
-            printf("[gxm-approx] two-sided depth state front func=%u write=%u back func=%u write=%u; using the front state\n",
-                unsigned(ctx.record.front_depth_func), unsigned(ctx.record.front_depth_write_mode),
-                unsigned(ctx.record.back_depth_func), unsigned(ctx.record.back_depth_write_mode));
-        }
-    }
-    if (ctx.record.front_depth_func > SCE_GXM_DEPTH_FUNC_ALWAYS)
-        unsupported("depth function not implemented");
-    // Without a depth attachment the recorded depth state is not representable:
-    // WebGPU would silently test against nothing. Only the inert default
-    // (the same state the pre-attachment consumer required) is accepted.
-    if (!ctx.has_depth && (ctx.record.front_depth_func != SCE_GXM_DEPTH_FUNC_LESS_EQUAL
-            || ctx.record.front_depth_write_mode != SCE_GXM_DEPTH_WRITE_ENABLED))
-        unsupported("depth test state without depth surface");
-    // No stencil stage exists, so only the inert GXM default is accepted. The
-    // S8D24 attachment is cleared/discarded, never written back to guest memory.
-    if (ctx.has_depth && !(stencil_state_default(ctx.record.front_stencil_state_op, ctx.record.front_stencil_state_values)
-            && stencil_state_default(ctx.record.back_stencil_state_op, ctx.record.back_stencil_state_values)))
-        unsupported("stencil state not implemented");
+    if (!out.pass_open || !ctx.has_surface || !ctx.record.vertex_program || !ctx.record.fragment_program)
+        return skip_draw("draw without surface or programs");
+    if (instances != 1)
+        return skip_draw("instanced draw");
+    if (primitive == SCE_GXM_PRIMITIVE_TRIANGLE_EDGES)
+        return skip_draw("triangle-edges primitive");
+    if (!count || (format != SCE_GXM_INDEX_FORMAT_U16 && format != SCE_GXM_INDEX_FORMAT_U32))
+        return skip_draw("index format");
     const auto *vp = ctx.record.vertex_program.get(mem);
     const auto *fp = ctx.record.fragment_program.get(mem);
-    if (!vp->renderer_data || !fp->renderer_data || fp->is_maskupdate
-        || vp->renderer_data->textures_used.any()
-        || (fp->renderer_data->textures_used >> 1).any()
-        || vp->streams.size() != 1 || vp->attributes.empty() || vp->attributes.size() > 16)
-        unsupported("vertex/nonzero fragment textures/mask/multiple streams or missing program metadata");
-    const bool textured = fp->renderer_data->textures_used[0];
-    std::vector<uint8_t> texture_pixels;
-    uint32_t texture_width = 0, texture_height = 0;
-    if (textured) {
-        if (!ctx.has_fragment_texture) unsupported("missing fragment texture unit zero");
-        const auto &t = ctx.fragment_texture;
-        validate_fragment_texture(t);
-        const auto *format = find_fragment_texture_format(gxm::get_format(t));
-        texture_width = gxm::get_width(t); texture_height = gxm::get_height(t);
-        if (!texture_width || !texture_height || texture_width > 4096 || texture_height > 4096)
-            unsupported("fragment texture dimensions");
-        // LINEAR guest rows are aligned to 8 pixels (gxm::texture_size_first_mip
-        // and the texture cache both align a LINEAR stride to 8), then sized in
-        // the guest texel size of the format.
-        const uint64_t pitch = uint64_t((texture_width + 7) & ~7u) * format->bytes_per_texel;
-        const uint64_t footprint = pitch * texture_height;
-        if (footprint > 16 * 1024 * 1024) unsupported("fragment texture upload size");
-        const Address address = uint32_t(t.data_addr) << 2; // sceGxmTextureGetData
-        require_guest(mem, address, footprint);
-        // Snapshot every draw, even without a dirty descriptor: guest pixels
-        // can change independently. Expand to the sampled RGBA8 and strip row
-        // padding before the first await.
-        texture_pixels.resize(size_t(texture_width) * texture_height * 4);
-        const auto *source = Ptr<const uint8_t>(address).get(mem);
-        for (uint32_t y = 0; y < texture_height; ++y)
-            format->expand(texture_pixels.data() + size_t(y) * texture_width * 4,
-                source + size_t(y) * pitch, texture_width);
+    if (!vp->renderer_data || !fp->renderer_data)
+        return skip_draw("program without renderer data");
+    const int vs = program_id(mem, *vp->renderer_data, vp->program, false);
+    const int fs = program_id(mem, *fp->renderer_data, fp->program, true);
+    if (vs < 0 || fs < 0)
+        return skip_draw("untranslated program");
+    for (int i = 0; i < 2; ++i) {
+        const auto &program = i == 0 ? static_cast<const renderer::ShaderProgram &>(*vp->renderer_data) : *fp->renderer_data;
+        if (ctx.uniforms[i].size() != program.max_total_uniform_buffer_storage * 4)
+            ctx.uniforms[i].resize(program.max_total_uniform_buffer_storage * 4);
     }
-    const size_t index_size = format == SCE_GXM_INDEX_FORMAT_U16 ? 2 : 4;
-    const size_t source_index_bytes = size_t(count) * index_size;
-    // WebGPU has no triangle-fan topology, so a fan is expanded to the
-    // equivalent triangle list with the same index buffer (the fan centre is
-    // the first guest index, not vertex zero). GXM and WebGPU both take the
-    // provoking vertex from the first index of each triangle, so emitting
-    // (centre, k, k+1) preserves flat shading, and cull mode is restricted to
-    // NONE so the winding of the expansion cannot matter.
-    const bool fan = primitive == SCE_GXM_PRIMITIVE_TRIANGLE_FAN;
-    const size_t index_bytes = fan ? size_t(count - 2) * 3 * index_size : source_index_bytes;
-    std::vector<uint8_t> fan_indices;
-    if (fan) {
-        const uint8_t *guest_indices = indices.get(mem);
-        // Explicit little-endian reads/writes: the guest index buffer carries
-        // no alignment guarantee and wasm is little-endian like the JS decoder.
-        const auto read_index = [&](uint32_t i) {
-            const uint8_t *p = guest_indices + size_t(i) * index_size;
-            if (index_size == 2) return uint32_t(p[0] | (p[1] << 8));
-            return uint32_t(p[0] | (p[1] << 8) | (p[2] << 16) | (uint32_t(p[3]) << 24));
-        };
-        fan_indices.resize(index_bytes);
-        uint8_t *out = fan_indices.data();
-        const auto write_index = [&](uint32_t value) {
-            for (size_t byte = 0; byte < index_size; ++byte) *out++ = uint8_t(value >> (8 * byte));
-        };
-        const uint32_t centre = read_index(0);
-        for (uint32_t k = 1; k + 1 < count; ++k) {
-            write_index(centre); write_index(read_index(k)); write_index(read_index(k + 1));
+
+    // Textures first: their upload commands precede the draw that samples them.
+    struct UnitBinding { uint32_t unit; BoundTexture bound; };
+    std::vector<UnitBinding> units;
+    for (int stage = 0; stage < 2; ++stage) {
+        const auto used = stage == 0 ? fp->renderer_data->textures_used : vp->renderer_data->textures_used;
+        auto &bound_units = stage == 0 ? ctx.fragment_textures : ctx.vertex_textures;
+        for (uint32_t unit = 0; unit < 16; ++unit) {
+            if (!used[unit])
+                continue;
+            if (!bound_units[unit].bound)
+                return skip_draw("sampled texture unit without a texture");
+            BoundTexture bound;
+            std::string why;
+            if (!bind_texture(mem, bound_units[unit].texture, out, bound, why))
+                return skip_draw("texture: " + why);
+            units.push_back({unit | (stage == 1 ? 16u : 0u), bound});
         }
     }
-    const auto &stream = ctx.record.vertex_streams[0];
-    const size_t stride = vp->streams[0].stride;
-    if (gxm::is_stream_instancing(static_cast<SceGxmIndexSource>(vp->streams[0].indexSource)))
-        unsupported("instanced vertex stream");
-    if (!stride || stream.size > 16 * 1024 * 1024 || index_bytes > 16 * 1024 * 1024)
-        unsupported("draw upload size");
-    require_guest(mem, indices.address(), source_index_bytes);
-    require_guest(mem, stream.data.address(), stream.size);
-    std::vector<std::array<uint32_t, 4>> attributes;
+
+    // Vertex streams and attributes.
+    const size_t stream_count = vp->streams.size();
+    std::array<uint32_t, SCE_GXM_MAX_VERTEX_STREAMS> stream_offset{}, stream_size{};
+    for (size_t i = 0; i < stream_count; ++i) {
+        const auto &stream = ctx.record.vertex_streams[i];
+        if (gxm::is_stream_instancing(static_cast<SceGxmIndexSource>(vp->streams[i].indexSource)))
+            return skip_draw("instanced vertex stream");
+        if (!stream.data || !stream.size || stream.size > (16u << 20))
+            return skip_draw("vertex stream range");
+        require_guest(mem, stream.data.address(), stream.size);
+        stream_offset[i] = out.bytes(stream.data.get(mem), stream.size, 4);
+        stream_size[i] = static_cast<uint32_t>(stream.size);
+    }
+    struct Attribute { uint32_t location, stream, offset, format, components; };
+    std::vector<Attribute> attributes;
     for (const auto &a : vp->attributes) {
         const auto info = vp->renderer_data->attribute_infos.find(a.regIndex);
-        const uint32_t element = webgpu_vertex_element_size(a.format, a.componentCount);
-        // The element must fit entirely inside the stride, and the shader input
-        // must be a float: every accepted format is fetched as normalized or
-        // float data, while an integer shader input would need an integer
-        // vertex format this consumer does not build.
-        if (a.streamIndex != 0 || !element || a.offset + element > stride
-            || info == vp->renderer_data->attribute_infos.end() || info->second.is_integer) {
-            // Name the exact attribute: the rejected shape must be visible
-            // without a debugger (regIndex, format, layout, and the program
-            // metadata the pipeline layout is built from).
-            printf("[gxm-reject] vertex attribute regIndex=%u stream=%u format=%u(%s) components=%u offset=%u stride=%zu element=%u metadata=%s\n",
-                unsigned(a.regIndex), unsigned(a.streamIndex), unsigned(a.format),
-                attribute_format_name(a.format), unsigned(a.componentCount), a.offset, stride,
-                element, info == vp->renderer_data->attribute_infos.end() ? "missing" : "present");
-            if (info != vp->renderer_data->attribute_infos.end())
-                printf("[gxm-reject] vertex attribute metadata location=%u type=%u componentCount=%u integer=%d signed=%d regformat=%d\n",
-                    info->second.location, unsigned(info->second.gxm_type), unsigned(info->second.component_count),
-                    info->second.is_integer, info->second.is_signed, info->second.regformat);
-            unsupported("vertex attribute format");
+        if (info == vp->renderer_data->attribute_infos.end())
+            continue; // stripped symbol: the shader does not read it
+        const bool small = a.format <= SCE_GXM_ATTRIBUTE_FORMAT_F16 && a.componentCount != 2 && a.componentCount != 4;
+        if (small || a.format > SCE_GXM_ATTRIBUTE_FORMAT_F32 || a.streamIndex >= stream_count)
+            return skip_draw("vertex attribute format " + std::to_string(a.format) + "x" + std::to_string(a.componentCount));
+        attributes.push_back({info->second.location, a.streamIndex, a.offset, uint32_t(a.format), a.componentCount});
+    }
+
+    // Indices; fans become lists with the same provoking vertex.
+    const size_t index_size = format == SCE_GXM_INDEX_FORMAT_U16 ? 2 : 4;
+    require_guest(mem, indices.address(), size_t(count) * index_size);
+    uint32_t index_offset = 0, index_count = count;
+    if (primitive == SCE_GXM_PRIMITIVE_TRIANGLE_FAN) {
+        if (count < 3)
+            return;
+        index_count = (count - 2) * 3;
+        uint8_t *dest = out.reserve(size_t(index_count) * index_size, 4, index_offset);
+        const uint8_t *source = indices.get(mem);
+        for (uint32_t k = 1; k + 1 < count; ++k) {
+            std::memcpy(dest, source, index_size); dest += index_size;
+            std::memcpy(dest, source + k * index_size, index_size); dest += index_size;
+            std::memcpy(dest, source + (k + 1) * index_size, index_size); dest += index_size;
         }
-        attributes.push_back({info->second.location, a.offset, a.componentCount, uint32_t(a.format)});
+    } else {
+        index_offset = out.bytes(indices.get(mem), size_t(count) * index_size, 4);
     }
-    const auto shader = [&](Ptr<const SceGxmProgram> ptr) {
-        require_guest(mem, ptr.address(), sizeof(SceGxmProgram));
-        const auto *gxp = ptr.get(mem);
-        if (gxp->size < sizeof(SceGxmProgram) || gxp->size > 16 * 1024 * 1024)
-            unsupported("GXP size");
-        require_guest(mem, ptr.address(), gxp->size);
-        return gxp;
-    };
-    const auto *vs = shader(vp->program), *fs = shader(fp->program);
-    for (unsigned i = 0; i < 2; ++i) {
-        const auto *p = i == 0 ? static_cast<const ShaderProgram *>(vp->renderer_data.get()) : fp->renderer_data.get();
-        if (ctx.uniforms[i].size() != p->max_total_uniform_buffer_storage * 4)
-            unsupported("missing guest shader uniforms");
+
+    // Render info blocks (see renderer/src/vulkan/scene.cpp).
+    const auto &surface = ctx.record.color_surface;
+    const float vs_info[12] = {ctx.record.viewport_flip[0], ctx.record.viewport_flip[1],
+        ctx.record.viewport_flip[2], ctx.record.viewport_flip[3], ctx.record.viewport_flat ? 0.0f : 1.0f,
+        float(surface.width), float(surface.height), ctx.record.z_offset, ctx.record.z_scale, 0, 0, 0};
+    const float fs_info[8] = {
+        ctx.record.back_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED ? 1.0f : 0.0f,
+        ctx.record.front_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED ? 1.0f : 0.0f,
+        ctx.record.writing_mask, 0.0f, 1.0f, 0, 0, 0};
+    const uint32_t vs_info_offset = out.bytes(vs_info, sizeof(vs_info), scene::kUniformAlign);
+    const uint32_t fs_info_offset = out.bytes(fs_info, sizeof(fs_info), scene::kUniformAlign);
+    const uint32_t vs_uniforms = out.bytes(ctx.uniforms[0].data(), ctx.uniforms[0].size(), scene::kUniformAlign);
+    const uint32_t fs_uniforms = out.bytes(ctx.uniforms[1].data(), ctx.uniforms[1].size(), scene::kUniformAlign);
+
+    // Viewport rect (vulkan sync_viewport_real, positive height) and scissor.
+    float vx = 0, vy = 0, vw = float(surface.width), vh = float(surface.height);
+    if (!ctx.record.viewport_flat && ctx.has_viewport) {
+        vw = std::abs(2 * ctx.viewport[3]);
+        vh = 2 * ctx.viewport[4];
+        vy = ctx.viewport[1] - ctx.viewport[4];
+        vx = ctx.viewport[0] - std::abs(ctx.viewport[3]);
+        if (vh < 0) { vy += vh; vh = -vh; }
     }
-    std::vector<uint8_t> packet;
-    const auto append = [&](const void *data, size_t size) {
-        if (!size) return;
-        const auto *bytes = static_cast<const uint8_t *>(data);
-        packet.insert(packet.end(), bytes, bytes + size);
-    };
-    const auto word = [&](uint32_t value) { append(&value, 4); };
-    // The bound fragment program carries the guest blend descriptor retained at
-    // program creation (gxm_webgpu_program.h); the packet ships it in guest
-    // units so the JS decoder owns the single GXM -> WebGPU translation, like
-    // the texture sampler/format fields. Every draw reaches the consumer as a
-    // triangle list: triangle fans are expanded above before the packet exists.
-    const auto *const webgpu_fp = static_cast<const browser::WebGPUFragmentProgram *>(fp->renderer_data.get());
+    int32_t sx = 0, sy = 0, sw = int32_t(surface.width), sh = int32_t(surface.height);
+    switch (ctx.record.region_clip_mode) {
+    case SCE_GXM_REGION_CLIP_ALL: sw = sh = 0; break;
+    case SCE_GXM_REGION_CLIP_OUTSIDE:
+        sx = ctx.record.region_clip_min.x; sy = ctx.record.region_clip_min.y;
+        sw = std::max(ctx.record.region_clip_max.x - ctx.record.region_clip_min.x + 1, 0);
+        sh = std::max(ctx.record.region_clip_max.y - ctx.record.region_clip_min.y + 1, 0);
+        break;
+    default: break; // NONE, and INSIDE (unimplemented upstream as well)
+    }
+    sx = std::clamp(sx, 0, int32_t(surface.width)); sy = std::clamp(sy, 0, int32_t(surface.height));
+    sw = std::clamp(sw, 0, int32_t(surface.width) - sx); sh = std::clamp(sh, 0, int32_t(surface.height) - sy);
+
+    const auto *webgpu_fp = static_cast<const browser::WebGPUFragmentProgram *>(fp->renderer_data.get());
     const auto &blend = webgpu_fp->blend;
-    const bool blend_enabled = blend.color_func != SCE_GXM_BLEND_FUNC_NONE
-        || blend.alpha_func != SCE_GXM_BLEND_FUNC_NONE;
-    // GXM5 fixed words: magic, stride, indexSize, six payload lengths,
-    // attribute count, blend enabled u32, seven guest blend words (colorMask,
-    // colorFunc, alphaFunc, colorSrc, colorDst, alphaSrc, alphaDst), depth
-    // enabled u32, optional five depth words (format, compare, write mode,
-    // load mode 0=clear, clear value f32), texture count (0/1), optional eight
-    // texture words, viewport flat u32, viewport
-    // xOffset,yOffset,zOffset,xScale,yScale,zScale f32 bits. Then render info
-    // (48 bytes), four words per attribute (location, offset, componentCount,
-    // guest SceGxmAttributeFormat), the six payloads, and packed texture bytes.
-    // The vertex shader consumes only flip/flag/screen/z from render info; x/y
-    // mapping is the WebGPU viewport, computed in JS from these exact GXM
-    // floats. GXM4 is no longer accepted: native and JS deploy together, old
-    // packets must fail loudly. All words are little-endian wasm u32.
-    word(0x47584d35); word(stride); word(index_size);
-    for (auto size : {index_bytes, stream.size, size_t(vs->size), size_t(fs->size), ctx.uniforms[0].size(), ctx.uniforms[1].size()}) word(size);
-    word(attributes.size());
-    word(blend_enabled ? 1u : 0u);
-    word(blend.color_mask); word(blend.color_func); word(blend.alpha_func);
-    word(blend.color_src); word(blend.color_dst); word(blend.alpha_src); word(blend.alpha_dst);
-    word(ctx.has_depth ? 1u : 0u);
-    if (ctx.has_depth) {
-        const auto &depth = ctx.record.depth_stencil_surface;
-        word(static_cast<uint32_t>(depth.get_format()));
-        word(static_cast<uint32_t>(ctx.record.front_depth_func));
-        word(static_cast<uint32_t>(ctx.record.front_depth_write_mode));
-        // Load mode is always clear: force_load was rejected when the surface
-        // was recorded, so the draw starts from background_depth.
-        word(0);
-        const float clear_depth = depth.background_depth;
-        append(&clear_depth, sizeof(clear_depth));
+    const bool two_sided = ctx.record.two_sided == SCE_GXM_TWO_SIDED_ENABLED;
+    const auto &front_op = ctx.record.front_stencil_state_op;
+    const auto &back_op = two_sided ? ctx.record.back_stencil_state_op : front_op;
+    const auto &front_values = ctx.record.front_stencil_state_values;
+    const bool fragment_disabled = ctx.record.front_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED
+        || fp->program.get(mem)->has_no_effect();
+
+    out.word(scene::Draw);
+    out.word(uint32_t(vs));
+    out.word(uint32_t(fs));
+    out.word(ctx.record.cull_mode == SCE_GXM_CULL_CW ? 1 : ctx.record.cull_mode == SCE_GXM_CULL_CCW ? 2 : 0);
+    out.word(topology_index(primitive));
+    for (const uint32_t value : {blend.color_mask, blend.color_func, blend.alpha_func, blend.color_src,
+             blend.color_dst, blend.alpha_src, blend.alpha_dst})
+        out.word(value);
+    out.word(fragment_disabled ? 1 : 0);
+    out.word(uint32_t(ctx.record.front_depth_func) >> 22);
+    out.word(ctx.record.front_depth_write_mode == SCE_GXM_DEPTH_WRITE_ENABLED ? 1 : 0);
+    for (const auto *op : {&front_op, &back_op}) {
+        out.word(uint32_t(op->func) >> 25);
+        out.word(uint32_t(op->stencil_fail));
+        out.word(uint32_t(op->depth_fail));
+        out.word(uint32_t(op->depth_pass));
     }
-    word(textured ? 1 : 0);
-    if (textured) {
-        const auto &t = ctx.fragment_texture;
-        word(texture_width); word(texture_height); word(gxm::get_format(t));
-        word(t.min_filter); word(t.mag_filter); word(t.uaddr_mode); word(t.vaddr_mode);
-        word(texture_pixels.size());
+    out.word(front_values.compare_mask);
+    out.word(front_values.write_mask);
+    out.word(front_values.ref);
+    out.word(uint32_t(stream_count));
+    for (size_t i = 0; i < stream_count; ++i) {
+        out.word(vp->streams[i].stride);
+        out.word(stream_offset[i]);
+        out.word(stream_size[i]);
     }
-    word(ctx.record.viewport_flat ? 1u : 0u);
-    append(ctx.viewport.data(), sizeof(float) * 6);
-    // RenderVertUniformBlock fields, mirroring gl/draw.cpp from record state:
-    // flip, flat?0:1 flag, surface dimensions, z offset/scale. Previously the
-    // flag was hardcoded to 1, mis-describing flat viewports to the shader.
-    const float *flip = ctx.record.viewport_flip.data();
-    const float info[12] = {flip[0], flip[1], flip[2], flip[3],
-        ctx.record.viewport_flat ? 0.0f : 1.0f, float(w), float(height),
-        ctx.record.z_offset, ctx.record.z_scale, 0, 0, 0};
-    append(info, sizeof(info));
-    for (const auto &a : attributes) for (auto value : a) word(value);
-    append(fan_indices.empty() ? indices.get(mem) : fan_indices.data(), index_bytes);
-    append(stream.data.get(mem), stream.size);
-    append(vs, vs->size); append(fs, fs->size);
-    for (const auto &data : ctx.uniforms) append(data.data(), data.size());
-    append(texture_pixels.data(), texture_pixels.size());
-    return web_gxm_draw(packet.data(), packet.size(), w, height, surface.strideInPixels * 4, surface.data.get(mem));
+    out.word(uint32_t(attributes.size()));
+    for (const auto &a : attributes)
+        for (const uint32_t value : {a.location, a.stream, a.offset, a.format, a.components})
+            out.word(value);
+    out.word(uint32_t(index_size));
+    out.word(index_count);
+    out.word(index_offset);
+    out.real(vx); out.real(vy); out.real(vw); out.real(vh);
+    out.word(uint32_t(sx)); out.word(uint32_t(sy)); out.word(uint32_t(sw)); out.word(uint32_t(sh));
+    out.word(vs_info_offset);
+    out.word(fs_info_offset);
+    out.word(vs_uniforms);
+    out.word(uint32_t(ctx.uniforms[0].size()));
+    out.word(fs_uniforms);
+    out.word(uint32_t(ctx.uniforms[1].size()));
+    out.word(uint32_t(units.size()));
+    for (const auto &[unit, bound] : units)
+        for (const uint32_t value : {unit, bound.id, bound.min, bound.mag, bound.mip, bound.u, bound.v, bound.lod_max})
+            out.word(value);
+    ++out.draws;
+}
+
+// False when gxm_scene.js rejected the stream (its error is logged).
+static bool submit_scene(scene::Writer &out) {
+    end_pass(out);
+    int result = 0;
+    if (out.words.size() > 1) {
+        const double started = emscripten_get_now();
+        result = web_gxm_submit(out.words.data(), uint32_t(out.words.size()), out.data.data(), uint32_t(out.data.size()));
+        timing().submit += emscripten_get_now() - started;
+    }
+    out.reset();
+    return result == 0;
+}
+
+// Fill guest memory (the CPU view) and the GPU target living there, if any.
+static int transfer_fill(MemState &mem, uint32_t color, const SceGxmTransferImage &d, scene::Writer &out) {
+    const uint64_t start = uint64_t(d.address.address()) + uint64_t(d.y) * d.stride + uint64_t(d.x) * 4;
+    const uint64_t end = start + uint64_t(d.height ? d.height - 1 : 0) * d.stride + uint64_t(d.width) * 4;
+    if (d.format != SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR || !d.width || !d.height
+        || d.width > 4096 || d.height > 4096 || d.stride <= 0
+        || uint64_t(d.stride) < (uint64_t(d.x) + d.width) * 4
+        || start > UINT32_MAX || end > uint64_t(UINT32_MAX) + 1
+        || !is_valid_addr_range(mem, static_cast<Address>(start), end))
+        return -1;
+    auto *base = Ptr<uint8_t>(static_cast<Address>(start)).get(mem);
+    for (uint32_t y = 0; y < d.height; ++y) {
+        auto *row = reinterpret_cast<uint32_t *>(base + size_t(y) * d.stride);
+        std::fill(row, row + d.width, color);
+    }
+    // The GPU copy of a rendered target at this address gets the same
+    // rectangle (gxm_scene.js clears or writes it, keeping the target size).
+    const Address target = d.address.address();
+    if (rendered_targets().contains(target)) {
+        // In stream order with the scenes of this command list.
+        if (out.pass_open)
+            unsupported("transfer fill of a render target inside a scene");
+        for (const uint32_t value : {uint32_t(scene::ClearTarget), target, d.x, d.y, d.width, d.height, color})
+            out.word(value);
+    }
+    return 0;
 }
 
 void submit_command_list(State &state, Context *ctx, CommandList &list) {
-    // Reject unsupported opcodes before publishing any batch completion.
-    // Signal/WaitSyncObject and NewFrame are the display-queue/sync slice:
-    // steady-state waits are already signaled, and NewFrame only records the
-    // predicted frame (presentation is a later slice). Everything else still
-    // rejects here instead of partially executing the batch.
-    for (Command *cmd = list.first; cmd; cmd = cmd->next) {
-        if (cmd->opcode != CommandOpcode::Nop && cmd->opcode != CommandOpcode::TransferFill
-            && cmd->opcode != CommandOpcode::SignalNotification && cmd->opcode != CommandOpcode::SetContext
-            && cmd->opcode != CommandOpcode::SetState && cmd->opcode != CommandOpcode::Draw
-            && cmd->opcode != CommandOpcode::SyncSurfaceData && cmd->opcode != CommandOpcode::SignalSyncObject
-            && cmd->opcode != CommandOpcode::WaitSyncObject && cmd->opcode != CommandOpcode::NewFrame) {
-            trace_scene(list, static_cast<WebState &>(state).mem);
-            unsupported("command opcode not implemented");
-        }
-    }
+    const double started = emscripten_get_now();
+    struct Charge { double started; ~Charge() { timing().build += emscripten_get_now() - started; } } charge{started};
+    auto &web_state = static_cast<WebState &>(state);
+    auto &mem = web_state.mem;
     if (!list.first) return;
+    // The guest may rewrite a texture between scenes: every submission
+    // rehashes each texture it binds (once), decoding only changed ones.
+    ++texture_cache().frame;
+    auto &out = scene::writer();
+    out.reset();
     int result = 0;
     std::exception_ptr failure;
+    // Guest-visible completion (notifications, sync signals, command
+    // statuses) is published only once the scene stream was accepted.
+    std::vector<std::function<void()>> completions;
+    const auto publish = [&] {
+        if (!submit_scene(out))
+            unsupported("scene submission failed (see browser log)");
+        for (const auto &complete : completions)
+            complete();
+        completions.clear();
+    };
     Command *cmd = list.first;
     reset_command_list(list);
     while (cmd) {
@@ -885,124 +1253,70 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
             auto *target = helper.pop<RenderTarget *>();
             const auto *color = helper.pop<SceGxmColorSurface *>();
             const auto *depth = helper.pop<SceGxmDepthStencilSurface *>();
-            if (!target || !color || color->disabled || color->downscale || color->gamma
-                || color->colorFormat != SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR
-                || color->surfaceType != SCE_GXM_COLOR_SURFACE_LINEAR
-                || !color->width || !color->height || color->width > 4096 || color->height > 4096
-                || color->strideInPixels < color->width || color->strideInPixels > UINT32_MAX / 4) {
-                printf("[gxm-reject] surface target=%d color=%d depth=%d\n",
-                    target != nullptr, color != nullptr, depth != nullptr);
-                if (color) {
-                    printf("[gxm-reject] color format=%08x type=%u width=%u height=%u stride=%u disabled=%d downscale=%u gamma=%u\n",
-                        unsigned(color->colorFormat), unsigned(color->surfaceType), color->width, color->height,
-                        color->strideInPixels, bool(color->disabled), unsigned(color->downscale), unsigned(color->gamma));
-                }
-                unsupported("color surface format");
-            }
-            require_guest(static_cast<WebState &>(state).mem, color->data.address(),
-                (uint64_t(color->height) - 1) * color->strideInPixels * 4 + uint64_t(color->width) * 4);
-            web.record.color_surface = *color; web.has_surface = true;
             ctx->current_render_target = target;
-            // Depth-stencil attachment, mirroring scene.cpp handle_set_context:
-            // a null or disabled guest surface clears the recorded addresses.
-            // The attachment always matches the color surface dimensions, which
-            // is what a single GXM render target guarantees.
-            web.has_depth = false;
-            web.record.depth_stencil_surface = SceGxmDepthStencilSurface{};
-            if (depth && !depth->disabled()) {
-                const auto format = depth->get_format();
-                const uint32_t bytes = depth_bytes_per_sample(format);
-                // Validation bound, not a layout model: the guest depth memory is
-                // never read or written (force_load/force_store are rejected
-                // below), so LINEAR and TILED differ only in a buffer the
-                // consumer does not touch. A tiled allocation is never smaller
-                // than this row-major estimate, so the check cannot false-reject.
-                const uint64_t footprint = uint64_t(depth->get_stride()) * bytes * color->height;
-                const Address data = depth->depth_data.address();
-                if (!supported_depth_format(format) || !depth->depth_data
-                    || depth->get_stride() < color->width || !std::isfinite(depth->background_depth)
-                    || depth->background_depth < 0.0f || depth->background_depth > 1.0f
-                    || !footprint || footprint > 64 * 1024 * 1024
-                    || !is_valid_addr_range(static_cast<WebState &>(state).mem, data, uint64_t(data) + footprint)) {
-                    printf("[gxm-reject] depth tiling=%s format=%08x strideSamples=%u depth=%d stencil=%d forceLoad=%d forceStore=%d background=%g footprint=%llu\n",
-                        depth->get_type() == SCE_GXM_DEPTH_STENCIL_SURFACE_TILED ? "tiled" : "linear",
-                        unsigned(format), depth->get_stride(),
-                        depth->depth_data.address() != 0, depth->stencil_data.address() != 0,
-                        bool(depth->force_load), bool(depth->force_store), double(depth->background_depth),
-                        static_cast<unsigned long long>(footprint));
-                    unsupported("depth surface format/layout");
-                }
-                // force_load means the previous depth-stencil contents must be
-                // preserved; force_store means they must be written back to
-                // guest memory. The consumer has a per-draw attachment and no
-                // depth readback, so both reject instead of losing contents.
-                if (depth->force_load || depth->force_store)
-                    unsupported(depth->force_load ? "depth force load (guest depth contents)"
-                                                 : "depth force store (guest depth writeback)");
-                web.record.depth_stencil_surface = *depth;
-                web.has_depth = true;
+            web.has_surface = false;
+            if (!target || !color || color->disabled || !color->width || !color->height
+                || color->width > 4096 || color->height > 4096) {
+                skip_draw("scene without a usable color surface");
+                end_pass(out);
+                break;
             }
+            if (color->surfaceType != SCE_GXM_COLOR_SURFACE_LINEAR || color->downscale)
+                skip_draw("tiled/swizzled or downscaled color surface rendered as linear");
+            web.record.color_surface = *color;
+            web.has_surface = true;
+            web.has_depth_surface = depth && !depth->disabled();
+            if (web.has_depth_surface)
+                web.depth = *depth;
+            web.record.depth_stencil_surface = web.has_depth_surface ? *depth : SceGxmDepthStencilSurface{};
+            begin_pass(web, out);
             break;
         }
         case CommandOpcode::SetState:
             if (!ctx) unsupported("state without context");
-            consume_state(static_cast<WebContext &>(*ctx), helper, static_cast<WebState &>(state).mem);
+            consume_state(static_cast<WebContext &>(*ctx), helper, mem);
             break;
         case CommandOpcode::Draw:
             if (!ctx) unsupported("draw without context");
-            result = consume_draw(static_cast<WebContext &>(*ctx), helper, static_cast<WebState &>(state).mem);
+            consume_draw(static_cast<WebContext &>(*ctx), helper, mem, out);
             break;
         case CommandOpcode::SyncSurfaceData: {
-            // Draw readback is awaited before execution reaches notifications.
-            // Mirror scene.cpp signal_notifications: publish under the mutex
-            // and wake sceGxmNotificationWait. No notify on validation failure.
-            auto &mem = static_cast<WebState &>(state).mem;
+            // Published after the scene is submitted, as the desktop path
+            // does (renderer/src/vulkan/scene.cpp signal_notifications).
             const auto vertex = helper.pop<SceGxmNotification>(), fragment = helper.pop<SceGxmNotification>();
             for (const auto &n : {vertex, fragment}) if (n.address)
                 require_guest(mem, n.address.address(), sizeof(uint32_t));
-            // Signal only when at least one waiter address exists, mirroring
-            // the were_notifications_signaled guard (memory mapping is never
-            // enabled on this backend; disable_surface_sync is false while
-            // the draw readback await stands in for fence completion).
             if (vertex.address || fragment.address) {
-                // Unlock before notifying, exactly like the desktop path.
-                std::unique_lock<std::mutex> lock(state.notification_mutex);
-                for (const auto &n : {vertex, fragment}) if (n.address) *n.address.get(mem) = n.value;
-                lock.unlock();
-                state.notification_ready.notify_all();
+                completions.push_back([&state, &mem, vertex, fragment] {
+                    std::unique_lock<std::mutex> lock(state.notification_mutex);
+                    for (const auto &n : {vertex, fragment}) if (n.address) *n.address.get(mem) = n.value;
+                    lock.unlock();
+                    state.notification_ready.notify_all();
+                });
             }
             break;
         }
         case CommandOpcode::SignalSyncObject: {
-            // EndScene emits this after SyncSurfaceData when a fragment sync
-            // object is bound. Advance exactly like renderer::subject_done so
-            // display-queue waits observe scene completion.
             const auto sync = helper.pop<Ptr<SceGxmSyncObject>>();
             const auto timestamp = helper.pop<uint32_t>();
-            auto &mem = static_cast<WebState &>(state).mem;
             if (!sync) unsupported("sync signal without object");
             require_guest(mem, sync.address(), sizeof(SceGxmSyncObject));
-            subject_done(sync.get(mem), timestamp);
+            completions.push_back([&mem, sync, timestamp] { subject_done(sync.get(mem), timestamp); });
             break;
         }
         case CommandOpcode::WaitSyncObject: {
-            // BeginScene emits this for the bound fragment sync object. Steady
-            // state is already signaled; genuine backpressure blocks with
-            // desktop wishlist semantics rather than skipping the wait.
             const auto sync = helper.pop<Ptr<SceGxmSyncObject>>();
             const auto timestamp = helper.pop<uint32_t>();
-            auto &mem = static_cast<WebState &>(state).mem;
             if (!sync) unsupported("sync wait without object");
             require_guest(mem, sync.address(), sizeof(SceGxmSyncObject));
+            // A signal earlier in this list must be visible to the wait.
+            if (!completions.empty() && !out.pass_open)
+                publish();
             if (wishlist(sync.get(mem), timestamp) != SyncWaitResult::Ready)
                 result = -1;
             break;
         }
         case CommandOpcode::NewFrame: {
-            // sceGxmDisplayQueueAddEntry path (always sent with null context).
-            // Record the predicted frame for a future presentation slice;
-            // pixels are NOT presented yet. Mirrors sync.cpp new_frame minus
-            // the backend-specific frame advance.
             auto *frame = helper.pop<DisplayFrameInfo *>();
             auto *display = helper.pop<DisplayState *>();
             helper.pop<Context *>();
@@ -1016,70 +1330,74 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
             break;
         }
         case CommandOpcode::Nop:
+            // sceGxmFinish: every scene was submitted synchronously and no
+            // guest-visible result waits on the GPU.
             code = helper.pop<int>();
-            result = web_gxm_fence();
             break;
         case CommandOpcode::TransferFill: {
             const uint32_t color = helper.pop<uint32_t>();
             const auto *d = helper.pop<const SceGxmTransferImage *>();
-            auto &mem = static_cast<WebState &>(state).mem;
-            const uint64_t start = uint64_t(d->address.address()) + uint64_t(d->y) * d->stride + uint64_t(d->x) * 4;
-            const uint64_t end = start + uint64_t(d->height ? d->height - 1 : 0) * d->stride + uint64_t(d->width) * 4;
-            if (d->format != SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR || !d->width || !d->height
-                || d->width > 4096 || d->height > 4096 || d->stride <= 0
-                || uint64_t(d->stride) < (uint64_t(d->x) + d->width) * 4
-                || start > UINT32_MAX || end > uint64_t(UINT32_MAX) + 1
-                || !is_valid_addr_range(mem, static_cast<Address>(start), end)) {
-                result = -1;
-            } else {
-                result = web_gxm_fill(color, d->width, d->height, d->stride,
-                    Ptr<void>(static_cast<Address>(start)).get(mem));
-            }
+            result = transfer_fill(mem, color, *d, out);
             break;
         }
         case CommandOpcode::SignalNotification: {
-            // Mirror sync.cpp handle_notification: publish under the mutex and
-            // wake sceGxmNotificationWait. An invalid address fails the batch
-            // without publishing, exactly as before.
             const auto n = helper.pop<SceGxmNotification>();
-            auto &mem = static_cast<WebState &>(state).mem;
             if (n.address) {
                 if (!is_valid_addr_range(mem, n.address.address(), uint64_t(n.address.address()) + sizeof(uint32_t)))
                     result = -1;
                 else {
-                    std::unique_lock<std::mutex> lock(state.notification_mutex);
-                    *n.address.get(mem) = n.value;
-                    lock.unlock();
+                    completions.push_back([&state, &mem, n] {
+                        std::unique_lock<std::mutex> lock(state.notification_mutex);
+                        *n.address.get(mem) = n.value;
+                        lock.unlock();
+                        state.notification_ready.notify_all();
+                    });
                 }
             }
-            // handle_notification notifies unconditionally after the locked
-            // publish; waiters re-check their own predicates.
-            state.notification_ready.notify_all();
             break;
         }
-        default: break; // Preflight above excludes all other opcodes.
+        default:
+            trace_scene(list, mem);
+            unsupported("command opcode not implemented");
         }
-        } catch (...) {
-            // Drain and free the detached batch even on validation failure.
-            // No later notification/status may acknowledge a failed draw.
-            failure = std::current_exception();
-            result = -1;
+        } catch (const std::exception &error) {
+            if (survey_mode()) {
+                if (++survey_counts()[error.what()] == 1)
+                    std::printf("[gxm-survey] first: %s\n", error.what());
+            } else {
+                // No later notification/status may acknowledge a failed batch.
+                failure = std::current_exception();
+                result = -1;
+            }
         }
-        if (cmd->status) *cmd->status = result == 0 ? code : -1;
+        if (int *status = cmd->status) {
+            const int value = result == 0 ? code : -1;
+            completions.push_back([status, value] { *status = value; });
+        }
         destroy_command_payload(*cmd);
         if (ctx) ctx->free_func(cmd);
         else generic_command_free(cmd);
         cmd = next;
     }
     if (failure) std::rethrow_exception(failure);
-    if (result != 0) unsupported("WebGPU command failed (see browser log)");
+    publish();
+    if (result != 0 && !survey_mode())
+        unsupported("GXM command failed (see browser log)");
 }
 int wait_for_status(State &, int *status, int signal, bool equal) {
     if ((*status == signal) != equal) unsupported("uncompleted command");
     return *status;
 }
 void finish(State &s, Context *ctx) {
-    printf("[vita3k-web] GXM finish entered\n");
     send_single_command(s, ctx, CommandOpcode::Nop, true, 1);
 }
+} // namespace renderer
+
+namespace browser {
+// Presentation hook (vita_display_bridge.cpp): a frame whose base is a GPU
+// render target is shown from the GPU; otherwise the caller presents guest
+// memory.
+bool gxm_present_gpu_target(Address base) {
+    return web_gxm_present(base) != 0;
 }
+} // namespace browser

@@ -18,6 +18,20 @@ globalThis.vita3kWebOnFrame = (generation, width, height, view) => {
   const data = view.slice().buffer;
   post({ type: 'vita-frame', generation, width, height, pixelFormat: 'A8B8G8R8', data }, [data]);
 };
+// GXM frames presented from the GPU (browser/web/gxm_scene.js). Pixels are
+// present only on read-back frames; the canvas (when attached) already shows
+// every frame.
+globalThis.vita3kWebOnGpuFrame = (generation, width, height, pixels) => {
+  if (!pixels) { post({ type: 'vita-present', generation, width, height }); return; }
+  const data = pixels.buffer;
+  post({ type: 'vita-frame', generation, width, height, pixelFormat: 'A8B8G8R8', data }, [data]);
+};
+// A canvas transferred by the page ('attach-canvas'); bound once the GXM
+// device exists.
+let pendingCanvas = null;
+globalThis.vita3kGxmReady = (scene) => {
+  if (pendingCanvas) { scene.attachCanvas(pendingCanvas); pendingCanvas = null; }
+};
 // PCM tap (see browser/src/hle_audio_null.cpp): one copied buffer per
 // sceAudioOutOutput call. Transfer the copy; the Wasm scratch is reused by
 // the next call, so the page must not retain the view.
@@ -84,6 +98,8 @@ try {
         // Region-cache size: unset keeps the built-in default (currently
         // 4096); a number overrides it for cache-size A/B runs.
         VITA3K_WASMJIT_REGION_CACHE: workerParams.get('regionCache') || undefined,
+        // GPU-presented frames read back to the page every N frames (0 = never).
+        VITA3K_FRAME_READBACK: workerParams.get('readback') ?? undefined,
         // Emulated guest CPU cores (vita_app.cpp); unset keeps the default.
         VITA3K_GUEST_CORES: workerParams.get('cores') ?? undefined,
       });
@@ -202,6 +218,12 @@ self.onmessage = async ({ data }) => {
     // SCE_CTRL_* button mask and stick axes in [-1, 1] (vita_app.cpp vita3k_web_set_pad).
     module?._vita3k_web_set_pad?.(data.buttons >>> 0, ...(data.axes ?? [0, 0, 0, 0]));
     break;
+  case 'attach-canvas': {
+    globalThis.vita3kHasCanvas = true;
+    const scene = module?.['vita3kGxm'];
+    if (scene) scene.attachCanvas(data.canvas); else pendingCanvas = data.canvas;
+    break;
+  }
   case 'run-app': {
     // Retail-app launch (vita_app.cpp): the guest sees <vitaFs>/ux0/... and
     // the module owns module loading, license setup and the main thread.

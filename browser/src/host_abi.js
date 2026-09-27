@@ -22,6 +22,10 @@ Module['preRun'].push(() => {
   }
 });
 
+// Benchmark-only: skip WebGPU draws so the CPU path can run under Node.
+Module['vita3kNullGpu'] = Module['VITA3K_NULL_GPU'] === '1' ||
+  (typeof process !== 'undefined' && process.env?.VITA3K_NULL_GPU === '1');
+
 // Typed-array offsets are Numbers; raw Wasm i64 arguments are BigInts. Convert
 // only after an exact range check. No bitwise coercion of native pointers.
 Module['vita3kHostOffset'] = (pointer, length = 0) => {

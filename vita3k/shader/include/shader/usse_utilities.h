@@ -91,6 +91,17 @@ spv::Id make_uniform_vector_from_type(spv::Builder &b, spv::Id type, T val) {
     return v0;
 }
 
+// OpIsNan for 32-bit floats as an exponent/mantissa test: WGSL has no isNan
+// (Naga rejects the instruction) and may fold x != x.
+inline spv::Id make_is_nan(spv::Builder &b, spv::Id value) {
+    const int num_comp = b.getNumComponents(value);
+    const spv::Id uint_type = make_vector_or_scalar_type(b, b.makeUintType(32), num_comp);
+    const spv::Id bits = b.createUnaryOp(spv::OpBitcast, uint_type, value);
+    const spv::Id magnitude = b.createBinOp(spv::OpBitwiseAnd, uint_type, bits, make_uniform_vector_from_type(b, uint_type, 0x7fffffffu));
+    return b.createBinOp(spv::OpUGreaterThan, make_vector_or_scalar_type(b, b.makeBoolType(), num_comp),
+        magnitude, make_uniform_vector_from_type(b, uint_type, 0x7f800000u));
+}
+
 template <typename F>
 void make_for_loop(spv::Builder &b, spv::Id iterator, spv::Id initial_value_ite, spv::Id iterator_limit, F body) {
     auto blocks = b.makeNewLoop();

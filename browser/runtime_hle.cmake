@@ -409,6 +409,9 @@ add_library(vita3k_web_runtime_hle STATIC
     "${_HLE_ROOT}/renderer/src/renderer.cpp"
     "${_HLE_ROOT}/renderer/src/creation.cpp"
     "${_HLE_ROOT}/gxm/src/textures.cpp"
+    # Guest texel layout helpers (swizzle/tiled -> linear) for the scene stream.
+    "${_HLE_ROOT}/renderer/src/texture/format.cpp"
+    "${_HLE_ROOT}/renderer/src/texture/pvrt-dec.cpp"
     "${_HLE_ROOT}/gxm/src/attributes.cpp"
     "${_HLE_ROOT}/shader/src/usse_program_analyzer.cpp"
     "${_HLE_ROOT}/shader/src/gxp_parser.cpp"

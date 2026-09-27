@@ -769,7 +769,7 @@ bool USSETranslatorVisitor::vcomp(
         // define exp(Nan) as 1.0, this is needed for Freedom Wars to render properly
         const spv::Id exp_val = m_b.createBuiltinCall(m_b.getTypeId(result), std_builtins, GLSLstd450Exp, { result });
         const spv::Id ones = utils::make_uniform_vector_from_type(m_b, m_b.getTypeId(result), 1.0f);
-        const spv::Id is_nan = m_b.createUnaryOp(spv::OpIsNan, m_b.makeBoolType(), result);
+        const spv::Id is_nan = utils::make_is_nan(m_b, result);
         result = m_b.createTriOp(spv::OpSelect, m_b.getTypeId(result), is_nan, ones, exp_val);
         break;
     }
@@ -1866,9 +1866,8 @@ bool USSETranslatorVisitor::vdual(
             // hack: set exp(nan) = 1.0 (see VEXP)
             const spv::Id source = load(ops[0], write_mask_source);
             result = m_b.createBuiltinCall(m_b.getTypeId(source), std_builtins, GLSLstd450Exp, { source });
-            const int num_comp = m_b.getNumComponents(source);
             const spv::Id ones = utils::make_uniform_vector_from_type(m_b, m_b.getTypeId(result), 1.0f);
-            const spv::Id is_nan = m_b.createUnaryOp(spv::OpIsNan, utils::make_vector_or_scalar_type(m_b, m_b.makeBoolType(), num_comp), result);
+            const spv::Id is_nan = utils::make_is_nan(m_b, result);
             result = m_b.createTriOp(spv::OpSelect, m_b.getTypeId(result), is_nan, ones, result);
             break;
         }
