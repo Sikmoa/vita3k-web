@@ -555,13 +555,13 @@ void float_to_int32() {
         expected.fpscr = fpscr_dn | 1;
         run(block, state, &expected);
     }
-    // More fraction bits than the 32-bit result holds, and the other
-    // explicit rounding modes (VCVTA/VCVTP/VCVTM), must fail closed.
+    // More fraction bits than the 32-bit result holds, and ToOdd (not an
+    // FPToFixed rounding mode), must fail closed.
     auto scaled = blank(0);
     write_s(scaled, append(scaled, Op::FPSingleToFixedS32,
         {read_s(scaled), Value{uint8_t(33)}, Value{uint8_t(3)}}));
     CHECK(vita3k::wasmjit::emit_block(scaled).empty());
-    for (uint8_t rounding : {1, 2, 4, 5}) {
+    for (uint8_t rounding : {5, 6}) {
         for (Op op : {Op::FPSingleToFixedS32, Op::FPSingleToFixedU32,
                  Op::FPDoubleToFixedS32, Op::FPDoubleToFixedU32}) {
             auto bad = blank(0);
@@ -762,6 +762,69 @@ void mode_guards() {
 // sources read d7, so overlapping lanes cannot hide a miswired operand.
 // The Thumb words are the half-swapped ARM encodings, verified against the
 // A32 decoder patterns (VCVT to u32/s32) and a Thumb disassembler.
+// VCVT{A,N,P,M}.S32/U32.F32/F64 (VFPv5; rm 0..3 = A, N, P, M) and VCVTR under
+// each FPSCR.RMode, through the ARM/Thumb translator. Hand-derived results.
+void guest_float_to_int_rounding(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    struct Case { uint32_t input; uint32_t by_mode[4]; }; // A, N, P, M
+    const Case cases[] = {
+        {0x3fc00000u, {2, 2, 2, 1}}, // 1.5
+        {0x40200000u, {3, 2, 3, 2}}, // 2.5
+        {0xbfc00000u, {0xfffffffeu, 0xfffffffeu, 0xffffffffu, 0xfffffffeu}}, // -1.5
+        {0xc0200000u, {0xfffffffdu, 0xfffffffeu, 0xfffffffeu, 0xfffffffdu}}, // -2.5
+        {0x3f000000u, {1, 0, 1, 0}}, // 0.5
+        {0xbf000000u, {0xffffffffu, 0, 0, 0xffffffffu}}, // -0.5
+        {0x3e800000u, {0, 0, 1, 0}}, // 0.25
+        {0xbe800000u, {0, 0, 0, 0xffffffffu}}, // -0.25
+    };
+    unsigned count = 0;
+    for (bool regions : {false, true}) for (bool thumb : {false, true}) for (bool from_double : {false, true})
+        for (unsigned rm = 0; rm < 4; ++rm) for (bool vcvtr : {false, true}) for (bool is_unsigned : {false, true})
+            for (const auto &c : cases) {
+                // VCVTR follows FPSCR.RMode (0 N, 1 P, 2 M, 3 Z); A has no RMode.
+                if (vcvtr && rm == 0) continue;
+                const uint32_t rmode = rm == 1 ? 0 : rm == 2 ? 1 : 2;
+                // Destination s2; source s5 (M=1, Vm=2) or d7 (sz=1, Vm=7).
+                const uint32_t source = from_double ? 0x107u : 0x22u;
+                const uint32_t opcode = vcvtr
+                    ? (is_unsigned ? 0xeebc1a40u : 0xeebd1a40u) | source
+                    : (is_unsigned ? 0xfebc1a40u : 0xfebc1ac0u) | (rm << 16) | source;
+                jit.set_region_mode(regions);
+                if (thumb) put_thumb(mem, jit, {(opcode << 16) | (opcode >> 16), 0xbf00df00u});
+                else put(mem, jit, {opcode, 0xef000000u});
+                auto before = jit.save_context();
+                if (from_double) {
+                    const double wide = double(std::bit_cast<float>(c.input));
+                    std::memcpy(&before.fpu_registers[14], &wide, 8);
+                } else {
+                    std::memcpy(&before.fpu_registers[5], &c.input, 4);
+                }
+                before.fpscr = 0x90000080u | (vcvtr ? rmode << 22 : 0);
+                jit.load_context(before);
+                if (jit.run() != 0) {
+                    std::fprintf(stderr, "vcvt rounding guest failed: %08x (%s): %s\n", opcode,
+                        thumb ? "Thumb" : "ARM", jit.get_last_error().c_str());
+                    CHECK(false);
+                }
+                const bool negative = c.input >> 31;
+                const uint32_t want = is_unsigned && negative ? 0 : c.by_mode[rm];
+                const uint32_t flags = is_unsigned && negative ? 1 : 0x10;
+                const auto after = jit.save_context();
+                uint32_t result;
+                std::memcpy(&result, &after.fpu_registers[2], 4);
+                if (result != want || after.fpscr != (before.fpscr | flags))
+                    std::fprintf(stderr, "vcvt rounding op=%08x input=%08x got=%08x/%08x want=%08x/%08x\n",
+                        opcode, c.input, result, after.fpscr, want, before.fpscr | flags);
+                CHECK(result == want);
+                CHECK(after.fpscr == (before.fpscr | flags));
+                ++count;
+            }
+    std::printf("VCVT{A,N,P,M}/VCVTR rounding: %u guest cases passed\n", count);
+}
+
 void guest_float_to_int(MemState &mem) {
     CPUState parent{};
     parent.mem = &mem;
@@ -933,13 +996,22 @@ void float_to_fixed_scaled() {
     std::vector<uint32_t> singles{0x00000000u, 0x80000000u, 0x00000001u, 0x807fffffu, 0x00800000u,
         0x3f800000u, 0xbf800000u, 0x3fc00000u, 0xbfc00000u, 0x3f000000u, 0x37000000u, 0x37800000u,
         0x37c00000u, 0x46ffffffu, 0x47000000u, 0xc7000000u, 0xc7000001u, 0x4f000000u, 0x4f800000u,
-        0x7f7fffffu, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0x7f800001u, 0x2f800000u, 0x30000000u};
+        0x7f7fffffu, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0x7f800001u, 0x2f800000u, 0x30000000u,
+        0x40200000u, 0xc0200000u, 0x3e800000u, 0xbe800000u, 0x2f000000u, 0xaf000000u, 0xceffffffu};
     std::vector<uint64_t> doubles{0, 0x8000000000000000ull, 1, 0x800fffffffffffffull, 0x0010000000000000ull,
         0x3ff0000000000000ull, 0xbff8000000000000ull, 0x3ef0000000000000ull, 0x3ee0000000000000ull,
         0x3ef8000000000000ull, 0x40dfffffffffffffull, 0x40e0000000000000ull, 0xc0e0000000000000ull,
         0xc0e0000000000001ull, 0x41f0000000000000ull, 0x7fefffffffffffffull, 0x7ff0000000000000ull,
         0xfff0000000000000ull, 0x7ff8000000000000ull, 0x7ff0000000000001ull, 0x3df0000000000000ull,
-        0x41e0000000100000ull, 0xc1e0000000100000ull, 0x41efffffffe00000ull}; // overflow after a fraction
+        0x41e0000000100000ull, 0xc1e0000000100000ull, 0x41efffffffe00000ull, // overflow after a fraction
+        // +-(2^32 - 1/2) and 2^32 - 1/4: rounding up carries out of 32 bits.
+        0x41effffffff00000ull, 0xc1effffffff00000ull, 0x41effffffff80000ull,
+        // -(2^31 - 1/4, 1/2, 3/4) and -(2^31 + 1/2): see dynarmic_quirk below.
+        0xc1dffffffff00000ull, 0xc1dfffffffe00000ull, 0xc1dfffffffd00000ull, 0xc1e0000000100000ull,
+        0x41dfffffffe00000ull, 0x41dffffffff00000ull, // 2^31 - 1/2, - 1/4
+        // Ties and tiny magnitudes for the nearest and directed modes.
+        0x3fe0000000000000ull, 0xbfe0000000000000ull, 0x4004000000000000ull, 0xc004000000000000ull,
+        0x3d70000000000000ull, 0xbd70000000000000ull};
     uint32_t rng32 = 0x2545f491u;
     uint64_t rng64 = 0x853c49e6748fea9bull;
     for (unsigned i = 0; i < 400; ++i) {
@@ -949,8 +1021,24 @@ void float_to_fixed_scaled() {
         singles.push_back((rng32 & 0x807fffffu) | ((0x60u + (rng32 >> 24) % 0x40u) << 23));
         doubles.push_back((rng64 & 0x800fffffffffffffull) | (uint64_t(0x3c0u + (rng64 >> 52) % 0x80u) << 52));
     }
-    unsigned count = 0;
-    for (const Op op : ops) for (uint8_t fbits : {0, 1, 8, 16, 31, 32}) for (uint8_t rounding : {0, 3})
+    // FPToFixed decides overflow on the magnitude plus one rounding unit
+    // whenever it increments its (two's complement) result. For a negative
+    // signed value in (-2^31, -(2^31 - 1)) scaled units that increment goes
+    // towards zero into range, yet it reports IOC and returns INT_MIN; ARM
+    // ARM FPToFixed rounds first and returns -(2^31 - 1) with IXC. Only
+    // binary64 inputs can land there (binary32 has no fraction that high).
+    const auto dynarmic_quirk = [](uint64_t input, uint8_t fbits, uint8_t rounding, bool unsigned_) {
+        double scaled;
+        std::memcpy(&scaled, &input, sizeof(scaled));
+        scaled = std::ldexp(scaled, fbits);
+        const double magnitude = -scaled;
+        if (unsigned_ || !(magnitude > 2147483647.0 && magnitude < 2147483648.0)) return false;
+        const double fraction = magnitude - 2147483647.0;
+        // Towards zero: RZ and RP always, the nearest modes below one half.
+        return rounding == 1 || rounding == 3 || ((rounding == 0 || rounding == 4) && fraction < 0.5);
+    };
+    unsigned count = 0, quirks = 0;
+    for (const Op op : ops) for (uint8_t fbits : {0, 1, 8, 16, 31, 32}) for (uint8_t rounding : {0, 1, 2, 3, 4})
         for (uint32_t location_fpscr : {0u, fpscr_fz}) {
             const bool is_double = op == Op::FPDoubleToFixedS32 || op == Op::FPDoubleToFixedU32;
             const bool unsigned_ = op == Op::FPSingleToFixedU32 || op == Op::FPDoubleToFixedU32;
@@ -972,12 +1060,18 @@ void float_to_fixed_scaled() {
                 for (size_t i = 0; i < n; ++i) {
                     Dynarmic::FP::FPSR fpsr{0};
                     const auto mode = static_cast<Dynarmic::FP::RoundingMode>(rounding);
-                    const uint32_t want = is_double
+                    uint32_t want = is_double
                         ? uint32_t(Dynarmic::FP::FPToFixed<uint64_t>(32, doubles[i], fbits, unsigned_,
                             Dynarmic::FP::FPCR{location_fpscr}, mode, fpsr))
                         : uint32_t(Dynarmic::FP::FPToFixed<uint32_t>(32, singles[i], fbits, unsigned_,
                             Dynarmic::FP::FPCR{location_fpscr}, mode, fpsr));
-                    const uint32_t want_flags = fpsr.Value() & 0x9f;
+                    uint32_t want_flags = fpsr.Value() & 0x9f;
+                    if (is_double && dynarmic_quirk(doubles[i], fbits, rounding, unsigned_)) {
+                        CHECK(want == 0x80000000u && want_flags == 1); // the quirk itself
+                        want = 0x80000001u;
+                        want_flags = 0x10;
+                        ++quirks;
+                    }
                     auto state = base_state(location_fpscr | 0x90000000u);
                     if (is_double) set_d_bits(state, doubles[i], 1);
                     else set_s_bits(state, singles[i], 1);
@@ -1020,6 +1114,34 @@ void float_to_fixed_scaled() {
         // Saturation raises IOC only, even when a fraction was dropped.
         {Op::FPDoubleToFixedS32, 0x41e0000000100000ull, 0, 3, 0x7fffffffu, 1}, // 2^31 + 0.5
         {Op::FPDoubleToFixedS32, 0x40dfffffffe00000ull, 16, 0, 0x7fffffffu, 1}, // 2^31 - 0.5 ties up to 2^31
+        // Rounding modes 1 (+inf), 2 (-inf) and 4 (nearest, ties away).
+        {Op::FPSingleToFixedS32, 0x3fc00000, 0, 1, 2, 0x10}, // 1.5
+        {Op::FPSingleToFixedS32, 0x3fc00000, 0, 2, 1, 0x10},
+        {Op::FPSingleToFixedS32, 0x3fc00000, 0, 4, 2, 0x10},
+        {Op::FPSingleToFixedS32, 0xc0200000, 0, 1, 0xfffffffeu, 0x10}, // -2.5
+        {Op::FPSingleToFixedS32, 0xc0200000, 0, 2, 0xfffffffdu, 0x10},
+        {Op::FPSingleToFixedS32, 0xc0200000, 0, 4, 0xfffffffdu, 0x10},
+        {Op::FPSingleToFixedS32, 0x40200000, 0, 4, 3, 0x10}, // 2.5 ties away
+        {Op::FPSingleToFixedS32, 0x2f000000, 0, 1, 1, 0x10}, // tiny positive
+        {Op::FPSingleToFixedS32, 0xaf000000, 0, 2, 0xffffffffu, 0x10}, // tiny negative
+        {Op::FPSingleToFixedS32, 0xaf000000, 0, 1, 0, 0x10},
+        {Op::FPSingleToFixedU32, 0x2f000000, 0, 1, 1, 0x10},
+        {Op::FPSingleToFixedU32, 0xbf000000, 0, 1, 0, 1}, // negative unsigned: IOC
+        {Op::FPDoubleToFixedS32, 0x3d70000000000000ull, 0, 1, 1, 0x10}, // 2^-40
+        {Op::FPDoubleToFixedS32, 0xbd70000000000000ull, 0, 2, 0xffffffffu, 0x10},
+        // 2^32 - 0.5 rounds up to 2^32: the 32-bit magnitude carries out.
+        {Op::FPDoubleToFixedU32, 0x41effffffff00000ull, 0, 0, 0xffffffffu, 1},
+        {Op::FPDoubleToFixedU32, 0x41effffffff00000ull, 0, 1, 0xffffffffu, 1},
+        {Op::FPDoubleToFixedU32, 0x41effffffff00000ull, 0, 2, 0xffffffffu, 0x10},
+        {Op::FPDoubleToFixedS32, 0x41effffffff00000ull, 0, 4, 0x7fffffffu, 1},
+        // Towards zero into range from just below -2^31 (ARM ARM, not
+        // FPToFixed's IOC; see dynarmic_quirk above).
+        {Op::FPDoubleToFixedS32, 0xc1dfffffffe00000ull, 0, 3, 0x80000001u, 0x10}, // -(2^31 - 0.5)
+        {Op::FPDoubleToFixedS32, 0xc1dfffffffe00000ull, 0, 1, 0x80000001u, 0x10},
+        {Op::FPDoubleToFixedS32, 0xc1dfffffffe00000ull, 0, 2, 0x80000000u, 0x10},
+        {Op::FPDoubleToFixedS32, 0xc1dfffffffe00000ull, 0, 4, 0x80000000u, 0x10},
+        {Op::FPDoubleToFixedS32, 0xc1dfffffffe00000ull, 0, 0, 0x80000000u, 0x10}, // tie to even
+        {Op::FPDoubleToFixedS32, 0xc1dfffffffd00000ull, 0, 0, 0x80000001u, 0x10}, // -(2^31 - 0.75)
     };
     for (const auto &c : pinned) {
         const bool is_double = c.op == Op::FPDoubleToFixedS32 || c.op == Op::FPDoubleToFixedU32;
@@ -1034,7 +1156,9 @@ void float_to_fixed_scaled() {
         expected.fpscr |= c.flags;
         run(block, state, &expected);
     }
-    std::printf("fixed-point VCVT: %u oracle cases (fbits 0..32, RN/RZ, FZ, block+region) and pinned cases passed\n", count);
+    CHECK(quirks != 0);
+    std::printf("fixed-point VCVT: %u oracle cases (fbits 0..32, five rounding modes, FZ, block+region; "
+                "%u FPToFixed overflow-quirk cases replaced) and pinned cases passed\n", count, quirks);
 }
 
 // Real fixed-point VCVT encodings (ARM and Thumb) through the translator.

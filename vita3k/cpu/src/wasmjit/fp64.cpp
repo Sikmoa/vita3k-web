@@ -363,6 +363,13 @@ FP64Result fp64_arithmetic(uint32_t operation, uint64_t a, uint64_t b, uint32_t 
         return fp32_lane_estimate(operation, uint32_t(a), uint32_t(b));
     if (operation == 10)
         return sqrt64(a, fpscr);
+    if ((operation == 11 || operation == 12) && b <= 4) {
+        const auto fpcr = Dynarmic::FP::FPCR{0}.ASIMDStandardValue(); // FZ=1, DN=1
+        Dynarmic::FP::FPSR fpsr{0};
+        const auto result = Dynarmic::FP::FPToFixed<uint32_t>(32, uint32_t(a), 0, operation == 12, fpcr,
+            static_cast<Dynarmic::FP::RoundingMode>(b), fpsr);
+        return {result & 0xffffffffu, fpsr.Value() & 0x9f};
+    }
     if (operation > 10)
         return {default_nan, ioc};
 

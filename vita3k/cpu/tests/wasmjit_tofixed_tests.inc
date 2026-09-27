@@ -11,9 +11,10 @@
 // for overflow, and IXC for discarded fractions. FZ input flushing happens
 // first: either sign of subnormal becomes zero with IDC only, even unsigned.
 //
-// The helper executes the standard VCVT shape only (fbits=0, TowardsZero
-// rounding, fpcr_controlled=false) under ASIMDStandardValue() (FZ=1, DN=1;
-// explicit rounding overrides RN). Every other immediate shape must reject.
+// The helper executes the A32 VCVT shapes only (fbits=0, fpcr_controlled=
+// false; TowardsZero for VCVT, the other four modes for v8 VCVT{A,N,P,M})
+// under ASIMDStandardValue() (FZ=1, DN=1; explicit rounding overrides RN).
+// Every other immediate shape must reject.
 // Mode fixtures vary live RMode/FZ/DN and match region keys to prove these
 // bits cannot perturb the standard-FPSCR conversion.
 #include <dynarmic/common/fp/op/FPToFixed.h>
@@ -85,11 +86,11 @@ void run(const IR::Block &block, const JitState &initial, const JitState *expect
     }
 }
 
-uint32_t oracle_tofixed(uint32_t lane, bool unsigned_, uint32_t &flags) {
+uint32_t oracle_tofixed(uint32_t lane, bool unsigned_, uint32_t &flags,
+    Dynarmic::FP::RoundingMode rounding = Dynarmic::FP::RoundingMode::TowardsZero) {
     const auto fpcr = Dynarmic::FP::FPCR{0}.ASIMDStandardValue();
     Dynarmic::FP::FPSR fpsr{0};
-    const uint64_t result = Dynarmic::FP::FPToFixed<uint32_t>(
-        32, lane, 0, unsigned_, fpcr, Dynarmic::FP::RoundingMode::TowardsZero, fpsr);
+    const uint64_t result = Dynarmic::FP::FPToFixed<uint32_t>(32, lane, 0, unsigned_, fpcr, rounding, fpsr);
     flags = fpsr.Value() & 0x9f;
     return uint32_t(result & 0xffffffffu);
 }
@@ -201,10 +202,25 @@ void helper_differential() {
             CHECK(result.flags == oracle_flags);
         }
     }
-    // The first selector past VSQRT.F64 (10) must still reject.
-    const auto invalid = fp64_arithmetic(11, 0, 0, 0);
-    CHECK(invalid.bits == 0x7ff8000000000000ull && invalid.flags == 1);
-    std::puts("tofixed helper differential: 1000000 patterns x 2 operations passed");
+    // Operations 11/12 take the rounding mode in b; ToOdd (5) and the first
+    // selector past them must still reject.
+    for (const auto &[operation, b] : {std::pair{11u, 5ull}, std::pair{12u, 1ull << 32}, std::pair{13u, 0ull}}) {
+        const auto invalid = fp64_arithmetic(operation, 0x3fc00000u, b, 0);
+        CHECK(invalid.bits == 0x7ff8000000000000ull && invalid.flags == 1);
+    }
+    rng = 0x51ab3c7d;
+    for (uint64_t iteration = 0; iteration < 200000; ++iteration) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        const uint32_t lane = iteration < sizeof(edges) / sizeof(edges[0]) ? edges[iteration] : rng;
+        for (uint32_t operation : {11u, 12u}) for (uint32_t rounding = 0; rounding <= 4; ++rounding) {
+            const auto result = fp64_arithmetic(operation, lane, rounding, 0);
+            uint32_t oracle_flags = 0;
+            const uint32_t oracle = oracle_tofixed(lane, operation == 12, oracle_flags,
+                static_cast<Dynarmic::FP::RoundingMode>(rounding));
+            CHECK(result.bits == oracle && result.flags == oracle_flags);
+        }
+    }
+    std::puts("tofixed helper differential: 1000000 patterns x 2 operations (+200000 x 2 x 5 rounding modes) passed");
     // Every sign and exponent with edge and random fractions: the lane
     // conversion is independent of the vendored FPToFixed.
     uint64_t swept = 0;
@@ -249,11 +265,11 @@ void ir_lanes() {
         cases.push_back(c);
     }
     for (const auto &item : cases) {
-        for (bool unsigned_ : {false, true}) {
+        for (bool unsigned_ : {false, true}) for (uint8_t rounding = 0; rounding <= 4; ++rounding) {
             auto block = blank();
             const auto q0 = read_q(block);
             write_q(block, append(block, unsigned_ ? Op::FPVectorToUnsignedFixed32 : Op::FPVectorToSignedFixed32,
-                {q0, Value{uint8_t(0)}, Value{uint8_t(3)}, Value{false}}), 1);
+                {q0, Value{uint8_t(0)}, Value{rounding}, Value{false}}), 1);
             JitState state = base_state();
             for (unsigned word = 0; word < 4; ++word)
                 state.fpu[word] = item.lanes[word];
@@ -261,27 +277,28 @@ void ir_lanes() {
             uint32_t fpscr = 0;
             for (unsigned lane = 0; lane < 4; ++lane) {
                 uint32_t flags = 0;
-                expected.fpu[4 + lane] = oracle_tofixed(state.fpu[lane], unsigned_, flags);
+                expected.fpu[4 + lane] = oracle_tofixed(state.fpu[lane], unsigned_, flags,
+                    static_cast<Dynarmic::FP::RoundingMode>(rounding));
                 fpscr |= flags;
             }
             expected.fpscr = fpscr;
             run(block, state, &expected);
         }
     }
-    std::printf("tofixed ir lanes: %zu cases x 2 ops x (block+region) passed\n", cases.size());
+    std::printf("tofixed ir lanes: %zu cases x 2 ops x 5 rounding modes x (block+region) passed\n", cases.size());
 }
 
-// Only the standard VCVT shape may emit: fbits must be 0, rounding must be
-// TowardsZero (3), and fpcr_controlled must be false. Every other immediate
-// combination rejects the block in both modes with zero writes.
+// Only the A32 VCVT shapes may emit: fbits must be 0, rounding one of the
+// five FPToFixed modes (not ToOdd), and fpcr_controlled must be false.
+// Every other immediate combination rejects the block in both modes.
 void immediate_guards() {
     const uint8_t fbits_values[] = {0, 1, 31};
-    const uint8_t rounding_values[] = {0, 1, 2, 3, 4};
+    const uint8_t rounding_values[] = {0, 1, 2, 3, 4, 5};
     for (bool unsigned_ : {false, true}) {
         for (uint8_t fbits : fbits_values) {
             for (uint8_t rounding : rounding_values) {
                 for (bool controlled : {false, true}) {
-                    const bool accepted = fbits == 0 && rounding == 3 && !controlled;
+                    const bool accepted = fbits == 0 && rounding <= 4 && !controlled;
                     auto block = blank();
                     const auto q0 = read_q(block);
                     write_q(block, append(block, unsigned_ ? Op::FPVectorToUnsignedFixed32 : Op::FPVectorToSignedFixed32,
@@ -317,7 +334,7 @@ void immediate_guards() {
             }
         }
     }
-    std::puts("tofixed immediate guards: only fbits=0/ToZero/uncontrolled emits");
+    std::puts("tofixed immediate guards: only fbits=0/non-ToOdd/uncontrolled emits");
 }
 
 // The conversion runs under the standard FPSCR value regardless of the live
@@ -434,6 +451,55 @@ void limbo_shape() {
     expected.fpscr = fpscr;
     run(block, state, &expected);
     std::puts("tofixed limbo shape: PC=811b001e VCVT pattern passed");
+}
+
+// VCVT{A,N,P,M}.S32/U32.F32 (v8, vector): hand-derived per-mode results,
+// through the ARM/Thumb translator and the production JIT.
+void guest_rounding(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    const uint32_t lanes[4] = {0x3fc00000u, 0xc0200000u, 0x3f000000u, 0xbe800000u}; // 1.5, -2.5, 0.5, -0.25
+    const uint32_t by_mode[4][4] = {
+        {2, 0xfffffffdu, 1, 0}, // A: nearest, ties away
+        {2, 0xfffffffeu, 0, 0}, // N: nearest, ties even
+        {2, 0xfffffffeu, 1, 0}, // P: towards +inf
+        {1, 0xfffffffdu, 0, 0xffffffffu}, // M: towards -inf
+    };
+    unsigned count = 0;
+    for (bool region : {false, true}) for (bool thumb : {false, true}) for (unsigned rm = 0; rm < 4; ++rm)
+        for (bool is_unsigned : {false, true}) {
+            jit.set_region_mode(region);
+            // VCVT<rm>.<S|U>32.F32 q1, q2
+            const uint32_t opcode = 0xf3bb2044u | (rm << 8) | (is_unsigned ? 0x80u : 0);
+            if (thumb) put_thumb(mem, jit, {vector_tests::thumb_word(opcode), 0xbf00df00u});
+            else put(mem, jit, {opcode, 0xef000000u});
+            auto before = jit.save_context();
+            for (unsigned lane = 0; lane < 4; ++lane) {
+                before.fpu_registers[8 + lane] = std::bit_cast<float>(lanes[lane]);
+                before.fpu_registers[4 + lane] = std::bit_cast<float>(0x5a5a5a5au);
+            }
+            before.fpscr = 0x90000080u;
+            before.cpsr = 0x10 | (thumb ? 0x20 : 0);
+            jit.load_context(before);
+            if (jit.run() != 0) {
+                std::fprintf(stderr, "vector vcvt rounding guest failed: %08x: %s\n", opcode, jit.get_last_error().c_str());
+                CHECK(false);
+            }
+            const auto after = jit.save_context();
+            uint32_t flags = 0x10;
+            for (unsigned lane = 0; lane < 4; ++lane) {
+                const bool invalid = is_unsigned && (lanes[lane] >> 31);
+                if (invalid) flags |= 1;
+                const uint32_t want = invalid ? 0 : by_mode[rm][lane];
+                CHECK(std::bit_cast<uint32_t>(after.fpu_registers[4 + lane]) == want);
+                CHECK(std::bit_cast<uint32_t>(after.fpu_registers[8 + lane]) == lanes[lane]);
+            }
+            CHECK(after.fpscr == (before.fpscr | flags));
+            ++count;
+        }
+    std::printf("tofixed vector VCVT{A,N,P,M}: %u guest cases passed\n", count);
 }
 
 inline void run() {

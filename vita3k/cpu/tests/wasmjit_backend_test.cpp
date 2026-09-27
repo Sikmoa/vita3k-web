@@ -1983,10 +1983,12 @@ int main() {
     f64_tests::binary_arithmetic();
     f64_tests::guest_multiply(mem);
     f64_tests::guest_float_to_int(mem);
+    f64_tests::guest_float_to_int_rounding(mem);
     f64_tests::guest_tls_write(mem);
     fp64_helper_tests::run();
     recip_tests::run();
     tofixed_tests::run();
+    tofixed_tests::guest_rounding(mem);
     vectormul_tests::run();
     fpsqrt_tests::run();
     fpsqrt_tests::guest64(mem);

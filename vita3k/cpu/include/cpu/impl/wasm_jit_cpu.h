@@ -127,7 +127,9 @@ public:
     // Root location for a code address (bit 0 = Thumb) in the default
     // execution state: IT/E clear and the default FPSCR mode.
     static uint64_t aot_location(uint32_t address);
-    static constexpr uint32_t aot_version = 3; // 3: JitState write tracking fields
+    // Bump when the module ABI changes: JitState layout, imports or the
+    // fp64 helper operations generated code calls (fp64.h).
+    static constexpr uint32_t aot_version = 4;
     // Translates and emits the module from the currently loaded guest code.
     static bool build_aot(MemState &mem, const AotBuildSpec &spec, std::vector<uint8_t> &out, std::string &report);
     // Loads the module the host supplied (Module.vita3kAotModule or the Node

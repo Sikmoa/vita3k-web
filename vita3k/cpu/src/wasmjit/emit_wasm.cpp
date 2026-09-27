@@ -2603,23 +2603,27 @@ public:
     uint32_t ssa_words() const { return next_local - ssa_base; }
 
 private:
-    // Float-to-integer and float-to-fixed conversion (VCVT.S32/U32.F32/F64,
-    // with fbits 0..32 fraction bits). Pure bit-pattern integer lowering: no
-    // host FP and no trapping Wasm conversion is used, so NaN/infinity/
-    // overflow saturation, rounding and cumulative flags match Dynarmic's
-    // FPToFixed exactly. Scaling by 2^fbits only adds fbits to the exponent
-    // before the range decisions. Plain VCVT and the fixed-point form
-    // truncate towards zero; VCVTR snapshots the FPSCR mode into the
-    // rounding immediate, of which only nearest-even is emitted (wasm has
-    // no round-to-nearest float-to-int). The other explicit rounding modes
-    // stay rejected rather than silently converting with the wrong mode.
+    // Float-to-integer and float-to-fixed conversion (VCVT.S32/U32.F32/F64
+    // with fbits 0..32 fraction bits, VCVTR and VCVT{A,N,P,M}). Pure
+    // bit-pattern integer lowering: no host FP and no trapping Wasm
+    // conversion. NaN/infinity/overflow saturation, the five rounding modes
+    // and cumulative flags follow Dynarmic's FPToFixed, including its IOC for
+    // any nonzero negative unsigned input, with one exception: a negative
+    // signed binary64 value just below -2^31 whose rounding goes towards zero
+    // into range converts with IXC, as ARM ARM FPToFixed (round, then
+    // saturate) specifies; FPToFixed tests overflow on the magnitude plus one
+    // rounding unit and reports IOC there (f64_tests pins those cases).
+    // Scaling by 2^fbits only adds fbits to the exponent before the range
+    // decisions.
     bool fp_to_fixed(const Inst &inst, bool is_signed, bool is_double) {
         if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() > 32) return false;
         const uint32_t fbits = inst.GetArg(1).GetU8();
         if (!inst.GetArg(2).IsImmediate()) return false;
+        // Dynarmic::FP::RoundingMode: 0 nearest-even, 1 towards +inf,
+        // 2 towards -inf, 3 towards zero, 4 nearest-away. ToOdd (5) is not
+        // an FPToFixed mode.
         const uint8_t rounding = inst.GetArg(2).GetU8();
-        const bool to_nearest = rounding == 0;
-        if (!to_nearest && rounding != 3) return false;
+        if (rounding > 4) return false;
         if (inst.GetArg(0).GetType() != (is_double ? Type::U64 : Type::U32)) return false;
         // Exception enables are live state, not part of the location key.
         load(offsetof(JitState, fpscr)); mask(0x00009f00u);
@@ -2637,16 +2641,38 @@ private:
             else { imm(0); imm(0xffffffffu); }
             get(sign_slot); op(Select);
         };
-        // Overflow tail shared by every magnitude path. A rounded-up 2^31
-        // stays exact for a negative signed result only; anything larger
-        // saturates with IOC and never additionally IXC, which the binary64
-        // path has already raised for a dropped fraction.
-        const auto publish_mag = [&] {
+        // Result for a nonzero magnitude below one unit (IXC is raised by
+        // the caller): 1 or -1 when the directed mode rounds away from zero,
+        // otherwise 0 (below 2^-8, the nearest modes never reach one half).
+        // A negative unsigned input never gets here.
+        const auto tiny = [&] {
+            if (rounding == 1) { get(sign_slot); op(Eqz); }
+            else if (rounding == 2 && is_signed) { imm(0); get(sign_slot); op(Sub); }
+            else imm(0);
+        };
+        // Pushes the magnitude increment (0/1) for the selected mode from
+        // the dropped fraction: top = its half bit, below = any lower bit,
+        // any = top | below, odd = the kept magnitude's low bit.
+        const auto increment = [&](const auto &top, const auto &below, const auto &any) {
+            switch (rounding) {
+            case 0: top(); below(); get(mag_slot); imm(1); op(And); op(Or); op(And); break;
+            case 1: any(); get(sign_slot); op(Eqz); op(And); break;
+            case 2: any(); get(sign_slot); op(And); break;
+            case 4: top(); break;
+            default: imm(0); break;
+            }
+        };
+        // Overflow tail shared by every magnitude path. A rounded 2^31 stays
+        // exact for a negative signed result only; anything larger (or a
+        // carry out of the 32-bit magnitude) saturates with IOC and never
+        // additionally IXC, which the dropped fraction has already raised.
+        const auto publish_mag = [&](uint32_t carry_slot) {
             if (is_signed) {
                 get(mag_slot); imm(0x80000000u); imm(0x7fffffffu); get(sign_slot); op(Select); op(GtU);
             } else {
-                get(mag_slot); imm(0xffffffffu); op(GtU);
+                imm(0);
             }
+            if (carry_slot) { get(carry_slot); op(Or); }
             begin_if();
             get(flags_slot); mask(~0x10u); imm(1); op(Or); set(flags_slot);
             saturate(); set(next_local);
@@ -2670,11 +2696,10 @@ private:
             const auto range = [&] {
                 // From here on expr is the exponent of value * 2^fbits.
                 if (fbits) { get(expr); imm(fbits); op(Add); set(expr); }
-                // Tiny magnitudes truncate to zero (nearest-even cannot
-                // reach 1 below one half); non-FZ denormals land here too,
-                // even scaled by 2^32.
+                // Magnitudes below 2^-8, including non-FZ denormals even
+                // scaled by 2^32, are tiny.
                 get(expr); imm(118); op(LeU);
-                begin_if(); accumulate(0x10); imm(0); set(next_local);
+                begin_if(); accumulate(0x10); tiny(); set(next_local);
                 op(Else);
                 // Overflow: magnitudes of 2^32 and above exceed every range.
                 get(expr); imm(159); op(GeU);
@@ -2685,7 +2710,7 @@ private:
                 get(expr); imm(150); op(Sub); set(count);
                 get(frac); imm(0x800000); op(Or); set(frac);
                 get(frac); get(count); op(Shl); set(mag_slot);
-                publish_mag();
+                publish_mag(0);
                 op(Else);
                 imm(150); get(expr); op(Sub); set(count);
                 get(frac); imm(0x800000); op(Or); set(frac);
@@ -2694,14 +2719,15 @@ private:
                 get(frac); op(And); set(trunc);
                 get(flags_slot); get(trunc); op(Eqz); op(Eqz); imm(0x10); op(Mul); op(Or);
                 set(flags_slot);
-                if (to_nearest) {
+                if (rounding != 3) {
+                    // A 24-bit magnitude cannot carry out of 32 bits.
                     imm(1); get(count); imm(1); op(Sub); op(Shl); set(half);
-                    get(trunc); get(half); op(GtU);
-                    get(trunc); get(half); op(Eq); get(mag_slot); imm(1); op(And); op(And);
-                    op(Or);
+                    increment([&] { get(trunc); get(half); op(GeU); },
+                        [&] { get(trunc); get(half); imm(1); op(Sub); op(And); op(Eqz); op(Eqz); },
+                        [&] { get(trunc); op(Eqz); op(Eqz); });
                     get(mag_slot); op(Add); set(mag_slot);
                 }
-                publish_mag();
+                publish_mag(0);
                 end_if(); end_if(); end_if();
             };
             const auto classify = [&] {
@@ -2743,6 +2769,8 @@ private:
         const auto mag_lo = next_local + 6, mag_hi = next_local + 7;
         const auto count = next_local + 9;
         sign_slot = next_local + 2; flags_slot = next_local + 8; mag_slot = next_local + 1;
+        // mag_lo/mag_hi are free once the magnitude is in mag_slot.
+        const auto inc = mag_lo, carry = mag_hi;
         value_word(inst.GetArg(0), 1); set(hi);
         value_word(inst.GetArg(0), 0); set(frac_lo);
         get(hi); imm(31); op(ShrU); set(sign_slot);
@@ -2763,10 +2791,10 @@ private:
         const auto range = [&] {
             // From here on expr is the exponent of value * 2^fbits.
             if (fbits) { get(expr); imm(fbits); op(Add); set(expr); }
-            // Tiny magnitudes truncate to zero in both modes (denormals too,
-            // even scaled by 2^32).
+            // Magnitudes below 2^-11 (denormals too, even scaled by 2^32)
+            // are tiny.
             get(expr); imm(1011); op(LeU);
-            begin_if(); accumulate(0x10); imm(0); set(next_local);
+            begin_if(); accumulate(0x10); tiny(); set(next_local);
             op(Else);
             // Overflow at 2^32 and above.
             get(expr); imm(1055); op(GeU);
@@ -2776,25 +2804,24 @@ private:
             push_frac(); constant64(code, 0x10000000000000LL); op(Or64);
             get(count); op(ExtendU); op(ShrU64);
             store_i64_words(mag_lo);
+            // The dropped bits, aligned so the half bit is bit 63.
             push_frac(); constant64(code, 0x10000000000000LL); op(Or64);
             imm(64); get(count); op(Sub); op(ExtendU); op(Shl64);
             store_i64_words(frac_lo);
             get(flags_slot); get(frac_lo); get(frac_hi); op(Or); op(Eqz); op(Eqz);
             imm(0x10); op(Mul); op(Or); set(flags_slot);
             push_mag(); op(Wrap); set(mag_slot);
-            if (to_nearest) {
-                // top = shifted >> 63; rest = (shifted << 1) != 0; round
-                // up when the truncated part exceeds half, or ties it
-                // with an odd kept bit.
-                push_frac(); constant64(code, 63); op(ShrU64); set(scratch_local);
-                get(scratch_local); op(Wrap);
-                push_frac(); constant64(code, 1); op(Shl64);
-                constant64(code, 0); op(0x51); op(Eqz);
-                get(mag_slot); imm(1); op(And);
-                op(Or); op(And);
-                get(mag_slot); op(Add); set(mag_slot);
+            if (rounding != 3) {
+                increment([&] { push_frac(); constant64(code, 63); op(ShrU64); op(Wrap); },
+                    [&] { push_frac(); constant64(code, 1); op(Shl64); op(Eqz64); op(Eqz); },
+                    [&] { get(frac_lo); get(frac_hi); op(Or); op(Eqz); op(Eqz); });
+                set(inc);
+                // Magnitudes up to 2^32 - 1 are in range here; rounding one
+                // up carries out of the i32 magnitude.
+                get(mag_slot); imm(0xffffffffu); op(Eq); get(inc); op(And); set(carry);
+                get(mag_slot); get(inc); op(Add); set(mag_slot);
             }
-            publish_mag();
+            publish_mag(rounding != 3 ? carry : 0);
             end_if(); end_if();
         };
         const auto classify = [&] {
@@ -3482,29 +3509,34 @@ private:
         }
         case Op::FPVectorToSignedFixed32:
         case Op::FPVectorToUnsignedFixed32: {
-            // ARM vector float-to-int VCVT (vcvt.s32/u32.f32), one helper
-            // call per lane. The A32 translator emits fbits=0,
-            // TowardsZero rounding and fpcr_controlled=false for these, so
-            // the conversion always runs under the standard FPSCR value;
-            // the native helper re-derives every result from the vendored
-            // Dynarmic FPToFixed implementation. Any other immediate shape
-            // rejects the block, as does any live exception enable.
+            // ARM vector float-to-int VCVT (vcvt.s32/u32.f32) and VCVT{A,N,P,M}
+            // (v8), one helper call per lane. The A32 translator emits
+            // fbits=0 and fpcr_controlled=false for these, so the conversion
+            // always runs under the standard FPSCR value; the native helper
+            // re-derives every result from the vendored Dynarmic FPToFixed
+            // (operations 6/7 towards zero, 11/12 with the rounding mode in
+            // memory_value[2]). Any other immediate shape rejects the block,
+            // as does any live exception enable.
             if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0
-                || !inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU8() != 3
+                || !inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU8() > 4
                 || !inst.GetArg(3).IsImmediate() || inst.GetArg(3).GetU1() != 0)
                 return false;
+            const uint8_t rounding = inst.GetArg(2).GetU8();
+            const bool towards_zero = rounding == 3;
             load(offsetof(JitState, fpscr)); mask(0x00009f00u);
             begin_if(); ret(ExitReason::Unsupported); end_if();
-            // fp64.h contract for operations 6/7: the lane rides in the low
-            // 32 bits of memory_value[0] (the first i64 operand word the
+            // fp64.h contract for operations 6/7/11/12: the lane rides in the
+            // low 32 bits of memory_value[0] (the first i64 operand word the
             // scalar ops pack). The helper overwrites memory_value[0] with
             // the result bits on every call, so the lane is republished
             // per lane exactly like the reciprocal estimates.
+            if (!towards_zero) store_constant(offsetof(JitState, memory_value) + 8, rounding);
             for (unsigned word = 0; word < 4; ++word) {
                 get(0); value_word(inst.GetArg(0), word);
                 store(offsetof(JitState, memory_value));
                 get(0);
-                imm(kind == Op::FPVectorToSignedFixed32 ? 6 : 7);
+                const bool is_signed = kind == Op::FPVectorToSignedFixed32;
+                imm(towards_zero ? (is_signed ? 6 : 7) : (is_signed ? 11 : 12));
                 load(offsetof(JitState, fpscr));
                 op(Call); uleb(code, 2); set(next_local + word);
                 // OR the returned cumulative-flag bits into FPSCR.
