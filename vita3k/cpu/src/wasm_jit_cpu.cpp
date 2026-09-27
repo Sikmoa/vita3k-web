@@ -926,6 +926,13 @@ private:
         if (!ir) {
             // The single-instruction attempt names the first unsupported op.
             ++rejections[last_rejection.empty() ? "fetch/translate" : last_rejection];
+            if (trace) {
+                std::array<uint8_t, 4> bytes{};
+                mem_fetch(mem, location.PC(), bytes.data(), bytes.size());
+                std::fprintf(stderr, "[aot] untranslatable %08x%s bytes=%02x%02x%02x%02x %s\n", location.PC(),
+                    location.TFlag() ? "T" : "A", bytes[0], bytes[1], bytes[2], bytes[3],
+                    last_rejection.empty() ? "fetch/translate" : last_rejection.c_str());
+            }
             untranslatable.insert(key);
             return nullptr;
         }
