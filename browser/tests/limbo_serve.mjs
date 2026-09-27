@@ -1,5 +1,5 @@
 // Standalone Limbo dev server: serves the browser runtime plus a staged retail
-// app to a real browser, and renders the presented frames to a canvas. This is
+// app to a real browser, and shows the presented frames on the page. This is
 // the interactive counterpart of limbo_app_chromium.mjs (which drives the same
 // routes headlessly); the routes and asset locations are intentionally
 // identical so a live session and a probe run exercise the same files.
@@ -9,12 +9,23 @@
 //
 // Query parameters: ?backend=jit|interp  ?memory=auto|w64|w32
 // ?inlineMutex=0 disables the inline-mutex optimization for A/B testing; ?auto=1 (start
-// immediately). Requires a WebGPU browser **on a secure origin**: WebGPU is
+// immediately); ?present=readback keeps the canvas on the page and has the worker
+// read every GPU frame back instead (slower; for tools that read the page canvas,
+// e.g. limbo_watch.mjs). By default the page transfers an OffscreenCanvas to the
+// worker, gxm_scene.js presents GPU frames into it directly, and the page only
+// counts them ('vita-present'); frames that arrive with pixels (CPU-presented
+// guest memory) are drawn on a 2D canvas stacked over it.
+//
+// Keyboard (shown on the page): arrows = d-pad + left stick, X cross, C circle,
+// Z square, V triangle, Q/E = L/R, Enter start, Right Shift select, I/J/K/L =
+// right stick.
+//
+// Requires a WebGPU browser **on a secure origin**: WebGPU is
 // exposed only to secure contexts, so a page served over plain HTTP from a
 // non-loopback address has no navigator.gpu and the first draw fails. Serve it
 // through a TLS reverse proxy (e.g. Caddy) and open https://<name>/, or forward
 // the port and open http://localhost:<PORT>/ (loopback is secure). Both the page
-// and the bridge name this reason explicitly instead of failing late.
+// and gxm_scene.js name this reason explicitly instead of failing late.
 // A Chromium without a usable GPU needs
 // --enable-unsafe-webgpu --enable-unsafe-swiftshader. The page probes
 // Memory64 and the worker falls back to the wasm32 module when it is missing,
@@ -30,6 +41,8 @@
 //   LIMBO_APP           app directory under ux0/app (default: LIMBO_TITLE)
 //   GXM_RUNTIME_DIST    built module directory (default build/web64/browser)
 //   GXM_SHADER_ASSETS   GXP compiler/Naga/WASI assets (default .limbo_work/gxm)
+//   LIMBO_AOT           ahead-of-time module for the title (AOT.md), served as
+//                       /aot.wasm and passed to run-app as aotUrl
 import { createServer } from 'node:http';
 import { readFile, readdir } from 'node:fs/promises';
 import { networkInterfaces } from 'node:os';
@@ -43,11 +56,13 @@ const shaderRoot = resolve(process.env.GXM_SHADER_ASSETS || '.limbo_work/gxm');
 const stage = resolve(process.env.LIMBO_STAGE || '.limbo_work/stage');
 const title = process.env.LIMBO_TITLE || 'PCSE00268';
 const app = process.env.LIMBO_APP || title;
+const aotPath = process.env.LIMBO_AOT ? resolve(process.env.LIMBO_AOT) : '';
 
 if (!existsSync(resolve(stage, 'ux0/app', app, 'eboot.bin')))
   throw new Error(`no staged app at ${resolve(stage, 'ux0/app', app, 'eboot.bin')} (set LIMBO_STAGE/LIMBO_APP)`);
 if (!existsSync(resolve(root, 'vita3k_web_jit.wasm')))
   throw new Error(`no built module at ${root} (build vita3k_web_jit first, or set GXM_RUNTIME_DIST)`);
+if (aotPath && !existsSync(aotPath)) throw new Error(`no AOT module at ${aotPath} (LIMBO_AOT)`);
 
 async function walk(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
@@ -64,10 +79,9 @@ async function walk(directory) {
 }
 const manifestBytes = new TextEncoder().encode(JSON.stringify(await walk(stage)));
 
-// The host files (Worker and bridges) must all come from one directory: the
-// bridges are resolved relative to the Worker's own location.
-const hostFiles = ['/worker.js', '/storage.js', '/gxm_hle_bridge.js', '/gxm_renderer.js',
-  '/gxp_shader_adapter.js', '/webgpu.js', '/capabilities.js', '/audio_input.js'];
+// The Worker and the modules it loads must come from one directory:
+// gxm_scene.js is resolved relative to the Worker's own location.
+const hostFiles = ['/worker.js', '/storage.js', '/gxm_scene.js', '/gxp_shader_adapter.js'];
 
 const shaderFiles = {
   '/shaders/gxp_compiler.mjs': resolve(shaderRoot, 'shader-wasm/gxp_compiler.mjs'),
@@ -83,7 +97,11 @@ const page = `<!doctype html>
 <style>
   body { margin: 0; background: #111; color: #ddd; font: 13px/1.45 ui-monospace, monospace; }
   header { padding: 10px 14px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
-  canvas { display: block; margin: 0 auto; max-width: 100%; background: #000; image-rendering: pixelated; }
+  #display { display: grid; justify-content: center; }
+  #display > canvas { grid-area: 1 / 1; width: min(100vw, 960px); height: auto; background: #000;
+    image-rendering: pixelated; }
+  #display > canvas[hidden] { display: none; }
+  #keys { margin: 0; padding: 0 14px 6px; color: #999; }
   #log { margin: 0; padding: 10px 14px; height: 30vh; overflow: auto; white-space: pre-wrap; color: #9c9; }
   #warning { display: none; margin: 8px 14px; padding: 8px 10px; background: #4a2222; color: #fdd;
     border-left: 3px solid #f66; max-width: 70ch; }
@@ -100,14 +118,22 @@ const page = `<!doctype html>
   <span id="status">idle</span>
   <span id="stats"></span>
 </header>
+<p id="keys">keys: arrows = d-pad + left stick · X cross · C circle · Z square · V triangle ·
+  Q/E = L/R · Enter start · Right Shift select · I/J/K/L right stick</p>
 <div id="warning"></div>
-<canvas id="screen" width="960" height="544"></canvas>
+<div id="display">
+  <canvas id="gpu-screen" width="960" height="544"></canvas>
+  <canvas id="screen" width="960" height="544" hidden></canvas>
+</div>
 <pre id="log"></pre>
 <script type="module">
 const params = new URLSearchParams(location.search);
 const backend = params.get('backend') === 'interp' ? 'interp' : 'jit';
 const memory = ['w64', 'w32'].includes(params.get('memory')) ? params.get('memory') : 'auto';
-const TITLE = ${JSON.stringify(title)}, APP = ${JSON.stringify(app)};
+const TITLE = ${JSON.stringify(title)}, APP = ${JSON.stringify(app)}, AOT = ${JSON.stringify(Boolean(aotPath))};
+// A transferred canvas can no longer be drawn or read from this page, so GPU
+// frames get their own element and pixel frames the 2D canvas over it.
+const presentToCanvas = params.get('present') !== 'readback';
 const screen = document.querySelector('#screen'), ctx = screen.getContext('2d');
 const status = document.querySelector('#status'), stats = document.querySelector('#stats');
 const logBox = document.querySelector('#log'), runButton = document.querySelector('#run');
@@ -123,7 +149,8 @@ function webgpuProblem() {
 }
 const webgpuBlocked = webgpuProblem();
 if (webgpuBlocked) { warningBox.textContent = webgpuBlocked; warningBox.style.display = 'block'; }
-let worker = null, frames = 0, firstFrameAt = 0, startedAt = 0;
+let worker = null, running = false, frames = 0, gpuFrames = 0, pixelFrames = 0, firstFrameAt = 0, startedAt = 0;
+let fps = 0, fpsSince = 0, fpsFrames = 0;
 // Web Audio sink: guest PCM (int16 interleaved; 48 kHz stereo on the MAIN
 // port) arrives as transferred ArrayBuffers from the worker (see
 // browser/src/hle_audio_null.cpp). AudioBuffers are chained on the context
@@ -187,10 +214,66 @@ const showStats = () => {
   const elapsed = (performance.now() - startedAt) / 1000;
   const audio = audioCtx ? ' audio=chunks=' + audioChunks + ' ' + (audioBytes / 1048576).toFixed(1) + 'MiB peak=' + audioPeak + ' ctx=' + audioCtx.state : ' audio=off';
   if (!frames) { stats.textContent = 'elapsed=' + elapsed.toFixed(1) + 's' + audio; return; }
-  stats.textContent = 'frames=' + frames + ' elapsed=' + elapsed.toFixed(1) + 's first=' + (firstFrameAt / 1000).toFixed(1) + 's' + audio;
+  stats.textContent = 'frames=' + frames + ' (gpu=' + gpuFrames + ' pixels=' + pixelFrames + ') fps=' + fps.toFixed(1) +
+    ' elapsed=' + elapsed.toFixed(1) + 's first=' + (firstFrameAt / 1000).toFixed(1) + 's' + audio;
 };
+function countFrame() {
+  const now = performance.now();
+  frames += 1;
+  if (!firstFrameAt) { firstFrameAt = now - startedAt; fpsSince = now; fpsFrames = 0; }
+  fpsFrames += 1;
+  if (now - fpsSince >= 1000) { fps = fpsFrames * 1000 / (now - fpsSince); fpsSince = now; fpsFrames = 0; }
+  showStats();
+}
+// An OffscreenCanvas lives only as long as its worker and a canvas element can
+// transfer control once, so every run gets a fresh GPU canvas.
+function attachCanvas() {
+  const gpuScreen = document.createElement('canvas');
+  gpuScreen.id = 'gpu-screen'; gpuScreen.width = 960; gpuScreen.height = 544;
+  document.querySelector('#gpu-screen').replaceWith(gpuScreen);
+  const canvas = gpuScreen.transferControlToOffscreen();
+  worker.postMessage({ type: 'attach-canvas', canvas }, [canvas]);
+}
+
+// Keyboard -> SCE_CTRL button mask and stick axes [lx, ly, rx, ry] in [-1, 1].
+const SCE_CTRL = { select: 0x1, start: 0x8, up: 0x10, right: 0x20, down: 0x40, left: 0x80,
+  l: 0x100, r: 0x200, triangle: 0x1000, circle: 0x2000, cross: 0x4000, square: 0x8000 };
+const keyMap = {
+  ArrowUp: { button: SCE_CTRL.up, axis: [1, -1] }, ArrowDown: { button: SCE_CTRL.down, axis: [1, 1] },
+  ArrowLeft: { button: SCE_CTRL.left, axis: [0, -1] }, ArrowRight: { button: SCE_CTRL.right, axis: [0, 1] },
+  KeyX: { button: SCE_CTRL.cross }, KeyC: { button: SCE_CTRL.circle },
+  KeyZ: { button: SCE_CTRL.square }, KeyV: { button: SCE_CTRL.triangle },
+  KeyQ: { button: SCE_CTRL.l }, KeyE: { button: SCE_CTRL.r },
+  Enter: { button: SCE_CTRL.start }, ShiftRight: { button: SCE_CTRL.select },
+  KeyI: { axis: [3, -1] }, KeyK: { axis: [3, 1] }, KeyJ: { axis: [2, -1] }, KeyL: { axis: [2, 1] },
+};
+const held = new Set();
+function sendPad() {
+  if (!running) return;
+  let buttons = 0;
+  const axes = [0, 0, 0, 0];
+  for (const code of held) {
+    const { button = 0, axis } = keyMap[code];
+    buttons |= button;
+    if (axis) axes[axis[0]] += axis[1];
+  }
+  worker.postMessage({ type: 'input', buttons, axes: axes.map((value) => Math.max(-1, Math.min(1, value))) });
+}
+function onKey(event) {
+  if (!running || !(event.code in keyMap)) return;
+  // While the guest runs, mapped keys are its input: no scrolling or button activation.
+  event.preventDefault();
+  const down = event.type === 'keydown';
+  if (down === held.has(event.code)) return; // auto-repeat
+  if (down) held.add(event.code); else held.delete(event.code);
+  sendPad();
+}
+addEventListener('keydown', onKey);
+addEventListener('keyup', onKey);
+addEventListener('blur', () => { held.clear(); sendPad(); });
+
 function stop(keepsStatus) {
-  worker?.terminate(); worker = null;
+  worker?.terminate(); worker = null; running = false; held.clear();
   runButton.disabled = false; stopButton.disabled = true;
   if (!keepsStatus) status.textContent = 'stopped';
 }
@@ -205,7 +288,9 @@ beepButton.onclick = () => {
 };
 async function run() {
   stop();
-  frames = 0; firstFrameAt = 0; logBox.textContent = ''; startedAt = performance.now();
+  frames = 0; gpuFrames = 0; pixelFrames = 0; fps = 0; firstFrameAt = 0; logBox.textContent = ''; startedAt = performance.now();
+  screen.hidden = true;
+  document.querySelector('#gpu-screen').hidden = !presentToCanvas;
   audioChunks = 0; audioBytes = 0; audioLogged = false; audioFirstAt = 0;
   status.textContent = 'loading module…';
   if (webgpuBlocked) log('warning: ' + webgpuBlocked);
@@ -220,6 +305,11 @@ async function run() {
       case 'ready':
         status.textContent = 'staging content…';
         log(\`ready (backend=\${data.diagnostics?.backend} memory=\${data.diagnostics?.memoryModel} inlineMutex=\${data.diagnostics?.inlineMutex})\`);
+        if (presentToCanvas) {
+          try { attachCanvas(); } catch (error) {
+            log('canvas transfer failed: ' + error); status.textContent = 'canvas transfer failed'; stop(true); break;
+          }
+        }
         try {
           const files = await (await fetch('/manifest.json')).json();
           worker.postMessage({ type: 'stage-files', root: '/vita',
@@ -229,7 +319,16 @@ async function run() {
       case 'staged':
         status.textContent = 'running';
         log(\`staged \${data.files} files (\${(data.bytes / 1048576).toFixed(1)} MiB) — launching\`);
-        worker.postMessage({ type: 'run-app', vitaFs: data.root, title: TITLE, app: APP, fastVblank: true });
+        worker.postMessage({ type: 'run-app', vitaFs: data.root, title: TITLE, app: APP, fastVblank: true,
+          ...(AOT ? { aotUrl: '/aot.wasm' } : {}) });
+        running = true;
+        sendPad();
+        break;
+      case 'vita-present':
+        // Already on the GPU canvas; nothing to draw here.
+        screen.hidden = true;
+        gpuFrames += 1;
+        countFrame();
         break;
       case 'vita-frame': {
         const pixels = new Uint8Array(data.data);
@@ -238,9 +337,9 @@ async function run() {
         }
         ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels.buffer, pixels.byteOffset, pixels.byteLength),
           data.width, data.height), 0, 0);
-        frames += 1;
-        if (!firstFrameAt) firstFrameAt = performance.now() - startedAt;
-        showStats();
+        screen.hidden = false;
+        pixelFrames += 1;
+        countFrame();
         break;
       }
       case 'vita-audio':
@@ -277,6 +376,7 @@ const server = createServer(async (req, res) => {
     if (path === '/') return body(new TextEncoder().encode(page), 'text/html');
     if (path === '/manifest.json') return body(manifestBytes, 'application/json');
     if (path === '/favicon.ico') { res.writeHead(404); return res.end(); }
+    if (path === '/aot.wasm' && aotPath) return send(await readFile(aotPath), 'application/wasm');
     if (path.startsWith('/stage/')) {
       const file = resolve(stage, path.slice('/stage/'.length));
       if (!file.startsWith(stage + sep)) throw new Error('bad stage path');
@@ -306,6 +406,7 @@ server.listen(port, host, () => {
   console.log(`Limbo dev server: (title ${title}, ${files.length} staged files)`);
   console.log(`  module root ${root}`);
   console.log(`  staged root ${stage}`);
+  if (aotPath) console.log(`  AOT module  ${aotPath}`);
   // Name every address the server actually answers on, so a browser on another
   // host does not have to guess which one to open.
   const addresses = host === '0.0.0.0' || host === '::'

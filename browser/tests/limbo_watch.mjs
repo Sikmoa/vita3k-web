@@ -34,7 +34,8 @@ const shutdown = () => { if (!server.killed) server.kill('SIGTERM'); };
 process.on('exit', shutdown);
 process.on('SIGINT', () => { shutdown(); process.exit(130); });
 
-const url = `http://127.0.0.1:${port}/?auto=1&memory=${memory}`;
+// Read-back mode: a canvas transferred to the worker cannot be read from the page.
+const url = `http://127.0.0.1:${port}/?auto=1&memory=${memory}&present=readback`;
 for (let attempt = 0; ; ++attempt) {
   try {
     const response = await fetch(url);

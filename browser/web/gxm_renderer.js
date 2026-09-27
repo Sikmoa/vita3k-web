@@ -8,9 +8,9 @@
 // RGBA8, one mip, explicit sampler, group 3 bindings 0/1. No guest texture
 // state is inferred. Optional fixed-function state: per-target write mask and
 // color/alpha blending, and a per-target depth-stencil attachment with the
-// depth compare/write mode from the GXM record state. The guest depth-stencil
-// descriptor is translated by the caller (gxm_hle_bridge.js); this consumer
-// accepts WebGPU values and rejects anything it cannot express.
+// depth compare/write mode from the GXM record state. Guest descriptors are
+// translated by the caller; this consumer accepts WebGPU values and rejects
+// anything it cannot express.
 
 // Vertex formats: [byte size, minimum attribute offset alignment]. WebGPU
 // requires the offset to be a multiple of min(4, byte size of the format), so

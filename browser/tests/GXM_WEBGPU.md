@@ -1,11 +1,11 @@
 # GXM/WebGPU renderer boundary
 
-The consumer `browser/web/gxm_renderer.js` is used by the guest bridge in
-`gxm_hle_bridge.js`. The existing guest triangle milestone routes production
-SceGxm commands through `browser/src/gxm_webgpu_bridge.cpp`, converts GXP with
-the production USSE compiler and Naga, and copies GPU-completed pixels back to
-guest memory. See GXM_GUEST_INTEGRATION.md for the historical evidence. The
-consumer itself accepts WGSL; it is not the shader translator.
+The consumer `browser/web/gxm_renderer.js` is the WGSL-level renderer behind
+`browser/web/webgpu.js`, exercised by `gxm_webgpu_smoke.mjs`. The runtime does
+not use it: `browser/src/gxm_webgpu_bridge.cpp` emits one GXS1 scene stream per
+command list, consumed by `browser/web/gxm_scene.js`. See
+GXM_GUEST_INTEGRATION.md for the historical evidence. The consumer itself
+accepts WGSL; it is not the shader translator.
 
 ## Existing supported boundary
 
@@ -15,9 +15,9 @@ consumer itself accepts WGSL; it is not the shader translator.
   guest index); cull mode is restricted to NONE, so the expansion cannot change
   which faces are drawn.
 - One interleaved vertex stream. The guest attribute format travels in the
-  packet and is translated in JS: U8N/S8N/U16N/S16N with 2 or 4 components,
+  GXS1 scene stream and is translated in `gxm_scene.js`: U8N/S8N/U16N/S16N with 2 or 4 components,
   F16 with 2 or 4, and F32 with 1 to 4.
-- Explicit WGSL, or WGSL translated from guest GXP by the guest bridge.
+- Explicit WGSL.
 - Group-0 uniform/read-only-storage bindings with explicit sizes/visibility;
   the original single uniform-buffer API remains available.
 - Owned uploads, Memory64-safe host-pointer snapshots, tightly packed RGBA8
@@ -145,33 +145,11 @@ Native (`browser/src/gxm_webgpu_bridge.cpp`):
   Indexed/default vertex/fragment uniform buffers need no change: they already
   flow through `set_uniform_buffer` into the packed draw payload.
 
-Packet GXM5 (`0x47584d35`, replaces GXM4; native and JS deploy together): fixed
-words as before, then blend enabled u32 plus seven guest blend words (colorMask,
-colorFunc, alphaFunc, colorSrc, colorDst, alphaSrc, alphaDst), then depth
-enabled u32 plus, when enabled, four words (guest depth format, guest depth
-func, guest depth write mode, load mode) and one f32 clear value, then the
-texture count/header, viewport flat u32 and six f32 bits
-(xOffset,yOffset,zOffset,xScale,yScale,zScale), then render info, four words per
-attribute (shader location, offset, component count, guest
-`SceGxmAttributeFormat`), the six payloads and packed texture bytes. GXM5 adds
-that attribute-format word so the guest vertex format is translated in JS next
-to every other guest enum; attributes were previously assumed F32. Blend and
-depth words are guest enum values, so the
-single GXM -> WebGPU translation lives in the JS decoder next to the sampler
-and texture-format translation; the guest blend descriptor is retained on the
-WebGPU fragment program at creation time (`browser/src/gxm_webgpu_program.h`)
-because the guest pointer is not kept. GXM2, GXM3 and GXM4 now fail loudly in
-the decoder, and the transparent blend block replaces the previous native
-all-or-nothing rejection that made `sceGxmShaderPatcherCreateFragmentProgram`
-return `SCE_GXM_ERROR_DRIVER` for every non-default descriptor.
-
-JS (`gxm_hle_bridge.js`): `decodeGuestDrawPacket` validates the viewport
-words (flat must be 0/1, floats finite) and exports pure `gxmViewportRect`,
-which mirrors `vulkan/sync_viewport_real` (res_multiplier 1) with
-negative-height normalization; flat covers the full target. The rect is
-computed before any await and passed per draw to `submit`, which applies
-`setViewport(x, y, w, h, 0, 1)` per draw. Depth stays `[0, 1]` because the
-translated WebGPU shader (`is_vulkan` path) applies z offset/scale itself.
+Guest blend, depth, stencil, viewport and vertex-format words travel in the
+GXS1 scene stream and are translated to WebGPU in `browser/web/gxm_scene.js`;
+the guest blend descriptor is retained on the WebGPU fragment program at
+creation time (`browser/src/gxm_webgpu_program.h`) because the guest pointer is
+not kept.
 
 Assumptions to verify: a WebGPU viewport rect renders the same NDC mapping
 as the equivalent Vulkan viewport (affine-equivalent by construction; the
@@ -199,22 +177,6 @@ evicting a cache entry cannot invalidate another handle. Failed compilation or
 validation creates neither a cache entry nor a program. Disposal clears all
 references. `pipelineCacheStats()` returns an immutable diagnostic snapshot;
 cache misses include failed compilation attempts, entries include successes only.
-
-The guest bridge now retains the consumer across draws, destroying each draw's
-target/program handle only after submission/readback settles. It serializes
-draws, fills and fences on one Promise chain so the shared renderer's exclusive
-operation contract and device error scopes remain valid. A failure poisons
-subsequent work with the original error, including queued fences; no later
-fence may turn an unsupported draw into apparent success. Recovery currently
-requires a new worker/module instance. This is device-work ordering, **not**
-cooperative guest-thread scheduling.
-
-Construction references: the existing `createProgram` descriptor/error-scope
-path and `submit`/`destroyProgram` lifecycle in `gxm_renderer.js`; guest
-`drawGuestSurface` packet snapshots and the native `web_gxm_draw` transport at
-`gxm_webgpu_bridge.cpp:49`. Packet and initial pixel bytes are copied before
-queueing or any await. Readback remains owned after unmap. Native writeback and
-guest completion still happen after the awaited bridge call returns.
 
 Assumptions to verify: equivalent descriptor keys produce interchangeable GPU
 pipelines; translating identical GXP produces stable WGSL for useful cache hits;
@@ -248,23 +210,18 @@ descriptors; then far/near ordering, near-first rejection of the farther quad,
 depth-write-disabled keeping the earlier depth value (with the write-enabled
 control), `greater` compare against a zero clear value (with its control),
 `depth16unorm`, depth-state pipeline reuse, and six rejected depth
-configurations. The guest packet contract test (`gxm_hle_packet_test.mjs`)
-covers the decode side without a device: all six blend operations, all eleven
-translatable factors with the saturate factor's position rule, the color-mask
-bit remap, all three depth formats, all eight compare functions, both write
-modes, and the rejections for old packet versions, unknown formats, load mode,
-non-finite/out-of-range clear values and inconsistent enable flags.
+configurations.
 No game assets or shader compiler are needed. Unavailable WebGPU is a failure
 to verify, never a successful skip.
 
 The historical baseline was 18 checks (37 after C1). Four new assertions cover
 viewport clipping to a sub-rect, initial-surface preservation outside the
 viewport, and explicit rejection of negative/non-finite viewport rects.
-Eleven earlier assertions cover equivalent
+Earlier assertions cover equivalent
 descriptors sharing a pipeline but not handles, handle lifetime, changed shader
 pixels, changed vertex layout, changed binding size/visibility, named unsupported
 state rejection, failed compilation not entering the cache, successful reuse
-after failure, disposal, and queue failure propagation to both fill and fence.
+after failure, and disposal.
 Pixels are produced by real WebGPU, not mocks. Before C1 there is no cache API,
 unknown top-level state is ignored and a rejected guest packet does not prevent
 an independent fence from succeeding. Cache eviction/device-loss behavior and

@@ -13,15 +13,10 @@ const server = createServer(async (req, res) => {
     let content, type;
     if (path === '/') { content = '<!doctype html><title>GXM guest probe</title>'; type = 'text/html'; }
     else if (path === '/probe.bin') { content = fixture; type = 'application/octet-stream'; }
-    else if (path === '/gxm-probe-worker.js') {
-      content = `import { initializeGuestDevice } from './gxm_hle_bridge.js';
-        await initializeGuestDevice(); await import('./worker.js?backend=jit&memory=w64');`;
-      type = 'text/javascript';
-    }
     else {
       // Force the existing Memory64-only distribution through worker.js's w64
       // path, without falling back to an interpreter or a wasm32 module.
-      if (['/worker.js', '/storage.js', '/gxm_hle_bridge.js', '/gxm_renderer.js', '/gxp_shader_adapter.js'].includes(path)) {
+      if (['/worker.js', '/storage.js', '/gxm_scene.js', '/gxp_shader_adapter.js'].includes(path)) {
         content = await readFile(resolve('browser/web', path.slice(1)));
         res.writeHead(200, { 'Content-Type': 'text/javascript' }); res.end(content); return;
       }
@@ -60,7 +55,7 @@ try {
   const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   const outcome = await page.evaluate(() => new Promise((resolveRun, reject) => {
-    const worker = new Worker('./gxm-probe-worker.js?backend=jit&memory=w64', { type: 'module' });
+    const worker = new Worker('./worker.js?backend=jit&memory=w64', { type: 'module' });
     const logs = []; let ready;
     const done = (error, value) => { clearTimeout(timer); worker.terminate(); error ? reject(error) : resolveRun(value); };
     const timer = setTimeout(() => done(new Error('probe deadline')), 40000);

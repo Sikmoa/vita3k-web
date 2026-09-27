@@ -44,9 +44,9 @@ Host-only shader/renderer checks do not substitute for guest execution.
 
 ## Integration blockers / notes
 
-- Device acquisition must happen before the wasm64 runtime loads
-  (`gxm-probe-worker.js` imports `gxm_hle_bridge.js` first). Acquiring inside the
-  suspended (Asyncify) stack intermittently reports "WebGPU adapter unavailable".
+- The GXM device is acquired by `gxm_scene.js` `init()` from `web_gxm_init`
+  (sceGxmInitialize), inside the suspended (Asyncify) stack. An earlier bridge
+  intermittently reported "WebGPU adapter unavailable" when acquiring there.
 - The guest draw path currently supports ABGR8 linear surfaces, one interleaved
   F32 vertex stream, U16/U32 indexed triangle lists, arbitrary viewports
   (forwarded to the WebGPU viewport; draws without recorded viewport state
@@ -81,12 +81,10 @@ Host-only shader/renderer checks do not substitute for guest execution.
   workspace headlessly; both are still development tools, not a shipped app.
 - `vita3k/renderer/src/sync.cpp` intentionally NOT linked (single-threaded, GPU-fenced
   bridge replaces its queue thread); `wishlist` / `subject_done` reimplemented locally.
-- `browser/web/gxm_context.js` is owned by main; the bridge uses the separate
-  `gxm_hle_bridge.js` instead.
 - Full renderer completeness and Limbo gameplay are NOT verified. Textured GXP
   has separate host-driven browser tests. Bounded guest texture wiring is now
   GPU-verified; the guest `SceGxmAttributeFormat` set U8N/S8N/U16N/S16N/F16/F32
-  is translated in JS (GXM5 packet); display-queue integration, retail-app
+  is translated in JS (`gxm_scene.js`); display-queue integration, retail-app
   scheduling and presentation are implemented and verified against retail Limbo,
   which presented its title/loading frames in a browser (GXM_WEBGPU.md
   "Presentation"). Blend and depth-stencil state are implemented and
@@ -235,7 +233,7 @@ its sync is display-queue plus notification waits.
   remain production functions. In particular `verify_texture_mode` rejects
   setting MIRROR on LINEAR: already-encoded MIRROR descriptors are accepted by
   the bridge, but no production setter semantics are changed. The guest probe
-  covers clamp/repeat; mirror mapping is covered by the packet test only.
+  covers clamp/repeat; mirror mapping has no test.
 
 Extended repo-owned GXP fixture: two existing color draws, six textured draws
 (4x4 texture with poisoned 8-pixel row padding, distinct channels/alpha, nearest
@@ -243,10 +241,8 @@ UV selection, repeat wrapping, linear interpolation, pixel-only mutation without
 rebinding, then data-address replacement), and return to an untextured program.
 Expected exit 42 and nine completed readbacks. No new shader binaries or WGSL.
 
-Lightweight checks performed: `gxm_hle_packet_test.mjs` passes (36 sampler
-combinations, 4x4 payload/ownership, malformed/version/truncation/trailing-byte
-rejection); SDK guest build succeeds; shell/JS syntax and `git diff --check`
-pass. The packet test emulates depadding and does **not** execute the C++ loop.
+Lightweight checks performed: SDK guest build succeeds; shell/JS syntax and
+`git diff --check` pass.
 Parent verification rebuilt `vita3k_web_jit` and passed the real Memory64 guest
 Chromium probe (exit 42, nine draw readbacks, zero missing NIDs). The consumer
 regression also passed all 37 checks (41 after the C2 viewport extension,
@@ -259,7 +255,6 @@ Use scratch/cache overrides for compilation, not for the browser invocation.
 Parent verification, **serially** (existing compiler/Naga staging required):
 
 ```sh
-node --experimental-default-type=module browser/tests/gxm_hle_packet_test.mjs
 # With the build environment's writable Emscripten cache configured:
 timeout -s KILL 180s cmake --build build/web64 --target vita3k_web_jit -j1
 bash browser/tests/build_gxm_guest_probe.sh

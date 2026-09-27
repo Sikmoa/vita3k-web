@@ -119,7 +119,5 @@ the test files) to keep Chromium on `/dev/shm`.
 Known differences from the Vulkan path (intentional, WebGPU only): separate
 texture/sampler bindings (`2n`/`2n+1`), same SPIR-V 1.0 feature set otherwise.
 
-Not yet done (honest status): runtime integration of these descriptor bindings
-into `browser/web/gxm_renderer.js`/`gxm_context.js` (owned by the integration
-worker — layout documented above); guest-side execution of translated shaders
-is still false by design in these tests.
+The runtime consumes these bindings in `browser/web/gxm_scene.js`. Guest-side
+execution of translated shaders is still false by design in these tests.

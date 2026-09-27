@@ -6,10 +6,9 @@
 // consumer needs it again on every draw, and the guest SceGxmBlendInfo pointer
 // is not retained, so the descriptor is copied onto a WebGPU-owned
 // FragmentProgram subclass in *guest* units. Translation to WebGPU happens
-// where the packet is consumed (gxm_hle_bridge.js), exactly like the fragment
-// texture sampler and format fields. No WebGPU enum value is stored in state
-// that guest code can observe, and the JS decoder re-validates every field as
-// the last line of defence.
+// where the scene stream is consumed (browser/web/gxm_scene.js), like the
+// sampler and vertex format fields, so no WebGPU enum value is stored in state
+// that guest code can observe.
 #pragma once
 
 #include <gxm/types.h>
@@ -20,7 +19,7 @@
 namespace browser {
 
 // Guest blend descriptor, mirroring SceGxmBlendInfo field semantics without the
-// bitfield layout (the packet carries plain u32 words).
+// bitfield layout (the scene stream carries plain u32 words).
 struct WebGPUBlendState {
     uint32_t color_mask; // SceGxmColorMask bits (A=1, R=2, G=4, B=8)
     uint32_t color_func; // SceGxmBlendFunc

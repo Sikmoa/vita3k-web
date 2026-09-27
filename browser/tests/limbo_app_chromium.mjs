@@ -122,10 +122,9 @@ const server = createServer(async (req, res) => {
       send(await readFile(file), 'application/octet-stream');
       return;
     }
-    // The Worker and the GXM WebGPU bridge must be served from one directory:
-    // the bridge is resolved relative to the Worker's own location.
-    if (['/worker.js', '/storage.js', '/gxm_scene.js', '/gxm_hle_bridge.js', '/gxm_renderer.js',
-      '/gxp_shader_adapter.js', '/webgpu.js', '/capabilities.js', '/audio_input.js'].includes(path)) {
+    // The Worker and the modules it loads must be served from one directory:
+    // gxm_scene.js is resolved relative to the Worker's own location.
+    if (['/worker.js', '/storage.js', '/gxm_scene.js', '/gxp_shader_adapter.js'].includes(path)) {
       send(await readFile(resolve('browser/web', path.slice(1))), 'text/javascript');
       return;
     }
