@@ -74,6 +74,13 @@ struct NpState {
     bool inited = false;
     np_callbacks cbs;
     SceUID state_cb_id;
+    // Service-state callbacks owed one notification: the NP service queues
+    // the current state when a callback registers; sceNpCheckCallback
+    // delivers it once (firmware 3.74 shell SceNpImpsUtil).
+    std::vector<SceUID> state_cb_pending;
+    bool basic_inited = false; // SceNpBasic
+    bool signaling_inited = false; // SceNpSignaling
+    std::map<int, Address> signaling_ctxs; // context id (1..8) -> handler
 
     NpTrophyState trophy_state;
     np::CommunicationID comm_id;

@@ -361,6 +361,18 @@ set(_hle_exports
     # field (ime_bridge.cpp) and sceImeUpdate runs the guest's event handler
     # on the calling thread (run_callback), as on desktop.
     sceImeOpen sceImeUpdate sceImeClose
+    # NP while signed out, as firmware 3.74 answers it (np_basic,
+    # np_signaling, np_activity_sdk, np_common, np_manager and the shell's NP
+    # service): friend/block lists need sign-in, presence the online state,
+    # there is no cached ticket for the content rating; signaling contexts
+    # are local and no connection ever exists.
+    sceNpBasicGetFriendListEntryCount sceNpBasicGetFriendListEntries
+    sceNpBasicGetBlockListEntryCount sceNpBasicGetBlockListEntries
+    sceNpBasicCheckIfPlayerIsBlocked sceNpBasicGetFriendOnlineStatus
+    sceNpBasicGetGamePresenceOfFriend
+    sceNpSignalingCreateCtx sceNpSignalingDestroyCtx sceNpSignalingSetCtxOpt
+    sceNpSignalingTerminateConnection sceNpSignalingGetConnectionInfo
+    sceNpActivityPostStatus sceNpGetPlatformType sceNpManagerGetContentRatingFlag
 )
 
 # Take NID values from the one authoritative database, never a second resolver.
@@ -425,6 +437,7 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceNpBasic/SceNpBasic.cpp"
     "${_HLE_ROOT}/modules/SceNpCommon/SceNpCommon.cpp"
     "${_HLE_ROOT}/modules/SceNpSignaling/SceNpSignaling.cpp"
+    "${_HLE_ROOT}/modules/SceNpActivity/SceNpActivity.cpp"
     "${_HLE_ROOT}/modules/SceNpTrophy/SceNpTrophy.cpp"
     "${_HLE_ROOT}/modules/SceAppUtil/SceAppUtil.cpp"
     "${_HLE_ROOT}/modules/SceCommonDialog/SceCommonDialog.cpp"

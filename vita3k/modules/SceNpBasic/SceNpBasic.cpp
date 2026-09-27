@@ -17,45 +17,100 @@
 
 #include <module/module.h>
 
+#include <config/state.h>
+#include <np/state.h>
+
+// Error values of firmware 3.74 np_basic.suprx; names where known.
 enum SceNpBasicError : uint32_t {
+    SCE_NP_ERROR_NOT_INITIALIZED = 0x80550002,
     SCE_NP_BASIC_ERROR_INVALID_ARGUMENT = 0x80551d02,
+    SCE_NP_BASIC_ERROR_NOT_INITIALIZED = 0x80551d04,
+    SCE_NP_BASIC_ERROR_ALREADY_INITIALIZED = 0x80551d05,
+    SCE_NP_BASIC_ERROR_NO_COMMUNICATION_ID = 0x80551d0b, // sceNpInit had none
+    // The NP service's friend/block lists need PSN sign-in (0x80551a08 from
+    // the service), presence needs the online state (0x80551a09).
+    SCE_NP_BASIC_ERROR_NOT_SIGNED_IN = 0x80551d06,
+    SCE_NP_BASIC_ERROR_NOT_ONLINE = 0x80551d07,
 };
+
+// Friend and block lists and presence come from the NP service in the
+// shell; what they answer while signed out is fixed by firmware 3.74.
+static bool signed_in(EmuEnvState &emuenv) {
+    return emuenv.cfg.current_config.psn_signed_in;
+}
 
 EXPORT(int, sceNpBasicCheckCallback) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNpBasicCheckIfPlayerIsBlocked) {
-    return UNIMPLEMENTED();
+EXPORT(int, sceNpBasicCheckIfPlayerIsBlocked, Ptr<const void> np_id, SceInt32 *result) {
+    if (!emuenv.np.basic_inited)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    if (!np_id || !result)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    if (!signed_in(emuenv))
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_SIGNED_IN);
+    *result = 0;
+    return STUBBED("Nobody blocked");
 }
 
-EXPORT(int, sceNpBasicGetBlockListEntries) {
-    return UNIMPLEMENTED();
+EXPORT(int, sceNpBasicGetBlockListEntries, SceUInt32 start, Ptr<void> entries, SceUInt32 num, SceSize *retrieved) {
+    if (!emuenv.np.basic_inited)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    if (!entries || !num || !retrieved || start >= 100)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    if (!signed_in(emuenv))
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_SIGNED_IN);
+    *retrieved = 0;
+    return STUBBED("Nobody blocked");
 }
 
-EXPORT(int, sceNpBasicGetBlockListEntryCount) {
-    return UNIMPLEMENTED();
+EXPORT(int, sceNpBasicGetBlockListEntryCount, SceSize *count) {
+    if (!emuenv.np.basic_inited)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    if (!count)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    if (!signed_in(emuenv))
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_SIGNED_IN);
+    *count = 0;
+    return STUBBED("Nobody blocked");
 }
 
 EXPORT(int, sceNpBasicGetFriendContextState) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNpBasicGetFriendListEntries) {
-    return UNIMPLEMENTED();
+EXPORT(int, sceNpBasicGetFriendListEntries, SceUInt32 start, Ptr<void> entries, SceUInt32 num, SceSize *retrieved) {
+    if (!emuenv.np.basic_inited)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    if (!entries || !num || !retrieved || start >= 100)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    if (!signed_in(emuenv))
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_SIGNED_IN);
+    *retrieved = 0;
+    return STUBBED("No friends");
 }
 
-EXPORT(int, sceNpBasicGetFriendListEntryCount, int *nb_friends) {
-    if (!nb_friends)
+EXPORT(int, sceNpBasicGetFriendListEntryCount, SceSize *count) {
+    if (!emuenv.np.basic_inited)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    if (!count)
         return RET_ERROR(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
-
+    if (!signed_in(emuenv))
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_SIGNED_IN);
     STUBBED("No friends");
-    *nb_friends = 0;
+    *count = 0;
     return 0;
 }
 
-EXPORT(int, sceNpBasicGetFriendOnlineStatus) {
-    return UNIMPLEMENTED();
+EXPORT(int, sceNpBasicGetFriendOnlineStatus, Ptr<const void> np_id, SceInt32 *status) {
+    if (!emuenv.np.basic_inited)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    if (!np_id || !status)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    // The service answers status 0 unless its session is online.
+    *status = 0;
+    return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_ONLINE);
 }
 
 EXPORT(int, sceNpBasicGetFriendRequestEntries) {
@@ -70,8 +125,12 @@ EXPORT(int, sceNpBasicGetGameJoiningPresence) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNpBasicGetGamePresenceOfFriend) {
-    return UNIMPLEMENTED();
+EXPORT(int, sceNpBasicGetGamePresenceOfFriend, Ptr<const void> np_id, Ptr<void> presence) {
+    if (!emuenv.np.basic_inited)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    if (!np_id || !presence)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_ONLINE);
 }
 
 EXPORT(int, sceNpBasicGetPlaySessionLog) {
@@ -90,8 +149,11 @@ EXPORT(int, sceNpBasicGetRequestedFriendRequestEntryCount) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNpBasicInit) {
-    return UNIMPLEMENTED();
+EXPORT(int, sceNpBasicInit, Ptr<void> param) {
+    if (emuenv.np.basic_inited)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_ALREADY_INITIALIZED);
+    emuenv.np.basic_inited = true;
+    return 0;
 }
 
 EXPORT(int, sceNpBasicJoinGameAckResponseSend) {
@@ -102,8 +164,17 @@ EXPORT(int, sceNpBasicRecordPlaySessionLog) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNpBasicRegisterHandler) {
-    return UNIMPLEMENTED();
+EXPORT(int, sceNpBasicRegisterHandler, Ptr<const void> handlers, Ptr<const void> comm_id, Ptr<void> arg) {
+    if (!emuenv.np.basic_inited)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    if (!handlers)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    // Without a communication id the one given to sceNpInit is used.
+    if (!comm_id && !emuenv.np.inited)
+        return RET_ERROR(SCE_NP_ERROR_NOT_INITIALIZED);
+    if (!comm_id && !emuenv.np.comm_id.data[0])
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NO_COMMUNICATION_ID);
+    return 0; // no event reaches the handlers while offline
 }
 
 EXPORT(int, sceNpBasicRegisterInGameDataMessageHandler) {
@@ -123,11 +194,16 @@ EXPORT(int, sceNpBasicSetInGamePresence) {
 }
 
 EXPORT(int, sceNpBasicTerm) {
-    return UNIMPLEMENTED();
+    if (!emuenv.np.basic_inited)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    emuenv.np.basic_inited = false;
+    return 0;
 }
 
 EXPORT(int, sceNpBasicUnregisterHandler) {
-    return UNIMPLEMENTED();
+    if (!emuenv.np.basic_inited)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    return 0;
 }
 
 EXPORT(int, sceNpBasicUnregisterInGameDataMessageHandler) {

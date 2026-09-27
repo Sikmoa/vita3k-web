@@ -153,9 +153,22 @@ EXPORT(int, sceNpCommonMallocNpServerName) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNpGetPlatformType) {
-    TRACY_FUNC(sceNpGetPlatformType);
-    return UNIMPLEMENTED();
+// Firmware 3.74 np_common: the platform field of the id, locally.
+EXPORT(int, sceNpGetPlatformType, const np::SceNpId *np_id) {
+    TRACY_FUNC(sceNpGetPlatformType, np_id);
+    constexpr uint32_t SCE_NP_ERROR_INVALID_ARGUMENT_ID = 0x80550601, SCE_NP_ERROR_UNKNOWN_PLATFORM_TYPE = 0x80550004;
+    if (!np_id)
+        return RET_ERROR(SCE_NP_ERROR_INVALID_ARGUMENT_ID);
+    const std::string platform(np_id->opt.platformType, strnlen(np_id->opt.platformType, sizeof(np_id->opt.platformType)));
+    if (platform.empty())
+        return 0;
+    if (platform == "ps3")
+        return 1;
+    if (platform == "psp2")
+        return 2;
+    if (platform == "ps4")
+        return 3;
+    return RET_ERROR(SCE_NP_ERROR_UNKNOWN_PLATFORM_TYPE);
 }
 
 EXPORT(int, sceNpSetPlatformType) {

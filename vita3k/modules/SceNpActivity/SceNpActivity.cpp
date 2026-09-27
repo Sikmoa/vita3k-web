@@ -25,8 +25,11 @@ EXPORT(int, sceNpActivityPostAppStartupStatus) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNpActivityPostStatus) {
-    return UNIMPLEMENTED();
+// Firmware 3.74 np_activity_sdk checks its initialized flag first; only
+// sceNpActivityInit (not implemented here) sets it.
+EXPORT(int, sceNpActivityPostStatus, const char *message, const char *url, Ptr<const void> option) {
+    constexpr uint32_t SCE_NP_ACTIVITY_ERROR_NOT_INITIALIZED = 0x80552302;
+    return RET_ERROR(SCE_NP_ACTIVITY_ERROR_NOT_INITIALIZED);
 }
 
 EXPORT(int, sceNpActivityTerm) {

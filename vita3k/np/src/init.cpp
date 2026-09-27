@@ -35,6 +35,7 @@ bool deinit(NpState &state) {
     deinit(state.trophy_state);
 
     state.cbs.clear();
+    state.state_cb_pending.clear();
     state.state_cb_id = 0;
     state.comm_id = {};
     state.inited = false;

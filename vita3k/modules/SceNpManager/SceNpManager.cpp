@@ -43,7 +43,8 @@ enum SceNpManagerErrorCode : uint32_t {
     SCE_NP_MANAGER_ERROR_NOT_INITIALIZED = 0x80550502,
     SCE_NP_MANAGER_ERROR_INVALID_ARGUMENT = 0x80550503,
     SCE_NP_MANAGER_ERROR_INVALID_STATE = 0x80550506,
-    SCE_NP_MANAGER_ERROR_ID_NOT_AVAIL = 0x80550509
+    SCE_NP_MANAGER_ERROR_ID_NOT_AVAIL = 0x80550509,
+    SCE_NP_MANAGER_ERROR_NO_TICKET = 0x8055050B // name unknown; no cached sign-in ticket
 };
 
 EXPORT(int, sceNpAuthAbortOAuthRequest) {
@@ -69,20 +70,34 @@ EXPORT(int, sceNpAuthGetAuthorizationCode) {
 EXPORT(int, sceNpCheckCallback) {
     TRACY_FUNC(sceNpCheckCallback);
 
+    if (!emuenv.np.inited)
+        return RET_ERROR(SCE_NP_ERROR_NOT_INITIALIZED);
+
+    // Firmware 3.74 drains the service-state messages queued since the last
+    // call: one per registration (and per state change, none here), not one
+    // per call.
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
     const SceNpServiceState state = emuenv.cfg.current_config.psn_signed_in ? SCE_NP_SERVICE_STATE_SIGNED_IN : SCE_NP_SERVICE_STATE_SIGNED_OUT;
-    for (auto &[_, np_callback] : emuenv.np.cbs) {
-        thread->run_callback(np_callback.pc, { static_cast<uint32_t>(state), 0, np_callback.data });
+    const auto pending = std::move(emuenv.np.state_cb_pending);
+    emuenv.np.state_cb_pending.clear();
+    for (const SceUID cid : pending) {
+        const auto callback = emuenv.np.cbs.find(cid);
+        if (callback != emuenv.np.cbs.end())
+            thread->run_callback(callback->second.pc, { static_cast<uint32_t>(state), 0, callback->second.data });
     }
 
-    return STUBBED("Stub");
+    return 0;
 }
 
 EXPORT(int, sceNpGetServiceState, SceNpServiceState *state) {
     TRACY_FUNC(sceNpGetServiceState, state);
+    if (!state)
+        return RET_ERROR(SCE_NP_ERROR_INVALID_ARGUMENT);
+    if (!emuenv.np.inited)
+        return RET_ERROR(SCE_NP_ERROR_NOT_INITIALIZED);
     *state = emuenv.cfg.current_config.psn_signed_in ? SCE_NP_SERVICE_STATE_SIGNED_IN : SCE_NP_SERVICE_STATE_SIGNED_OUT;
 
-    return STUBBED("Stub");
+    return 0;
 }
 
 EXPORT(int, sceNpInit, np::CommunicationConfig *comm_config, void *dontcare) {
@@ -118,6 +133,12 @@ EXPORT(int, sceNpManagerGetChatRestrictionFlag, SceInt *isRestricted) {
 
 EXPORT(int, sceNpManagerGetContentRatingFlag, SceInt *isRestricted, SceInt *age) {
     TRACY_FUNC(sceNpManagerGetContentRatingFlag, isRestricted, age);
+    if (!isRestricted || !age)
+        return RET_ERROR(SCE_NP_MANAGER_ERROR_INVALID_ARGUMENT);
+    // Firmware 3.74 reads the rating from the ticket cached at PSN sign-in;
+    // signed out there is none.
+    if (!emuenv.cfg.current_config.psn_signed_in)
+        return RET_ERROR(SCE_NP_MANAGER_ERROR_NO_TICKET);
     *isRestricted = 0; // User is never restricted
     *age = 21; // Assume user is 21 years old
     return STUBBED("isRestricted = 0; age = 21; return 0;");
@@ -150,6 +171,7 @@ EXPORT(int, sceNpRegisterServiceStateCallback, Ptr<void> callback, Ptr<void> dat
     };
     emuenv.np.cbs.emplace(cid, sceNpServiceStateCallback);
     emuenv.np.state_cb_id = cid;
+    emuenv.np.state_cb_pending.push_back(cid);
     return 0;
 }
 
