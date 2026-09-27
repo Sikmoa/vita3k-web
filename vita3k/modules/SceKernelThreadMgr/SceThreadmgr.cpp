@@ -596,12 +596,13 @@ EXPORT(int, _sceKernelGetThreadExitStatus, SceUID thid, SceInt32 *pExitStatus) {
     return 0;
 }
 
-static SceUInt32 thread_info_status(const ThreadState &thread, SceUID caller) {
+static SceUInt32 thread_info_status(const KernelState &kernel, const ThreadState &thread, SceUID caller) {
     switch (thread.status) {
     case ThreadStatus::run:
-        // The browser runtime executes one guest thread at a time: any other
-        // runnable thread is ready, not running.
-        return thread.id == caller ? SCE_THREAD_RUNNING : SCE_THREAD_READY;
+        // The cooperative (browser) runtime executes one guest thread at a
+        // time, so any other runnable thread is ready; desktop runs each
+        // runnable thread on its own host thread.
+        return thread.id == caller || !kernel.execution_host ? SCE_THREAD_RUNNING : SCE_THREAD_READY;
     case ThreadStatus::wait: return SCE_THREAD_WAITING;
     case ThreadStatus::dormant: return SCE_THREAD_DORMANT;
     case ThreadStatus::suspend: return SCE_THREAD_SUSPENDED;
@@ -630,7 +631,7 @@ static SceInt32 get_thread_info(EmuEnvState &emuenv, const char *export_name, Sc
     {
         const std::lock_guard<std::mutex> thread_lock(thread->mutex);
         record.attr = thread->attr;
-        record.status = thread_info_status(*thread, caller);
+        record.status = thread_info_status(emuenv.kernel, *thread, caller);
         record.entry = SceKernelThreadEntry(thread->entry_point);
         record.stack = Ptr<void>(thread->stack.get());
         record.stackSize = thread->stack_size;

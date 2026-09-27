@@ -151,6 +151,12 @@ inline void test_guest_kernel_info(EmuEnvState &env, vita3k::web::GuestThreadRun
     REQUIRE(semaphore_signal(env.kernel, "fixture", 0, sema, 1) == 0);
     REQUIRE(get_info(caller->id, waiter->id, sizeof(*info)) == 0);
     REQUIRE(info->status == SCE_THREAD_READY);
+    // Desktop runs every runnable thread on its own host thread.
+    auto *const host = env.kernel.execution_host;
+    env.kernel.execution_host = nullptr;
+    REQUIRE(get_info(caller->id, waiter->id, sizeof(*info)) == 0);
+    env.kernel.execution_host = host;
+    REQUIRE(info->status == SCE_THREAD_RUNNING);
     run_until([&] { return waiter->status == ThreadStatus::dormant; });
     REQUIRE(word(8) == 0);
     std::puts("GetThreadInfo and GetProcessId passed");
