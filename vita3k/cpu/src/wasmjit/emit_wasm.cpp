@@ -421,8 +421,17 @@ constexpr uint32_t kAblateHoistSmc = 16u;
 // Exported override + flag reader live in wasmjit scope (header-declared).
 // Anonymous-namespace constants above stay visible here (same TU).
 HostAddress scratch_write_epochs() {
+#ifdef __EMSCRIPTEN__
+    // Generated code shares this linear memory, so a host pointer is the
+    // Wasm address of the table.
     static std::array<uint32_t, 1u << 20> table{};
     return reinterpret_cast<HostAddress>(table.data());
+#else
+    // Native builds only generate modules; they run in another address
+    // space (the Node fixture runner), where no host pointer means anything.
+    // That runner owns the table and the state must name it explicitly.
+    return 0;
+#endif
 }
 uint32_t g_ablate_override = 0;
 void set_ablate_flags(uint32_t flags) { g_ablate_override = flags; }

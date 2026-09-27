@@ -48,6 +48,8 @@ enum class ExitReason : uint32_t {
 
 // Shared with generated Wasm, not Dynarmic's native backend JitState.
 // 1M-entry table standing in for MemState::write_epochs until a CPU binds one.
+// Emscripten only: native builds return 0 because generated code never runs
+// in their address space; whoever runs it must supply the table.
 HostAddress scratch_write_epochs();
 
 struct JitState {
@@ -112,7 +114,8 @@ struct JitState {
     // store records write_epoch for its page in the table at write_epochs_base.
     uint32_t write_epoch;           // +460
     // A value-initialized state points at a scratch table, so generated
-    // stores can never write through a null base (tests, block mode).
+    // stores can never write through a null base (tests, block mode). See
+    // scratch_write_epochs() for native generator builds.
     HostAddress write_epochs_base = scratch_write_epochs(); // +464 MemState::write_epochs
 };
 static_assert(std::is_standard_layout_v<JitState>);

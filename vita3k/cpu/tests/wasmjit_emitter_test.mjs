@@ -7,7 +7,15 @@ import {join} from 'node:path';
 
 const directory = process.argv[2];
 const fixtures = JSON.parse(readFileSync(join(directory, 'cases.json'), 'utf8'));
-const memory = new WebAssembly.Memory({initial: 2});
+// Guest-write epoch table (JitState.write_epochs_base, word 116): each inline
+// fast-path store writes JitState.write_epoch at base + (guest address >> 12)
+// * 4. This runner owns the scratch table the generator names (kEpochTable in
+// wasmjit_emitter_test.cpp), above the 128 KiB guest window the checked
+// helpers serve; it covers guest pages below 2^15, and a store past it traps
+// instead of landing in fixture data.
+const guestBytes = 0x20000;
+const epochTable = guestBytes, epochTableBytes = 0x20000;
+const memory = new WebAssembly.Memory({initial: (epochTable + epochTableBytes) / 65536});
 const bytes = new Uint8Array(memory.buffer);
 // Helper contract (wasm_jit_cpu.cpp checked_memory_read/write): reads zero
 // memory_value[0..3] then fill the addressed guest bytes little-endian;
@@ -17,7 +25,7 @@ const mem_read = (stateOffset, address, rawWidth) => {
     address >>>= 0; // Wasm i32 arguments arrive in JavaScript as signed numbers.
     const view = new DataView(memory.buffer);
     const width = rawWidth & 0xff;
-    if (address + width > bytes.length) {
+    if (address + width > guestBytes) {
         view.setUint32(stateOffset + 88, address >>> 0, true);
         view.setUint32(stateOffset + 92, 0, true);
         return 2;
@@ -34,7 +42,7 @@ const mem_write = (stateOffset, address, rawWidth) => {
     address >>>= 0;
     const view = new DataView(memory.buffer);
     const width = rawWidth & 0xff;
-    if (address + width > bytes.length) {
+    if (address + width > guestBytes) {
         view.setUint32(stateOffset + 88, address >>> 0, true);
         view.setUint32(stateOffset + 92, 1, true);
         return 2;
@@ -131,6 +139,7 @@ for (const fixture of fixtures) {
             reset();
             const label = `${fixture.name} case ${index} @${offset}`;
             assert.equal(test.in.length, test.out.length, `${label}: state size`);
+            assert.equal(test.in[116], epochTable, `${label}: write epoch table`);
             const reason = invoke(offset);
             if (!fixture.differential) {
                 assert.equal(reason >>> 0, test.out[19], `${label}: reason`);

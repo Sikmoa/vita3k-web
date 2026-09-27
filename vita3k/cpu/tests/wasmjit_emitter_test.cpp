@@ -60,8 +60,21 @@ Value append(IR::Block &block, Opcode op, std::initializer_list<Value> args) {
 Value reg(IR::Block &block, Reg r) { return append(block, Opcode::A32GetRegister, {Value{r}}); }
 void set(IR::Block &block, Reg r, Value v) { append(block, Opcode::A32SetRegister, {Value{r}, v}); }
 
-JitState initial(bool thumb = false) {
+// Guest-write tracking: every inline fast-path store records write_epoch at
+// write_epochs_base + (guest address >> 12) * 4. Generated modules run in the
+// Node runner's memory, so the base is that runner's scratch table
+// (wasmjit_emitter_test.mjs epochTable), never a host pointer.
+constexpr uint32_t kEpochTable = 0x20000;
+constexpr uint32_t kEpoch = 0x5eed0001;
+JitState fixture_state() {
     JitState state{};
+    state.write_epochs_base = kEpochTable;
+    state.write_epoch = kEpoch;
+    return state;
+}
+
+JitState initial(bool thumb = false) {
+    JitState state = fixture_state();
     for (uint32_t i = 0; i < 16; ++i)
         state.regs[i] = 0xdead0000 + i;
     state.regs[15] = 0x1000;
@@ -872,6 +885,10 @@ void memory_bases(Suite &suite) {
                 if (write) {
                     const uint32_t old = fast ? backing_word : guest_word;
                     test.mem[fast ? backing : guest] = (old & ~mask) | (in.regs[0] & mask);
+                    // Only the inline store records the page's write epoch;
+                    // the checked helper is the host's job.
+                    test.pre[kEpochTable + (guest >> 12) * 4] = 0;
+                    test.mem[kEpochTable + (guest >> 12) * 4] = fast ? kEpoch : 0;
                 }
                 cases.push_back(test);
             }
@@ -908,8 +925,11 @@ void memory_counters_off(Suite &suite) {
         test.pre = {{0, 0x03000000}, {12, 0}, {0x800c, 0xb000},
             {0x9000, 0x03000000}, {0xa00c, 0}, {0x3000, 0x11223344}, {0xb000, 0x11223344}};
         test.mem = {{0x3000, 0x11223344}, {0xb000, 0x11223344}};
-        if (write)
+        if (write) {
             test.mem[0xb000] = 0xe5b6c7d8;
+            test.pre[kEpochTable + (0x3000 >> 12) * 4] = 0;
+            test.mem[kEpochTable + (0x3000 >> 12) * 4] = kEpoch;
+        }
         suite.add(write ? "memory_counters_off_write" : "memory_counters_off_read",
             block, {test});
     }
@@ -1537,7 +1557,7 @@ void fp_track_block(const IR::Block &block, FpTracker &fp) {
 // goldens never capture), and NZCV comes from [out.flags] over the preserved
 // low cpsr bits (Q/GE/IT/mode start clear, matching the cleared-flags seed).
 Case make_case(const VCase &c, const IR::Block &block, uint32_t ticks) {
-    JitState in{};
+    JitState in = fixture_state();
     for (const auto &[reg, value] : c.in_regs) in.regs[reg] = value;
     in.regs[13] = 0x5000;
     in.regs[15] = kBase;
