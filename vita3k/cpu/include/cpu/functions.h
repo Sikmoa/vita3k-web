@@ -36,7 +36,7 @@ uint32_t read_reg(CPUState &state, size_t index);
 float read_float_reg(CPUState &state, size_t index);
 void write_float_reg(CPUState &state, size_t index, float value);
 uint32_t read_sp(CPUState &state);
-uint32_t read_pc(CPUState &state);
+uint32_t read_pc(CPUState &state) noexcept;
 uint32_t read_lr(CPUState &state);
 uint32_t read_tpidruro(CPUState &state);
 void write_reg(CPUState &state, size_t index, uint32_t value);
@@ -58,12 +58,12 @@ void write_cpsr(CPUState &state, uint32_t value);
 uint32_t stack_alloc(CPUState &state, size_t size);
 uint32_t stack_free(CPUState &state, size_t size);
 
-void clear_exclusive(CPUState &state);
+void clear_exclusive(CPUState &state) noexcept;
 
 // Debugging helpers
 std::string disassemble(CPUState &state, uint64_t at, bool thumb, uint16_t *insn_size = nullptr);
 std::string disassemble(CPUState &state, uint64_t at, uint16_t *insn_size = nullptr);
-bool hit_breakpoint(CPUState &state);
+bool hit_breakpoint(CPUState &state) noexcept;
 void trigger_breakpoint(CPUState &state);
 void set_log_code(CPUState &state, bool log);
 

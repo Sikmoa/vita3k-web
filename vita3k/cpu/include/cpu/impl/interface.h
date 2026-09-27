@@ -34,7 +34,7 @@ struct CPUInterface {
     virtual uint32_t get_sp() = 0;
     virtual void set_sp(uint32_t val) = 0;
 
-    virtual uint32_t get_pc() = 0;
+    virtual uint32_t get_pc() noexcept = 0;
     virtual void set_pc(uint32_t val) = 0;
 
     virtual uint32_t get_lr() = 0;
@@ -59,14 +59,14 @@ struct CPUInterface {
     virtual bool is_thumb_mode() = 0;
     virtual int step() = 0;
 
-    virtual bool hit_breakpoint() = 0;
+    virtual bool hit_breakpoint() noexcept = 0;
     virtual void trigger_breakpoint() = 0;
     virtual void set_log_code(bool log) = 0;
     virtual void set_log_mem(bool log) = 0;
     virtual bool get_log_code() = 0;
     virtual bool get_log_mem() = 0;
 
-    virtual void clear_exclusive() = 0;
+    virtual void clear_exclusive() noexcept = 0;
 
     virtual std::size_t processor_id() const {
         return 0;

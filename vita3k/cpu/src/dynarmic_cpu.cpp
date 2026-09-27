@@ -381,7 +381,7 @@ int DynarmicCPU::step() {
     return 0;
 }
 
-bool DynarmicCPU::hit_breakpoint() {
+bool DynarmicCPU::hit_breakpoint() noexcept {
     return break_;
 }
 
@@ -426,7 +426,7 @@ uint32_t DynarmicCPU::get_sp() {
     return jit->Regs()[13];
 }
 
-uint32_t DynarmicCPU::get_pc() {
+uint32_t DynarmicCPU::get_pc() noexcept {
     return jit->Regs()[15];
 }
 
@@ -520,6 +520,6 @@ void DynarmicCPU::invalidate_jit_cache(Address start, size_t length) {
     jit->InvalidateCacheRange(start, length);
 }
 
-void DynarmicCPU::clear_exclusive() {
+void DynarmicCPU::clear_exclusive() noexcept {
     shared_monitor.ClearProcessor(core_id);
 }

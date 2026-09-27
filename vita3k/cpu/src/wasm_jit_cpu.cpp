@@ -751,6 +751,10 @@ uint64_t aot_diff_every() {
     return every;
 }
 bool is_nan32(uint32_t bits) { return (bits & 0x7fffffffu) > 0x7f800000u; }
+bool jit_timing() noexcept {
+    static const bool enabled = std::getenv("VITA3K_JIT_TIMING") != nullptr;
+    return enabled;
+}
 // VITA3K_AOT_DIFF_AFTER=<seconds>: start sampling that long after startup.
 double aot_diff_after_ms() {
     static const double after = [] {
@@ -1896,8 +1900,15 @@ struct WasmJitCPU::Impl {
                 }
             }
             if (!via_aot && found == region_cache.end()) {
-                RegionBuildStats build{};
-                found = ensure_region(pc, key, &build);
+                // The frontend reports untranslatable guest code (fetch
+                // faults, bad encodings) by throwing: only this cold path is
+                // inside a try, so the hot path keeps direct calls.
+                try {
+                    RegionBuildStats build{};
+                    found = ensure_region(pc, key, &build);
+                } catch (const std::exception &e) {
+                    return fail(e.what());
+                }
                 if (found == region_cache.end())
                     return -1; // ensure_region already reported via fail()/reject().
             }
@@ -1956,7 +1967,9 @@ struct WasmJitCPU::Impl {
             const uint32_t executed_before = state.executed;
             const uint32_t dispatches_before = state.dispatches;
             const uint32_t tx_before = state.tx_wasm;
-            const double t2 = emscripten_get_now();
+            // Wall time in generated code costs two JS calls per entry: only
+            // when requested (VITA3K_JIT_TIMING, progress guest_ms).
+            const double t2 = jit_timing() ? emscripten_get_now() : 0.0;
             const bool diff_sample = via_aot && aot_diff_every()
                 && (!aot_diff_thread() || aot_diff_thread() == parent->thread_id)
                 && emscripten_get_now() >= aot_diff_after_ms()
@@ -1965,7 +1978,8 @@ struct WasmJitCPU::Impl {
                 : via_aot ? g_aot.entry(&state, granted)
                 : vita3k_jit_run_dispatch(state_offset, granted, map_base, dispatch_epoch_addr());
             aot_calls += via_aot;
-            run_js_ms += emscripten_get_now() - t2;
+            if (jit_timing())
+                run_js_ms += emscripten_get_now() - t2;
             ++js_calls;
             account_counters();
             dispatches += counter_delta(dispatches_before, state.dispatches);
@@ -2177,9 +2191,12 @@ struct WasmJitCPU::Impl {
             // Host entry currently uses the EM_JS trampoline below.
             // Guest faults use return reasons; checked helpers are Wasm imports.
             const uintptr_t state_offset = reinterpret_cast<uintptr_t>(&state);
-            const double t2 = emscripten_get_now();
+            // Wall time in generated code costs two JS calls per entry: only
+            // when requested (VITA3K_JIT_TIMING, progress guest_ms).
+            const double t2 = jit_timing() ? emscripten_get_now() : 0.0;
             const uint32_t reason = vita3k_jit_call(found->second.table_index, state_offset);
-            run_js_ms += emscripten_get_now() - t2;
+            if (jit_timing())
+                run_js_ms += emscripten_get_now() - t2;
             ++js_calls;
             account_counters();
             if (reason == static_cast<uint32_t>(vita3k::wasmjit::ExitReason::Fault)) {
@@ -2377,13 +2394,8 @@ int WasmJitCPU::run() {
     impl->parent->svc_called = false;
     impl->error.clear();
     const auto start = impl->executed;
-    if (impl->region_mode) {
-        try {
-            return impl->execute_regions(impl->budget);
-        } catch (const std::exception &e) {
-            return impl->fail(e.what());
-        }
-    }
+    if (impl->region_mode)
+        return impl->execute_regions(impl->budget);
     while (impl->executed - start < impl->budget) {
         if (impl->stopped || impl->breakpoint) return 1;
         const uint32_t limit = std::min<uint64_t>(32, impl->budget - (impl->executed - start));
@@ -2392,18 +2404,15 @@ int WasmJitCPU::run() {
     }
     return impl->budget_exhausted();
 }
-int WasmJitCPU::run_slice(uint64_t instructions) {
+int WasmJitCPU::run_slice(uint64_t instructions) noexcept {
     const auto previous = impl->budget;
     const auto previous_slice = impl->scheduler_slice;
-    struct Restore {
-        Impl &impl;
-        uint64_t budget;
-        bool slice;
-        ~Restore() { impl.budget = budget; impl.scheduler_slice = slice; }
-    } restore{*impl, previous, previous_slice};
     impl->budget = instructions;
     impl->scheduler_slice = true;
-    return run();
+    const int result = run();
+    impl->budget = previous;
+    impl->scheduler_slice = previous_slice;
+    return result;
 }
 int WasmJitCPU::step() {
     impl->parent->svc_called = false;
@@ -2418,7 +2427,7 @@ uint32_t WasmJitCPU::get_sp() { return get_reg(13); }
 void WasmJitCPU::set_sp(uint32_t v) { set_reg(13, v); }
 uint32_t WasmJitCPU::get_lr() { return get_reg(14); }
 void WasmJitCPU::set_lr(uint32_t v) { set_reg(14, v); }
-uint32_t WasmJitCPU::get_pc() { return get_reg(15); }
+uint32_t WasmJitCPU::get_pc() noexcept { return impl->state.regs[15]; }
 void WasmJitCPU::set_pc(uint32_t v) {
     impl->state.cpsr = (impl->state.cpsr & ~0x20u) | ((v & 1) ? 0x20u : 0);
     set_reg(15, v & ((v & 1) ? ~1u : ~3u));
@@ -2516,13 +2525,13 @@ void WasmJitCPU::release_code_caches() {
     impl->clear_regions();
 }
 bool WasmJitCPU::is_thumb_mode() { return impl->state.cpsr & 0x20; }
-bool WasmJitCPU::hit_breakpoint() { return impl->breakpoint; }
+bool WasmJitCPU::hit_breakpoint() noexcept { return impl->breakpoint; }
 void WasmJitCPU::trigger_breakpoint() { impl->breakpoint = true; stop(); }
 void WasmJitCPU::set_log_code(bool v) { impl->log_code = v; }
 void WasmJitCPU::set_log_mem(bool v) { impl->log_mem = v; }
 bool WasmJitCPU::get_log_code() { return impl->log_code; }
 bool WasmJitCPU::get_log_mem() { return impl->log_mem; }
-void WasmJitCPU::clear_exclusive() {
+void WasmJitCPU::clear_exclusive() noexcept {
     // A reservation is only valid within the thread that took it: the kernel
     // calls this on a guest context switch. Ordinary stores deliberately do
     // not clear it (validity is decided by re-reading memory at STREX).
@@ -2532,7 +2541,7 @@ std::size_t WasmJitCPU::processor_id() const { return impl->core; }
 void WasmJitCPU::set_instruction_budget(uint64_t v) { impl->budget = v; }
 void WasmJitCPU::set_region_mode(bool v) { impl->region_mode = v; }
 bool WasmJitCPU::inline_mutex_fast_paths_enabled() { return inline_mutex_enabled(); }
-void WasmJitCPU::set_inline_mutex_table(vita3k::wasmjit::InlineMutexTable *table) {
+void WasmJitCPU::set_inline_mutex_table(vita3k::wasmjit::InlineMutexTable *table) noexcept {
     impl->state.mutex_table = inline_mutex_enabled() ? reinterpret_cast<uintptr_t>(table) : 0;
 }
 const std::string &WasmJitCPU::get_last_error() const { return impl->error; }

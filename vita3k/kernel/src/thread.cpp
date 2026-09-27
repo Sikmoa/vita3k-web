@@ -296,6 +296,13 @@ void ThreadState::run_loop(bool cooperative) {
             lock.lock();
         }
 
+        if (kernel.execution_host) {
+            lock.unlock();
+            guest_returned = run_host_active_loop();
+            lock.lock();
+            continue;
+        }
+
         // Active JIT loop. Lock held on entry and exit; unlocked only around run/step.
         while (!delete_requested && !exit_requested && !guest_returned && status == ThreadStatus::run) {
             const bool do_step = single_stepping;
@@ -329,11 +336,7 @@ void ThreadState::run_loop(bool cooperative) {
             // Guest function for this run_loop returned (or errored).
             if (res != 0) {
                 if (res < 0) {
-                    LOG_ERROR("Thread {} ({}) experienced a cpu error.", name, cpu->thread_id);
-                    std::string regs;
-                    for (int r = 0; r < 13; ++r)
-                        regs += fmt::format("r{}={:08x} ", r, read_reg(*cpu, r));
-                    LOG_ERROR("{}sp={:08x} lr={:08x} pc={:08x}", regs, read_sp(*cpu), read_lr(*cpu), read_pc(*cpu));
+                    report_cpu_error();
                     returned_value = 0xDEADDEAD;
                 } else {
                     // Halt-sentinel (res = 1): guest function returned cleanly.
@@ -348,6 +351,52 @@ void ThreadState::run_loop(bool cooperative) {
             }
         }
     }
+}
+
+void ThreadState::report_cpu_error() {
+    LOG_ERROR("Thread {} ({}) experienced a cpu error.", name, cpu->thread_id);
+    std::string regs;
+    for (int r = 0; r < 13; ++r)
+        regs += fmt::format("r{}={:08x} ", r, read_reg(*cpu, r));
+    LOG_ERROR("{}sp={:08x} lr={:08x} pc={:08x}", regs, read_sp(*cpu), read_lr(*cpu), read_pc(*cpu));
+}
+
+// Active loop under a cooperative execution host (one OS thread): the thread
+// mutex only guards against other OS threads, so it is not held here. No
+// local here has a destructor, so Emscripten's JS exception handling adds no
+// landing pad and every call stays a direct Wasm call instead of an invoke_*
+// round trip through JS; an HLE exception still unwinds to the host's fiber.
+bool ThreadState::run_host_active_loop() {
+    bool guest_returned = false;
+    while (!delete_requested && !exit_requested && !guest_returned && status == ThreadStatus::run) {
+        const bool do_step = single_stepping;
+        if (do_step)
+            single_stepping = false;
+        const int res = kernel.execution_host->run_cpu(*this, do_step);
+        if (cpu->svc_called) {
+            const uint32_t nid = *Ptr<uint32_t>(read_pc(*cpu) + 4).get(mem);
+            kernel.call_import(*cpu, nid, id);
+            clear_exclusive(*cpu);
+        }
+        if (cpu->abort_pending.exchange(false))
+            dispatch_abort(*cpu);
+        if (do_step || suspend_requested || hit_breakpoint(*cpu)) {
+            suspend_requested = false;
+            update_status(ThreadStatus::suspend);
+        }
+        if (res != 0) {
+            if (res < 0) {
+                report_cpu_error();
+                returned_value = 0xDEADDEAD;
+            } else {
+                returned_value = read_reg(*cpu, 0);
+            }
+            guest_returned = true;
+        }
+        if (!guest_returned && !exit_requested && !delete_requested)
+            kernel.execution_host->checkpoint(*this);
+    }
+    return guest_returned;
 }
 
 void ThreadState::push_arguments(const std::vector<uint32_t> &args) {

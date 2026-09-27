@@ -435,9 +435,11 @@ struct Writer {
         pass_open = false;
         draws = 0;
     }
-    void word(uint32_t value) { words.push_back(value); }
-    void real(float value) { words.push_back(std::bit_cast<uint32_t>(value)); }
-    uint32_t bytes(const void *source, size_t size, size_t alignment) {
+    // noexcept: allocation failure is fatal anyway, and callers with cleanups
+    // would otherwise reach every append through a JS invoke wrapper.
+    void word(uint32_t value) noexcept { words.push_back(value); }
+    void real(float value) noexcept { words.push_back(std::bit_cast<uint32_t>(value)); }
+    uint32_t bytes(const void *source, size_t size, size_t alignment) noexcept {
         const size_t offset = align(data.size(), alignment);
         data.resize(offset + size);
         if (size)
@@ -445,7 +447,7 @@ struct Writer {
         return static_cast<uint32_t>(offset);
     }
     // Reserve `size` bytes and return a pointer the caller fills in place.
-    uint8_t *reserve(size_t size, size_t alignment, uint32_t &offset) {
+    uint8_t *reserve(size_t size, size_t alignment, uint32_t &offset) noexcept {
         offset = static_cast<uint32_t>(align(data.size(), alignment));
         data.resize(offset + size);
         return data.data() + offset;

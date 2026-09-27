@@ -59,7 +59,7 @@ public:
     uint32_t get_sp() override;
     void set_sp(uint32_t val) override;
 
-    uint32_t get_pc() override;
+    uint32_t get_pc() noexcept override;
     void set_pc(uint32_t val) override;
 
     uint32_t get_lr() override;
@@ -83,14 +83,14 @@ public:
     bool is_thumb_mode() override;
     int step() override;
 
-    bool hit_breakpoint() override;
+    bool hit_breakpoint() noexcept override;
     void trigger_breakpoint() override;
     void set_log_code(bool log) override;
     void set_log_mem(bool log) override;
     bool get_log_code() override;
     bool get_log_mem() override;
 
-    void clear_exclusive() override;
+    void clear_exclusive() noexcept override;
     std::size_t processor_id() const override;
     void invalidate_jit_cache(Address start, size_t length) override;
 

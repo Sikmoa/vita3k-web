@@ -116,6 +116,9 @@ struct ThreadState {
 private:
     void push_arguments(const std::vector<uint32_t> &args);
     void dispatch_abort(CPUState &cpu);
+    void report_cpu_error();
+    // Returns true when the guest entry function returned.
+    bool run_host_active_loop();
 
     KernelState &kernel;
 

@@ -98,7 +98,7 @@ uint32_t read_sp(CPUState &state) {
     return state.cpu->get_sp();
 }
 
-uint32_t read_pc(CPUState &state) {
+uint32_t read_pc(CPUState &state) noexcept {
     return state.cpu->get_pc();
 }
 
@@ -142,7 +142,7 @@ bool is_thumb_mode(CPUState &state) {
     return state.cpu->is_thumb_mode();
 }
 
-bool hit_breakpoint(CPUState &state) {
+bool hit_breakpoint(CPUState &state) noexcept {
     return state.cpu->hit_breakpoint();
 }
 
@@ -166,7 +166,7 @@ bool get_log_mem(CPUState &state) {
     return state.cpu->get_log_mem();
 }
 
-void clear_exclusive(CPUState &state) {
+void clear_exclusive(CPUState &state) noexcept {
     state.cpu->clear_exclusive();
 }
 

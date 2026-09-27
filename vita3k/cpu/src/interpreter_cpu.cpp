@@ -103,7 +103,7 @@ uint32_t InterpreterCPU::get_reg(uint8_t idx) { return regs[idx & 15]; }
 void InterpreterCPU::set_reg(uint8_t idx, uint32_t value) { regs[idx & 15] = value; }
 uint32_t InterpreterCPU::get_sp() { return regs[13]; }
 void InterpreterCPU::set_sp(uint32_t value) { regs[13] = value; }
-uint32_t InterpreterCPU::get_pc() { return regs[15]; }
+uint32_t InterpreterCPU::get_pc() noexcept { return regs[15]; }
 void InterpreterCPU::set_pc(uint32_t value) {
     if (value & 1) { cpsr |= t_flag; regs[15] = value & ~1u; }
     else { cpsr &= ~t_flag; regs[15] = value & ~3u; }
@@ -636,11 +636,11 @@ int InterpreterCPU::arm(uint32_t op, uint32_t pc) {
     return 0;
 }
 bool InterpreterCPU::is_thumb_mode() { return (cpsr & t_flag) != 0; }
-bool InterpreterCPU::hit_breakpoint() { return breakpoint; }
+bool InterpreterCPU::hit_breakpoint() noexcept { return breakpoint; }
 void InterpreterCPU::trigger_breakpoint() { breakpoint = true; stopped = true; }
 void InterpreterCPU::set_log_code(bool value) { log_code = value; }
 void InterpreterCPU::set_log_mem(bool value) { log_mem = value; }
 bool InterpreterCPU::get_log_code() { return log_code; }
 bool InterpreterCPU::get_log_mem() { return log_mem; }
-void InterpreterCPU::clear_exclusive() {}
+void InterpreterCPU::clear_exclusive() noexcept {}
 std::size_t InterpreterCPU::processor_id() const { return core_id; }

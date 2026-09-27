@@ -6,6 +6,11 @@ add_library(vita3k_wasm_jit STATIC
     "${VITA_ROOT}/cpu/src/wasmjit/fp64.cpp"
 )
 target_link_libraries(vita3k_wasm_jit PUBLIC vita3k_dynarmic_frontend vita3k_web_runtime_core)
+# fp64.cpp calls the vendored Dynarmic FP routines, which throw only from
+# mcl's compile-time ASSERT branch. Ignoring exceptions drops their landing
+# pads: under Emscripten's JS exception handling each call would otherwise go
+# through an invoke_* JS wrapper on every guest FP helper call.
+set_source_files_properties("${VITA_ROOT}/cpu/src/wasmjit/fp64.cpp" PROPERTIES COMPILE_OPTIONS "-fignore-exceptions")
 target_include_directories(vita3k_wasm_jit PRIVATE "${VITA_ROOT}/cpu/src")
 target_link_options(vita3k_wasm_jit INTERFACE
     ${VITA3K_WEB_GROWTH_LINK_OPTION} -sALLOW_TABLE_GROWTH=1 -Wl,--export-table

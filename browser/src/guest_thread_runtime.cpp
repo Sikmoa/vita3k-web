@@ -240,21 +240,15 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
         if (stopping_)
             return -1;
         auto &jit = static_cast<WasmJitCPU &>(*thread.cpu->cpu);
-        int result;
-        {
-            // Generated regions cannot suspend or call HLE. Commit their final
-            // inline owners/counts before run_loop can import, checkpoint or
-            // retire a thread, including when JIT execution throws.
-            struct CommitInlineMutexes {
-                KernelState &kernel;
-                const ThreadStatePtr &thread;
-                ~CommitInlineMutexes() noexcept { mutex_inline_commit(kernel, thread); }
-            } commit{*kernel, active->thread};
-            jit.set_inline_mutex_table(kernel->inline_mutex_table.get());
-            const uint64_t before = jit.instructions_executed();
-            result = single_step ? jit.step() : jit.run_slice(slice);
-            active->since_yield += jit.instructions_executed() - before + kHleCharge;
-        }
+        // Generated regions cannot suspend or call HLE. Commit their final
+        // inline owners/counts before run_loop can import, checkpoint or
+        // retire a thread. run_slice cannot throw, so no RAII guard (and no
+        // landing pad turning these calls into JS invoke wrappers) is needed.
+        jit.set_inline_mutex_table(kernel->inline_mutex_table.get());
+        const uint64_t before = jit.instructions_executed();
+        const int result = single_step ? jit.step() : jit.run_slice(slice);
+        active->since_yield += jit.instructions_executed() - before + kHleCharge;
+        mutex_inline_commit(*kernel, active->thread);
         if (result < 0 && !active->faulted) {
             active->faulted = true;
         }

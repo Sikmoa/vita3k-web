@@ -20,7 +20,7 @@ public:
     uint32_t get_reg(uint8_t idx) override;
     void set_reg(uint8_t idx, uint32_t value) override;
     uint32_t get_sp() override; void set_sp(uint32_t value) override;
-    uint32_t get_pc() override; void set_pc(uint32_t value) override;
+    uint32_t get_pc() noexcept override; void set_pc(uint32_t value) override;
     uint32_t get_lr() override; void set_lr(uint32_t value) override;
     uint32_t get_cpsr() override; void set_cpsr(uint32_t value) override;
     uint32_t get_tpidruro() override; void set_tpidruro(uint32_t value) override;
@@ -28,10 +28,10 @@ public:
     uint32_t get_fpscr() override; void set_fpscr(uint32_t value) override;
     CPUContext save_context() override; void load_context(const CPUContext &ctx) override;
     bool is_thumb_mode() override;
-    bool hit_breakpoint() override; void trigger_breakpoint() override;
+    bool hit_breakpoint() noexcept override; void trigger_breakpoint() override;
     void set_log_code(bool value) override; void set_log_mem(bool value) override;
     bool get_log_code() override; bool get_log_mem() override;
-    void clear_exclusive() override;
+    void clear_exclusive() noexcept override;
     std::size_t processor_id() const override;
     // Guest code in [start, start+length) changed: drops lazy regions and
     // disables every AOT function whose code overlaps the range.
@@ -44,14 +44,16 @@ public:
     // Explicit scheduler boundary, distinct from halt (1), SVC (0), and
     // fault (<0). Ordinary run() retains its fatal runaway-budget contract.
     static constexpr int slice_yield = 2;
-    int run_slice(uint64_t instructions);
+    // Translation failures are reported through the result like other CPU
+    // errors, never thrown.
+    int run_slice(uint64_t instructions) noexcept;
     // Region modules (many blocks, in-Wasm dispatch) vs single-block modules.
     // Default: region mode (M14c production path).
     void set_region_mode(bool value);
     // Cooperative runtime only: borrowed host table (nullptr disables).
     // The caller must commit dirty entries before any HLE/scheduler observer.
     static bool inline_mutex_fast_paths_enabled();
-    void set_inline_mutex_table(vita3k::wasmjit::InlineMutexTable *table);
+    void set_inline_mutex_table(vita3k::wasmjit::InlineMutexTable *table) noexcept;
     // Diagnostic: false keeps this CPU on the lazy JIT even where the loaded
     // AOT module has code (VITA3K_AOT_EXCLUDE_THREADS).
     void set_aot_enabled(bool enabled);
