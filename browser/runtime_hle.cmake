@@ -189,7 +189,7 @@ set(_hle_exports
     sceKernelWaitThreadEnd
     # LwCond wait: releases the LwMutex, parks on the condition queue and
     # re-acquires through the cooperative mutex wait (sync_primitives
-    # execution_host branch); timeout and cancel return without re-acquiring.
+    # execution_host branch), also after a timeout; deletion returns without it.
     sceKernelWaitLwCond
     # Keep DelayThreadCB, WaitThreadEndCB, WaitEventFlagCB and WaitLwCondCB
     # unselected: their production paths wait on host condition variables
@@ -318,9 +318,9 @@ set(_hle_exports
     # argument and leaves stopping to the guest's own break instruction.
     sceDbgAssertionHandler sceDbgLoggingHandler
     # LwCond signal/delete: signal unlinks parked waiters and sets them
-    # running (notify only); delete with waiters returns ILLEGAL_CONTEXT
-    # under the fiber host. No host condition variable is reached.
-    sceKernelSignalLwCond sceKernelSignalLwCondAll sceKernelDeleteLwCond
+    # running (notify only); delete wakes waiters with WAIT_DELETE_LW_COND.
+    # No host condition variable is reached.
+    sceKernelSignalLwCond sceKernelSignalLwCondAll sceKernelSignalLwCondTo sceKernelDeleteLwCond
     # libc time conversions and memblock lookups: host libc time math and
     # SysmemState reads; SceDateTime fill from a time_t is pure.
     sceKernelLibcGmtime_r sceKernelLibcLocaltime_r sceKernelLibcMktime

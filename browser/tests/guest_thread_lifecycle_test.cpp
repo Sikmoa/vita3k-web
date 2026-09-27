@@ -7,6 +7,7 @@
 #include <kernel/thread/thread_state.h>
 #include <mem/functions.h>
 #include <modules/module_parent.h>
+#include <module/module.h>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -19,6 +20,12 @@
 #include "guest_fios_overlay_tests.h"
 #include "guest_clib_tests.h"
 #include "inline_mutex_fixture.h"
+#include "guest_sync_delete_tests.h"
+
+DECL_EXPORT(int, sceKernelDeleteLwCond, Ptr<SceKernelLwCondWork> workarea);
+DECL_EXPORT(int, sceKernelSignalLwCondTo, Ptr<SceKernelLwCondWork> workarea, SceUID thread_target);
+DECL_EXPORT(int, sceKernelSignalLwCond, Ptr<SceKernelLwCondWork> workarea);
+DECL_EXPORT(int, sceKernelWaitLwCond, Ptr<SceKernelLwCondWork> workarea, SceUInt32 *timeout);
 
 int main() {
     test_inline_mutex_runtime();
@@ -96,7 +103,9 @@ int main() {
 
     // Each case uses a fresh runtime attachment and the same production queues.
     // No synthetic scheduler wakeup substitutes for a semaphore operation.
-    for (unsigned scenario = 0; scenario < 4; ++scenario) {
+    // Scenario 4 deletes the semaphore under its parked waiter; scenario 5
+    // cancels after the waiter itself was deleted.
+    for (unsigned scenario = 0; scenario < 6; ++scenario) {
         env->kernel.call_import = [&](CPUState &cpu, uint32_t nid, SceUID tid) {
             call_import(*env, cpu, nid, tid);
             REQUIRE(env->missing_nids.empty());
@@ -123,10 +132,24 @@ int main() {
             REQUIRE(waiter->status == ThreadStatus::wait);
             REQUIRE(queue->waiting_threads->size() == 1);
             REQUIRE(*Ptr<uint32_t>(result).get(env->mem) == 0xcccccccc);
-            // Reject unsupported object deletion without changing the queue.
-            REQUIRE(semaphore_delete(env->kernel, "fixture", 0, id) == SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
-            REQUIRE(queue->waiting_threads->size() == 1);
-            if (scenario == 1) {
+            if (scenario == 4) {
+                // Firmware deletion succeeds and wakes the waiter with WAIT_DELETE.
+                REQUIRE(semaphore_delete(env->kernel, "fixture", 0, id) == 0);
+                REQUIRE(!env->kernel.semaphores.contains(id) && queue->waiting_threads->empty());
+                REQUIRE(waiter->status == ThreadStatus::run);
+                runtime.resume(64);
+                REQUIRE(waiter->status == ThreadStatus::dormant);
+                REQUIRE(*Ptr<uint32_t>(result).get(env->mem) == uint32_t(SCE_KERNEL_ERROR_WAIT_DELETE));
+            } else if (scenario == 5) {
+                // A deleted waiter is no longer waiting: cancel neither counts
+                // nor wakes it.
+                waiter->exit_delete(false);
+                SceUInt32 count = 0xcccccccc;
+                REQUIRE(semaphore_cancel(env->kernel, "fixture", 0, id, 0, &count) == 0);
+                REQUIRE(count == 0 && queue->waiting_threads->empty());
+                runtime.resume(64);
+                REQUIRE(!env->kernel.threads.contains(waiter->id));
+            } else if (scenario == 1) {
                 SceUInt32 count = 0;
                 REQUIRE(semaphore_cancel(env->kernel, "fixture", 0, id, 0, &count) == 0);
                 REQUIRE(count == 1);
@@ -145,7 +168,7 @@ int main() {
         REQUIRE(queue->waiting_threads->empty());
         REQUIRE(queue->val == 0);
         REQUIRE(get_current_cpu_state() == nullptr);
-        REQUIRE(semaphore_delete(env->kernel, "fixture", 0, id) == 0);
+        REQUIRE(semaphore_delete(env->kernel, "fixture", 0, id) == (scenario == 4 ? SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID : 0));
         std::printf("Semaphore edge case %u passed\n", scenario);
     }
 
@@ -200,10 +223,20 @@ int main() {
     REQUIRE(*Ptr<uint32_t>(data + 0x40).get(env->mem) == 0u);
     REQUIRE(*Ptr<uint32_t>(data + 0x4c).get(env->mem) == 0xccccccccu);
     REQUIRE(*Ptr<uint32_t>(data + 0x50).get(env->mem) == 0xccccccccu);
-    REQUIRE(mutex_delete(env->kernel, "fixture", lock_parent->id, lwmutex, SyncWeight::Light)
-        == SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
+    // Firmware unlock errors (SceLibKernel sceKernelUnlockLwMutex): a thread
+    // that does not own it, and a count above one on a non-recursive mutex,
+    // fail without touching the owner or the queue.
+    REQUIRE(mutex_unlock(env->kernel, "fixture", lock_child->id, lwmutex, 1, SyncWeight::Light)
+        == SCE_KERNEL_ERROR_LW_MUTEX_NOT_OWNED);
+    REQUIRE(mutex_unlock(env->kernel, "fixture", 0, lwmutex, 1, SyncWeight::Light)
+        == SCE_KERNEL_ERROR_LW_MUTEX_NOT_OWNED);
+    REQUIRE(mutex_unlock(env->kernel, "fixture", lock_parent->id, lwmutex, 2, SyncWeight::Light)
+        == SCE_KERNEL_ERROR_ILLEGAL_COUNT);
+    REQUIRE(mutex_unlock(env->kernel, "fixture", lock_parent->id, lwmutex, 0, SyncWeight::Light)
+        == SCE_KERNEL_ERROR_ILLEGAL_COUNT);
     REQUIRE(env->kernel.lwmutexes.contains(lwmutex));
     REQUIRE(lock->waiting_threads->size() == 1 && lock->owner == lock_parent);
+    REQUIRE(lock_work->owner == uint32_t(lock_parent->id) && lock_work->lockCount == 1);
     *Ptr<uint32_t>(data + 0x54).get(env->mem) = 1; // open the host gate
     const auto drained = runtime.resume(256);
     REQUIRE(drained.failed == 0 && drained.idle && drained.dormant == 2);
@@ -229,7 +262,8 @@ int main() {
     // cleanup, and unlock BEFORE cleanup with/without a surviving waiter.
     for (const auto weight : {SyncWeight::Heavy, SyncWeight::Light}) {
         const bool light = weight == SyncWeight::Light;
-        for (unsigned scenario = 0; scenario < 5; ++scenario) {
+        // Scenario 5 deletes the mutex under its parked waiter.
+        for (unsigned scenario = 0; scenario < 6; ++scenario) {
             SceUID observed_waiter = -1;
             uint32_t wait_return = 0xcccccccc;
             env->kernel.call_import = [&](CPUState &cpu, uint32_t nid, SceUID tid) {
@@ -292,8 +326,12 @@ int main() {
                 REQUIRE((*mutex->waiting_threads->begin()).lock_count == 2);
                 REQUIRE(*Ptr<uint32_t>(result).get(env->mem) == 0xcccccccc);
                 check_owner(owner, 1);
-                REQUIRE(mutex_delete(env->kernel, "fixture", owner->id, id, weight) == SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
-                REQUIRE((light ? env->kernel.lwmutexes : env->kernel.mutexes).contains(id));
+                // Only the owner may unlock; the count cannot underflow.
+                REQUIRE(mutex_unlock(env->kernel, "fixture", waiter->id, id, 1, weight)
+                    == (light ? SCE_KERNEL_ERROR_LW_MUTEX_NOT_OWNED : SCE_KERNEL_ERROR_MUTEX_NOT_OWNED));
+                REQUIRE(mutex_unlock(env->kernel, "fixture", owner->id, id, 2, weight)
+                    == (light ? SCE_KERNEL_ERROR_LW_MUTEX_UNLOCK_UDF : SCE_KERNEL_ERROR_MUTEX_UNLOCK_UDF));
+                check_owner(owner, 1);
                 REQUIRE(mutex->waiting_threads->size() == 1);
             }
             if (scenario <= 1) {
@@ -314,6 +352,22 @@ int main() {
                 REQUIRE(!env->kernel.threads.contains(waiter->id));
                 REQUIRE(mutex->waiting_threads->empty());
                 check_owner(owner, 1);
+            } else if (scenario == 5) {
+                // Firmware deletion succeeds and wakes the waiter with
+                // WAIT_DELETE; the woken waiter leaves the dead workarea alone.
+                if (light)
+                    wa->lockCount = 7; // sentinel: no write-back after deletion
+                REQUIRE(mutex_delete(env->kernel, "fixture", owner->id, id, weight) == 0);
+                REQUIRE(!(light ? env->kernel.lwmutexes : env->kernel.mutexes).contains(id));
+                REQUIRE(mutex->waiting_threads->empty() && mutex->deleted);
+                REQUIRE(runtime.resume(64).failed == 0);
+                REQUIRE(waiter->status == ThreadStatus::dormant);
+                REQUIRE(*Ptr<uint32_t>(result).get(env->mem) == uint32_t(SCE_KERNEL_ERROR_WAIT_DELETE));
+                if (light)
+                    REQUIRE(wa->lockCount == 7);
+                // Its id no longer resolves.
+                REQUIRE(mutex_unlock(env->kernel, "fixture", owner->id, id, 1, weight)
+                    == (light ? SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID : SCE_KERNEL_ERROR_UNKNOWN_MUTEX_ID));
             } else if (scenario == 3) {
                 // A second live waiter proves unlock skips the deleted front
                 // entry and hands off the requested recursive count exactly once.
@@ -341,7 +395,7 @@ int main() {
                 REQUIRE(mutex_unlock(env->kernel, "fixture", survivor->id, id, 1, weight) == 0);
                 check_owner({}, 0);
             }
-            if (scenario != 3) {
+            if (scenario != 3 && scenario != 5) {
                 if (scenario == 4) {
                     // Delete the only waiter, then unlock before its cleanup.
                     waiter->exit_delete(false);
@@ -353,9 +407,11 @@ int main() {
             }
             REQUIRE(runtime.shutdown());
             REQUIRE(env->kernel.threads.empty() && mutex->waiting_threads->empty());
-            REQUIRE(wait_return == uint32_t(scenario <= 1 ? SCE_KERNEL_ERROR_WAIT_TIMEOUT : SCE_KERNEL_ERROR_WAIT_CANCEL));
+            REQUIRE(wait_return == uint32_t(scenario <= 1 ? SCE_KERNEL_ERROR_WAIT_TIMEOUT
+                    : scenario == 5 ? SCE_KERNEL_ERROR_WAIT_DELETE : SCE_KERNEL_ERROR_WAIT_CANCEL));
             REQUIRE(get_current_cpu_state() == nullptr);
-            REQUIRE(mutex_delete(env->kernel, "fixture", 0, id, weight) == 0);
+            if (scenario != 5)
+                REQUIRE(mutex_delete(env->kernel, "fixture", 0, id, weight) == 0);
             std::printf("%s edge case %u passed\n", light ? "LwMutex" : "Mutex", scenario);
         }
     }
@@ -463,7 +519,10 @@ int main() {
         lw::build(env->mem, lw_code, lw_data);
         const auto word = [&](Address offset) -> uint32_t & { return *Ptr<uint32_t>(lw_data + offset).get(env->mem); };
         const auto waiter_word = [&](unsigned slot, Address offset) -> uint32_t & { return word(lw::waiter_area(slot) + offset); };
-        for (unsigned scenario = 0; scenario < 8; ++scenario) {
+        const auto lw_export = [&](auto fn, auto... args) {
+            return fn(*env, 0, "fixture", Ptr<SceKernelLwCondWork>(lw_data + lw::kCond), args...);
+        };
+        for (unsigned scenario = 0; scenario < 14; ++scenario) {
             env->kernel.call_import = [&](CPUState &cpu, uint32_t nid, SceUID tid) {
                 call_import(*env, cpu, nid, tid);
                 REQUIRE(env->missing_nids.empty());
@@ -472,7 +531,7 @@ int main() {
             std::memset(Ptr<void>(lw_data).get(env->mem), 0xcc, 0x200);
             for (unsigned slot = 0; slot < 4; ++slot)
                 word(lw::kTimeout + 4 * slot) = 0;
-            word(lw::kTimeout) = scenario == 2 ? lw_data + 0x70 : 0; // waiter 0 timeout pointer
+            word(lw::kTimeout) = scenario == 2 || scenario == 12 ? lw_data + 0x70 : 0; // waiter 0 timeout pointer
             word(0x70) = 50000;
             word(lw::kSignaler) = 0; word(lw::kSignaler + 0x10) = 0;
             std::memset(Ptr<void>(lw_data + lw::kMutex).get(env->mem), 0, 0x60);
@@ -508,7 +567,7 @@ int main() {
                 REQUIRE(waiter_word(slot, 8) == uint32_t(t->id)); // re-acquired on return
                 REQUIRE(waiter_word(slot, 0xc) == 0 && waiter_word(slot, 0x10) == 1);
             };
-            const unsigned waiters = scenario == 1 ? 3 : (scenario == 0 || scenario == 5) ? 2 : 1;
+            const unsigned waiters = scenario == 1 ? 3 : (scenario == 0 || scenario == 5 || scenario == 9) ? 2 : 1;
             std::vector<ThreadStatePtr> w;
             for (unsigned slot = 0; slot < waiters; ++slot) {
                 w.push_back(thread("lwcond waiter", lw_code + 0x100 * slot));
@@ -559,23 +618,113 @@ int main() {
                     completed(1, w[1]);
                 }
             } else if (scenario == 2) {
-                // Timeout: desktop condvar_wait returns WAIT_TIMEOUT without
-                // re-acquiring the mutex, and zeroes the remaining time.
+                // Timeout: firmware re-acquires the mutex before returning
+                // WAIT_TIMEOUT, and the remaining time is zero.
                 run_until([&] { return w[0]->status == ThreadStatus::dormant; });
                 REQUIRE(waiter_word(0, 0) == 0);
                 REQUIRE(waiter_word(0, 4) == uint32_t(SCE_KERNEL_ERROR_WAIT_TIMEOUT));
-                REQUIRE(waiter_word(0, 8) == uint32_t(-1));
+                REQUIRE(waiter_word(0, 8) == uint32_t(w[0]->id));
+                REQUIRE(waiter_word(0, 0xc) == 0 && waiter_word(0, 0x10) == 1);
                 REQUIRE(word(0x70) == 0);
                 REQUIRE(cond->waiting_threads->empty());
             } else if (scenario == 3) {
-                // Deleting a condition with a parked waiter is rejected without
-                // touching the queue (same contract as semaphore/mutex deletion).
-                REQUIRE(condvar_delete(env->kernel, "fixture", 0, cond_id, SyncWeight::Light) == SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
-                REQUIRE(env->kernel.lwcondvars.contains(cond_id) && cond->waiting_threads->size() == 1);
+                // Deleting a condition with a parked waiter succeeds; the waiter
+                // gets WAIT_DELETE_LW_COND without the mutex, so its unlock fails.
+                REQUIRE(lw_export(export_sceKernelDeleteLwCond) == 0);
+                REQUIRE(!env->kernel.lwcondvars.contains(cond_id) && cond->waiting_threads->empty());
+                REQUIRE(word(lw::kCond) == uint32_t(-1) && word(lw::kCond + 4) == uint32_t(-1));
+                run_until([&] { return w[0]->status == ThreadStatus::dormant; });
+                REQUIRE(waiter_word(0, 4) == uint32_t(SCE_KERNEL_ERROR_WAIT_DELETE_LW_COND));
+                REQUIRE(waiter_word(0, 8) == uint32_t(-1));
+                REQUIRE(waiter_word(0, 0xc) == uint32_t(SCE_KERNEL_ERROR_LW_MUTEX_NOT_OWNED));
+            } else if (scenario == 8) {
+                // Deleted while the signalled waiter re-acquires the mutex the
+                // signaler holds: it wakes with WAIT_DELETE_LW_COND, unowned.
                 auto signaler = thread("lwcond signaler", lw_code + 0x400);
-                word(lw::kSignaler) = 1; word(lw::kSignaler + 0x10) = 1;
+                word(lw::kSignaler) = 1;
+                run_until([&] { return word(lw::kSignaler + 0xc) == 1; });
+                REQUIRE(mutex->owner == signaler && mutex->waiting_threads->size() == 1);
+                REQUIRE(lw_export(export_sceKernelDeleteLwCond) == 0);
+                REQUIRE(mutex->waiting_threads->empty() && mutex->owner == signaler);
+                run_until([&] { return w[0]->status == ThreadStatus::dormant; });
+                REQUIRE(waiter_word(0, 4) == uint32_t(SCE_KERNEL_ERROR_WAIT_DELETE_LW_COND));
+                REQUIRE(waiter_word(0, 8) == uint32_t(signaler->id));
+                REQUIRE(waiter_word(0, 0xc) == uint32_t(SCE_KERNEL_ERROR_LW_MUTEX_NOT_OWNED));
+                word(lw::kSignaler + 0x10) = 1;
+                run_until([&] { return signaler->status == ThreadStatus::dormant; });
+                REQUIRE(word(lw::kSignaler + 0x14) == 0);
+            } else if (scenario == 9) {
+                // SignalLwCondTo (SceKernelThreadMgr 0x8102dee4/0x810244b8).
+                REQUIRE(lw_export(export_sceKernelSignalLwCondTo, 0) == SCE_KERNEL_ERROR_ILLEGAL_THREAD_ID);
+                REQUIRE(lw_export(export_sceKernelSignalLwCondTo, 0x7ffffff0) == SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+                REQUIRE(export_sceKernelSignalLwCondTo(*env, w[0]->id, "fixture", Ptr<SceKernelLwCondWork>(lw_data + lw::kCond), w[0]->id)
+                    == SCE_KERNEL_ERROR_ILLEGAL_THREAD_ID);
+                REQUIRE(cond->waiting_threads->size() == 2);
+                // Wakes exactly the target, not the queue head.
+                REQUIRE(lw_export(export_sceKernelSignalLwCondTo, w[1]->id) == 0);
+                REQUIRE(cond->waiting_threads->size() == 1 && (*cond->waiting_threads->begin()).thread == w[0]);
+                run_until([&] { return w[1]->status == ThreadStatus::dormant; });
+                completed(1, w[1]);
+                REQUIRE(w[0]->status == ThreadStatus::wait);
+                // A thread that is not waiting on the condition.
+                REQUIRE(lw_export(export_sceKernelSignalLwCondTo, w[1]->id) == SCE_KERNEL_ERROR_ILLEGAL_THREAD_ID);
+                // Processes built with an SDK before 2.00 get -1 instead.
+                const Address param = lw_data + 0x800;
+                auto *process = Ptr<SceProcessParam>(param).get(env->mem);
+                std::memset(process, 0, sizeof(*process));
+                process->magic = '2PSP'; process->version = 1; process->fw_version = 0x01500000;
+                env->kernel.process_param = Ptr<SceProcessParam>(param);
+                REQUIRE(lw_export(export_sceKernelSignalLwCondTo, w[1]->id) == -1);
+                process->fw_version = 0x03600000;
+                REQUIRE(lw_export(export_sceKernelSignalLwCondTo, w[1]->id) == SCE_KERNEL_ERROR_ILLEGAL_THREAD_ID);
+                env->kernel.process_param = Ptr<SceProcessParam>();
+                REQUIRE(w[0]->status == ThreadStatus::wait && cond->waiting_threads->size() == 1);
+                REQUIRE(lw_export(export_sceKernelSignalLwCond) == 0);
+                run_until([&] { return w[0]->status == ThreadStatus::dormant; });
+                completed(0, w[0]);
+                // Signalling an empty condition succeeds.
+                REQUIRE(lw_export(export_sceKernelSignalLwCond) == 0);
+            } else if (scenario == 10) {
+                // Deleting the mutex wakes the condition's waiters with
+                // WAIT_DELETE_LW_MUTEX and dissociates the condition.
+                REQUIRE(mutex_delete(env->kernel, "fixture", 0, mutex_id, SyncWeight::Light) == 0);
+                REQUIRE(cond->waiting_threads->empty() && !cond->associated_mutex);
+                run_until([&] { return w[0]->status == ThreadStatus::dormant; });
+                REQUIRE(waiter_word(0, 4) == uint32_t(SCE_KERNEL_ERROR_WAIT_DELETE_LW_MUTEX));
+                REQUIRE(waiter_word(0, 0xc) == uint32_t(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID));
+            } else if (scenario == 11) {
+                // Signalled, then the mutex is deleted before the waiter runs:
+                // its re-acquire finds no mutex.
+                REQUIRE(lw_export(export_sceKernelSignalLwCond) == 0);
+                REQUIRE(mutex_delete(env->kernel, "fixture", 0, mutex_id, SyncWeight::Light) == 0);
+                run_until([&] { return w[0]->status == ThreadStatus::dormant; });
+                REQUIRE(waiter_word(0, 4) == uint32_t(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID));
+                REQUIRE(waiter_word(0, 0xc) == uint32_t(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID));
+                REQUIRE(!mutex->owner && mutex->waiting_threads->empty());
+            } else if (scenario == 12) {
+                // The re-acquire after a signal has no timeout, even when the
+                // wait's own deadline passes while the signaler holds the mutex.
+                auto signaler = thread("lwcond signaler", lw_code + 0x400);
+                word(lw::kSignaler) = 1;
+                run_until([&] { return word(lw::kSignaler + 0xc) == 1; });
+                REQUIRE(mutex->owner == signaler && mutex->waiting_threads->size() == 1);
+                const auto deadline = vita3k::web::GuestThreadRuntime::now_us() + 60000;
+                while (vita3k::web::GuestThreadRuntime::now_us() < deadline) {}
+                REQUIRE(runtime.resume(64).failed == 0);
+                REQUIRE(w[0]->status == ThreadStatus::wait && mutex->waiting_threads->size() == 1);
+                word(lw::kSignaler + 0x10) = 1;
                 run_until([&] { return w[0]->status == ThreadStatus::dormant && signaler->status == ThreadStatus::dormant; });
                 completed(0, w[0]);
+            } else if (scenario == 13) {
+                // Signalled, then the condition is deleted before the waiter
+                // runs: firmware returns the signal's success without
+                // re-acquiring (the woken wait no longer finds the object).
+                REQUIRE(lw_export(export_sceKernelSignalLwCond) == 0);
+                REQUIRE(lw_export(export_sceKernelDeleteLwCond) == 0);
+                run_until([&] { return w[0]->status == ThreadStatus::dormant; });
+                REQUIRE(waiter_word(0, 4) == 0);
+                REQUIRE(waiter_word(0, 8) == uint32_t(-1));
+                REQUIRE(waiter_word(0, 0xc) == uint32_t(SCE_KERNEL_ERROR_LW_MUTEX_NOT_OWNED));
             } else if (scenario == 4) {
                 // A waiter deleted while parked leaves the queue and never
                 // re-acquires the mutex.
@@ -596,7 +745,7 @@ int main() {
             } else if (scenario == 6) {
                 // Signalled, then deleted before it resumes: the dying waiter
                 // must not re-acquire (and leak) the mutex.
-                REQUIRE(condvar_signal(env->kernel, "fixture", 0, cond_id,
+                REQUIRE(condvar_signal(env->kernel, env->mem, "fixture", 0, cond_id,
                     Condvar::SignalTarget(Condvar::SignalTarget::Type::Any), SyncWeight::Light) == 0);
                 REQUIRE(cond->waiting_threads->empty() && w[0]->status == ThreadStatus::run);
                 w[0]->exit_delete(false);
@@ -621,11 +770,22 @@ int main() {
             REQUIRE(runtime.shutdown());
             REQUIRE(env->kernel.threads.empty());
             REQUIRE(get_current_cpu_state() == nullptr);
-            REQUIRE(condvar_delete(env->kernel, "fixture", 0, cond_id, SyncWeight::Light) == 0);
-            REQUIRE(mutex_delete(env->kernel, "fixture", 0, mutex_id, SyncWeight::Light) == 0);
+            const bool cond_deleted = scenario == 3 || scenario == 8 || scenario == 13;
+            const bool mutex_deleted = scenario == 10 || scenario == 11;
+            REQUIRE(condvar_delete(env->kernel, "fixture", 0, cond_id, SyncWeight::Light)
+                == (cond_deleted ? SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID : 0));
+            REQUIRE(mutex_delete(env->kernel, "fixture", 0, mutex_id, SyncWeight::Light)
+                == (mutex_deleted ? SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID : 0));
             std::printf("LwCond case %u passed\n", scenario);
         }
+        // A null workarea is ILLEGAL_ADDR (SceKernelThreadMgr syscall entries).
+        const Ptr<SceKernelLwCondWork> null_work;
+        REQUIRE(export_sceKernelDeleteLwCond(*env, 0, "fixture", null_work) == SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+        REQUIRE(export_sceKernelSignalLwCond(*env, 0, "fixture", null_work) == SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+        REQUIRE(export_sceKernelSignalLwCondTo(*env, 0, "fixture", null_work, 1) == SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+        REQUIRE(export_sceKernelWaitLwCond(*env, 0, "fixture", null_work, nullptr) == SCE_KERNEL_ERROR_ILLEGAL_ADDR);
     }
+    test_guest_sync_deletion(*env, runtime);
     // A throwing HLE import must be diagnosed at the fiber boundary, counted
     // once, and reaped without executing guest writeback or acknowledging it
     // as success. Exercise standard and non-standard C++ exceptions alike.

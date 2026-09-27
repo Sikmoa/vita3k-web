@@ -153,11 +153,21 @@ EXPORT(int, _sceKernelCreateTimer, const char *name, SceUInt32 attr, const uint3
     return timer_create(emuenv.kernel, emuenv.mem, export_name, name, thread_id, attr);
 }
 
+// SceKernelThreadMgr 3.74 _sceKernelDeleteLwCond (0x8102b0d0): a null
+// workarea is ILLEGAL_ADDR; a successful deletion stores -1 in the first two
+// workarea words (uid and the associated LwMutex workarea).
 EXPORT(int, _sceKernelDeleteLwCond, Ptr<SceKernelLwCondWork> workarea) {
     TRACY_FUNC(_sceKernelDeleteLwCond, workarea);
+    if (!workarea)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
     SceUID lightweight_condition_id = workarea.get(emuenv.mem)->uid;
 
-    return condvar_delete(emuenv.kernel, export_name, thread_id, lightweight_condition_id, SyncWeight::Light);
+    const int res = condvar_delete(emuenv.kernel, export_name, thread_id, lightweight_condition_id, SyncWeight::Light);
+    if (res >= 0) {
+        uint32_t *const words = workarea.cast<uint32_t>().get(emuenv.mem);
+        words[0] = words[1] = UINT32_MAX;
+    }
+    return res;
 }
 
 EXPORT(int, _sceKernelDeleteLwMutex, Ptr<SceKernelLwMutexWork> workarea) {
@@ -702,21 +712,29 @@ EXPORT(int, _sceKernelSetTimerTime) {
 
 EXPORT(int, _sceKernelSignalLwCond, Ptr<SceKernelLwCondWork> workarea) {
     TRACY_FUNC(_sceKernelSignalLwCond, workarea);
+    if (!workarea)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
     SceUID condid = workarea.get(emuenv.mem)->uid;
-    return condvar_signal(emuenv.kernel, export_name, thread_id, condid,
+    return condvar_signal(emuenv.kernel, emuenv.mem, export_name, thread_id, condid,
         Condvar::SignalTarget(Condvar::SignalTarget::Type::Any), SyncWeight::Light);
 }
 
 EXPORT(int, _sceKernelSignalLwCondAll, Ptr<SceKernelLwCondWork> workarea) {
     TRACY_FUNC(_sceKernelSignalLwCondAll, workarea);
+    if (!workarea)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
     SceUID condid = workarea.get(emuenv.mem)->uid;
-    return condvar_signal(emuenv.kernel, export_name, thread_id, condid,
+    return condvar_signal(emuenv.kernel, emuenv.mem, export_name, thread_id, condid,
         Condvar::SignalTarget(Condvar::SignalTarget::Type::All), SyncWeight::Light);
 }
 
-EXPORT(int, _sceKernelSignalLwCondTo) {
-    TRACY_FUNC(_sceKernelSignalLwCondTo);
-    return UNIMPLEMENTED();
+EXPORT(int, _sceKernelSignalLwCondTo, Ptr<SceKernelLwCondWork> workarea, SceUID thread_target) {
+    TRACY_FUNC(_sceKernelSignalLwCondTo, workarea, thread_target);
+    if (!workarea)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+    SceUID condid = workarea.get(emuenv.mem)->uid;
+    return condvar_signal(emuenv.kernel, emuenv.mem, export_name, thread_id, condid,
+        Condvar::SignalTarget(Condvar::SignalTarget::Type::Specific, thread_target), SyncWeight::Light);
 }
 
 EXPORT(int, _sceKernelStartThread, SceUID thid, SceSize arglen, Ptr<void> argp) {
@@ -772,7 +790,7 @@ EXPORT(SceInt32, _sceKernelWaitEvent, SceUID event_id, SceUInt32 bit_pattern, Sc
 EXPORT(SceInt32, _sceKernelWaitEventCB, SceUID event_id, SceUInt32 bit_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout) {
     TRACY_FUNC(_sceKernelWaitEventCB, event_id, bit_pattern, result_pattern, user_data, timeout);
     process_callbacks(emuenv.kernel, thread_id);
-    return simple_event_waitorpoll(emuenv.kernel, export_name, thread_id, event_id, bit_pattern, result_pattern, user_data, timeout, false);
+    return simple_event_waitorpoll(emuenv.kernel, export_name, thread_id, event_id, bit_pattern, result_pattern, user_data, timeout, true);
 }
 
 EXPORT(SceInt32, _sceKernelWaitEventFlag, SceUID evfId, SceUInt32 bitPattern, SceUInt32 waitMode, SceUInt32 *pResultPat, SceUInt32 *pTimeout) {
@@ -798,12 +816,16 @@ EXPORT(int, _sceKernelWaitExceptionCB) {
 
 EXPORT(int, _sceKernelWaitLwCond, Ptr<SceKernelLwCondWork> workarea, SceUInt32 *timeout) {
     TRACY_FUNC(_sceKernelWaitLwCond, workarea, timeout);
+    if (!workarea)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
     const auto cond_id = workarea.get(emuenv.mem)->uid;
     return condvar_wait(emuenv.kernel, emuenv.mem, export_name, thread_id, cond_id, timeout, SyncWeight::Light);
 }
 
 EXPORT(SceInt32, _sceKernelWaitLwCondCB, Ptr<SceKernelLwCondWork> pWork, SceUInt32 *pTimeout) {
     TRACY_FUNC(_sceKernelWaitLwCondCB, pWork, pTimeout);
+    if (!pWork)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
     process_callbacks(emuenv.kernel, thread_id);
     const auto cond_id = pWork.get(emuenv.mem)->uid;
     return condvar_wait(emuenv.kernel, emuenv.mem, export_name, thread_id, cond_id, pTimeout, SyncWeight::Light);
@@ -1457,19 +1479,19 @@ EXPORT(int, sceKernelSetTimerTimeWide, SceUID timer_handle, SceUInt64 time) {
 
 EXPORT(int, sceKernelSignalCond, SceUID condid) {
     TRACY_FUNC(sceKernelSignalCond, condid);
-    return condvar_signal(emuenv.kernel, export_name, thread_id, condid,
+    return condvar_signal(emuenv.kernel, emuenv.mem, export_name, thread_id, condid,
         Condvar::SignalTarget(Condvar::SignalTarget::Type::Any), SyncWeight::Heavy);
 }
 
 EXPORT(int, sceKernelSignalCondAll, SceUID condid) {
     TRACY_FUNC(sceKernelSignalCondAll, condid);
-    return condvar_signal(emuenv.kernel, export_name, thread_id, condid,
+    return condvar_signal(emuenv.kernel, emuenv.mem, export_name, thread_id, condid,
         Condvar::SignalTarget(Condvar::SignalTarget::Type::All), SyncWeight::Heavy);
 }
 
 EXPORT(int, sceKernelSignalCondTo, SceUID condid, SceUID thread_target) {
     TRACY_FUNC(sceKernelSignalCondTo, condid, thread_target);
-    return condvar_signal(emuenv.kernel, export_name, thread_id, condid,
+    return condvar_signal(emuenv.kernel, emuenv.mem, export_name, thread_id, condid,
         Condvar::SignalTarget(Condvar::SignalTarget::Type::Specific, thread_target), SyncWeight::Heavy);
 }
 

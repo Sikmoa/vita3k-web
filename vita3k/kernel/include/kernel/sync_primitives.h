@@ -26,12 +26,16 @@ struct KernelState;
 struct WaitingThreadData {
     ThreadStatePtr thread;
     int32_t priority;
-    bool *was_canceled;
+    // Where a waker that dequeues this entry reports a failure (cancel or
+    // deletion) to the waiter; the waiter's frame owns it. Null: no report.
+    SceInt32 *wake_error = nullptr;
 
     // additional fields for each primitive
     union {
         struct { // mutex
             int32_t lock_count;
+            // Condition variable whose waiter re-acquires the mutex (0: none).
+            SceUID relock_cond;
         };
         struct { // rwlock
             bool is_write;
@@ -81,6 +85,8 @@ struct SyncPrimitive {
     uint32_t attr{};
     std::mutex mutex;
     char name[KERNELOBJECT_MAX_NAME_LENGTH + 1];
+    // Set under `mutex` on deletion: holders of a stale pointer must not use it.
+    bool deleted = false;
     virtual ~SyncPrimitive() = default;
 };
 
@@ -181,6 +187,7 @@ struct Condvar : SyncPrimitive {
     };
 
     WaitingThreadQueuePtr waiting_threads;
+    // Null once the mutex is deleted: firmware dissociates the condition.
     MutexPtr associated_mutex;
 };
 typedef std::shared_ptr<Condvar> CondvarPtr;
@@ -255,7 +262,7 @@ int semaphore_cancel(KernelState &kernel, const char *export_name, SceUID thread
 // Condition Variable
 SceUID condvar_create(SceUID *uid_out, KernelState &kernel, const char *export_name, const char *name, SceUID thread_id, SceUInt attr, SceUID assoc_mutexid, SyncWeight weight);
 int condvar_wait(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID condid, SceUInt *timeout, SyncWeight weight);
-int condvar_signal(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID condid, Condvar::SignalTarget signal_target, SyncWeight weight);
+int condvar_signal(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID condid, Condvar::SignalTarget signal_target, SyncWeight weight);
 int condvar_delete(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID condid, SyncWeight weight);
 
 // Event Flag

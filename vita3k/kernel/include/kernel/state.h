@@ -121,7 +121,8 @@ struct KernelExecutionHost {
     virtual int run_cpu(ThreadState &thread, bool step) = 0; // 0 continue, 1 return, <0 fault
     virtual void checkpoint(ThreadState &thread) = 0;
     virtual void park(ThreadState &thread) = 0;
-    // Only opted-in semaphore and mutex queues use this continuation contract.
+    // Only the opted-in semaphore, mutex, condition and event-flag queues use
+    // this continuation contract.
     virtual WaitResult wait_sync(ThreadState &thread, std::optional<uint32_t> timeout_us) = 0;
     virtual uint32_t run_guest_function(ThreadState &thread, Address entry, SceSize args, Ptr<void> argp) = 0;
     virtual bool stopping() const noexcept = 0;

@@ -52,6 +52,11 @@ DECL_EXPORT(SceInt32, _sceKernelGetCallbackInfo, SceUID callbackId, SceKernelCal
 DECL_EXPORT(int, _sceKernelGetRWLockInfo, SceUID rwlockId, SceKernelRWLockInfo *info);
 DECL_EXPORT(SceInt32, _sceKernelGetThreadCpuAffinityMask, SceUID thid);
 DECL_EXPORT(SceInt32, _sceKernelWaitLwCondCB, Ptr<SceKernelLwCondWork> pWork, SceUInt32 *pTimeout);
+DECL_EXPORT(int, _sceKernelDeleteLwCond, Ptr<SceKernelLwCondWork> workarea);
+DECL_EXPORT(int, _sceKernelSignalLwCond, Ptr<SceKernelLwCondWork> workarea);
+DECL_EXPORT(int, _sceKernelSignalLwCondAll, Ptr<SceKernelLwCondWork> workarea);
+DECL_EXPORT(int, _sceKernelSignalLwCondTo, Ptr<SceKernelLwCondWork> workarea, SceUID thread_target);
+DECL_EXPORT(int, _sceKernelWaitLwCond, Ptr<SceKernelLwCondWork> workarea, SceUInt32 *timeout);
 DECL_EXPORT(int, sceKernelCreateThreadForUser, const char *name, SceKernelThreadEntry entry, int init_priority, SceKernelCreateThread_opt *options);
 DECL_EXPORT(int, _sceKernelStartThread, SceUID thid, SceSize arglen, Ptr<void> argp);
 DECL_EXPORT(SceInt32, _sceKernelGetThreadInfo, SceUID threadId, Ptr<SceKernelThreadInfo> pInfo);

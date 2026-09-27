@@ -1297,11 +1297,11 @@ EXPORT(SceUID, sceKernelCreateTimer, const char *name, SceUInt32 attr, const uin
     return CALL_EXPORT(_sceKernelCreateTimer, name, attr, opt_params);
 }
 
+// SceLibKernel 3.74 forwards the LwCond API to the ThreadMgr syscalls
+// unchanged (sceKernelDeleteLwCond 0x8100aafc .. SignalLwCondTo 0x8100ab1c).
 EXPORT(int, sceKernelDeleteLwCond, Ptr<SceKernelLwCondWork> workarea) {
     TRACY_FUNC(sceKernelDeleteLwCond, workarea);
-    SceUID lightweight_condition_id = workarea.get(emuenv.mem)->uid;
-
-    return condvar_delete(emuenv.kernel, export_name, thread_id, lightweight_condition_id, SyncWeight::Light);
+    return CALL_EXPORT(_sceKernelDeleteLwCond, workarea);
 }
 
 EXPORT(int, sceKernelDeleteLwMutex, Ptr<SceKernelLwMutexWork> workarea) {
@@ -1715,23 +1715,17 @@ EXPORT(int, sceKernelSetTimerTime) {
 
 EXPORT(int, sceKernelSignalLwCond, Ptr<SceKernelLwCondWork> workarea) {
     TRACY_FUNC(sceKernelSignalLwCond, workarea);
-    SceUID condid = workarea.get(emuenv.mem)->uid;
-    return condvar_signal(emuenv.kernel, export_name, thread_id, condid,
-        Condvar::SignalTarget(Condvar::SignalTarget::Type::Any), SyncWeight::Light);
+    return CALL_EXPORT(_sceKernelSignalLwCond, workarea);
 }
 
 EXPORT(int, sceKernelSignalLwCondAll, Ptr<SceKernelLwCondWork> workarea) {
     TRACY_FUNC(sceKernelSignalLwCondAll, workarea);
-    SceUID condid = workarea.get(emuenv.mem)->uid;
-    return condvar_signal(emuenv.kernel, export_name, thread_id, condid,
-        Condvar::SignalTarget(Condvar::SignalTarget::Type::All), SyncWeight::Light);
+    return CALL_EXPORT(_sceKernelSignalLwCondAll, workarea);
 }
 
 EXPORT(int, sceKernelSignalLwCondTo, Ptr<SceKernelLwCondWork> workarea, SceUID thread_target) {
     TRACY_FUNC(sceKernelSignalLwCondTo, workarea, thread_target);
-    SceUID condid = workarea.get(emuenv.mem)->uid;
-    return condvar_signal(emuenv.kernel, export_name, thread_id, condid,
-        Condvar::SignalTarget(Condvar::SignalTarget::Type::Specific, thread_target), SyncWeight::Light);
+    return CALL_EXPORT(_sceKernelSignalLwCondTo, workarea, thread_target);
 }
 
 EXPORT(int, sceKernelStackChkFail) {
@@ -1872,8 +1866,7 @@ EXPORT(int, sceKernelWaitExceptionCB) {
 
 EXPORT(int, sceKernelWaitLwCond, Ptr<SceKernelLwCondWork> workarea, SceUInt32 *timeout) {
     TRACY_FUNC(sceKernelWaitLwCond, workarea, timeout);
-    const auto cond_id = workarea.get(emuenv.mem)->uid;
-    return condvar_wait(emuenv.kernel, emuenv.mem, export_name, thread_id, cond_id, timeout, SyncWeight::Light);
+    return CALL_EXPORT(_sceKernelWaitLwCond, workarea, timeout);
 }
 
 EXPORT(SceInt32, sceKernelWaitLwCondCB, Ptr<SceKernelLwCondWork> pWork, SceUInt32 *pTimeout) {
