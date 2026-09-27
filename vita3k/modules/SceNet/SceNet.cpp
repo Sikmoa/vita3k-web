@@ -17,6 +17,7 @@
 
 #include "SceNet.h"
 
+#include <kernel/callback.h>
 #include <kernel/state.h>
 
 #include <net/state.h>
@@ -121,25 +122,6 @@ std::string to_debug_str<SceNetSocketOption>(const MemState &mem, SceNetSocketOp
     return std::to_string(type);
 }
 
-static int ret_net_errno(EmuEnvState &emuenv, int thread_id, int ret) {
-    if (ret < 0) {
-        auto addr = emuenv.kernel.get_thread_tls_addr(emuenv.mem, thread_id, TLS_NET_ERRNO);
-        if (addr) {
-            auto inner_ptr = addr.get(emuenv.mem);
-            if (inner_ptr)
-                *reinterpret_cast<int *>(inner_ptr) = ret & 0xff;
-        }
-    }
-
-    return ret;
-}
-
-#define RET_NET_ERRNO(ret)                                \
-    do {                                                  \
-        int _r = ret_net_errno(emuenv, thread_id, (ret)); \
-        return (_r < 0 ? RET_ERROR(_r) : _r);             \
-    } while (0)
-
 #ifdef __EMSCRIPTEN__
 // The browser has no host sockets: every socket is an OfflineSocket
 // (net/offline_socket.h), and the calls that wait park the guest thread.
@@ -182,14 +164,28 @@ static int recv_offline(EmuEnvState &emuenv, SceUID thread_id, int sid, void *bu
 }
 
 // Epoll readiness of a socket, or of a resolver whose lookup has finished.
+// Evaluating a socket consumes its sceNetInternalIcmConnect completion
+// (SceNetPs 0x81009774 clears it at 0x810097d8), which only a socket entry
+// that registered SCE_NET_EPOLL_ICM_DONE receives (0x81009ee2).
 static unsigned int offline_ready_events(EmuEnvState &emuenv, int id, const EpollSocket &entry) {
     if (const auto resolver = emuenv.net.resolvers.find(id); resolver != emuenv.net.resolvers.end())
         return resolver->second ? SCE_NET_EPOLLIN : 0;
     const auto sock = entry.sock.lock();
-    return sock ? static_cast<const OfflineSocket &>(*sock).poll_events() : 0;
+    if (!sock)
+        return 0;
+    auto &offline = static_cast<OfflineSocket &>(*sock);
+    unsigned int events = offline.poll_events();
+    if (offline.icm_completed) {
+        offline.icm_completed = false;
+        events |= SCE_NET_EPOLL_ICM_DONE;
+    }
+    return events;
 }
 
-static int epoll_wait_offline(EmuEnvState &emuenv, SceUID thread_id, int eid, SceNetEpollEvent *events, int maxevents, int timeout_us) {
+// A wait with callbacks (sceNetEpollWaitCB: SceNetPs waits with
+// ksceKernelWaitEventFlagCB, 0x8102a4c8) runs the thread's notified
+// callbacks whenever it would wait, then waits on.
+static int epoll_wait_offline(EmuEnvState &emuenv, SceUID thread_id, int eid, SceNetEpollEvent *events, int maxevents, int timeout_us, bool callbacks) {
     if (!events || maxevents <= 0)
         return SCE_NET_ERROR_EINVAL;
     const auto start = std::chrono::steady_clock::now();
@@ -205,8 +201,10 @@ static int epoll_wait_offline(EmuEnvState &emuenv, SceUID thread_id, int eid, Sc
             return SCE_NET_ERROR_EINTR;
         int count = 0;
         for (const auto &[id, entry] : epoll->eventEntries) {
+            if (count == maxevents)
+                break; // later entries are not evaluated
             const unsigned int ready = offline_ready_events(emuenv, id, entry) & (entry.events | SCE_NET_EPOLLERR);
-            if (!ready || count == maxevents)
+            if (!ready)
                 continue;
             events[count] = {};
             events[count].events = ready;
@@ -222,6 +220,9 @@ static int epoll_wait_offline(EmuEnvState &emuenv, SceUID thread_id, int eid, Sc
                 return 0;
             remaining = static_cast<uint32_t>(timeout_us) - elapsed;
         }
+        // A callback may have made an entry ready: scan again before waiting.
+        if (callbacks && process_callbacks(emuenv.kernel, thread_id) > 0)
+            continue;
         if (offline_net_park(emuenv.kernel, emuenv.net, thread_id, remaining) == KernelExecutionHost::WaitResult::cancelled)
             return SCE_NET_ERROR_EINTR;
     }
@@ -388,7 +389,9 @@ EXPORT(int, sceNetEpollDestroy, int eid) {
 EXPORT(int, sceNetEpollWait, int eid, SceNetEpollEvent *events, int maxevents, int timeout) {
     TRACY_FUNC(sceNetEpollWait, eid, events, maxevents, timeout);
 #ifdef __EMSCRIPTEN__
-    RET_NET_ERRNO(epoll_wait_offline(emuenv, thread_id, eid, events, maxevents, timeout));
+    if (!emuenv.net.inited)
+        return RET_ERROR(SCE_NET_ERROR_ENOTINIT); // libnet 0x81004324, errno untouched
+    RET_NET_ERRNO(epoll_wait_offline(emuenv, thread_id, eid, events, maxevents, timeout, false));
 #else
     auto epoll = lock_and_find(eid, emuenv.net.epolls, emuenv.kernel.mutex);
 
@@ -396,9 +399,15 @@ EXPORT(int, sceNetEpollWait, int eid, SceNetEpollEvent *events, int maxevents, i
 #endif
 }
 
-EXPORT(int, sceNetEpollWaitCB) {
-    TRACY_FUNC(sceNetEpollWaitCB);
+EXPORT(int, sceNetEpollWaitCB, int eid, SceNetEpollEvent *events, int maxevents, int timeout) {
+    TRACY_FUNC(sceNetEpollWaitCB, eid, events, maxevents, timeout);
+#ifdef __EMSCRIPTEN__
+    if (!emuenv.net.inited)
+        return RET_ERROR(SCE_NET_ERROR_ENOTINIT); // libnet 0x8100438c, errno untouched
+    RET_NET_ERRNO(epoll_wait_offline(emuenv, thread_id, eid, events, maxevents, timeout, true));
+#else
     return UNIMPLEMENTED();
+#endif
 }
 
 EXPORT(Ptr<int>, sceNetErrnoLoc) {

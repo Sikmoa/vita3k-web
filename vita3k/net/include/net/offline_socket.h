@@ -48,6 +48,9 @@ struct OfflineSocket final : Socket {
     std::deque<OfflineDatagram> queue;
     size_t queued_bytes = 0; // payload + address per queued datagram, bounded by SO_RCVBUF
     int so_error = 0;
+    // sceNetInternalIcmConnect found no usable interface: the next epoll
+    // scan of the socket reports SCE_NET_EPOLL_ICM_DONE once.
+    bool icm_completed = false;
     // Abort: each sceNetSocketAbort ends the waits in progress; PRESERVATION
     // flags also fail every later receive/send with EINTR.
     unsigned abort_generation = 0;

@@ -329,7 +329,9 @@ enum SceNetEpollControlFlag : int32_t {
 enum SceNetEpollEventType {
     SCE_NET_EPOLLIN = 1,
     SCE_NET_EPOLLOUT = 2,
-    SCE_NET_EPOLLERR = 8
+    SCE_NET_EPOLLERR = 8,
+    // sceNetInternalIcmConnect finished (name unknown; libhttp waits for it).
+    SCE_NET_EPOLL_ICM_DONE = 0x40000
 };
 
 struct SceNetEtherAddr {

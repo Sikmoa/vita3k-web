@@ -29,7 +29,9 @@ uint32_t process_callbacks(KernelState &kernel, SceUID thread_id) {
 
     thread->is_processing_callbacks = true;
     uint32_t num_callbacks_processed = 0;
-    for (CallbackPtr &cb : thread->callbacks) {
+    // A callback may create or delete callbacks of this thread.
+    const auto callbacks = thread->callbacks;
+    for (const CallbackPtr &cb : callbacks) {
         if (cb->is_executable()) {
             std::string name = cb->get_name();
             cb->execute(kernel, [name]() {
@@ -86,16 +88,22 @@ uint32_t Callback::get_num_notifications() {
 }
 
 void Callback::execute(KernelState &kernel, const std::function<void()> &deleter) {
-    std::lock_guard lock(this->_mutex);
-    if (!this->is_notified())
-        return;
-
-    std::vector<uint32_t> args = { (uint32_t)(this->notifier_id), this->num_notifications, (uint32_t)this->notification_arg, this->userdata.address() };
+    // Firmware 3.74 threadmgr (0x8100c17c) takes the notification and clears
+    // it before the callback runs: a notification sent meanwhile runs it again.
+    std::vector<uint32_t> args;
+    {
+        std::lock_guard lock(this->_mutex);
+        if (!this->is_notified())
+            return;
+        args = { (uint32_t)(this->notifier_id), this->num_notifications, (uint32_t)this->notification_arg, this->userdata.address() };
+        this->reset();
+        this->notification_arg = 0;
+    }
+    // Unlocked: the guest callback may wait, and another thread notify it.
     int ret = kernel.get_thread(this->thread_id)->run_callback(this->cb_func.address(), args);
     if (ret != 0) {
         deleter();
     }
-    this->reset(); // Callbacks return to their default state after running
 }
 
 /** Private methods **/

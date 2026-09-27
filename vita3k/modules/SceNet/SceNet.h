@@ -19,7 +19,30 @@
 
 #include <module/module.h>
 
+#include <emuenv/state.h>
+#include <kernel/state.h>
 #include <net/types.h>
+
+// SceNet's convention (libnet 0x81003b18): a failed call stores its errno in
+// the thread's sce_net_errno TLS word and returns 0x80410100 | errno.
+inline int ret_net_errno(EmuEnvState &emuenv, int thread_id, int ret) {
+    if (ret < 0) {
+        auto addr = emuenv.kernel.get_thread_tls_addr(emuenv.mem, thread_id, TLS_NET_ERRNO);
+        if (addr) {
+            auto inner_ptr = addr.get(emuenv.mem);
+            if (inner_ptr)
+                *reinterpret_cast<int *>(inner_ptr) = ret & 0xff;
+        }
+    }
+
+    return ret;
+}
+
+#define RET_NET_ERRNO(ret)                                \
+    do {                                                  \
+        int _r = ret_net_errno(emuenv, thread_id, (ret)); \
+        return (_r < 0 ? RET_ERROR(_r) : _r);             \
+    } while (0)
 
 DECL_EXPORT(int, sceNetBind, int sid, const SceNetSockaddr *addr, unsigned int addrlen);
 DECL_EXPORT(int, sceNetInetPton, int af, const char *src, void *dst);

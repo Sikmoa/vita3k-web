@@ -433,10 +433,6 @@ void ThreadState::push_arguments(const std::vector<uint32_t> &args) {
 }
 
 uint32_t ThreadState::run_callback(Address callback_address, const std::vector<uint32_t> &args) {
-    // Callback::execute holds its notification mutex across this call. Those
-    // callbacks cannot enter a switching host yet; thread event handlers can.
-    if (kernel.execution_host && is_processing_callbacks)
-        return static_cast<uint32_t>(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
     std::unique_lock<std::mutex> thread_lock(mutex);
     if (call_level == 0) {
         LOG_ERROR("run_callback should not be called as the first thread entry");

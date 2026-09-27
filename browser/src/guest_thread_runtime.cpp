@@ -24,8 +24,9 @@ namespace vita3k::web {
 namespace {
 constexpr uint32_t context_error = static_cast<uint32_t>(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
 
-// These paths use host waits outside sync_primitives.cpp, or notification
-// callbacks holding Callback::_mutex. Guard aliases by their canonical name.
+// These paths use host waits outside sync_primitives.cpp, or run callbacks
+// on paths not yet exercised on the fiber host. Guard aliases by their
+// canonical name.
 // Custom/device HLE must obey the host contract too; this is not a sandbox.
 bool classify_unsupported_import(uint32_t nid) {
     const char *name = import_name(nid);
@@ -67,8 +68,9 @@ bool classify_unsupported_import(uint32_t nid) {
     if (n == "sceNpCheckCallback")
         return false;
     // Offline network stack: parks until readiness, timeout or abort
-    // (SceNet execution_host branch); the CB variant stays rejected.
-    if (n == "sceNetEpollWait")
+    // (SceNet execution_host branch); the CB variant runs the thread's
+    // notified callbacks inline (run_callback) before each park.
+    if (n == "sceNetEpollWait" || n == "sceNetEpollWaitCB")
         return false;
     return n.find("Wait") != n.npos || n.find("DelayThread") != n.npos
         || n.find("CheckCallback") != n.npos || n.find("CB") != n.npos

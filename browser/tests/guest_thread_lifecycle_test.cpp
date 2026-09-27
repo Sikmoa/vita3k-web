@@ -29,6 +29,7 @@
 #include "guest_sync_delete_tests.h"
 #include "guest_kernel_info_tests.h"
 #include "guest_kernel_handle_tests.h"
+#include "guest_net_offline_tests.h"
 
 DECL_EXPORT(int, sceKernelDeleteLwCond, Ptr<SceKernelLwCondWork> workarea);
 DECL_EXPORT(int, sceKernelSignalLwCondTo, Ptr<SceKernelLwCondWork> workarea, SceUID thread_target);
@@ -806,6 +807,7 @@ int main() {
     test_guest_sync_deletion(*env, runtime);
     test_guest_kernel_info(*env, runtime);
     test_guest_kernel_handles(*env, runtime);
+    test_guest_net_offline(*env, runtime);
     // A throwing HLE import must be diagnosed at the fiber boundary, counted
     // once, and reaped without executing guest writeback or acknowledging it
     // as success. Exercise standard and non-standard C++ exceptions alike.

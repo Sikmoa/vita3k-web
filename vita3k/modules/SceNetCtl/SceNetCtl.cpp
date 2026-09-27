@@ -567,11 +567,10 @@ EXPORT(int, sceNetCtlInetGetInfo, int code, SceNetCtlInfo *info) {
     }
 
 #ifdef __EMSCRIPTEN__
-    // Offline: no infrastructure connection, so nothing about it can be read.
-    if (code < SCE_NETCTL_INFO_GET_CNF_NAME || code > SCE_NETCTL_INFO_GET_HTTP_PROXY_PORT)
-        return RET_ERROR(SCE_NET_CTL_ERROR_INVALID_CODE);
+    // Offline: the shell's NetCtl service (0x81216d2c) answers NOT_CONNECTED
+    // while disconnected before it looks at the code, and writes nothing.
     return RET_ERROR(SCE_NET_CTL_ERROR_NOT_CONNECTED);
-#endif
+#else
     const auto addr = net_utils::get_selected_assigned_addr(emuenv.cfg.adhoc_addr);
 
     switch (code) {
@@ -652,6 +651,7 @@ EXPORT(int, sceNetCtlInetGetInfo, int code, SceNetCtlInfo *info) {
         }
     }
     return 0;
+#endif
 }
 
 EXPORT(int, sceNetCtlInetGetResult, int eventType, int *errorCode) {

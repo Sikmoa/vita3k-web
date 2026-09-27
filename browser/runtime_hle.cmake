@@ -389,6 +389,9 @@ set(_hle_exports
     sceNetShutdown sceNetSetsockopt sceNetGetsockopt sceNetGetsockname sceNetGetpeername
     sceNetSend sceNetSendto sceNetRecv sceNetRecvfrom
     sceNetEpollCreate sceNetEpollControl sceNetEpollWait sceNetEpollDestroy sceNetEpollAbort
+    # The CB wait runs the thread's notified callbacks before it parks; ICM
+    # connect finds no interface to bring up and completes at once.
+    sceNetEpollWaitCB sceNetInternalIcmConnect
     sceNetResolverCreate sceNetResolverStartNtoa sceNetResolverGetError
     sceNetResolverAbort sceNetResolverDestroy
     sceNetInetPton sceNetInternalInetPton
