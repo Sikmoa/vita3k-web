@@ -332,6 +332,8 @@ set(_hle_exports
     # Files and directories:
     sceIoDopen sceIoDread sceIoDclose sceIoMkdir sceIoRmdir sceIoRemove sceIoRename
     sceIoPread sceIoPwrite sceIoSync sceIoSyncByFd sceIoChstat
+    # Device and file control as iofilemgr, exfatfs and PfsMgr answer a game.
+    sceIoDevctl sceIoIoctl
     # Clock:
     sceRtcGetCurrentClock sceRtcGetCurrentClockLocalTime sceRtcGetTick sceRtcTickAddSeconds
     # Remaining static imports of the eboot and the preloaded LLE modules

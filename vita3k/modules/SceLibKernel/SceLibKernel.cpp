@@ -40,7 +40,9 @@
 #include <util/log.h>
 #include <util/tracy.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -619,9 +621,9 @@ EXPORT(int, sceClibVsnprintfChk) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceIoChstat) {
-    TRACY_FUNC(sceIoChstat);
-    return UNIMPLEMENTED();
+EXPORT(int, sceIoChstat, const char *path, const SceIoStat *stat, SceUInt32 bits) {
+    TRACY_FUNC(sceIoChstat, path, stat, bits);
+    return chstat_path(emuenv.io, path, stat, bits, emuenv.vita_fs_path, export_name);
 }
 
 EXPORT(int, sceIoChstatAsync) {
@@ -644,39 +646,83 @@ EXPORT(int, sceIoCompleteMultiple) {
     return UNIMPLEMENTED();
 }
 
+// Command bits only system programs may use (iofilemgr 0x81016b3a,
+// 0x81016d36): 0x800, or 0x200/0x400 without it.
+static bool system_io_command(SceInt cmd) {
+    return (cmd & 0xe00) != 0;
+}
+
+// The mount a game reaches through a device: ux0: is exFAT; savedata0: and
+// app0: are PfsMgr mounts on it (app0: read-only, mode 2), which refuse a
+// game's devctl and ioctl on app0: (0x810089c0) and pass them to exFAT on
+// savedata0:. Other devices' drivers are not modelled.
+enum class IoMount { exfat, pfs_savedata, pfs_app, other };
+static IoMount io_mount(VitaIoDevice device) {
+    switch (device) {
+    case VitaIoDevice::ux0: return IoMount::exfat;
+    case VitaIoDevice::savedata0: return IoMount::pfs_savedata;
+    case VitaIoDevice::app0: return IoMount::pfs_app;
+    default: return IoMount::other;
+    }
+}
+
+// exfatfs mounts with a block size of its cluster size, at most 0x8000
+// (0x8100acea); PfsMgr with 0x8000 (0x810017aa).
+static SceUInt32 mount_block_size(IoMount mount, const fs::path &host_path) {
+    VolumeInfo volume{};
+    if (mount != IoMount::exfat || !get_volume_info(host_path, volume))
+        return 0x8000;
+    return std::min<SceUInt32>(volume.cluster_size, 0x8000);
+}
+
+// iofilemgr 0x810021d8/0x81007770 -> exfatfs devctl 0x8100978c. The output
+// buffer is filled with 0xFF and copied back only on success.
 EXPORT(int, sceIoDevctl, const char *dev, SceInt cmd, const void *indata, SceSize inlen, void *outdata, SceSize outlen) {
     TRACY_FUNC(sceIoDevctl, dev, cmd, indata, inlen, outdata, outlen);
-    if (!dev || !outdata)
+    if (system_io_command(cmd))
+        return RET_ERROR(SCE_ERROR_ERRNO_ENOTSUP);
+    VitaIoDevice device;
+    fs::path host_path;
+    bool volume_root = false;
+    const int error = lookup_path(emuenv.io, dev, emuenv.vita_fs_path, export_name, device, host_path, volume_root);
+    if (error && !(error == SCE_ERROR_ERRNO_ENOENT && volume_root))
+        return error;
+    if (!volume_root)
+        return RET_ERROR(SCE_ERROR_ERRNO_ENODEV);
+    if (static_cast<SceUInt32>(cmd) == 0x80000001)
+        return RET_ERROR(SCE_ERROR_ERRNO_ENOTSUP); // system and kernel programs only
+    const IoMount mount = io_mount(device);
+    if (mount == IoMount::pfs_app)
+        return RET_ERROR(SCE_ERROR_ERRNO_EPERM);
+    if (mount == IoMount::other) {
+        LOG_ERROR("sceIoDevctl: the driver of {} is not modelled (cmd {})", dev, log_hex(cmd));
+        return RET_ERROR(SCE_ERROR_ERRNO_ENOTSUP);
+    }
+    if (cmd != 0x3001)
+        return RET_ERROR(SCE_ERROR_ERRNO_ENOTSUP);
+    // Device capacity: the volume holding ux0:, less the 32 MiB exfatfs
+    // keeps back on it (0x81009a66).
+    if (outlen != 0x18 && outlen != sizeof(SceIoDevInfo))
         return RET_ERROR(SCE_ERROR_ERRNO_EINVAL);
-
-    // TODO: Turn the commands into an enum of commands
-    switch (cmd) {
-    case 12289: { // Get device capacity info?
-        assert(outlen == sizeof(SceIoDevInfo));
-
-        auto device = device::get_device(dev);
-        if (device == VitaIoDevice::_INVALID) {
-            LOG_ERROR("Cannot find device for path: {}", dev);
-            return RET_ERROR(SCE_ERROR_ERRNO_ENOENT);
-        }
-
-        fs::path dev_path = boost::describe::enum_to_string(device, "");
-        fs::path path = emuenv.vita_fs_path / dev_path;
-        fs::space_info space = fs::space(path);
-
-        ((SceIoDevInfo *)outdata)->max_size = space.capacity;
-        ((SceIoDevInfo *)outdata)->free_size = space.available;
-        STUBBED("cluster size = 4096");
-        ((SceIoDevInfo *)outdata)->cluster_size = 4096;
-        break;
+    if (!outdata)
+        return RET_ERROR(SCE_ERROR_ERRNO_EFAULT); // exfatfs would store through it in kernel mode
+    VolumeInfo volume{};
+    const fs::path ux0_root = emuenv.vita_fs_path / "ux0";
+    if (!get_volume_info(ux0_root, volume))
+        return RET_ERROR(SCE_ERROR_ERRNO_ENODEV);
+    constexpr uint64_t reserved = 32 * 1024 * 1024;
+    SceIoDevInfo info;
+    std::memset(&info, 0xff, sizeof(info));
+    info.max_size = static_cast<SceInt64>(volume.capacity);
+    info.free_size = static_cast<SceInt64>(volume.available > reserved ? volume.available - reserved : 0);
+    info.cluster_size = volume.cluster_size;
+    if (outlen == sizeof(SceIoDevInfo)) {
+        info.unk = 0;
+        info.serial = volume.serial;
+        std::memset(info.label, ' ', sizeof(info.label));
+        info.zero = 0;
     }
-    default: {
-        LOG_WARN("Unhandled case for sceIoDevctl cmd={}", cmd);
-        assert(false);
-        return 0;
-    }
-    }
-
+    std::memcpy(outdata, &info, outlen);
     return 0;
 }
 
@@ -710,9 +756,80 @@ EXPORT(int, sceIoGetstatByFd, const SceUID fd, SceIoStat *stat) {
     return stat_file_by_fd(emuenv.io, fd, stat, emuenv.vita_fs_path, export_name);
 }
 
+// iofilemgr 0x810022b4/0x810083b8: 0x1001/0x1002 are the file's buffer
+// cache (0x81008184); other commands go to the driver, and exFAT has none.
 EXPORT(int, sceIoIoctl, SceUID fd, int cmd, const void *argp, SceSize arglen, void *bufp, SceSize buflen) {
     TRACY_FUNC(sceIoIoctl, fd, cmd, argp, arglen, bufp, buflen);
-    return UNIMPLEMENTED();
+    auto &io = emuenv.io;
+    const auto file = io.std_files.find(fd);
+    const bool directory = io.dir_entries.contains(fd);
+    if (file == io.std_files.end() && !directory)
+        return RET_ERROR(SCE_ERROR_ERRNO_EBADF);
+    if (system_io_command(cmd))
+        return RET_ERROR(SCE_ERROR_ERRNO_ENOTSUP);
+    if (cmd >= 0x8000)
+        return RET_ERROR(SCE_ERROR_ERRNO_EINVAL);
+    const char *vita_path = directory ? io.dir_entries.at(fd).get_vita_loc() : file->second.get_vita_loc();
+    const IoMount mount = io_mount(device::get_device(resolve_user_mount(io, vita_path)));
+    if (cmd == 0x1001 || cmd == 0x1002) {
+        if (directory)
+            return RET_ERROR(SCE_ERROR_ERRNO_EISDIR);
+        // No cache for a file opened unbuffered (ksceVopOpen 0x8100dc44).
+        if (file->second.get_open_mode() & SCE_O_NOBUF)
+            return RET_ERROR(SCE_ERROR_ERRNO_ENOBUFS);
+        const fs::path &host_path = file->second.get_system_location();
+        const SceUInt32 mount_block = mount_block_size(mount, host_path);
+        const std::string key = host_path.generic_path().string();
+        const auto changed = io.buffer_caches.find(key);
+        SceIoBufferCache cache = changed != io.buffer_caches.end() ? changed->second : SceIoBufferCache{ 0x2000, 0x200, 2, mount_block, 0, 0, 0 };
+        if (cmd == 0x1002) {
+            auto *out = static_cast<SceIoBufferCache *>(bufp);
+            if (!out || out->zero != 0 || buflen < 0x20)
+                return RET_ERROR(SCE_ERROR_ERRNO_EINVAL);
+            *out = { cache.total, cache.unit, cache.ways, cache.block, 0, 0, 0 };
+            return 0;
+        }
+        const auto *in = static_cast<const SceIoBufferCache *>(argp);
+        if (!in || in->zero != 0)
+            return RET_ERROR(SCE_ERROR_ERRNO_EINVAL);
+        if (in->mask & 1)
+            cache.total = in->total;
+        if (in->mask & 2)
+            cache.unit = in->unit;
+        if (in->mask & 4)
+            cache.ways = in->ways;
+        if (in->mask & 8)
+            cache.block = in->block;
+        const bool writer = std::ranges::any_of(io.std_files, [&](const auto &entry) {
+            return entry.second.get_system_location() == host_path && (entry.second.get_open_mode() & SCE_O_WRONLY);
+        });
+        if (!cache.unit || !cache.total || !cache.block || cache.block % cache.unit
+            || (cache.block <= mount_block ? mount_block % cache.block != 0 : writer)
+            || (cache.ways != 1 && cache.ways != 2 && cache.ways != 4) || cache.total % (cache.unit * cache.ways) || cache.block % 512)
+            return RET_ERROR(SCE_ERROR_ERRNO_EINVAL);
+        io.buffer_caches[key] = { cache.total, cache.unit, cache.ways, cache.block, 0, 0, 0 };
+        return 0;
+    }
+    if (cmd >= 0x1800 && cmd < 0x2000)
+        return RET_ERROR(SCE_ERROR_ERRNO_ENOTSUP); // system programs only
+    switch (mount) {
+    case IoMount::exfat:
+        return RET_ERROR(SCE_ERROR_ERRNO_ENOTSUP);
+    case IoMount::pfs_app:
+        // Only 0x4420-0x4422 pass the mount's gate (0x81008b3e): they are
+        // PfsMgr's own and not modelled.
+        if (cmd < 0x4420 || cmd > 0x4422)
+            return RET_ERROR(SCE_ERROR_ERRNO_EPERM);
+        break;
+    case IoMount::pfs_savedata:
+        if ((cmd & 0xf000) != 0x4000)
+            return RET_ERROR(SCE_ERROR_ERRNO_ENOTSUP); // passed on to exFAT
+        break;
+    case IoMount::other:
+        break;
+    }
+    LOG_ERROR("sceIoIoctl: command {} of the driver of {} is not modelled", log_hex(cmd), vita_path);
+    return RET_ERROR(SCE_ERROR_ERRNO_ENOTSUP);
 }
 
 EXPORT(int, sceIoIoctlAsync) {
@@ -846,9 +963,9 @@ EXPORT(int, sceIoRmdirAsync) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceIoSync) {
-    TRACY_FUNC(sceIoSync);
-    return UNIMPLEMENTED();
+EXPORT(int, sceIoSync, const char *path, SceUInt32 flags) {
+    TRACY_FUNC(sceIoSync, path, flags);
+    return sync_path(emuenv.io, path, emuenv.vita_fs_path, export_name);
 }
 
 EXPORT(int, sceIoSyncAsync) {

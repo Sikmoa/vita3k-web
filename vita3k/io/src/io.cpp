@@ -31,8 +31,11 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <sys/utime.h>
 #else
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 #endif
 
@@ -644,6 +647,12 @@ int stat_file(IOState &io, const char *file_in, SceIoStat *statp, const fs::path
         statp->st_mode |= SCE_S_IFDIR | SCE_S_IXUSR | SCE_S_IXGRP | SCE_S_IXOTH;
     }
 
+    if (const auto set = io.chstat_times.find(file_path.generic_path().string()); set != io.chstat_times.end()) {
+        if (set->second.created)
+            creation_time_ticks = RTC_OFFSET + static_cast<uint64_t>(*set->second.created) * VITA_CLOCKS_PER_SEC;
+        if (set->second.accessed)
+            last_access_time_ticks = RTC_OFFSET + static_cast<uint64_t>(*set->second.accessed) * VITA_CLOCKS_PER_SEC;
+    }
     __RtcTicksToPspTime(&statp->st_atime, last_access_time_ticks);
     __RtcTicksToPspTime(&statp->st_mtime, last_modification_time_ticks);
     __RtcTicksToPspTime(&statp->st_ctime, creation_time_ticks);
@@ -673,6 +682,164 @@ int close_file(IOState &io, const SceUID fd, const char *export_name) {
     io.std_files.erase(fd);
 
     return 0;
+}
+
+int lookup_path(IOState &io, const char *path_in, const fs::path &vita_fs_path, const char *export_name, VitaIoDevice &device, fs::path &host_path, bool &volume_root) {
+    if (!path_in)
+        return IO_ERROR(SCE_ERROR_ERRNO_EFAULT);
+    // The kernel copies at most 0x400 bytes of the path.
+    if (strnlen(path_in, 0x400) == 0x400)
+        return IO_ERROR(SCE_KERNEL_ERROR_UNTERMINATED_STRING);
+    const std::string resolved = resolve_user_mount(io, path_in);
+    const auto colon = resolved.find(':');
+    if (colon == std::string::npos) {
+        // Only an absolute path may leave out the device.
+        if (resolved.empty() || resolved[0] != '/')
+            return IO_ERROR(SCE_ERROR_ERRNO_EINVAL);
+        return IO_ERROR(SCE_ERROR_ERRNO_ENODEV); // no current device for a game
+    }
+    if (colon > 30)
+        return IO_ERROR(SCE_ERROR_ERRNO_ENAMETOOLONG);
+    device = device::get_device(resolved);
+    if (device == VitaIoDevice::_INVALID)
+        return IO_ERROR(SCE_ERROR_ERRNO_ENODEV);
+    const std::string_view rest = std::string_view(resolved).substr(colon + 1);
+    volume_root = rest.find_first_not_of('/') == std::string_view::npos;
+    VitaIoDevice redirected = device;
+    const auto translated_path = translate_path(resolved.c_str(), redirected, io.device_paths);
+    host_path = device::construct_emulated_path(redirected, translated_path, vita_fs_path, io.redirect_stdio);
+    if (fs::exists(host_path))
+        return 0;
+    if (io.case_isens_find_enabled) {
+        if (auto cached = find_in_cache(io, string_utils::tolower(host_path.string())); !cached.empty()) {
+            host_path = cached;
+            return 0;
+        }
+        const bool found = find_case_isens_path(io, redirected, translated_path, host_path);
+        if (auto cached = find_in_cache(io, string_utils::tolower(host_path.string())); found && !cached.empty()) {
+            host_path = cached;
+            return 0;
+        }
+    }
+    return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+}
+
+// Seconds since the epoch of a SceDateTime, as stat_file reads them back.
+static time_t io_time(const SceDateTime &time) {
+    return static_cast<time_t>((__RtcPspTimeToTicks(&time) - RTC_OFFSET) / VITA_CLOCKS_PER_SEC);
+}
+
+// exfatfs 0x810016bc: exFAT can hold these dates.
+static bool valid_io_time(const SceDateTime &time) {
+    return time.year >= 1980 && time.year <= 2107 && time.month >= 1 && time.month <= 12 && time.day >= 1
+        && time.day <= 31 && time.hour <= 23 && time.minute <= 59 && time.second <= 59;
+}
+
+// iofilemgr 0x810169cc/0x8100694c, ksceVopChstat 0x8100f248 and exfatfs
+// 0x81009b18. app0: is a read-only PFS mount; savedata0: passes MODE and
+// SIZE through PfsMgr and the times to exFAT, as ux0: has them. A game
+// thread's MODE only sets or clears the read-only attribute
+// (ksceSblACMgrConvertModeToFsAttribute 0x81001350).
+int chstat_path(IOState &io, const char *path, const SceIoStat *stat, SceUInt32 bits, const fs::path &vita_fs_path, const char *export_name) {
+    VitaIoDevice device;
+    fs::path host_path;
+    bool volume_root = false;
+    if (const int error = lookup_path(io, path, vita_fs_path, export_name, device, host_path, volume_root))
+        return error;
+    bits &= ~0x10000u; // the raw attribute is for the kernel only
+    const bool directory = fs::is_directory(host_path);
+    if ((bits & SCE_CST_SIZE) && directory)
+        return IO_ERROR(SCE_ERROR_ERRNO_EISDIR);
+    if (!stat)
+        return IO_ERROR(SCE_ERROR_ERRNO_EINVAL);
+    if (device == VitaIoDevice::app0)
+        return IO_ERROR(SCE_ERROR_ERRNO_EROFS);
+    if (volume_root && (bits & (SCE_CST_MODE | SCE_CST_CT | SCE_CST_AT | SCE_CST_MT)))
+        return IO_ERROR(SCE_ERROR_ERRNO_EACCES);
+    if (((bits & SCE_CST_CT) && !valid_io_time(stat->st_ctime)) || ((bits & SCE_CST_AT) && !valid_io_time(stat->st_atime))
+        || ((bits & SCE_CST_MT) && !valid_io_time(stat->st_mtime)))
+        return IO_ERROR(SCE_ERROR_ERRNO_EINVAL);
+    // A game's read (0x100) and write (0x80) bits, SCE_S_IROTH/IWOTH here.
+    const unsigned access = stat->st_mode & (SCE_S_IROTH | SCE_S_IWOTH);
+    if ((bits & SCE_CST_MODE) && access != (SCE_S_IROTH | SCE_S_IWOTH) && access != SCE_S_IROTH)
+        return IO_ERROR(SCE_ERROR_ERRNO_EINVAL);
+
+    boost::system::error_code error;
+    if (bits & SCE_CST_SIZE) {
+        fs::resize_file(host_path, static_cast<uintmax_t>(stat->st_size), error);
+        if (error)
+            return IO_ERROR(SCE_ERROR_ERRNO_ENOSPC);
+    }
+    if (bits & SCE_CST_MODE) {
+        fs::permissions(host_path, fs::perms::owner_write | (access == SCE_S_IROTH ? fs::perms::remove_perms : fs::perms::add_perms), error);
+        if (error)
+            return IO_ERROR_UNK();
+    }
+    if (bits & (SCE_CST_AT | SCE_CST_MT)) {
+#ifdef _WIN32
+        struct _stati64 sb;
+        if (_wstati64(host_path.generic_path().wstring().c_str(), &sb) < 0)
+            return IO_ERROR_UNK();
+        struct __utimbuf64 times = { sb.st_atime, sb.st_mtime };
+        if (bits & SCE_CST_AT)
+            times.actime = io_time(stat->st_atime);
+        if (bits & SCE_CST_MT)
+            times.modtime = io_time(stat->st_mtime);
+        if (_wutime64(host_path.generic_path().wstring().c_str(), &times) < 0)
+            return IO_ERROR_UNK();
+#else
+        // The date's microseconds are dropped (exfatfs 0x810047e6).
+        struct timespec times[2] = { { 0, UTIME_OMIT }, { 0, UTIME_OMIT } };
+        if (bits & SCE_CST_AT)
+            times[0] = { io_time(stat->st_atime), 0 };
+        if (bits & SCE_CST_MT)
+            times[1] = { io_time(stat->st_mtime), 0 };
+        if (utimensat(AT_FDCWD, host_path.generic_path().string().c_str(), times, 0) < 0)
+            return IO_ERROR_UNK();
+#endif
+    }
+    if (bits & (SCE_CST_CT | SCE_CST_AT)) {
+        auto &times = io.chstat_times[host_path.generic_path().string()];
+        if (bits & SCE_CST_CT)
+            times.created = io_time(stat->st_ctime);
+        if (bits & SCE_CST_AT)
+            times.accessed = io_time(stat->st_atime);
+    }
+    return 0;
+}
+
+// iofilemgr 0x81002144/0x810075c8: a volume root flushes the volume, any
+// other existing path its file, whatever the flags. Host files are written
+// through: nothing is left to flush.
+int sync_path(IOState &io, const char *path, const fs::path &vita_fs_path, const char *export_name) {
+    VitaIoDevice device;
+    fs::path host_path;
+    bool volume_root = false;
+    const int error = lookup_path(io, path, vita_fs_path, export_name, device, host_path, volume_root);
+    // The root of a mount is always there, even before a file is on it.
+    if (error == SCE_ERROR_ERRNO_ENOENT && volume_root)
+        return 0;
+    return error;
+}
+
+bool get_volume_info(const fs::path &host_path, VolumeInfo &info) {
+#ifdef _WIN32
+    const std::wstring root = host_path.root_path().wstring();
+    ULARGE_INTEGER available, capacity;
+    DWORD sectors_per_cluster, bytes_per_sector, free_clusters, clusters, serial;
+    if (!GetDiskFreeSpaceExW(host_path.wstring().c_str(), &available, &capacity, nullptr)
+        || !GetDiskFreeSpaceW(root.c_str(), &sectors_per_cluster, &bytes_per_sector, &free_clusters, &clusters)
+        || !GetVolumeInformationW(root.c_str(), nullptr, 0, &serial, nullptr, nullptr, nullptr, 0))
+        return false;
+    info = { capacity.QuadPart, available.QuadPart, static_cast<uint32_t>(sectors_per_cluster * bytes_per_sector), serial };
+#else
+    struct statvfs volume;
+    if (statvfs(host_path.generic_path().string().c_str(), &volume) < 0)
+        return false;
+    info = { static_cast<uint64_t>(volume.f_blocks) * volume.f_frsize, static_cast<uint64_t>(volume.f_bavail) * volume.f_frsize,
+        static_cast<uint32_t>(volume.f_frsize), static_cast<uint32_t>(volume.f_fsid) };
+#endif
+    return true;
 }
 
 int remove_file(IOState &io, const char *file_in, const fs::path &vita_fs_path, const char *export_name) {
@@ -705,6 +872,7 @@ int remove_file(IOState &io, const char *file_in, const fs::path &vita_fs_path, 
         LOG_ERROR("Error code: {} ({})", error_code.value(), error_code.message());
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
+    io.chstat_times.erase(emulated_path.generic_path().string());
 
     return 0;
 }
@@ -725,7 +893,13 @@ int rename(IOState &io, const char *old_name_in, const char *new_name_in, const 
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
 
-    const auto translated_new_path = translate_path(new_name, device, io.device_paths);
+    // The new name carries its own device (savedata0:, app0:, ...).
+    auto new_device = device::get_device(new_name);
+    if (new_device == VitaIoDevice::_INVALID) {
+        LOG_ERROR("Cannot find device for path: {}", new_name);
+        return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+    }
+    const auto translated_new_path = translate_path(new_name, new_device, io.device_paths);
     if (translated_new_path.empty()) {
         LOG_ERROR("Cannot translate path: {}", translated_new_path);
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
@@ -737,7 +911,7 @@ int rename(IOState &io, const char *old_name_in, const char *new_name_in, const 
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
     }
 
-    const auto emulated_new_path = device::construct_emulated_path(device, translated_new_path, vita_fs_path, io.redirect_stdio);
+    const auto emulated_new_path = device::construct_emulated_path(new_device, translated_new_path, vita_fs_path, io.redirect_stdio);
 
     LOG_TRACE_IF(log_file_op, "{}: Renaming file {} to {} ({} to {})", export_name, old_name, new_name, emulated_old_path, emulated_new_path);
 
@@ -748,6 +922,11 @@ int rename(IOState &io, const char *old_name_in, const char *new_name_in, const 
         LOG_ERROR("Cannot rename file: {} to {} ({} to {})", old_name, new_name, emulated_old_path, emulated_new_path);
         LOG_ERROR("Error code: {} ({})", error_code.value(), error_code.message());
         return IO_ERROR(SCE_ERROR_ERRNO_ENOENT);
+    }
+    io.chstat_times.erase(emulated_new_path.generic_path().string());
+    if (auto times = io.chstat_times.extract(emulated_old_path.generic_path().string())) {
+        times.key() = emulated_new_path.generic_path().string();
+        io.chstat_times.insert(std::move(times));
     }
 
     return 0;

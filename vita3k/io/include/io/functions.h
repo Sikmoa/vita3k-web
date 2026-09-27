@@ -68,6 +68,23 @@ SceOff tell_file(IOState &io, const SceUID fd, const char *export_name);
 int stat_file(IOState &io, const char *file, SceIoStat *statp, const fs::path &vita_fs_path, const char *export_name, SceUID fd = invalid_fd);
 int stat_file_by_fd(IOState &io, const SceUID fd, SceIoStat *statp, const fs::path &vita_fs_path, const char *export_name);
 int close_file(IOState &io, SceUID fd, const char *export_name);
+// Firmware 3.74 iofilemgr's checks of a path a program passes and its
+// lookup (0x81011ee8, 0x81004718): 0 with the device the path names (before
+// app0: and the like are redirected), its host path and whether it is the
+// volume's root, or the error.
+int lookup_path(IOState &io, const char *path, const fs::path &vita_fs_path, const char *export_name, VitaIoDevice &device, fs::path &host_path, bool &volume_root);
+// sceIoChstat of an existing path (SCE_CST_* bits; MODE as for a game
+// thread), and sceIoSync of a path.
+int chstat_path(IOState &io, const char *path, const SceIoStat *stat, SceUInt32 bits, const fs::path &vita_fs_path, const char *export_name);
+int sync_path(IOState &io, const char *path, const fs::path &vita_fs_path, const char *export_name);
+// The host volume holding a path, as the memory card it stands for.
+struct VolumeInfo {
+    uint64_t capacity;
+    uint64_t available;
+    uint32_t cluster_size;
+    uint32_t serial;
+};
+bool get_volume_info(const fs::path &host_path, VolumeInfo &info);
 int remove_file(IOState &io, const char *file, const fs::path &vita_fs_path, const char *export_name);
 int rename(IOState &io, const char *old_name, const char *new_name, const fs::path &vita_fs_path, const char *export_name);
 

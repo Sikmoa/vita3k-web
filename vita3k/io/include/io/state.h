@@ -22,6 +22,7 @@
 #include <io/util.h>
 
 #include <map>
+#include <optional>
 #include <unordered_map>
 
 // Class for all needed information to access files on Vita3K.
@@ -123,6 +124,15 @@ struct IOState {
     SceUID next_fd = 0;
     TtyFiles tty_files;
     StdFiles std_files;
+    // Creation and access dates sceIoChstat set, by host path: host files
+    // keep no creation date, and not every host file system an access date.
+    struct ChstatTimes {
+        std::optional<time_t> created, accessed;
+    };
+    std::map<std::string, ChstatTimes> chstat_times;
+    // Buffer caches sceIoIoctl 0x1001 changed, by host path; others have the
+    // default of their mount.
+    std::map<std::string, SceIoBufferCache> buffer_caches;
     DirEntries dir_entries;
 
     std::unordered_map<std::string, std::string> cachemap;

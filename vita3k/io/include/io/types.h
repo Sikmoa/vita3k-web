@@ -71,6 +71,15 @@ typedef enum SceIoAccessMode {
     SCE_S_IFMT = 0xF000, //!< Format bits mask
 } SceIoAccessMode;
 
+// sceIoChstat fields to change.
+enum SceIoChstatBits : unsigned {
+    SCE_CST_MODE = 0x0001,
+    SCE_CST_SIZE = 0x0004,
+    SCE_CST_CT = 0x0008,
+    SCE_CST_AT = 0x0010,
+    SCE_CST_MT = 0x0020,
+};
+
 enum SceIoFileMode {
     SCE_SO_IXOTH = 0x0001, //!< Hidden execute permission
     SCE_SO_IWOTH = 0x0002, //!< Hidden write permission
@@ -114,11 +123,30 @@ struct SceIoDirent {
     int dummy;
 };
 
+// sceIoDevctl 0x3001 output: 0x18 bytes, or 0x28 with the volume's serial
+// and label (exfatfs 0x81008a90).
 struct SceIoDevInfo {
     SceInt64 max_size;
     SceInt64 free_size;
     SceSize cluster_size;
+    SceUInt32 unk; // left alone in the short form, 0 in the long one
+    SceUInt32 serial;
+    char label[11];
+    char zero;
 };
+static_assert(sizeof(SceIoDevInfo) == 0x28);
+
+// sceIoIoctl 0x1001/0x1002 buffer cache of a file (iofilemgr 0x81008184).
+struct SceIoBufferCache {
+    SceUInt32 total;
+    SceUInt32 unit;
+    SceUInt32 ways;
+    SceUInt32 block;
+    SceUInt32 extra;
+    SceUInt32 mask; // 0x1001: which of the first four fields to set
+    SceUInt32 zero; // must be 0
+};
+static_assert(sizeof(SceIoBufferCache) == 0x1c);
 
 enum SceFiosOverlayType : uint8_t {
     SCE_FIOS_OVERLAY_TYPE_OPAQUE,
