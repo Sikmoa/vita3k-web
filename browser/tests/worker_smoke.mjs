@@ -14,8 +14,9 @@ const server = createServer(async (req, res) => {
     const file = pathname === '/fixture.bin' && fixture ? fixture : resolve(root, `.${pathname === '/' ? '/index.html' : pathname}`);
     if (file !== fixture && !file.startsWith(root + sep)) throw new Error('bad path');
     const mime = { '.js': 'text/javascript', '.html': 'text/html', '.wasm': 'application/wasm' }[extname(file)] || 'application/octet-stream';
+    const content = await readFile(file); // before writeHead: a missing file must still answer 404
     res.writeHead(200, { 'Content-Type': mime, 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp' });
-    res.end(await readFile(file));
+    res.end(content);
   } catch { res.writeHead(404); res.end(); }
 });
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
