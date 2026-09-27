@@ -83,9 +83,6 @@ const inputScript = (process.env.LIMBO_INPUT || '').split(',').filter(Boolean).m
 });
 const deadlineMs = Number(process.env.LIMBO_DEADLINE_MS || 600000);
 const inlineMutex = process.env.LIMBO_INLINE_MUTEX !== '0';
-// A/B switch for the JIT whole-cache revalidation gate: LIMBO_REVALIDATE_ALL=1
-// restores the unconditional every-entry sweep; default keeps the post-HLE gate.
-const revalidateAll = process.env.LIMBO_REVALIDATE_ALL === '1';
 // A/B switch for the code-page write observer: default ON (load-bearing for
 // correctness). LIMBO_WRITE_OBSERVER=0 disables the page-walk/epoch bump and is
 // a diagnostic state used to isolate the versioning build's run_js/emit
@@ -307,8 +304,8 @@ try {
     });
   }
 
-  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver, useAot, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale, surfaceSync, dialogAnswer, ctrlButtons }) => {
-    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&revalidateAll=${revalidateAll ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}${textureVerify ? '&textureVerify=1' : ''}${scale ? '&scale=' + scale : ''}${surfaceSync ? '&surfaceSync=1' : ''}`, { type: 'module' });
+  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale, surfaceSync, dialogAnswer, ctrlButtons }) => {
+    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}${textureVerify ? '&textureVerify=1' : ''}${scale ? '&scale=' + scale : ''}${surfaceSync ? '&surfaceSync=1' : ''}`, { type: 'module' });
     const state = { logs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
       backend: null, memory: null, workerErrors: [], ready: false, timedOut: false,
       gxmSceneStats: null, gxmFailures: [], gxmSkips: [],
@@ -501,7 +498,7 @@ try {
       };
     });
     return result;
-  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver, useAot: Boolean(aotPath), fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '', surfaceSync: process.env.LIMBO_SURFACE_SYNC === '1', dialogAnswer, ctrlButtons });
+  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot: Boolean(aotPath), fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '', surfaceSync: process.env.LIMBO_SURFACE_SYNC === '1', dialogAnswer, ctrlButtons });
 
   const saved = [];
   for (const frame of outcome.saved) {
@@ -515,7 +512,6 @@ try {
     backend: outcome.backend,
     memory: outcome.memory,
     inlineMutex,
-    revalidateAll,
     writeObserver,
     regionCache: regionCache || '(default)',
     latestProgress: outcome.latestProgress,

@@ -225,6 +225,53 @@ void cooperative_slices(MemState &mem) {
     }
 }
 
+// A tracked code write made while another thread runs HLE (the mem_write
+// funnel: module loading, a patch) must reach this CPU's cached regions even
+// though this CPU ran no HLE and no CPU entered the pump in between (the
+// writing thread is still inside its HLE call, e.g. suspended). Two regions
+// on separate pages chain through the dispatch map (BX, so neither is a
+// member of the other); only the first is revalidated at the loop top.
+void foreign_code_write(MemState &mem) {
+    constexpr uint32_t base = 0x81100000, first = base, second = base + page;
+    CHECK(try_alloc_at(mem, base, 2 * page, "JIT foreign code write") == base);
+    // first: ADD r0,r0,#1; BX r4    second: ADD r1,r1,#1; BX r5
+    CHECK(mem_write(mem, first, std::array<uint32_t, 2>{0xe2800001, 0xe12fff14}.data(), 8));
+    CHECK(mem_write(mem, second, std::array<uint32_t, 2>{0xe2811001, 0xe12fff15}.data(), 8));
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU a(&parent, 0);
+    a.set_region_mode(true);
+    a.set_cpsr(0x10);
+    a.set_pc(first);
+    a.set_reg(0, 0);
+    a.set_reg(1, 0);
+    a.set_reg(4, second);
+    a.set_reg(5, first);
+    CHECK(a.run_slice(400) == WasmJitCPU::slice_yield);
+    const auto warm = a.pump_counters();
+    CHECK(warm.tx_wasm > 0); // the pump chains the two regions in Wasm
+    CHECK(warm.post_hle_entries == 0);
+    // The other thread's HLE rewrites the second region: ADD r1,r1,#100.
+    const uint32_t patched = 0xe2811064;
+    CHECK(mem_write(mem, second, &patched, sizeof(patched)));
+    // Resume at the first region (budget exit: not a post-HLE entry). Its
+    // own bytes are unchanged, so the loop-top check passes and the pump
+    // transfers to the second region through its hint.
+    a.set_pc(first);
+    const uint32_t before = a.get_reg(1);
+    CHECK(a.run_slice(4) == WasmJitCPU::slice_yield);
+    const auto after = a.pump_counters();
+    CHECK(after.post_hle_entries == 0);
+    if (a.get_reg(1) != before + 100)
+        std::fprintf(stderr, "foreign code write: r1 %u -> %u (stale region ran)\n", before, a.get_reg(1));
+    CHECK(a.get_reg(1) == before + 100);
+    CHECK(a.get_pc() == first);
+    a.invalidate_jit_cache(base, 2 * page);
+    free(mem, base);
+    std::printf("foreign code write: patched region runs after a non-HLE re-entry (evicted=%llu)\n",
+        (unsigned long long)(after.entry_evicted - warm.entry_evicted));
+}
+
 // Step-2 dispatch-ownership measurement: alternating-vs-single-CPU on the
 // shared slice-0 map. Both CPUs use core 0, exactly like the cooperative
 // runtime. No evictions occur in the loop phases, so the signals are
@@ -1997,6 +2044,7 @@ int main() {
     memory_barriers(mem);
     cooperative_slices(mem);
     dispatch_ownership_probes(mem);
+    foreign_code_write(mem);
     leading_zeros(mem);
     multiply32(mem);
     saturation_flag(mem);

@@ -123,20 +123,6 @@ bool inline_mutex_enabled() noexcept {
     static const bool enabled = vita3k_jit_inline_mutex_option() != 0;
     return enabled;
 }
-// A/B switch for the whole-cache revalidation gate in execute_regions():
-// '1' restores the unconditional every-entry sweep (the "B1" measurement),
-// anything else keeps the post-HLE-only gate ("B2", the shipping default).
-// Read once per process so an interleaved A/B/A series cannot change modes
-// mid-run; start a fresh Worker/Node process per sample.
-EM_JS(int, vita3k_jit_revalidate_all_option, (), {
-    const v = Module['VITA3K_WASMJIT_REVALIDATE_ALL'] ??
-        (typeof process !== 'undefined' ? process.env?.VITA3K_WASMJIT_REVALIDATE_ALL : undefined);
-    return String(v) === '1' ? 1 : 0;
-});
-bool revalidate_all_enabled() noexcept {
-    static const bool enabled = vita3k_jit_revalidate_all_option() != 0;
-    return enabled;
-}
 // Only ARM little-endian stubs can match. Include return/NID in cache
 // validation below so patching only the literal cannot retain an intrinsic.
 uint32_t hot_stub_nid(const MemState &mem, uint32_t pc, uint32_t cpsr) noexcept {
@@ -1799,28 +1785,17 @@ struct WasmJitCPU::Impl {
                 last_dispatch_version = dispatch_global_version;
             }
         }
-        // The whole-cache revalidation below exists because host/HLE/loader Ptr
-        // writes can change any cached region while this CPU's own hints stay
-        // live (no other CPU entered, so the sync above did not bump). Guest
-        // writes by this CPU take the checked path, set smc_dirty and drop the
-        // affected regions. So the only entries that can need a sweep are the
-        // ones where host code ran for this CPU (an SVC/HLE exit was serviced
-        // since the previous entry). A measured 180s retail run spent 42.0s of
-        // 176.6s wall clock sweeping ~1021 regions on each of 69k host entries,
-        // with zero evictions; gating on HLE drops that to the HLE subset.
-        //
-        // VITA3K_WASMJIT_REVALIDATE_ALL=1 restores the every-entry sweep for
-        // matched A/B runs; whether the gate is a net win is an empirical
-        // question that needs interleaved samples rather than one pair.
-        if (parent->mem->direct_host_memory && (revalidate_all_enabled() || hle_ran)) {
-            // Host/HLE/loader Ptr writes are intentionally unchecked and can
-            // change any cached region, not only the first region entered.
-            // Revalidate ALL potential dispatch targets after each host entry
-            // (including a suspended HLE return). No host mutator runs inside
-            // this cooperative pump; generated code-page writes use smc_dirty.
-            // Thus M16 cannot chain to stale bytes or a freed/non-executable
-            // region after a tracked host write. No per-access host logging/hook.
-            //
+        // Revalidate every cached region whose code a TRACKED path wrote since
+        // this CPU's last sweep, on every entry: host code can change any
+        // cached region while this CPU's hints stay live, and the writer need
+        // not be this CPU's own HLE. Another guest thread's HLE (module
+        // loading, a patch through mem_write) can run between two entries of
+        // this CPU without an SVC of ours and without a pump entry of its own
+        // to bump the dispatch version above, e.g. while it is suspended in
+        // the call (backend test foreign_code_write). Guest writes by this CPU
+        // take the checked path, set smc_dirty and drop the affected regions;
+        // no host mutator runs inside the cooperative pump.
+        if (parent->mem->direct_host_memory) {
             // Two-level filter, because the unconditional form was 14-16% of
             // wall clock and had never once found anything (entry_evicted was
             // 0 in every measured run):
@@ -2665,7 +2640,7 @@ std::string WasmJitCPU::get_profile() const {
         "mutex_take=%llu mutex_release=%llu mutex_fallback=%llu "
         "host_entries=%llu post_hle_entries=%llu version_syncs=%llu version_bumps=%llu "
         "entry_scanned=%llu entry_evicted=%llu select_checks=%llu select_stale=%llu "
-        "capacity_evictions=%llu revalidate_ms=%.1f revalidate_all=%d cache_limit=%zu "
+        "capacity_evictions=%llu revalidate_ms=%.1f cache_limit=%zu "
         "aot=%d aot_calls=%llu aot_entry_misses=%llu aot_invalidated=%llu",
         impl->emit_ms, impl->install_ms, impl->run_js_ms,
         (unsigned long long)impl->js_calls, (unsigned long long)impl->misses,
@@ -2687,7 +2662,7 @@ std::string WasmJitCPU::get_profile() const {
         (unsigned long long)impl->entry_scanned, (unsigned long long)impl->entry_evicted,
         (unsigned long long)impl->select_checks, (unsigned long long)impl->select_stale,
         (unsigned long long)impl->capacity_evictions, impl->revalidate_ms,
-        revalidate_all_enabled() ? 1 : 0, region_cache_limit(),
+        region_cache_limit(),
         g_aot.loaded ? (g_aot.disabled ? -1 : 1) : 0,
         (unsigned long long)impl->aot_calls, (unsigned long long)impl->aot_entry_misses,
         (unsigned long long)g_aot.invalidated_functions);
