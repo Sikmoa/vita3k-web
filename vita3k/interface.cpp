@@ -531,7 +531,7 @@ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const
     add_preload_module(0x02000000, SCE_SYSMODULE_PERF, "libperf", false); // if DEVELOPMENT_MODE dipsw is set
 
     for (const auto &module_path : lib_load_list) {
-        auto res = load_module(emuenv, module_path);
+        auto res = load_module(emuenv, module_path, true);
         LOG_ERROR_IF(res < 0, "Failed to load preloaded module: {}. Ignoring this error.", module_path);
     }
 

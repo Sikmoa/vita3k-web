@@ -35,7 +35,7 @@ EXPORT(int, _sceKernelCloseModule) {
 
 EXPORT(SceUID, _sceKernelLoadModule, char *path, int flags, SceKernelLMOption *option) {
     TRACY_FUNC(_sceKernelLoadModule, path, flags, option);
-    return load_module(emuenv, path);
+    return load_module(emuenv, path, flags & SCE_KERNEL_LOAD_MODULE_SYSTEM);
 }
 
 static SceUID kernel_start_module(EmuEnvState &emuenv, SceUID module_id, SceSize args, Ptr<const void> argp, int *pRes) {
@@ -73,7 +73,7 @@ EXPORT(SceUID, _sceKernelLoadStartModule, const char *moduleFileName, SceSize ar
 
     const bool trace = std::getenv("VITA3K_TRACE_HLE") != nullptr;
     if (trace) std::fprintf(stderr, "[module-trace] load path=%s\n", moduleFileName);
-    SceUID module_id = load_module(emuenv, moduleFileName);
+    SceUID module_id = load_module(emuenv, moduleFileName, flags & SCE_KERNEL_LOAD_MODULE_SYSTEM);
     if (trace) std::fprintf(stderr, "[module-trace] loaded uid=%d; starting\n", module_id);
     if (module_id < 0)
         return module_id;
@@ -151,25 +151,43 @@ EXPORT(int, sceKernelGetModuleInfo, SceUID modid, SceKernelModuleInfo *info) {
     return SCE_KERNEL_OK;
 }
 
-EXPORT(int, sceKernelGetModuleList, int flags, SceUID *modids, int *num) {
+// The modules of the process (kernel modules loaded here for the LLE
+// sysmodule are not among them), in firmware 3.74's two classes: flag bit 0
+// selects modules loaded without SCE_KERNEL_LOAD_MODULE_SYSTEM, bit 7 the
+// system ones.
+static bool in_module_class(const KernelModule &module, int flags) {
+    if (std::string_view(module.info.path).ends_with(".skprx"))
+        return false;
+    return module.system_loaded ? (flags & 0x80) != 0 : (flags & 1) != 0;
+}
+
+// Firmware 3.74 modulemgr: flags 0 means 1; without an output array the
+// result is the number of such modules; the list stops at *num entries.
+EXPORT(int, sceKernelGetModuleList, int flags, SceUID *modids, SceUInt32 *num) {
     TRACY_FUNC(sceKernelGetModuleList, flags, modids, num);
+    if (flags == 0)
+        flags = 1;
     const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
     // for Maidump main module should be the last module
-    int i = 0;
+    std::vector<SceUID> ids;
     SceUID main_module_id = 0;
     for (auto &[module_id, module] : emuenv.kernel.loaded_modules) {
-        if (module->info.path == "app0:" + emuenv.self_path) {
+        if (!in_module_class(*module, flags))
+            continue;
+        if (module->info.path == "app0:" + emuenv.self_path)
             main_module_id = module_id;
-        } else {
-            modids[i] = module_id;
-            i++;
-        }
+        else
+            ids.push_back(module_id);
     }
-    if (main_module_id != 0) {
-        modids[i] = main_module_id;
-        i++;
-    }
-    *num = i;
+    if (main_module_id != 0)
+        ids.push_back(main_module_id);
+    if (!modids)
+        return static_cast<int>(ids.size());
+    if (!num)
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_MEMORY_ACCESS);
+    const SceUInt32 count = std::min<SceUInt32>(*num, static_cast<SceUInt32>(ids.size()));
+    std::copy_n(ids.begin(), count, modids);
+    *num = count;
     return SCE_KERNEL_OK;
 }
 
@@ -202,7 +220,19 @@ EXPORT(int, sceKernelInhibitLoadingModule) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceKernelIsCalledFromSysModule) {
-    TRACY_FUNC(sceKernelIsCalledFromSysModule);
-    return UNIMPLEMENTED();
+// Firmware 3.74 modulemgr: whether the process module whose segments hold
+// addr was a system load (0 when no module holds it). Never an error.
+EXPORT(int, sceKernelIsCalledFromSysModule, Address addr) {
+    TRACY_FUNC(sceKernelIsCalledFromSysModule, addr);
+    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+    for (const auto &[module_id, module] : emuenv.kernel.loaded_modules) {
+        if (!in_module_class(*module, 0x81))
+            continue;
+        for (const auto &segment : module->info.segments) {
+            const Address start = segment.vaddr.address();
+            if (segment.memsz && addr >= start && addr - start < segment.memsz)
+                return module->system_loaded ? 1 : 0;
+        }
+    }
+    return 0;
 }

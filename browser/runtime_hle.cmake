@@ -55,6 +55,11 @@ set(_hle_exports
     sceClibMspaceMallocStats sceClibMspaceIsHeapEmpty
     # Firmware 3.74 system software version; the low word of the system clock.
     sceKernelGetSystemSwVersion ksceKernelGetSystemTimeLow
+    # Module classes (KernelModule::system_loaded): libc's exit() runs the
+    # module_exit of class 1, libhttp asks whether its caller is a system
+    # module.
+    sceKernelCallModuleExit sceKernelIsCalledFromSysModule
+    sceKernelGetModuleList sceKernelGetModuleInfo
     # Production kernel memset/memcpy, required by observed firmware imports.
     kmemset kmemcpy
     sceIoOpen sceIoClose

@@ -542,7 +542,9 @@ static int run_app_impl() {
 
         SceUID eboot_uid = -1;
         for (const char *path : kPreloadChain) {
-            const SceUID uid = load_module(*env, path);
+            // Everything but the executable is a process preload or a
+            // sysmodule load: a system load.
+            const SceUID uid = load_module(*env, path, std::strcmp(path, "app0:eboot.bin") != 0);
             if (uid < 0) {
                 std::printf("[vita3k-web] load_module %s failed: %08x (continuing, desktop-tolerant)\n",
                     path, static_cast<std::uint32_t>(uid));

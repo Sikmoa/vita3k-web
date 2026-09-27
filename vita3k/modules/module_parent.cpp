@@ -207,20 +207,7 @@ struct SceKernelBootimageInfo {
 
 constexpr uint32_t nid_sceKernelBootimageInfo = 0x9C08E88A;
 
-SceUID load_module(EmuEnvState &emuenv, const std::string &module_path) {
-    // Check if module is already loaded
-    {
-        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
-        const auto &loaded_modules = emuenv.kernel.loaded_modules;
-        auto module_iter = std::find_if(loaded_modules.begin(), loaded_modules.end(), [&](const auto &p) {
-            return module_path == p.second->info.path;
-        });
-
-        if (module_iter != loaded_modules.end()) {
-            return module_iter->first;
-        }
-    }
-
+static SceUID load_new_module(EmuEnvState &emuenv, const std::string &module_path) {
     LOG_INFO("Loading module \"{}\"", module_path);
     if (module_path.starts_with("vs0:sys/external/")) {
         // check if module is LLEd or not
@@ -323,6 +310,27 @@ SceUID load_module(EmuEnvState &emuenv, const std::string &module_path) {
     return load_module_data(module_buffer.data());
 }
 
+SceUID load_module(EmuEnvState &emuenv, const std::string &module_path, bool system_loaded) {
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        const auto &loaded_modules = emuenv.kernel.loaded_modules;
+        auto module_iter = std::find_if(loaded_modules.begin(), loaded_modules.end(), [&](const auto &p) {
+            return module_path == p.second->info.path;
+        });
+
+        if (module_iter != loaded_modules.end()) {
+            return module_iter->first;
+        }
+    }
+
+    const SceUID uid = load_new_module(emuenv, module_path);
+    if (uid >= 0) {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        emuenv.kernel.loaded_modules.at(uid)->system_loaded = system_loaded;
+    }
+    return uid;
+}
+
 int unload_module(EmuEnvState &emuenv, SceUID module_id) {
     const auto module = lock_and_find(module_id, emuenv.kernel.loaded_modules, emuenv.kernel.mutex);
     if (!module) {
@@ -406,12 +414,12 @@ bool load_sys_module(EmuEnvState &emuenv, SceSysmoduleModuleId module_id) {
             module_path = fmt::format("vs0:sys/external/{}.suprx", module_filename);
         }
 
-        auto loaded_module_uid = load_module(emuenv, module_path);
+        auto loaded_module_uid = load_module(emuenv, module_path, true);
 
         if (loaded_module_uid < 0) {
             if (module_id == SCE_SYSMODULE_ULT && loaded_module_uid == SCE_ERROR_ERRNO_ENOENT) {
                 module_path = fmt::format("vs0:sys/external/{}.suprx", module_filename);
-                loaded_module_uid = load_module(emuenv, module_path);
+                loaded_module_uid = load_module(emuenv, module_path, true);
                 if (loaded_module_uid < 0)
                     return false;
             } else
@@ -470,7 +478,7 @@ bool load_sys_module_internal_with_arg(EmuEnvState &emuenv, SceSysmoduleInternal
 
     for (auto module_filename : module_paths) {
         std::string module_path = fmt::format("vs0:sys/external/{}.suprx", module_filename);
-        auto loaded_module_uid = load_module(emuenv, module_path);
+        auto loaded_module_uid = load_module(emuenv, module_path, true);
 
         if (loaded_module_uid < 0) {
             return false;

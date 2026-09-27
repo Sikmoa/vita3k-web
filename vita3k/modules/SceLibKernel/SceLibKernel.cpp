@@ -1231,9 +1231,27 @@ EXPORT(int, sceKernelBacktraceSelf) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceKernelCallModuleExit) {
-    TRACY_FUNC(sceKernelCallModuleExit);
-    return UNIMPLEMENTED();
+// Firmware 3.74 libkernel 0x810012e5, which libc's exit() calls with 1: run
+// module_exit of the started modules of that class (system loads, among them
+// the preloaded libc and libfios2, are not in class 1) and return the last
+// result. The firmware passes its SceKernelModuleInfo copy as argp; nothing
+// here reads it, so argp is NULL.
+EXPORT(int, sceKernelCallModuleExit, SceUInt8 type) {
+    TRACY_FUNC(sceKernelCallModuleExit, type);
+    SceUID ids[128];
+    SceUInt32 count = 128;
+    int result = CALL_EXPORT(sceKernelGetModuleList, type, ids, &count);
+    if (result != 0 || count == 0)
+        return result;
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    for (SceUInt32 i = 0; i < count; ++i) {
+        SceKernelModuleInfo info{};
+        info.size = sizeof(info);
+        result = CALL_EXPORT(sceKernelGetModuleInfo, ids[i], &info);
+        if (result == 0 && info.exit_entry && info.state == 6)
+            result = static_cast<int>(thread->run_callback(info.exit_entry.address(), { 0, 0 }));
+    }
+    return result;
 }
 
 EXPORT(int, sceKernelCallWithChangeStack) {

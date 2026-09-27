@@ -56,6 +56,10 @@ struct KernelModule {
     // pointers its code and data hold (see relocate()).
     std::vector<Address> absolute_relocations;
     uint64_t program_authority_id = 0; // SELF app info auth id (0 for a plain ELF)
+    // Module flag 0x1000 of firmware 3.74 modulemgr: loaded with load flag
+    // 0x8000, as process preloads and sysmodule loads are. It decides
+    // sceKernelIsCalledFromSysModule and the sceKernelGetModuleList classes.
+    bool system_loaded = false;
 };
 typedef std::shared_ptr<KernelModule> SceKernelModulePtr;
 

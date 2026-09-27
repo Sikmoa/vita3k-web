@@ -39,7 +39,8 @@ bool has_hle_implementation(uint32_t nid);
  * \param module_path Full path of module file (with device)
  * \return UID of the loaded module object or SCE_ERROR on failure
  */
-SceUID load_module(EmuEnvState &emuenv, const std::string &module_path);
+// system_loaded: see KernelModule::system_loaded (kept by an earlier load).
+SceUID load_module(EmuEnvState &emuenv, const std::string &module_path, bool system_loaded = false);
 int unload_module(EmuEnvState &emuenv, SceUID module_id);
 
 uint32_t start_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, SceSize args = 0, Ptr<const void> argp = Ptr<const void>{});

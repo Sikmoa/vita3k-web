@@ -124,6 +124,43 @@ inline void test_guest_appmgr_rtc(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(sw_version, { 0 }) == 0x80022005);
     const uint32_t first_low = call(time_low, {});
     REQUIRE(call(time_low, {}) - first_low < 10000000u); // microseconds, monotonic within the test
+    // Module classes: loaded by the app, or a system load (preload,
+    // sysmodule); kernel modules are not in the process.
+    constexpr uint32_t module_list = 0x2EF2581F, called_from_sys = 0x85E6D2BB, call_module_exit = 0x15E2A45D;
+    const auto add_module = [&](const char *path, bool system_loaded, Address segment) {
+        auto module = std::make_shared<KernelModule>();
+        std::strcpy(module->info.path, path);
+        module->info.size = sizeof(module->info);
+        module->info.segments[0].vaddr = Ptr<const void>(segment);
+        module->info.segments[0].memsz = 0x80;
+        module->system_loaded = system_loaded;
+        const SceUID uid = env.kernel.get_next_uid();
+        module->info.modid = uid;
+        env.kernel.loaded_modules[uid] = module;
+        return uid;
+    };
+    auto saved_modules = env.kernel.loaded_modules;
+    env.kernel.loaded_modules.clear();
+    const SceUID app_module = add_module("app0:sce_module/game.suprx", false, block + 0x100);
+    const SceUID system_module = add_module("vs0:sys/external/libhttp.suprx", true, block + 0x180);
+    add_module("os0:kd/sysmodule.skprx", true, block + 0x200);
+    auto *ids = Ptr<uint32_t>(block + 0x300).get(env.mem);
+    auto *count = Ptr<uint32_t>(block + 0x340).get(env.mem);
+    *count = 8;
+    REQUIRE(call(module_list, { 0, block + 0x300, block + 0x340 }) == 0 && *count == 1 && ids[0] == static_cast<uint32_t>(app_module));
+    *count = 8;
+    REQUIRE(call(module_list, { 0x80, block + 0x300, block + 0x340 }) == 0 && *count == 1 && ids[0] == static_cast<uint32_t>(system_module));
+    *count = 1;
+    REQUIRE(call(module_list, { 0x81, block + 0x300, block + 0x340 }) == 0 && *count == 1); // stops at the capacity
+    REQUIRE(call(module_list, { 0x81, 0, 0 }) == 2);
+    REQUIRE(call(called_from_sys, { block + 0x1c0 }) == 1 && call(called_from_sys, { block + 0x100 }) == 0);
+    REQUIRE(call(called_from_sys, { block + 0x200 }) == 0 && call(called_from_sys, { block + 0x7f0 }) == 0);
+    // Class 1 holds no started module with a module_exit: nothing runs.
+    env.kernel.loaded_modules[system_module]->info.exit_entry = Ptr<const void>(block + 0x181);
+    env.kernel.loaded_modules[system_module]->info.state = 6;
+    REQUIRE(call(call_module_exit, { 1 }) == 0);
+    env.kernel.loaded_modules = std::move(saved_modules);
+
     free(env.mem, block);
     std::puts("Guest AppMgr/RTC: system events, game program, vs0 drives, RFC 3339/1123 and sysmodule kernel imports passed");
 }

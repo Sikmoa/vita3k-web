@@ -599,6 +599,10 @@ enum SceSysmoduleErrorCode : uint32_t {
 typedef SceUInt64 SceKernelSysClock;
 typedef Ptr<int(SceSize args, Ptr<void> argp)> SceKernelThreadEntry;
 
+// sceKernelLoadModule flag: a system load (module flag 0x1000, see
+// KernelModule::system_loaded).
+constexpr SceUInt32 SCE_KERNEL_LOAD_MODULE_SYSTEM = 0x8000;
+
 struct SceKernelSegmentInfo {
     SceSize size; //!< this structure size (0x18)
     SceUInt perms; //!< probably rwx in low bits
