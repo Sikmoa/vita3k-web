@@ -1,6 +1,8 @@
 // Production SceMsgDialog bridges; button and system texts come from the
 // generated lang catalog, so this also proves lang::get links with English data.
 #pragma once
+#include "msg_dialog_bridge.h"
+#include <ctrl/ctrl.h>
 #include <dialog/state.h>
 #include <lang/state.h>
 #include <cstring>
@@ -54,6 +56,42 @@ inline void test_guest_msg_dialog(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(init, param) == 0);
     REQUIRE(dialog.msg.message == "Please wait..." && dialog.msg.btn_num == 0);
     REQUIRE(call(close) == 0 && call(term) == 0);
+
+    // Page answers (msg_dialog_bridge.cpp), with the default cross enter
+    // button: cross takes the highlighted button, circle the last of several.
+    auto *u = Ptr<SceMsgDialogUserMessageParam>(user).get(env.mem);
+    const auto answer = [&](SceMsgDialogButtonType type, uint32_t button, uint32_t selected) {
+        u->buttonType = type;
+        p->mode = SCE_MSG_DIALOG_MODE_USER_MSG;
+        REQUIRE(call(init, param) == 0);
+        const uint32_t id = browser::sync_message_dialog(env);
+        REQUIRE(id != 0 && browser::sync_message_dialog(env) == id);
+        browser::press_message_dialog(id + 1, SCE_CTRL_CROSS, 0); // a dialog that is gone
+        REQUIRE(browser::sync_message_dialog(env) == id);
+        browser::press_message_dialog(id, button, selected);
+        const uint32_t shown = browser::sync_message_dialog(env);
+        const uint32_t status = call(get_status);
+        uint32_t button_id = SCE_MSG_DIALOG_BUTTON_ID_INVALID;
+        if (status == SCE_COMMON_DIALOG_STATUS_FINISHED) {
+            REQUIRE(shown == 0);
+            REQUIRE(call(get_result, result) == 0);
+            const auto *r = Ptr<SceMsgDialogResult>(result).get(env.mem);
+            REQUIRE(r->result == SCE_COMMON_DIALOG_RESULT_OK);
+            button_id = r->buttonId;
+        } else {
+            REQUIRE(status == SCE_COMMON_DIALOG_STATUS_RUNNING && shown == id);
+            REQUIRE(call(close) == 0);
+        }
+        REQUIRE(call(term) == 0 && browser::sync_message_dialog(env) == 0);
+        return button_id;
+    };
+    REQUIRE(answer(SCE_MSG_DIALOG_BUTTON_TYPE_YESNO, SCE_CTRL_CROSS, 0) == SCE_MSG_DIALOG_BUTTON_ID_YES);
+    REQUIRE(answer(SCE_MSG_DIALOG_BUTTON_TYPE_YESNO, SCE_CTRL_CROSS, 1) == SCE_MSG_DIALOG_BUTTON_ID_NO);
+    REQUIRE(answer(SCE_MSG_DIALOG_BUTTON_TYPE_YESNO, SCE_CTRL_CIRCLE, 0) == SCE_MSG_DIALOG_BUTTON_ID_NO);
+    REQUIRE(answer(SCE_MSG_DIALOG_BUTTON_TYPE_OK, SCE_CTRL_CROSS, 0) == SCE_MSG_DIALOG_BUTTON_ID_OK);
+    // Circle cannot dismiss a single button; other buttons are not answers.
+    REQUIRE(answer(SCE_MSG_DIALOG_BUTTON_TYPE_OK, SCE_CTRL_CIRCLE, 0) == SCE_MSG_DIALOG_BUTTON_ID_INVALID);
+    REQUIRE(answer(SCE_MSG_DIALOG_BUTTON_TYPE_YESNO, SCE_CTRL_TRIANGLE, 0) == SCE_MSG_DIALOG_BUTTON_ID_INVALID);
     free(env.mem, block);
-    std::puts("Guest message dialog: init, status, close, result, term and English catalog texts passed");
+    std::puts("Guest message dialog: init, status, close, result, term, page answers and English catalog texts passed");
 }

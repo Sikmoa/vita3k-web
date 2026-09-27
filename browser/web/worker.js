@@ -26,6 +26,10 @@ globalThis.vita3kWebOnGpuFrame = (generation, width, height, pixels) => {
   const data = pixels.buffer;
   post({ type: 'vita-frame', generation, width, height, pixelFormat: 'A8B8G8R8', data }, [data]);
 };
+// sceMsgDialog shown to the page (browser/src/msg_dialog_bridge.cpp):
+// { id, state: 'open' | 'update', message, buttons, progress, enterButton } or
+// { id, state: 'close', buttonId, result }. The page answers with 'dialog-press'.
+globalThis.vita3kWebOnDialog = (dialog) => post({ type: 'vita-dialog', dialog });
 // A canvas transferred by the page ('attach-canvas'); bound once the GXM
 // device exists.
 let pendingCanvas = null;
@@ -229,6 +233,11 @@ self.onmessage = async ({ data }) => {
   case 'input':
     // SCE_CTRL_* button mask and stick axes in [-1, 1] (vita_app.cpp vita3k_web_set_pad).
     module?._vita3k_web_set_pad?.(data.buttons >>> 0, ...(data.axes ?? [0, 0, 0, 0]));
+    break;
+  case 'dialog-press':
+    // SCE_CTRL_CROSS / SCE_CTRL_CIRCLE pressed on dialog `id` with button
+    // `selected` highlighted; the runtime applies it at the next HLE call.
+    module?._vita3k_web_msg_dialog_press?.(data.id >>> 0, data.button >>> 0, data.selected >>> 0);
     break;
   case 'attach-canvas': {
     globalThis.vita3kHasCanvas = true;

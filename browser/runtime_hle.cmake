@@ -473,6 +473,7 @@ add_custom_command(
 
 add_library(vita3k_web_runtime_hle STATIC
     "${_HLE_BROWSER_ROOT}/src/gxm_webgpu_bridge.cpp"
+    "${_HLE_BROWSER_ROOT}/src/msg_dialog_bridge.cpp"
     "${_lang_root}/src/lang.cpp"
     "${_lang_generated}/generated_catalog.cpp"
     "${_HLE_ROOT}/renderer/src/renderer.cpp"

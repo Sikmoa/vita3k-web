@@ -23,7 +23,9 @@
 //
 // Keyboard (shown on the page): arrows = d-pad + left stick, X cross, C circle,
 // Z square, V triangle, Q/E = L/R, Enter start, Right Shift select, I/J/K/L =
-// right stick.
+// right stick. A guest message dialog (sceMsgDialog) is drawn over the screen
+// and takes the keys while it is open: left/right select a button, cross and
+// circle answer it as on the Vita (the runtime applies the enter-button rule).
 //
 // Requires a WebGPU browser **on a secure origin**: WebGPU is
 // exposed only to secure contexts, so a page served over plain HTTP from a
@@ -100,6 +102,16 @@ const page = `<!doctype html>
     border-left: 3px solid #f66; max-width: 70ch; }
   button { font: inherit; padding: 4px 12px; }
   #status { color: #fc6; }
+  #dialog { grid-area: 1 / 1; align-self: center; justify-self: center; z-index: 1; min-width: 40ch;
+    max-width: 70%; padding: 18px 22px; background: #eee; color: #111; border-radius: 8px;
+    font: 15px/1.4 system-ui, sans-serif; text-align: center; box-shadow: 0 4px 24px #000a; }
+  #dialog[hidden] { display: none; }
+  #dialog-message { margin: 0 0 14px; white-space: pre-wrap; }
+  #dialog progress { width: 100%; }
+  #dialog-buttons { display: flex; gap: 10px; justify-content: center; }
+  #dialog-buttons button { min-width: 10ch; }
+  #dialog-buttons button.selected { outline: 3px solid #36f; }
+  #dialog-hint { display: block; margin-top: 10px; color: #666; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -117,6 +129,12 @@ const page = `<!doctype html>
 <div id="display">
   <canvas id="gpu-screen" width="960" height="544"></canvas>
   <canvas id="screen" width="960" height="544" hidden></canvas>
+  <div id="dialog" role="dialog" hidden>
+    <p id="dialog-message"></p>
+    <progress id="dialog-progress" max="100" hidden></progress>
+    <div id="dialog-buttons"></div>
+    <small id="dialog-hint"></small>
+  </div>
 </div>
 <pre id="log"></pre>
 <script type="module">
@@ -242,6 +260,58 @@ const keyMap = {
   KeyI: { axis: [3, -1] }, KeyK: { axis: [3, 1] }, KeyJ: { axis: [2, -1] }, KeyL: { axis: [2, 1] },
 };
 const held = new Set();
+// Guest message dialog (worker 'vita-dialog'); null when none is shown.
+let dialog = null;
+const dialogBox = document.querySelector('#dialog');
+function pressDialog(button, selected) {
+  worker.postMessage({ type: 'dialog-press', id: dialog.id, button, selected });
+}
+function renderDialogButtons() {
+  const box = document.querySelector('#dialog-buttons');
+  box.replaceChildren(...dialog.buttons.map((label, index) => {
+    const element = document.createElement('button');
+    element.textContent = label;
+    element.className = index === dialog.selected ? 'selected' : '';
+    element.onclick = () => pressDialog(dialog.enter, index);
+    return element;
+  }));
+}
+function onDialog(message) {
+  if (message.state === 'close') {
+    log(\`dialog \${message.id} closed: buttonId=\${message.buttonId} result=\${message.result}\`);
+    if (dialog?.id === message.id) { dialog = null; dialogBox.hidden = true; }
+    return;
+  }
+  if (message.state === 'open') {
+    log(\`dialog \${message.id}: \${JSON.stringify(message.message)} [\${message.buttons.join(', ')}]\`);
+    // The dialog takes the pad, as the Vita's does: release what the guest holds.
+    held.clear(); sendPad();
+    dialog = { id: message.id, selected: 0 };
+  }
+  if (!dialog || dialog.id !== message.id) return;
+  dialog.buttons = message.buttons;
+  dialog.enter = message.enterButton === 'circle' ? SCE_CTRL.circle : SCE_CTRL.cross;
+  dialog.selected = Math.min(dialog.selected, Math.max(0, message.buttons.length - 1));
+  document.querySelector('#dialog-message').textContent = message.message;
+  const progress = document.querySelector('#dialog-progress');
+  progress.hidden = message.progress === null;
+  if (message.progress !== null) progress.value = message.progress;
+  renderDialogButtons();
+  document.querySelector('#dialog-hint').textContent = message.buttons.length
+    ? (message.enterButton === 'circle' ? 'C (circle) selects · X (cross) backs out' : 'X (cross) selects · C (circle) backs out') : '';
+  dialogBox.hidden = false;
+}
+function dialogKey(event) {
+  const { button = 0 } = keyMap[event.code];
+  if (event.type !== 'keydown' || event.repeat) return;
+  if (button === SCE_CTRL.left || button === SCE_CTRL.right) {
+    const last = Math.max(0, dialog.buttons.length - 1);
+    dialog.selected = Math.max(0, Math.min(last, dialog.selected + (button === SCE_CTRL.right ? 1 : -1)));
+    renderDialogButtons();
+  } else if (button === SCE_CTRL.cross || button === SCE_CTRL.circle) {
+    pressDialog(button, dialog.selected);
+  }
+}
 function sendPad() {
   if (!running) return;
   let buttons = 0;
@@ -257,6 +327,7 @@ function onKey(event) {
   if (!running || !(event.code in keyMap)) return;
   // While the guest runs, mapped keys are its input: no scrolling or button activation.
   event.preventDefault();
+  if (dialog) { dialogKey(event); return; }
   const down = event.type === 'keydown';
   if (down === held.has(event.code)) return; // auto-repeat
   if (down) held.add(event.code); else held.delete(event.code);
@@ -268,6 +339,7 @@ addEventListener('blur', () => { held.clear(); sendPad(); });
 
 function stop(keepsStatus) {
   worker?.terminate(); worker = null; running = false; held.clear();
+  dialog = null; dialogBox.hidden = true;
   runButton.disabled = false; stopButton.disabled = true;
   if (!keepsStatus) status.textContent = 'stopped';
 }
@@ -339,6 +411,7 @@ async function run() {
       case 'vita-audio':
         playAudioPCM(data.freq, data.channels, data.frames, data.data);
         break;
+      case 'vita-dialog': onDialog(data.dialog); break;
       case 'vita-exit':
         // Report first, then release the worker: stop() must not overwrite the
         // outcome the viewer is waiting to read.

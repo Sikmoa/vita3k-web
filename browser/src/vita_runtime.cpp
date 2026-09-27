@@ -15,6 +15,7 @@
 #include <nids/functions.h>
 #include <emscripten/emscripten.h>
 
+#include "msg_dialog_bridge.h"
 #include "vita_runtime.h"
 
 #include <bit>
@@ -133,6 +134,7 @@ static int run_vita(const uint8_t *bytes, uint32_t size) {
                 std::printf("[vita3k-web] Vita import: %s NID=%08x PC=%08x\n", import_name(nid), nid, read_pc(cpu));
                 trace_cpu(cpu, nid);
                 ::call_import(*env, cpu, nid, tid);
+                browser::sync_message_dialog(*env);
                 // Present exactly once per real sceDisplaySetFrameBuf call: one
                 // frame/update generation, matching the real API semantics.
                 if (nid == 0x7A410B64 /* sceDisplaySetFrameBuf */
