@@ -18,6 +18,11 @@ DECL_EXPORT(int, sceGxmMapVertexUsseMemory, Ptr<void> base, uint32_t size, uint3
 DECL_EXPORT(int, sceGxmMapFragmentUsseMemory, Ptr<void> base, uint32_t size, uint32_t *offset);
 DECL_EXPORT(int, sceGxmUnmapVertexUsseMemory, void *base);
 DECL_EXPORT(int, sceGxmUnmapFragmentUsseMemory, void *base);
+DECL_EXPORT(int, sceGxmMapVertexUsseMemoryInternal, Ptr<void> base, uint32_t size, uint32_t *offset);
+DECL_EXPORT(int, sceGxmMapFragmentUsseMemoryInternal, Ptr<void> base, uint32_t size, uint32_t *offset);
+DECL_EXPORT(int, sceGxmUnmapVertexUsseMemoryInternal, void *base);
+DECL_EXPORT(int, sceGxmUnmapFragmentUsseMemoryInternal, void *base);
+DECL_EXPORT(SceUID, sceGxmGetDisplayQueueThreadIdInternal);
 
 namespace guest_kernel_info {
 constexpr uint32_t kGetThreadId = 0x0fb972f9;
@@ -178,14 +183,26 @@ inline void test_guest_kernel_info(EmuEnvState &env, vita3k::web::GuestThreadRun
     REQUIRE(export_SceQafMgrForDriver_B9770A13(env, caller->id, "fixture") == 0);
     std::puts("Driver thread permission, callback state and QA flag passed");
 
-    // USSE mapping (libgxm 0x8100df34/0x8100e128, unmap 0x8100e084/0x8100e27c).
+    // USSE mapping (libgxm 0x8100df34/0x8100e128, unmap 0x8100e084/0x8100e27c;
+    // the internal heap's 0x8100e320/0x8100e518 and 0x8100e474/0x8100e66c
+    // check the same).
+    using UsseMap = int (*)(EmuEnvState &, SceUID, const char *, Ptr<void>, uint32_t, uint32_t *);
+    using UsseUnmap = int (*)(EmuEnvState &, SceUID, const char *, void *);
+    const std::pair<UsseMap, UsseUnmap> usse[] = {
+        { export_sceGxmMapVertexUsseMemory, export_sceGxmUnmapVertexUsseMemory },
+        { export_sceGxmMapFragmentUsseMemory, export_sceGxmUnmapFragmentUsseMemory },
+        { export_sceGxmMapVertexUsseMemoryInternal, export_sceGxmUnmapVertexUsseMemoryInternal },
+        { export_sceGxmMapFragmentUsseMemoryInternal, export_sceGxmUnmapFragmentUsseMemoryInternal },
+    };
     const bool initialized = env.gxm.initialized;
     env.gxm.initialized = false;
     uint32_t offset = 0xcccccccc;
     const Ptr<void> base(data + 0x800);
     void *const host_base = base.get(env.mem);
-    REQUIRE(export_sceGxmMapVertexUsseMemory(env, caller->id, "fixture", base, 0x1000, &offset) == SCE_GXM_ERROR_UNINITIALIZED);
-    REQUIRE(export_sceGxmUnmapFragmentUsseMemory(env, caller->id, "fixture", host_base) == SCE_GXM_ERROR_UNINITIALIZED);
+    for (const auto &[map, unmap] : usse) {
+        REQUIRE(map(env, caller->id, "fixture", base, 0x1000, &offset) == SCE_GXM_ERROR_UNINITIALIZED);
+        REQUIRE(unmap(env, caller->id, "fixture", host_base) == SCE_GXM_ERROR_UNINITIALIZED);
+    }
     REQUIRE(export_sceGxmTerminate(env, caller->id, "fixture") == SCE_GXM_ERROR_UNINITIALIZED);
     env.gxm.initialized = true;
     REQUIRE(export_sceGxmInitialize(env, caller->id, "fixture", nullptr) == SCE_GXM_ERROR_ALREADY_INITIALIZED);
@@ -195,9 +212,7 @@ inline void test_guest_kernel_info(EmuEnvState &env, vita3k::web::GuestThreadRun
     process->magic = '2PSP';
     process->version = 1;
     process->fw_version = 0x03100000;
-    for (const bool vertex : {true, false}) {
-        const auto map = vertex ? export_sceGxmMapVertexUsseMemory : export_sceGxmMapFragmentUsseMemory;
-        const auto unmap = vertex ? export_sceGxmUnmapVertexUsseMemory : export_sceGxmUnmapFragmentUsseMemory;
+    for (const auto &[map, unmap] : usse) {
         REQUIRE(map(env, caller->id, "fixture", Ptr<void>(), 0x1000, &offset) == SCE_GXM_ERROR_INVALID_POINTER);
         REQUIRE(map(env, caller->id, "fixture", base, 0x1000, nullptr) == SCE_GXM_ERROR_INVALID_POINTER);
         // Only titles built for SDK 3.10 or later are limited to 8 MiB.
@@ -208,11 +223,25 @@ inline void test_guest_kernel_info(EmuEnvState &env, vita3k::web::GuestThreadRun
         env.kernel.process_param = Ptr<SceProcessParam>();
         REQUIRE(unmap(env, caller->id, "fixture", nullptr) == SCE_GXM_ERROR_INVALID_POINTER);
         REQUIRE(unmap(env, caller->id, "fixture", host_base) == 0);
+        REQUIRE(offset == base.address());
     }
+    // sceGxmGetDisplayQueueThreadIdInternal (0x8100b8c0): the display queue
+    // exists only when sceGxmInitialize had a display queue callback.
+    const SceUID display_thread = env.gxm.display_queue_thread;
+    const Ptr<void> display_callback = env.gxm.params.displayQueueCallback;
+    env.gxm.display_queue_thread = caller->id;
+    env.gxm.params.displayQueueCallback = Ptr<void>();
+    REQUIRE(export_sceGxmGetDisplayQueueThreadIdInternal(env, caller->id, "fixture") == -1);
+    env.gxm.params.displayQueueCallback = Ptr<void>(code);
+    REQUIRE(export_sceGxmGetDisplayQueueThreadIdInternal(env, caller->id, "fixture") == caller->id);
+    env.gxm.initialized = false;
+    REQUIRE(export_sceGxmGetDisplayQueueThreadIdInternal(env, caller->id, "fixture") == -1);
+    env.gxm.display_queue_thread = display_thread;
+    env.gxm.params.displayQueueCallback = display_callback;
     env.gxm.initialized = initialized;
-    std::puts("USSE map and unmap validation passed");
+    std::puts("USSE map and unmap validation and the display queue thread passed");
 
-    REQUIRE(semaphore_delete(env.kernel, "fixture", 0, sema) == 0);
+    REQUIRE(semaphore_close(env.kernel, env.mem, "fixture", 0, sema, HandleClose::Delete) == 0);
     REQUIRE(runtime.shutdown());
     REQUIRE(env.kernel.threads.empty());
     REQUIRE(get_current_cpu_state() == nullptr);

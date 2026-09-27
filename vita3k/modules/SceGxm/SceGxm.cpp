@@ -2921,7 +2921,7 @@ EXPORT(int, sceGxmIsDebugVersion) {
 
 // libgxm 3.74 checks these before its driver maps the memory into a USSE
 // heap. Titles built for SDK 3.10 or later map at most 8 MiB at a time.
-static int check_usse_mapping(EmuEnvState &emuenv, const char *export_name, Ptr<void> base, uint32_t size, const uint32_t *offset) {
+int gxm_check_usse_mapping(EmuEnvState &emuenv, const char *export_name, Ptr<void> base, uint32_t size, const uint32_t *offset) {
     if (!emuenv.gxm.initialized)
         return RET_ERROR(SCE_GXM_ERROR_UNINITIALIZED);
     if (!base || !offset)
@@ -2931,7 +2931,7 @@ static int check_usse_mapping(EmuEnvState &emuenv, const char *export_name, Ptr<
     return 0;
 }
 
-static int check_usse_unmapping(EmuEnvState &emuenv, const char *export_name, const void *base) {
+int gxm_check_usse_unmapping(EmuEnvState &emuenv, const char *export_name, const void *base) {
     if (!emuenv.gxm.initialized)
         return RET_ERROR(SCE_GXM_ERROR_UNINITIALIZED);
     if (!base)
@@ -2941,7 +2941,7 @@ static int check_usse_unmapping(EmuEnvState &emuenv, const char *export_name, co
 
 EXPORT(int, sceGxmMapFragmentUsseMemory, Ptr<void> base, uint32_t size, uint32_t *offset) {
     TRACY_FUNC(sceGxmMapFragmentUsseMemory, base, size, offset);
-    if (auto error = check_usse_mapping(emuenv, export_name, base, size, offset))
+    if (auto error = gxm_check_usse_mapping(emuenv, export_name, base, size, offset))
         return error;
 
     // The offset encodes the USSE device address the driver picks; nothing
@@ -2991,7 +2991,7 @@ EXPORT(int, sceGxmMapMemory, Ptr<void> base, uint32_t size, uint32_t attribs) {
 
 EXPORT(int, sceGxmMapVertexUsseMemory, Ptr<void> base, uint32_t size, uint32_t *offset) {
     TRACY_FUNC(sceGxmMapVertexUsseMemory, base, size, offset);
-    if (auto error = check_usse_mapping(emuenv, export_name, base, size, offset))
+    if (auto error = gxm_check_usse_mapping(emuenv, export_name, base, size, offset))
         return error;
 
     // See sceGxmMapFragmentUsseMemory.
@@ -5731,7 +5731,7 @@ EXPORT(int, sceGxmTransferFinish) {
 
 EXPORT(int, sceGxmUnmapFragmentUsseMemory, void *base) {
     TRACY_FUNC(sceGxmUnmapFragmentUsseMemory, base);
-    return check_usse_unmapping(emuenv, export_name, base);
+    return gxm_check_usse_unmapping(emuenv, export_name, base);
 }
 
 EXPORT(int, sceGxmUnmapMemory, Ptr<void> base) {
@@ -5769,7 +5769,7 @@ EXPORT(int, sceGxmUnmapMemory, Ptr<void> base) {
 
 EXPORT(int, sceGxmUnmapVertexUsseMemory, void *base) {
     TRACY_FUNC(sceGxmUnmapVertexUsseMemory, base);
-    return check_usse_unmapping(emuenv, export_name, base);
+    return gxm_check_usse_unmapping(emuenv, export_name, base);
 }
 
 EXPORT(int, sceGxmVertexFence, SceGxmContext *immediateContext) {

@@ -19,6 +19,8 @@
 
 #include "SceGxm.h"
 
+#include <gxm/state.h>
+
 #include <util/tracy.h>
 
 TRACY_MODULE_NAME(SceGxmInternal);
@@ -32,8 +34,13 @@ EXPORT(int, sceGxmCreateRenderTargetInternal, const SceGxmRenderTargetParams *pa
     return CALL_EXPORT(sceGxmCreateRenderTarget, params, renderTarget);
 }
 
-EXPORT(int, sceGxmGetDisplayQueueThreadIdInternal) {
-    return UNIMPLEMENTED();
+// libgxm 3.74 has a display queue only when sceGxmInitialize was given a
+// display queue callback; without one the thread id is -1.
+EXPORT(SceUID, sceGxmGetDisplayQueueThreadIdInternal) {
+    TRACY_FUNC(sceGxmGetDisplayQueueThreadIdInternal);
+    if (!emuenv.gxm.initialized || !emuenv.gxm.params.displayQueueCallback)
+        return -1;
+    return emuenv.gxm.display_queue_thread;
 }
 
 EXPORT(int, sceGxmGetRenderTargetMemSizeInternal, const SceGxmRenderTargetParams *params, uint32_t *hostMemSize) {
@@ -53,12 +60,24 @@ EXPORT(int, sceGxmIsInitializationInternal) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceGxmMapFragmentUsseMemoryInternal) {
-    return UNIMPLEMENTED();
+// Checked like sceGxmMapFragmentUsseMemory; the driver maps into the internal
+// USSE heap instead, which the guest address stands in for as well.
+EXPORT(int, sceGxmMapFragmentUsseMemoryInternal, Ptr<void> base, uint32_t size, uint32_t *offset) {
+    TRACY_FUNC(sceGxmMapFragmentUsseMemoryInternal, base, size, offset);
+    if (auto error = gxm_check_usse_mapping(emuenv, export_name, base, size, offset))
+        return error;
+    *offset = base.address();
+    return 0;
 }
 
-EXPORT(int, sceGxmMapVertexUsseMemoryInternal) {
-    return UNIMPLEMENTED();
+// Checked like sceGxmMapVertexUsseMemory; the driver maps into the internal
+// USSE heap instead, which the guest address stands in for as well.
+EXPORT(int, sceGxmMapVertexUsseMemoryInternal, Ptr<void> base, uint32_t size, uint32_t *offset) {
+    TRACY_FUNC(sceGxmMapVertexUsseMemoryInternal, base, size, offset);
+    if (auto error = gxm_check_usse_mapping(emuenv, export_name, base, size, offset))
+        return error;
+    *offset = base.address();
+    return 0;
 }
 
 EXPORT(int, sceGxmRenderingContextIsWithinSceneInternal) {
@@ -74,10 +93,12 @@ EXPORT(int, sceGxmSetInitializeParamInternal) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceGxmUnmapFragmentUsseMemoryInternal) {
-    return UNIMPLEMENTED();
+EXPORT(int, sceGxmUnmapFragmentUsseMemoryInternal, void *base) {
+    TRACY_FUNC(sceGxmUnmapFragmentUsseMemoryInternal, base);
+    return gxm_check_usse_unmapping(emuenv, export_name, base);
 }
 
-EXPORT(int, sceGxmUnmapVertexUsseMemoryInternal) {
-    return UNIMPLEMENTED();
+EXPORT(int, sceGxmUnmapVertexUsseMemoryInternal, void *base) {
+    TRACY_FUNC(sceGxmUnmapVertexUsseMemoryInternal, base);
+    return gxm_check_usse_unmapping(emuenv, export_name, base);
 }
