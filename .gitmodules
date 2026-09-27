@@ -23,9 +23,6 @@
 [submodule "external/libfat16"]
 	path = external/libfat16
 	url = https://github.com/Vita3K/libfat16
-[submodule "external/printf"]
-	path = external/printf
-	url = https://github.com/Vita3K/printf
 [submodule "external/pugixml"]
 	path = external/pugixml
 	url = https://github.com/zeux/pugixml

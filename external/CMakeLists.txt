@@ -44,9 +44,6 @@ if(MSVC)
 	target_include_directories(dirent INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/dirent/include")
 endif()
 
-add_library(printf INTERFACE)
-target_include_directories(printf INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/printf")
-
 set(FMT_INSTALL ON)
 add_subdirectory(fmt)
 set(fmt_DIR fmt)
