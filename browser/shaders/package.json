@@ -1,0 +1,8 @@
+{
+  "name": "vita3k-web-shader-deps",
+  "private": true,
+  "dependencies": {
+    "@bjorn3/browser_wasi_shim": "0.4.2",
+    "naga-wasi-cli": "0.1.0"
+  }
+}

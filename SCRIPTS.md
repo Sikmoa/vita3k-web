@@ -205,10 +205,10 @@ Open the printed URL (add `?auto=1` to start on load). The page stages
 and boots the app with the same Worker messages the headless probe uses. The
 runtime files come from `browser/tests/runtime_routes.mjs`, shared with the
 probes: `browser/web` from source, everything else from the built dist
-`GXM_RUNTIME_DIST` (default `build/web64/dist`) and the shader compiler assets from `GXM_SHADER_ASSETS`
-(default `.limbo_work/gxm`: the compiler from `browser/tests/build_gxp_compiler.sh
-wasm`, Naga and the WASI shim from the npm packages `naga-wasi-cli` and
-`@bjorn3/browser_wasi_shim` installed there).
+`GXM_RUNTIME_DIST` (default `build/web64/dist`), including the shader
+toolchain in `dist/shaders/` (GXP compiler, Naga, WASI shim; building it runs
+`npm ci` on `browser/shaders/package-lock.json`, so it needs npm and the
+registry or an npm cache).
 `LIMBO_AOT=<file>` supplies an AOT module (below). The option list is the
 header of `limbo_serve.mjs`; the ones that change what is measured:
 

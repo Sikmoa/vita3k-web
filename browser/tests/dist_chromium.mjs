@@ -1,7 +1,8 @@
 // Deployment check: serves a built dist directory as plain static files (no
 // route rewriting, as a web server would) and loads the runtime from it in
 // Chromium. The Worker must load the JIT module for the dist's memory model
-// without falling back.
+// without falling back, and gxm_scene.js must initialise from the dist's
+// shaders/ and translate repository GXP programs, as sceGxmInitialize does.
 //
 //   PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index.mjs \
 //     node browser/tests/dist_chromium.mjs [build/web64/dist]
@@ -16,6 +17,7 @@ import { extname, resolve, sep } from 'node:path';
 import assert from 'node:assert/strict';
 
 const root = resolve(process.argv[2] || 'build/web64/dist');
+const gxpRoot = resolve('tools/native-tool/src/shaders');
 const expectedModel = process.env.DIST_MEMORY_MODEL || 'wasm64-direct';
 const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm' };
 const requests = [];
@@ -25,6 +27,11 @@ const server = createServer(async (req, res) => {
     if (path === '/__dist_probe.html') {
       res.writeHead(200, { 'Content-Type': 'text/html' });
       res.end('<!doctype html><title>dist probe</title>');
+      return;
+    }
+    if (path.startsWith('/__gxp/')) {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+      res.end(await readFile(resolve(gxpRoot, path.slice('/__gxp/'.length).replace(/[^\w.]/g, ''))));
       return;
     }
     const file = resolve(root, `.${path}`);
@@ -65,11 +72,30 @@ try {
     };
     worker.onerror = (event) => { clearTimeout(timer); fail(new Error(event.message)); };
   }));
-  console.log(JSON.stringify({ root, ready, requests }, null, 2));
+  // The URLs web_gxm_init (browser/src/gxm_webgpu_bridge.cpp) builds relative
+  // to the Worker, which sits next to this page.
+  const gxm = await page.evaluate(async () => {
+    const logs = [];
+    const scene = await import('./gxm_scene.js');
+    await scene.init({
+      compilerURL: new URL('shaders/gxp_compiler.mjs', location.href).href,
+      nagaURL: new URL('shaders/naga.wasm', location.href).href,
+      wasiShimURL: new URL('shaders/wasi/index.js', location.href).href,
+      logger: (message) => logs.push(message),
+    });
+    let id = 0;
+    for (const [name, fragment] of [['color_v.gxp', false], ['color_f.gxp', true]]) {
+      const gxp = new Uint8Array(await (await fetch(`/__gxp/${name}`)).arrayBuffer());
+      await scene.registerProgram(++id, gxp, fragment);
+    }
+    return { programs: id, logs };
+  });
+  console.log(JSON.stringify({ root, ready, gxm, requests }, null, 2));
   assert.deepEqual(pageErrors, []);
   assert.equal(ready.memoryModel, expectedModel, 'module memory model');
   assert.equal(ready.memoryFallback, false, 'the dist must hold the module where the Worker looks first');
-  console.log(`DIST OK: ${ready.module} ${ready.memoryModel} from ${root}`);
+  assert.equal(gxm.programs, 2, 'GXM initialised and translated both programs');
+  console.log(`DIST OK: ${ready.module} ${ready.memoryModel}, GXM initialised from ${root}`);
 } finally {
   await browser?.close();
   server.close();

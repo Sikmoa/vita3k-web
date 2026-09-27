@@ -15,7 +15,6 @@
 //
 // Environment overrides:
 //   GXM_RUNTIME_DIST        built dist (default build/web64/dist)
-//   GXM_SHADER_ASSETS       GXP compiler/Naga/WASI assets (default .limbo_work/gxm)
 //   LIMBO_STAGE             staged content root (default .limbo_work/stage)
 //   LIMBO_TITLE             title id (default PCSE00268)
 //   LIMBO_APP               app0 directory name (default the title id)

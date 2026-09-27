@@ -232,6 +232,62 @@ function(vita3k_web_dist_module target)
     set(_dist_outputs ${_dist_outputs} "${_dir}/${target}.js" "${_dir}/${target}.wasm" PARENT_SCOPE)
 endfunction()
 
+# dist/shaders/ holds what web_gxm_init (gxm_webgpu_bridge.cpp) loads: the
+# GXP compiler, built from browser/shaders as its own wasm32 project, and Naga
+# plus the WASI shim, installed by `npm ci` from the pinned
+# browser/shaders/package-lock.json. That install is the one input the build
+# fetches: it needs npm and the npm registry (or an npm cache holding them).
+include(ExternalProject)
+set(_gxp_compiler_dir "${CMAKE_CURRENT_BINARY_DIR}/gxp_compiler")
+ExternalProject_Add(vita3k_gxp_compiler
+    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+    BINARY_DIR "${_gxp_compiler_dir}"
+    CMAKE_ARGS "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
+    INSTALL_COMMAND ""
+    BUILD_ALWAYS ON # the inner build tracks the translator sources itself
+    BUILD_BYPRODUCTS "${_gxp_compiler_dir}/gxp_compiler.mjs" "${_gxp_compiler_dir}/gxp_compiler.wasm"
+)
+find_program(VITA3K_NPM npm)
+if(NOT VITA3K_NPM)
+    message(FATAL_ERROR "npm not found: it installs Naga and the WASI shim for dist/shaders "
+        "(browser/shaders/package-lock.json)")
+endif()
+set(_shader_deps "${CMAKE_CURRENT_BINARY_DIR}/shader_deps")
+set(_naga "${_shader_deps}/node_modules/naga-wasi-cli")
+set(_wasi_shim "${_shader_deps}/node_modules/@bjorn3/browser_wasi_shim")
+set(_shader_dep_files
+    "${_naga}/wasi/naga.wasm" "${_naga}/LICENSE-MIT" "${_naga}/LICENSE-APACHE"
+    "${_wasi_shim}/dist/index.js" "${_wasi_shim}/LICENSE-MIT" "${_wasi_shim}/LICENSE-APACHE")
+add_custom_command(
+    OUTPUT ${_shader_dep_files}
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_shader_deps}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/package.json"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/package-lock.json" "${_shader_deps}"
+    COMMAND ${CMAKE_COMMAND} -E chdir "${_shader_deps}"
+        "${VITA3K_NPM}" ci --ignore-scripts --no-audit --no-fund
+    # npm keeps the packages' 1985 timestamps; mark the outputs as fresh.
+    COMMAND ${CMAKE_COMMAND} -E touch ${_shader_dep_files}
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/package.json" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/package-lock.json"
+    COMMENT "Installing Naga and the WASI shim (npm ci)"
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT "${VITA3K_WEB_DIST}/shaders/wasi/index.js"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${_wasi_shim}/dist" "${VITA3K_WEB_DIST}/shaders/wasi"
+    DEPENDS "${_wasi_shim}/dist/index.js"
+    COMMENT "Staging dist/shaders/wasi"
+    VERBATIM
+)
+list(APPEND _dist_outputs "${VITA3K_WEB_DIST}/shaders/wasi/index.js")
+vita3k_web_dist_copy(shaders/gxp_compiler.mjs "${_gxp_compiler_dir}/gxp_compiler.mjs")
+vita3k_web_dist_copy(shaders/gxp_compiler.wasm "${_gxp_compiler_dir}/gxp_compiler.wasm")
+vita3k_web_dist_copy(shaders/naga.wasm "${_naga}/wasi/naga.wasm")
+vita3k_web_dist_copy(shaders/naga-LICENSE-MIT "${_naga}/LICENSE-MIT")
+vita3k_web_dist_copy(shaders/naga-LICENSE-APACHE "${_naga}/LICENSE-APACHE")
+vita3k_web_dist_copy(shaders/wasi/LICENSE-MIT "${_wasi_shim}/LICENSE-MIT")
+vita3k_web_dist_copy(shaders/wasi/LICENSE-APACHE "${_wasi_shim}/LICENSE-APACHE")
+
 # Every file in web/ is deployed; check_web_imports.cmake fails the build when
 # a script loaded by relative URL (from web/ or an EM_JS import) is not there.
 file(GLOB _web_assets LIST_DIRECTORIES false CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/web/*")
@@ -266,6 +322,7 @@ if(TARGET vita3k_web_jit)
     vita3k_web_dist_module(vita3k_web_jit)
 endif()
 add_custom_target(vita3k_web_dist ALL DEPENDS ${_dist_outputs})
+add_dependencies(vita3k_web_dist vita3k_gxp_compiler)
 if(TARGET vita3k_vita_display_fixture)
     add_dependencies(vita3k_web_dist vita3k_vita_display_fixture)
 endif()

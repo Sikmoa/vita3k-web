@@ -1,16 +1,20 @@
 // Translation runs IN Chromium, from public repo GXP bytes. No native compiler.
+// The shader assets come from the built dist (GXM_RUNTIME_DIST, default
+// build/web64/dist), served under /dist/.
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { resolve, sep } from 'node:path';
 import assert from 'node:assert/strict';
 const root = resolve('.');
+const dist = resolve(process.env.GXM_RUNTIME_DIST || 'build/web64/dist');
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE_URL || '../../build/playwright/node_modules/playwright/index.mjs');
 const server = createServer(async (req, res) => {
   try {
     const path = new URL(req.url, 'http://localhost').pathname;
     if (path === '/') { res.end('<!doctype html><title>Browser GXP translation</title>'); return; }
-    const file = resolve(root, `.${path}`);
-    if (!file.startsWith(root+sep)) throw new Error('bad path');
+    const base = path.startsWith('/dist/') ? dist : root;
+    const file = resolve(base, `.${path.replace(/^\/dist\//, '/')}`);
+    if (!file.startsWith(base+sep)) throw new Error('bad path');
     res.setHeader('Content-Type', file.endsWith('.wasm') ? 'application/wasm' : file.endsWith('.gxp') ? 'application/octet-stream' : 'text/javascript');
     res.end(await readFile(file));
   } catch { res.writeHead(404); res.end(); }
@@ -30,9 +34,9 @@ try {
   const result = await page.evaluate(async () => {
     const { createGXPShaderAdapter } = await import('/browser/web/gxp_shader_adapter.js');
     const adapter = await createGXPShaderAdapter({
-      compilerURL: '/.limbo_work/gxm/shader-wasm/gxp_compiler.mjs',
-      nagaURL: '/.limbo_work/gxm/node_modules/naga-wasi-cli/wasi/naga.wasm',
-      wasiShimURL: '/.limbo_work/gxm/node_modules/@bjorn3/browser_wasi_shim/dist/index.js',
+      compilerURL: '/dist/shaders/gxp_compiler.mjs',
+      nagaURL: '/dist/shaders/naga.wasm',
+      wasiShimURL: '/dist/shaders/wasi/index.js',
     });
     let checks = 0;
     const check = (ok, text) => { if (!ok) throw new Error(text); ++checks; };

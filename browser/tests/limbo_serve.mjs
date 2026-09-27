@@ -47,7 +47,6 @@
 //   LIMBO_TITLE         title id (default PCSE00268)
 //   LIMBO_APP           app directory under ux0/app (default: LIMBO_TITLE)
 //   GXM_RUNTIME_DIST    built dist (default build/web64/dist; target vita3k_web_dist)
-//   GXM_SHADER_ASSETS   GXP compiler/Naga/WASI assets (default .limbo_work/gxm)
 //   LIMBO_AOT           ahead-of-time module for the title (AOT.md), served as
 //                       /aot.wasm and passed to run-app as aotUrl
 import { createServer } from 'node:http';

@@ -24,40 +24,23 @@ combined image/sampler variable into separate texture (`2n`) and sampler
 formats default to RGBA8 (`SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR`) unless the
 caller passes 32 explicit `SceGxmTextureFormat` hints (16 vertex, 16 fragment).
 
-## Dependency versions (exact)
+## Dependencies
 
-| component | version | notes |
-|---|---|---|
-| Node.js | 22.22.1 | runs tests and WASI host side |
-| Emscripten `em++` | 3.1.69 | wasm32; system install is `FROZEN_CACHE=True` — never reuse or clear the shared cache; the build script sets a private `EM_CACHE` |
-| clang++ | 19.1.7 | native oracle build |
-| naga-wasi-cli | 0.1.0 | `.limbo_work/gxm/node_modules/naga-wasi-cli` (WASI `naga.wasm`) |
-| @bjorn3/browser_wasi_shim | 0.4.2 | pure-JS WASI host for running Naga in-browser |
-| Playwright (test-only) | 1.63.0 | `build/playwright/node_modules/playwright`, Chromium 1243 |
-| glslang SPIRV (in-tree `external/glslang`) | repo pinned | `SpvBuilder`, `SpvPostProcess`, `InReadableOrder`, `Logger`, `disassemble`, `doc` |
-| {fmt} (in-tree `external/fmt`) | 12.2.0 | `src/format.cc` only |
-| spdlog (in-tree, header use) | 1.17.0 | compile-time only |
+- The compiler: `browser/shaders/CMakeLists.txt` (translator sources, glslang
+  SPIRV files and `external/fmt/src/format.cc`, built with
+  `-DVITA3K_SHADER_SPIRV_ONLY`; GLSL/SPIRV-Cross output excluded).
+- Naga (`naga-wasi-cli`, WASI `naga.wasm`) and `@bjorn3/browser_wasi_shim`:
+  pinned in `browser/shaders/package-lock.json`.
 
-## Build the standalone shader compiler
+## Build
 
-No CMake, GUI, renderer, guest CPU or HLE involved; sequential compile, ≤240 s
-budget, private Emscripten cache under `.limbo_work/gxm/shader-wasm/emcache`.
+The browser build produces all of it in `dist/shaders/` (target
+`vita3k_web_dist`: the compiler as a separate wasm32 project, Naga and the
+shim by `npm ci`). The native oracle is the same project without Emscripten:
 
 ```sh
-cd <repo root>
-export TMPDIR="$PWD/.limbo_work/tmp"
-# Browser module (.limbo_work/gxm/shader-wasm/gxp_compiler.mjs + .wasm):
-timeout -s KILL 240s bash browser/tests/build_gxp_compiler.sh wasm
-# Native oracle (.limbo_work/gxm/gxp_compile):
-timeout -s KILL 240s bash browser/tests/build_gxp_compiler.sh native
+cmake -S browser/shaders -B build/gxp-native -G Ninja && cmake --build build/gxp-native
 ```
-
-Inputs: `browser/tests/gxp_compile.cpp`, `vita3k/shader/src/**`,
-`vita3k/gxm/src/{gxp,attributes,color,textures}.cpp`, the glslang SPIRV files
-above, `external/fmt/src/format.cc` — built with `-DVITA3K_SHADER_SPIRV_ONLY`
-(GLSL/SPIRV-Cross backend excluded). Objects are cached and rebuilt when any
-`vita3k/shader/include`, `vita3k/gxm/include`, `vita3k/util/include` or
-`external/glslang/SPIRV` header is newer.
 
 Exports of the Wasm module (`gxp_compiler.mjs`, ES6, MODULARIZE):
 
@@ -70,23 +53,21 @@ _gxp_error() -> char* (valid after failure)  _malloc/_free for argument buffers
 ## Translate a GXP file (native oracle + Naga CLI)
 
 ```sh
-TRACY_NO_INVARIANT_CHECK=1 .limbo_work/gxm/gxp_compile \
-  tools/native-tool/src/shaders/texture_f.gxp .limbo_work/gxm/texture_f.spv
-node .limbo_work/gxm/node_modules/naga-wasi-cli/bin/naga.mjs \
-  --keep-coordinate-space .limbo_work/gxm/texture_f.spv .limbo_work/gxm/texture_f.wgsl
-# CPU-side validation of any .spv (no browser needed):
-node .limbo_work/gxm/node_modules/naga-wasi-cli/bin/naga.mjs \
-  --bulk-validate .limbo_work/gxm/texture_f.spv
+naga=build/web64/browser/shader_deps/node_modules/naga-wasi-cli/bin/naga.mjs
+# Naga's WASI sandbox sees only the working directory: use relative paths.
+build/gxp-native/gxp_compile tools/native-tool/src/shaders/texture_f.gxp build/texture_f.spv
+node $naga --keep-coordinate-space build/texture_f.spv build/texture_f.wgsl
+node $naga --bulk-validate build/texture_f.spv   # CPU-side validation, no browser
 ```
 
 ## In-browser translation (no native binary)
 
 ```js
-import { createGXPShaderAdapter } from '/browser/web/gxp_shader_adapter.js';
+import { createGXPShaderAdapter } from './gxp_shader_adapter.js'; // served from dist
 const adapter = await createGXPShaderAdapter({
-  compilerURL: '/.limbo_work/gxm/shader-wasm/gxp_compiler.mjs',
-  nagaURL: '/.limbo_work/gxm/node_modules/naga-wasi-cli/wasi/naga.wasm',
-  wasiShimURL: '/.limbo_work/gxm/node_modules/@bjorn3/browser_wasi_shim/dist/index.js',
+  compilerURL: './shaders/gxp_compiler.mjs',
+  nagaURL: './shaders/naga.wasm',
+  wasiShimURL: './shaders/wasi/index.js',
 });
 const { spirv, wgsl } = await adapter.translate(gxpBytes, { textureFormats });
 ```
