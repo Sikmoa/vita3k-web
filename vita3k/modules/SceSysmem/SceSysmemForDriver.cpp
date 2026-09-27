@@ -471,6 +471,7 @@ EXPORT(int, ksceKernelMemcpyKernelToUserForPidUnchecked) {
 
 EXPORT(int, ksceKernelMemcpyUserToKernel, Ptr<void> dst, Ptr<const void> src, SceSize len) {
     memcpy(dst.get(emuenv.mem), src.get(emuenv.mem), len);
+    mem_mark_written(emuenv.mem, dst.address(), len);
     return 0;
 }
 

@@ -1924,6 +1924,8 @@ struct WasmJitCPU::Impl {
                 ? reinterpret_cast<uintptr_t>(mem_state->page_table.get()) : 0;
             state.page_perms_base = reinterpret_cast<uintptr_t>(mem_state->page_permissions.get());
             state.code_pages_base = reinterpret_cast<uintptr_t>(g_code_pages.data());
+            state.write_epochs_base = reinterpret_cast<uintptr_t>(mem_state->write_epochs.get());
+            state.write_epoch = mem_state->write_epoch;
             state.smc_dirty = 0;
             state.smc_page = 0;
             // stop() owns an atomic request. Mirror it at entry and return
@@ -2164,6 +2166,8 @@ struct WasmJitCPU::Impl {
                 ? reinterpret_cast<uintptr_t>(mem_state->page_table.get()) : 0;
             state.page_perms_base = reinterpret_cast<uintptr_t>(mem_state->page_permissions.get());
             state.code_pages_base = reinterpret_cast<uintptr_t>(g_code_pages.data());
+            state.write_epochs_base = reinterpret_cast<uintptr_t>(mem_state->write_epochs.get());
+            state.write_epoch = mem_state->write_epoch;
             // Fast-path tallies are per-call scratch (REGION_ABI.md): zero
             // them before the snapshot so the fault rollback below cannot
             // resurrect stale counts.

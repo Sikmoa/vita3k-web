@@ -42,6 +42,9 @@ enum class ExitReason : uint32_t {
 };
 
 // Shared with generated Wasm, not Dynarmic's native backend JitState.
+// 1M-entry table standing in for MemState::write_epochs until a CPU binds one.
+HostAddress scratch_write_epochs();
+
 struct JitState {
     uint32_t regs[16];
     uint32_t cpsr;
@@ -100,6 +103,12 @@ struct JitState {
     // AOT only: member block index at which the next AOT function starts
     // (written by the transfer helper right before the tail call).
     uint32_t aot_entry;          // +456
+    // Guest write tracking (mem/functions.h mem_mark_written): every inline
+    // store records write_epoch for its page in the table at write_epochs_base.
+    uint32_t write_epoch;           // +460
+    // A value-initialized state points at a scratch table, so generated
+    // stores can never write through a null base (tests, block mode).
+    HostAddress write_epochs_base = scratch_write_epochs(); // +464 MemState::write_epochs
 };
 static_assert(std::is_standard_layout_v<JitState>);
 static_assert(sizeof(JitState::regs) == 16 * sizeof(uint32_t));
@@ -131,7 +140,9 @@ static_assert(offsetof(JitState, mutex_fast_take) == 444);
 static_assert(offsetof(JitState, mutex_fast_release) == 448);
 static_assert(offsetof(JitState, mutex_fast_fallback) == 452);
 static_assert(offsetof(JitState, aot_entry) == 456);
-static_assert(sizeof(JitState) == 460);
+static_assert(offsetof(JitState, write_epoch) == 460);
+static_assert(offsetof(JitState, write_epochs_base) == 464);
+static_assert(sizeof(JitState) == 468);
 #else
 static_assert(sizeof(HostAddress) == sizeof(void *));
 static_assert(offsetof(JitState, memory_cookie) % alignof(HostAddress) == 0);

@@ -17,6 +17,7 @@
 
 #include "SceIofilemgr.h"
 
+#include <mem/functions.h>
 #include <io/functions.h>
 #include <kernel/types.h>
 
@@ -272,7 +273,10 @@ EXPORT(int, sceIoLseek32, const SceUID fd, const int32_t offset, const SceIoSeek
 
 EXPORT(int, sceIoRead, const SceUID fd, void *data, const SceSize size) {
     TRACY_FUNC(sceIoRead, fd, data, size);
-    return read_file(data, emuenv.io, fd, size, export_name);
+    const auto res = read_file(data, emuenv.io, fd, size, export_name);
+    if (res > 0)
+        mem_mark_written_host(emuenv.mem, data, static_cast<size_t>(res));
+    return res;
 }
 
 EXPORT(int, sceIoReadAsync) {

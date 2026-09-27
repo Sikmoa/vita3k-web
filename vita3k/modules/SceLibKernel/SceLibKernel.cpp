@@ -16,6 +16,7 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include "SceLibKernel.h"
+#include <mem/functions.h>
 #include <modules/module_parent.h>
 #include <v3kprintf.h>
 
@@ -157,6 +158,7 @@ EXPORT(int, sceClibMemcmpConstTime) {
 EXPORT(Ptr<void>, sceClibMemcpy, Ptr<void> dst, const void *src, SceSize len) {
     TRACY_FUNC(sceClibMemcpy, dst, src, len);
     memcpy(dst.get(emuenv.mem), src, len);
+    mem_mark_written(emuenv.mem, dst.address(), len);
     return dst;
 }
 
@@ -195,6 +197,7 @@ EXPORT(Ptr<void>, sceClibMemcpy_safe, Ptr<void> dst, const Ptr<void> src, SceSiz
 EXPORT(Ptr<void>, sceClibMemmove, Ptr<void> dst, const void *src, SceSize len) {
     TRACY_FUNC(sceClibMemmove, dst, src, len);
     memmove(dst.get(emuenv.mem), src, len);
+    mem_mark_written(emuenv.mem, dst.address(), len);
     return dst;
 }
 
@@ -206,6 +209,7 @@ EXPORT(int, sceClibMemmoveChk) {
 EXPORT(Ptr<void>, sceClibMemset, Ptr<void> dst, int ch, SceSize len) {
     TRACY_FUNC(sceClibMemset, dst, ch, len);
     memset(dst.get(emuenv.mem), ch, len);
+    mem_mark_written(emuenv.mem, dst.address(), len);
     return dst;
 }
 
@@ -649,6 +653,8 @@ EXPORT(SceSSize, sceIoPread, SceUID fd, void *buf, SceSize nbyte, SceOff offset)
     seek_file(fd, offset, SCE_SEEK_SET, emuenv.io, export_name);
     const auto res = read_file(buf, emuenv.io, fd, nbyte, export_name);
     seek_file(fd, pos, SCE_SEEK_SET, emuenv.io, export_name);
+    if (res > 0)
+        mem_mark_written_host(emuenv.mem, buf, static_cast<size_t>(res));
     return res;
 }
 

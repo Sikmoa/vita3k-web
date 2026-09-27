@@ -63,6 +63,18 @@ bool mem_fetch(const MemState &state, Address addr, void *destination, size_t si
 // the hook exists for the funnel that is actually used by tests and the
 // loader rather than pretending to cover every possible writer.
 extern void (*g_mem_write_observer)(Address addr, size_t size);
+// Guest write tracking for caches of guest data (the GXM texture cache): record
+// the current MemState::write_epoch for every page of [addr, addr + size).
+// mem_write() and JIT/AOT stores record automatically; HLE that writes through
+// Ptr<T>::get() must call this for the range it wrote.
+void mem_mark_written(MemState &state, Address addr, size_t size);
+// Same for HLE that received a host pointer into guest memory; a pointer
+// outside guest memory is ignored.
+void mem_mark_written_host(MemState &state, const void *pointer, size_t size);
+// Advance the write epoch (one per consumer check boundary) and return it.
+uint32_t mem_next_write_epoch(MemState &state);
+// Latest write epoch of any page in [addr, addr + size).
+uint32_t mem_written_epoch(const MemState &state, Address addr, size_t size);
 // Page-granular, outward-rounded guest permissions; default allocation is RWX.
 // Rejects invalid/unallocated ranges without changing permissions.
 bool mem_set_permissions(MemState &state, Address addr, size_t size, MemPerm perm);

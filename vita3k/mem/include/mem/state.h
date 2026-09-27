@@ -93,5 +93,9 @@ struct MemState {
     PageTable page_table;
     std::map<uint32_t, SparseAllocation> sparse_allocations; // keyed by first live page
     std::unique_ptr<MemPerm[]> page_permissions;
+    // Guest write tracking: the write epoch of the last write to each 4 KiB
+    // page (mem_mark_written). Generated code writes it inline for stores.
+    std::unique_ptr<uint32_t[]> write_epochs;
+    uint32_t write_epoch = 1;
     std::map<uint64_t, MemExternalMapping, std::greater<>> external_mapping;
 };

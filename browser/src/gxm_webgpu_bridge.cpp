@@ -109,7 +109,16 @@ EM_JS(int, web_gxm_survey_enabled, (), {
 
 namespace {
 // Host milliseconds per stage, reported with the run progress.
-struct Timing { double build = 0, decode = 0, submit = 0; unsigned decodes = 0; };
+struct Timing {
+    double build = 0, decode = 0, submit = 0;
+    unsigned decodes = 0, hashes = 0, clean = 0, untracked = 0;
+};
+// VITA3K_TEXTURE_VERIFY=1: hash every bound texture even when no write was
+// tracked, and report changes the write tracking missed.
+bool texture_verify() {
+    static const bool enabled = std::getenv("VITA3K_TEXTURE_VERIFY") != nullptr;
+    return enabled;
+}
 Timing &timing() {
     static Timing t;
     return t;
@@ -177,7 +186,8 @@ struct WebState final : renderer::State {
 namespace browser {
 void gxm_timing_report() {
     const auto &t = timing();
-    std::printf("[gxm] scene_ms=%.0f (decode_ms=%.0f decodes=%u js_submit_ms=%.0f)\n", t.build, t.decode, t.decodes, t.submit);
+    std::printf("[gxm] scene_ms=%.0f (decode_ms=%.0f decodes=%u hashes=%u clean=%u untracked=%u js_submit_ms=%.0f)\n",
+        t.build, t.decode, t.decodes, t.hashes, t.clean, t.untracked, t.submit);
 }
 void gxm_survey_report() {
     for (const auto &[reason, count] : survey_counts())
@@ -479,15 +489,19 @@ std::unordered_map<Address, RenderedTarget> &rendered_targets() {
     return targets;
 }
 
+// A texture is rehashed only when a page of its guest bytes was written
+// (MemState write epochs) since the submission that last checked it.
 struct CachedTexture {
     uint32_t id = 0;
     uint64_t hash = 0;
-    uint64_t checked_frame = UINT64_MAX;
+    uint32_t checked_epoch = 0; // 0 = never checked
+    Address source = 0;
+    uint32_t footprint = 0;
 };
 struct TextureCache {
     std::unordered_map<uint64_t, CachedTexture> entries;
     uint32_t next_id = 1;
-    uint64_t frame = 0; // advanced per submitted scene: guest pixels are rehashed once per scene
+    uint32_t epoch = 0; // write epoch of the submission being built
 };
 TextureCache &texture_cache() {
     static TextureCache cache;
@@ -571,6 +585,8 @@ static void decode_texel(SceGxmTextureBaseFormat base, const uint8_t *src, uint8
 // upload_texture (levels, alignment and swizzle/tiled order), or false with a
 // reason when the layout/format is not supported yet.
 struct DecodedTexture {
+    Address source = 0;     // guest bytes the chain is decoded from
+    uint32_t footprint = 0;
     uint32_t width = 0, height = 0, levels = 0;
     std::vector<std::pair<uint32_t, uint32_t>> level_bytes; // offset, size in the scene data
 };
@@ -634,6 +650,8 @@ static bool decode_texture(MemState &mem, const SceGxmTexture &t, scene::Writer 
         return false;
     }
     const uint8_t *source = Ptr<const uint8_t>(address).get(mem);
+    decoded.source = address;
+    decoded.footprint = static_cast<uint32_t>(footprint);
     source_hash = XXH3_64bits(source, footprint);
     if (known_hash && source_hash == known_hash)
         return true;
@@ -750,9 +768,13 @@ static bool bind_texture(MemState &mem, const SceGxmTexture &t, scene::Writer &o
     if (!entry.id)
         entry.id = cache.next_id++;
     bound.id = entry.id;
-    if (entry.checked_frame == cache.frame)
+    const bool unwritten = entry.checked_epoch
+        && mem_written_epoch(mem, entry.source, entry.footprint) < entry.checked_epoch;
+    if (unwritten && !texture_verify()) {
+        ++timing().clean;
         return true;
-    // An unchanged texture costs one hash of its guest bytes.
+    }
+    // Written (or never seen): one hash of its guest bytes, decoded only if changed.
     scene::Writer scratch;
     DecodedTexture decoded;
     uint64_t hash = 0;
@@ -764,9 +786,17 @@ static bool bind_texture(MemState &mem, const SceGxmTexture &t, scene::Writer &o
         why = reason;
         return false;
     }
-    entry.checked_frame = cache.frame;
+    ++timing().hashes;
+    entry.checked_epoch = cache.epoch;
+    entry.source = decoded.source;
+    entry.footprint = decoded.footprint;
     if (!decoded.levels)
         return true;
+    if (unwritten) {
+        // VITA3K_TEXTURE_VERIFY: the bytes changed without a tracked write.
+        if (++timing().untracked <= 20)
+            std::printf("[gxm-verify] untracked write to texture %08x (+%x bytes)\n", entry.source, entry.footprint);
+    }
     ++timing().decodes;
     entry.hash = hash;
     out.word(scene::Texture);
@@ -1203,6 +1233,7 @@ static int transfer_fill(MemState &mem, uint32_t color, const SceGxmTransferImag
         auto *row = reinterpret_cast<uint32_t *>(base + size_t(y) * d.stride);
         std::fill(row, row + d.width, color);
     }
+    mem_mark_written(mem, static_cast<Address>(start), static_cast<size_t>(end - start));
     // The GPU copy of a rendered target at this address gets the same
     // rectangle (gxm_scene.js clears or writes it, keeping the target size).
     const Address target = d.address.address();
@@ -1222,9 +1253,9 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
     auto &web_state = static_cast<WebState &>(state);
     auto &mem = web_state.mem;
     if (!list.first) return;
-    // The guest may rewrite a texture between scenes: every submission
-    // rehashes each texture it binds (once), decoding only changed ones.
-    ++texture_cache().frame;
+    // Writes after this point (the guest's next scene, stream-ordered
+    // transfer fills) belong to a new epoch the next check will see.
+    texture_cache().epoch = mem_next_write_epoch(mem);
     auto &out = scene::writer();
     out.reset();
     int result = 0;

@@ -135,6 +135,7 @@ bool init(MemState &state, const bool use_page_table) {
     try {
         state.alloc_table = AllocPageTable(new AllocMemPage[PAGE_COUNT]{});
         state.page_permissions = std::make_unique<MemPerm[]>(PAGE_COUNT);
+        state.write_epochs = std::make_unique<uint32_t[]>(PAGE_COUNT);
         state.allocator.set_maximum(PAGE_COUNT);
         state.use_page_table = !state.direct_host_memory && (state.sparse_host_memory || use_page_table);
         if (state.use_page_table) {
@@ -384,6 +385,7 @@ bool mem_write(MemState &state, Address addr, const void *source, size_t size) {
         return false;
     if (g_mem_write_observer)
         g_mem_write_observer(addr, size);
+    mem_mark_written(state, addr, size);
     if (state.direct_host_memory) {
         if (size)
             std::memcpy(vita3k::memory::direct_pointer(addr), source, size);
@@ -398,6 +400,34 @@ bool mem_write(MemState &state, Address addr, const void *source, size_t size) {
         size -= count;
     }
     return true;
+}
+
+void mem_mark_written(MemState &state, Address addr, size_t size) {
+    if (!size || !state.write_epochs)
+        return;
+    const uint64_t end = std::min<uint64_t>(uint64_t(addr) + size, TOTAL_MEM_SIZE);
+    for (uint64_t page = addr / STANDARD_PAGE_SIZE; page * STANDARD_PAGE_SIZE < end; ++page)
+        state.write_epochs[page] = state.write_epoch;
+}
+
+void mem_mark_written_host(MemState &state, const void *pointer, size_t size) {
+    Address addr = 0;
+    if (size && mem_host_to_guest(state, pointer, addr))
+        mem_mark_written(state, addr, size);
+}
+
+uint32_t mem_next_write_epoch(MemState &state) {
+    return ++state.write_epoch;
+}
+
+uint32_t mem_written_epoch(const MemState &state, Address addr, size_t size) {
+    if (!size || !state.write_epochs)
+        return 0;
+    uint32_t latest = 0;
+    const uint64_t end = std::min<uint64_t>(uint64_t(addr) + size, TOTAL_MEM_SIZE);
+    for (uint64_t page = addr / STANDARD_PAGE_SIZE; page * STANDARD_PAGE_SIZE < end; ++page)
+        latest = std::max(latest, state.write_epochs[page]);
+    return latest;
 }
 
 bool mem_set_permissions(MemState &state, Address addr, size_t size, MemPerm perm) {
@@ -803,6 +833,7 @@ void deinit_mem(MemState &state) {
 
     state.sparse_allocations.clear();
     state.page_permissions.reset();
+    state.write_epochs.reset();
     state.sparse_host_memory = false;
     state.direct_host_memory = false;
 #ifdef VITA3K_WEB_MEMORY64

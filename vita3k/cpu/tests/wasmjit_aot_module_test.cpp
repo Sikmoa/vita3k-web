@@ -285,6 +285,23 @@ void tls_addr_intrinsic() {
     CHECK(cpu.get_reg(4) == kTpidruro - 0x800 + 4 * 5);
     CHECK(cpu.get_reg(0) == 0x200);
 }
+// Write tracking (mem_mark_written): guest stores through lazy regions and
+// through the AOT module record the current write epoch on the pages they
+// touch (the data table, the stack) and leave the code page alone.
+void write_epochs_recorded(bool aot) {
+    Fixture fixture;
+    CPUState parent{};
+    parent.mem = &fixture.mem;
+    WasmJitCPU cpu(&parent, 0);
+    cpu.set_region_mode(true);
+    reset(cpu, fixture.mem);
+    fixture.mem.write_epoch = 77; // reset's own mem_write carries the old epoch
+    run_to_svc(cpu, parent, 0);
+    CHECK(fixture.mem.write_epochs[kData >> 12] == 77);
+    CHECK(fixture.mem.write_epochs[(kStackTop - 4) >> 12] == 77);
+    CHECK(fixture.mem.write_epochs[kCode >> 12] != 77);
+    CHECK((cpu.regions_formed() == 0) == aot);
+}
 } // namespace
 
 int main() {
@@ -293,13 +310,15 @@ int main() {
     // ones make no progress by contract.
     for (const uint64_t slice : {0u, 64u, 65u, 71u, 97u, 128u})
         check_same(oracle, run_lazy(slice));
+    write_epochs_recorded(false);
     build_and_load();
     check_same(oracle, run_aot(0));
     for (const uint64_t slice : {1u, 2u, 3u, 7u, 50u, 1000u})
         check_same(oracle, run_aot(slice));
+    write_epochs_recorded(true);
     vector_min_max_flags();
     tls_addr_intrinsic();
     invalidation_retires_aot();
-    std::printf("AOT module: %u checks passed (interpreter oracle, lazy JIT, AOT with slices, invalidation, VMIN/VMAX flags, TLS intrinsic)\n", checks);
+    std::printf("AOT module: %u checks passed (interpreter oracle, lazy JIT, AOT with slices, write epochs, invalidation, VMIN/VMAX flags, TLS intrinsic)\n", checks);
     return 0;
 }

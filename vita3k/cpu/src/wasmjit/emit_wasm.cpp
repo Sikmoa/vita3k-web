@@ -419,6 +419,10 @@ constexpr uint32_t kAblateHoistSmc = 16u;
 } // namespace
 // Exported override + flag reader live in wasmjit scope (header-declared).
 // Anonymous-namespace constants above stay visible here (same TU).
+HostAddress scratch_write_epochs() {
+    static std::array<uint32_t, 1u << 20> table{};
+    return reinterpret_cast<HostAddress>(table.data());
+}
 uint32_t g_ablate_override = 0;
 void set_ablate_flags(uint32_t flags) { g_ablate_override = flags; }
 RegionStateOptions region_state_options() {
@@ -895,6 +899,7 @@ private:
         op(Store); memarg(code, 2, 8);
         guest_effective_address(address, backing); get(owner);
         op(Store); memarg(code, 2, 0);
+        mark_written(address);
         store_constant(offsetof(JitState, exclusive_size), 0);
         if (region) { imm(0); set(reg_base); }
         else store_constant(offsetof(JitState, regs), 0);
@@ -958,6 +963,16 @@ private:
         memory_base(page_perms_local, offsetof(JitState, page_perms_base)); op(host_eqz);
         if (!memory64) op(Or);
         memory_base(code_pages_local, offsetof(JitState, code_pages_base)); op(host_eqz); op(Or);
+    }
+    // Guest write tracking: store the current write epoch into the page
+    // entry of the byte at `address` + `offset` (mem_mark_written's inline form).
+    void mark_written(uint32_t address, uint32_t offset = 0) {
+        b_load_host(code, offsetof(JitState, write_epochs_base));
+        get(address);
+        if (offset) { imm(offset); op(Add); }
+        imm(12); op(ShrU); imm(2); op(Shl); address_add_i32(code);
+        load(offsetof(JitState, write_epoch));
+        op(Store); uleb(code, 2); uleb(code, 0);
     }
     void guest_effective_address(uint32_t address, uint32_t backing) {
         if (memory64) {
@@ -1046,6 +1061,7 @@ private:
             if (bytes == 1) { op(Store8); uleb(code, 0); uleb(code, 0); }
             else if (bytes == 2) { op(Store16); uleb(code, 1); uleb(code, 0); }
             else { op(Store); uleb(code, 2); uleb(code, 0); }
+            mark_written(addr_local); // the fast path never crosses a page
             if (state.count_fast_memory()) {
                 get(0); load(offsetof(JitState, mem_fast_writes)); imm(1); op(Add);
                 store(offsetof(JitState, mem_fast_writes));
@@ -1089,6 +1105,12 @@ private:
                 else { op(Load); memarg(code, 2, offset); }
                 set(next_local + word);
             }
+        }
+        if (write) {
+            // At most 16 bytes span at most two pages: mark both ends.
+            mark_written(addr_local);
+            if (bytes > 1)
+                mark_written(addr_local, bytes - 1);
         }
     }
 
