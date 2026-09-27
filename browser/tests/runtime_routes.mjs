@@ -45,7 +45,8 @@ function runtimeFile(path) {
 export async function readRuntimeFile(path) {
   const file = runtimeFile(path);
   const type = file.endsWith('.wasm') ? 'application/wasm'
-    : file.endsWith('.html') ? 'text/html' : 'text/javascript';
+    : file.endsWith('.html') ? 'text/html'
+    : file.endsWith('.css') ? 'text/css' : 'text/javascript';
   return { content: await readFile(file), type };
 }
 
