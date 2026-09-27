@@ -28,6 +28,7 @@
 //   LIMBO_HEADED=1          headed browser (headless Chrome only has SwiftShader WebGPU)
 //   LIMBO_GUEST_CORES=N     emulated guest CPU cores (default 3; 1 = single-core scheduler)
 //   LIMBO_FPS_HACK=1        Vita3K fps-hack: display waits use one vblank
+//   LIMBO_TEXTURE_VERIFY=1  verify cached textures/vertex streams against guest memory
 //   LIMBO_AOT               ahead-of-time module to supply to the run (AOT.md)
 //   LIMBO_LOG_OUT           write the retained worker log tail (4000 lines) to this file
 import { createServer } from 'node:http';
@@ -53,6 +54,9 @@ const hleProfile = process.env.LIMBO_HLE_PROFILE === '1';
 // presses cross every 5 s after the loading window and holds the left stick
 // right once gameplay starts. The run ends after the gameplay window.
 const measure = process.env.LIMBO_MEASURE === '1';
+// LIMBO_PROFILE=0 keeps the measurement windows but skips the CPU profiler,
+// which itself costs guest throughput.
+const profileWindows = process.env.LIMBO_PROFILE !== '0';
 // Scripted pad input: LIMBO_INPUT="<ms>:<input>[+<input>]:<hold ms>,..." with
 // times relative to run-app, e.g. "30000:cross:200,32000:lstick-right:5000".
 const ctrlButtons = { select: 0x1, start: 0x8, up: 0x10, right: 0x20, down: 0x40, left: 0x80,
@@ -294,6 +298,7 @@ try {
         .catch(rejectCall);
     });
     await page.exposeFunction('limboMeasure', async ({ kind, name }) => {
+      if (!profileWindows) return;
       if (kind === 'start') {
         await workerCall('Profiler.enable');
         await workerCall('Profiler.setSamplingInterval', { interval: 500 });
@@ -307,8 +312,8 @@ try {
     });
   }
 
-  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver, useAot, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack }) => {
-    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&revalidateAll=${revalidateAll ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}`, { type: 'module' });
+  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver, useAot, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify }) => {
+    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&revalidateAll=${revalidateAll ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}${textureVerify ? '&textureVerify=1' : ''}`, { type: 'module' });
     const state = { logs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
       backend: null, memory: null, workerErrors: [], ready: false, timedOut: false,
       gxmDraws: 0, latestProgress: null, profiles: {}, jitThreads: {}, runStartedAt: null,
@@ -477,7 +482,7 @@ try {
       };
     });
     return result;
-  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver, useAot: Boolean(aotPath), fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1' });
+  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver, useAot: Boolean(aotPath), fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1' });
 
   const saved = [];
   for (const frame of outcome.saved) {
