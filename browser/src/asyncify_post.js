@@ -7,12 +7,13 @@
 // stack/setThrew helpers those wrappers call. An unwind through them is stopped
 // by the outer export and replayed through the import call on rewind, so the
 // wrapper adds nothing there but garbage on every C++ call that has a landing
-// pad. dynCall_vj stays wrapped: the fiber trampoline calls it as the outermost
-// entry of a new fiber. Needs unminified export names
+// pad. The fiber trampoline enters a new fiber through dynCall_vp (library_async
+// finishContextSwitch), dynCall_vj under Memory64 and dynCall_vi in wasm32:
+// that entry is outermost, so both stay wrapped. Needs unminified export names
 // (-lexports.js disables their minification).
 {
   const instrument = Asyncify.instrumentWasmExports;
-  const nested = /^(dynCall_(?!vj$)\w+|emscripten_stack_get_current|_emscripten_stack_restore|setThrew)$/;
+  const nested = /^(dynCall_(?!v[ij]$)\w+|emscripten_stack_get_current|_emscripten_stack_restore|setThrew)$/;
   Asyncify.instrumentWasmExports = (exports) => {
     const wrapped = instrument(exports);
     let kept = 0;
