@@ -203,8 +203,6 @@ set(_staged_assets
     "${CMAKE_CURRENT_SOURCE_DIR}/web/worker.js|${CMAKE_BINARY_DIR}/dist/worker.js"
     "${CMAKE_CURRENT_SOURCE_DIR}/web/capabilities.js|${CMAKE_BINARY_DIR}/dist/capabilities.js"
     "${CMAKE_CURRENT_SOURCE_DIR}/web/storage.js|${CMAKE_BINARY_DIR}/dist/storage.js"
-    "${CMAKE_CURRENT_SOURCE_DIR}/web/webgpu.js|${CMAKE_BINARY_DIR}/dist/webgpu.js"
-    "${CMAKE_CURRENT_SOURCE_DIR}/web/gxm_renderer.js|${CMAKE_BINARY_DIR}/dist/gxm_renderer.js"
     "${CMAKE_CURRENT_SOURCE_DIR}/web/audio_input.js|${CMAKE_BINARY_DIR}/dist/audio_input.js"
 )
 set(_stage_outputs "")

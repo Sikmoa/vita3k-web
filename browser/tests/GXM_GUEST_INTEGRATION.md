@@ -26,8 +26,6 @@ Use VERIFICATION_QUEUE.md for current bounded build/regression commands with
 runner-owned scratch/cache directories. The historical guest-probe builder and
 server still assume a previous host's shader/WASI asset staging arrangement;
 they need portable dependency paths before they are clean-checkout commands.
-The asset-free `gxm_webgpu_smoke.mjs` remains directly runnable. No commands
-were executed in the C1 pipeline-cache batch.
 
 Historical color-only baseline: guest `exit 42`, 56 imports, zero missing NIDs,
 `missingSceGxmBridge=false`, two draw readback log lines. The extended texture
@@ -37,9 +35,8 @@ passed: exit 42, 113 imports, zero missing NIDs, and nine readbacks on the
 Memory64 WASM JIT in Chromium/SwiftShader. This is the extended fixture's result,
 not the old color-only result.
 
-Regression baseline: `gxm_webgpu_smoke.mjs` (68 checks),
-`gxp_webgpu_smoke.mjs` (8 checks), `gxp_translation_smoke.mjs` (22 checks),
-and `gxm_guest_probe_chromium.mjs` all pass in Chromium/SwiftShader.
+Regression baseline: `gxp_translation_smoke.mjs` (22 checks) and
+`gxm_guest_probe_chromium.mjs` pass in Chromium/SwiftShader.
 Host-only shader/renderer checks do not substitute for guest execution.
 
 ## Integration blockers / notes
@@ -260,9 +257,6 @@ timeout -s KILL 180s cmake --build build/web64 --target vita3k_web_jit -j1
 bash browser/tests/build_gxm_guest_probe.sh
 PLAYWRIGHT_MODULE_URL="file://$PWD/build/playwright/node_modules/playwright/index.mjs" \
   timeout -s KILL 60s node browser/tests/gxm_guest_probe_chromium.mjs
-# Separate subsequent regression, never parallel with the Memory64 guest:
-PLAYWRIGHT_MODULE_URL="file://$PWD/build/playwright/node_modules/playwright/index.mjs" \
-  timeout -s KILL 60s node browser/tests/gxm_webgpu_smoke.mjs
 ```
 
 Native rejection branches (invalid guest range, unsupported descriptor, missing

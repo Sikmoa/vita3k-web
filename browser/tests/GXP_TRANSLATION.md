@@ -109,8 +109,7 @@ PLAYWRIGHT_MODULE_URL="file://$PWD/build/playwright/node_modules/playwright/inde
 # → {"checks":22,"browserTranslation":true,"texturedPixels":true,"guestExecution":false,...}
 ```
 
-Legacy smoke `gxp_webgpu_smoke.mjs` (8 checks, color shaders only, native
-oracle + Naga CLI) also passes. Note: on this host Playwright Chromium fails to
+Note: on this host Playwright Chromium fails to
 create shared memory inside the repo's AppArmor-limited `TMPDIR`, so browser
 tests must run with `TMPDIR=/tmp` **and** rely on the
 `ignoreDefaultArgs: ['--disable-dev-shm-usage']` launch option (already set in

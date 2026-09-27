@@ -203,13 +203,11 @@ M4 adds an explicit Worker lifecycle (`loading`, `ready`, `paused`, `stopped`,
 and `error`) with timestamped events, status/pause/resume/shutdown commands,
 and module diagnostics. M5 adds `browser/web/storage.js`, a logical-path Fetch
 read bridge; writes intentionally require an application upload endpoint rather
-than pretending that HTTP is writable storage. M6 adds `browser/web/webgpu.js`,
-which reports WebGPU support and can request a device without coupling the
-native renderer to browser APIs. M7 adds `browser/web/audio_input.js`, with a
+than pretending that HTTP is writable storage. M7 adds `browser/web/audio_input.js`, with a
 queued input API and block-oriented Float32 audio validation; actual
 AudioWorklet output and SDL/HLE integration remain future work.
 
-All three host bridges are staged by the browser CMake target and are exposed
+Both host bridges are staged by the browser CMake target and are exposed
 through `globalThis.vita3kWeb`. Validate the assembled browser target with:
 
 ```sh
