@@ -939,7 +939,10 @@ struct SceKernelCreateThread_opt {
     SceUInt attr;
     int cpu_affinity_mask;
     Ptr<SceKernelThreadOptParam> option;
+    // Return address of the sceKernelCreateThread call.
+    Address caller;
 };
+static_assert(sizeof(SceKernelCreateThread_opt) == 0x18);
 
 typedef SceInt32(SceKernelCallbackFunction)(SceUID notifyId, SceInt32 notifyCount, SceInt32 notifyArg, void *pCommon);
 

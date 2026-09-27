@@ -161,7 +161,7 @@ inline void test_inline_mutex_runtime() {
         }
         const auto m = env->kernel.lwmutexes.at(id);
         REQUIRE(!m->owner && m->lock_count == 0 && m->waiting_threads->empty());
-        REQUIRE(mutex_delete(env->kernel, "fixture", t->id, id, SyncWeight::Light) == 0);
+        REQUIRE(mutex_close(env->kernel, env->mem, "fixture", t->id, id, SyncWeight::Light, HandleClose::Delete) == 0);
         if (has_table) {
             // Delete clears the lifetime tag so a cached stub cannot own it stale.
             bool any_uid = false;
@@ -203,7 +203,7 @@ inline void test_inline_mutex_runtime() {
             REQUIRE(m->owner == t && m->lock_count == 1);
             REQUIRE(env->kernel.inline_mutex_table->entries[inline_mutex_index(m->workarea.address())].dirty == 0);
             REQUIRE(mutex_unlock(env->kernel, "fixture", t->id, id, 1, SyncWeight::Light) == 0);
-            REQUIRE(mutex_delete(env->kernel, "fixture", t->id, id, SyncWeight::Light) == 0);
+            REQUIRE(mutex_close(env->kernel, env->mem, "fixture", t->id, id, SyncWeight::Light, HandleClose::Delete) == 0);
         }
         REQUIRE(runtime.shutdown());
     }
@@ -253,7 +253,7 @@ inline void test_inline_mutex_runtime() {
         REQUIRE(m->waiting_threads->empty());
         REQUIRE(hle_unlocks >= 1); // owner unlock took slow path to wake directly
         REQUIRE(mutex_unlock(env->kernel, "fixture", contender->id, id, 1, SyncWeight::Light) == 0);
-        REQUIRE(mutex_delete(env->kernel, "fixture", contender->id, id, SyncWeight::Light) == 0);
+        REQUIRE(mutex_close(env->kernel, env->mem, "fixture", contender->id, id, SyncWeight::Light, HandleClose::Delete) == 0);
         REQUIRE(runtime.shutdown());
         REQUIRE(env->kernel.threads.empty());
     }
@@ -282,7 +282,7 @@ inline void test_inline_mutex_runtime() {
             REQUIRE(slot.workarea == work && slot.uid == uint32_t(a));
         }
         // Deleting the colliding second object must not clear the first slot.
-        REQUIRE(mutex_delete(env->kernel, "fixture", 0, b, SyncWeight::Light) == 0);
+        REQUIRE(mutex_close(env->kernel, env->mem, "fixture", 0, b, SyncWeight::Light, HandleClose::Delete) == 0);
         if (has_table) {
             const auto idx = inline_mutex_index(work);
             REQUIRE(env->kernel.inline_mutex_table->entries[idx].workarea == work);
@@ -302,7 +302,7 @@ inline void test_inline_mutex_runtime() {
         auto first = runtime.resume(64);
         REQUIRE(first.failed == 0 && first.idle && looper->returned_value == 42);
         REQUIRE(diag_calls == 1 && hle_locks == 0 && hle_unlocks == 0);
-        REQUIRE(mutex_delete(env->kernel, "fixture", 0, a, SyncWeight::Light) == 0);
+        REQUIRE(mutex_close(env->kernel, env->mem, "fixture", 0, a, SyncWeight::Light, HandleClose::Delete) == 0);
         if (has_table) {
             const auto idx = inline_mutex_index(work);
             REQUIRE(env->kernel.inline_mutex_table->entries[idx].uid == 0);
@@ -325,7 +325,7 @@ inline void test_inline_mutex_runtime() {
         const auto second = runtime.resume(64);
         REQUIRE(second.failed == 0 && second.idle && looper->returned_value == 42);
         REQUIRE(diag_calls == 2 && hle_locks == 0 && hle_unlocks == 0);
-        REQUIRE(mutex_delete(env->kernel, "fixture", 0, c, SyncWeight::Light) == 0);
+        REQUIRE(mutex_close(env->kernel, env->mem, "fixture", 0, c, SyncWeight::Light, HandleClose::Delete) == 0);
         observed_mutex = -1;
         REQUIRE(runtime.shutdown());
         REQUIRE(env->kernel.threads.empty());
@@ -350,7 +350,7 @@ inline void test_inline_mutex_runtime() {
         REQUIRE(m->lock_count == 1);
         REQUIRE(mutex_unlock(env->kernel, "fixture", owner->id, id, 1, SyncWeight::Light) == 0);
         REQUIRE(!m->owner && m->lock_count == 0);
-        REQUIRE(mutex_delete(env->kernel, "fixture", owner->id, id, SyncWeight::Light) == 0);
+        REQUIRE(mutex_close(env->kernel, env->mem, "fixture", owner->id, id, SyncWeight::Light, HandleClose::Delete) == 0);
         // Non-recursive self-lock must return the existing recursion error.
         SceUID id2 = -1;
         REQUIRE(mutex_create(&id2, env->kernel, env->mem, "fixture", "nonrec",
@@ -362,7 +362,7 @@ inline void test_inline_mutex_runtime() {
         REQUIRE(self_rc == SCE_KERNEL_ERROR_LW_MUTEX_RECURSIVE);
         REQUIRE(m2->lock_count == 1 && m2->owner == owner);
         REQUIRE(mutex_unlock(env->kernel, "fixture", owner->id, id2, 1, SyncWeight::Light) == 0);
-        REQUIRE(mutex_delete(env->kernel, "fixture", owner->id, id2, SyncWeight::Light) == 0);
+        REQUIRE(mutex_close(env->kernel, env->mem, "fixture", owner->id, id2, SyncWeight::Light, HandleClose::Delete) == 0);
         REQUIRE(runtime.shutdown());
         REQUIRE(env->kernel.threads.empty());
     }

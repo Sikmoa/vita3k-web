@@ -29,7 +29,7 @@ struct sceKernelRegisterThreadEventHandlerOpt {
 };
 
 DECL_EXPORT(SceUID, _sceKernelCreateCond, const char *pName, SceUInt32 attr, SceUID mutexId, const SceKernelCondOptParam *pOptParam);
-DECL_EXPORT(SceInt32, _sceKernelGetCondInfo, SceUID condId, Ptr<SceKernelCondInfo> pInfo);
+DECL_EXPORT(SceInt32, _sceKernelGetCondInfo, SceUID condId, Ptr<SceKernelCondInfo> pInfo, const SceSize *pSize);
 DECL_EXPORT(SceUID, _sceKernelCreateSimpleEvent, const char *name, SceUInt32 attr, SceUInt32 init_pattern, const SceKernelSimpleEventOptParam *pOptParam);
 DECL_EXPORT(int, _sceKernelCreateTimer, const char *name, SceUInt32 attr, const uint32_t *opt_params);
 DECL_EXPORT(int, _sceKernelPollEvent, SceUID event_id, SceUInt32 bit_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data);
@@ -38,7 +38,7 @@ DECL_EXPORT(int, _sceKernelWaitEventCB, SceUID event_id, SceUInt32 bit_pattern, 
 DECL_EXPORT(int, __sceKernelCreateLwMutex, Ptr<SceKernelLwMutexWork> workarea, const char *name, unsigned int attr, Ptr<SceKernelCreateLwMutex_opt> opt);
 DECL_EXPORT(int, _sceKernelDeleteLwMutex, Ptr<SceKernelLwMutexWork> workarea);
 DECL_EXPORT(int, _sceKernelLockLwMutex, Ptr<SceKernelLwMutexWork> workarea, int lock_count, unsigned int *ptimeout);
-DECL_EXPORT(int, _sceKernelGetLwMutexInfoById, SceUID lightweight_mutex_id, Ptr<SceKernelLwMutexInfo> info, SceSize size);
+DECL_EXPORT(SceInt32, _sceKernelGetLwMutexInfoById, SceUID lightweight_mutex_id, Ptr<SceKernelLwMutexInfo> pInfo, const SceSize *pSize);
 DECL_EXPORT(SceUID, _sceKernelCreateRWLock, const char *name, SceUInt32 attr, SceKernelMutexOptParam *opt_param);
 DECL_EXPORT(int, _sceKernelCreateMutex, const char *name, SceUInt attr, int init_count, SceKernelMutexOptParam *opt_param);
 DECL_EXPORT(int, sceKernelDeleteMutex, SceUID mutexid);
@@ -50,8 +50,8 @@ DECL_EXPORT(SceInt32, _sceKernelLockReadRWLockCB, SceUID lock_id, SceUInt32 *tim
 DECL_EXPORT(SceInt32, _sceKernelLockWriteRWLock, SceUID lock_id, SceUInt32 *timeout);
 DECL_EXPORT(SceInt32, _sceKernelLockWriteRWLockCB, SceUID lock_id, SceUInt32 *timeout);
 DECL_EXPORT(int, _sceKernelCreateLwCond, Ptr<SceKernelLwCondWork> workarea, const char *name, SceUInt attr, Ptr<SceKernelCreateLwCond_opt> opt);
-DECL_EXPORT(SceInt32, _sceKernelGetCallbackInfo, SceUID callbackId, SceKernelCallbackInfo *pInfo);
-DECL_EXPORT(int, _sceKernelGetRWLockInfo, SceUID rwlockId, SceKernelRWLockInfo *info);
+DECL_EXPORT(SceInt32, _sceKernelGetCallbackInfo, SceUID callbackId, SceKernelCallbackInfo *pInfo, const SceSize *pSize);
+DECL_EXPORT(SceInt32, _sceKernelGetRWLockInfo, SceUID rwlockId, Ptr<SceKernelRWLockInfo> pInfo, const SceSize *pSize);
 DECL_EXPORT(SceInt32, _sceKernelGetThreadCpuAffinityMask, SceUID thid);
 DECL_EXPORT(SceInt32, _sceKernelWaitLwCondCB, Ptr<SceKernelLwCondWork> pWork, SceUInt32 *pTimeout);
 DECL_EXPORT(int, _sceKernelDeleteLwCond, Ptr<SceKernelLwCondWork> workarea);
@@ -62,20 +62,26 @@ DECL_EXPORT(int, _sceKernelWaitLwCond, Ptr<SceKernelLwCondWork> workarea, SceUIn
 DECL_EXPORT(int, sceKernelCreateThreadForUser, const char *name, SceKernelThreadEntry entry, int init_priority, SceKernelCreateThread_opt *options);
 DECL_EXPORT(int, _sceKernelStartThread, SceUID thid, SceSize arglen, Ptr<void> argp);
 DECL_EXPORT(SceInt32, _sceKernelGetThreadInfo, SceUID threadId, Ptr<SceKernelThreadInfo> pInfo, const SceSize *pSize);
+DECL_EXPORT(int, _sceKernelGetThreadExitStatus, SceUID thid, SceInt32 *pExitStatus);
+
+// SceKernelThreadMgr 3.74 thread record fill, which ksceKernelGetThreadInfo
+// is: thread 0 is the caller.
+SceInt32 get_thread_info(EmuEnvState &emuenv, const char *export_name, SceUID caller, SceUID thid, SceKernelThreadInfo *info);
+
 DECL_EXPORT(SceInt32, _sceKernelGetLwCondInfo, Ptr<SceKernelLwCondWork> workarea, Ptr<SceKernelLwCondInfo> pInfo);
 DECL_EXPORT(SceInt32, _sceKernelGetLwCondInfoById, SceUID lwCondId, Ptr<SceKernelLwCondInfo> pInfo, const SceSize *pSize);
 DECL_EXPORT(int, _sceKernelCancelMutex, SceUID mutexId, SceInt32 newCount, SceUInt32 *pNumWaitThreads);
 DECL_EXPORT(int, _sceKernelLockMutex, SceUID mutexid, int lock_count, unsigned int *timeout);
 DECL_EXPORT(SceUID, _sceKernelCreateEventFlag, const char *pName, SceUInt32 attr, SceUInt32 initPattern, const SceKernelEventFlagOptParam *pOptParam);
 DECL_EXPORT(int, _sceKernelCreateSema, const char *name, SceUInt attr, int initVal, Ptr<SceKernelCreateSema_opt> opt);
-DECL_EXPORT(int, _sceKernelGetMutexInfo, SceUID mutexId, SceKernelMutexInfo *pInfo);
-DECL_EXPORT(SceInt32, _sceKernelGetSemaInfo, SceUID semaId, Ptr<SceKernelSemaInfo> pInfo);
+DECL_EXPORT(SceInt32, _sceKernelGetMutexInfo, SceUID mutexId, Ptr<SceKernelMutexInfo> pInfo, const SceSize *pSize);
+DECL_EXPORT(SceInt32, _sceKernelGetSemaInfo, SceUID semaId, Ptr<SceKernelSemaInfo> pInfo, const SceSize *pSize);
 DECL_EXPORT(SceInt32, _sceKernelWaitCond, SceUID condId, SceUInt32 *pTimeout);
 DECL_EXPORT(SceInt32, _sceKernelWaitCondCB, SceUID condId, SceUInt32 *pTimeout);
 DECL_EXPORT(SceInt32, _sceKernelWaitEventFlagCB, SceUID evfId, SceUInt32 bitPattern, SceUInt32 waitMode, SceUInt32 *pResultPat, SceUInt32 *pTimeout);
 DECL_EXPORT(SceInt32, _sceKernelWaitSema, SceUID semaId, SceInt32 needCount, SceUInt32 *pTimeout);
 DECL_EXPORT(SceInt32, _sceKernelWaitSemaCB, SceUID semaId, SceInt32 needCount, SceUInt32 *pTimeout);
-DECL_EXPORT(SceInt32, _sceKernelGetEventFlagInfo, SceUID evfId, Ptr<SceKernelEventFlagInfo> pInfo);
+DECL_EXPORT(SceInt32, _sceKernelGetEventFlagInfo, SceUID evfId, Ptr<SceKernelEventFlagInfo> pInfo, const SceSize *pSize);
 DECL_EXPORT(SceInt32, _sceKernelGetEventPattern, SceUID event_id, SceUInt32 *get_pattern);
 DECL_EXPORT(int, _sceKernelPollEventFlag, SceUID event_id, unsigned int flags, unsigned int wait, unsigned int *outBits);
 DECL_EXPORT(SceInt32, _sceKernelCancelEventFlag, SceUID event_id, SceUInt pattern, SceUInt32 *num_wait_thread);

@@ -29,3 +29,4 @@ DECL_EXPORT(int, _sceKernelStopUnloadModule, SceUID uid, SceSize args, Ptr<const
 DECL_EXPORT(int, _sceKernelUnloadModule, SceUID uid, SceUInt32 flags, const void *pOpt);
 DECL_EXPORT(int, sceKernelGetModuleList, int flags, SceUID *modids, SceUInt32 *num);
 DECL_EXPORT(int, sceKernelGetModuleInfo, SceUID modid, SceKernelModuleInfo *info);
+DECL_EXPORT(int, sceKernelIsCalledFromSysModule, Address addr);

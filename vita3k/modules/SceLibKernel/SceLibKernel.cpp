@@ -1411,11 +1411,14 @@ EXPORT(SceUID, sceKernelCreateThread, const char *name, SceKernelThreadEntry ent
     TRACY_FUNC(sceKernelCreateThread, name, entry, init_priority, stack_size, attr, cpu_affinity_mask, option);
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
 
+    // SceLibKernel 3.74 passes the syscall its caller's return address.
     auto options = Ptr<SceKernelCreateThread_opt>(stack_alloc(*thread->cpu, sizeof(SceKernelCreateThread_opt))).get(emuenv.mem);
+    options->size = sizeof(SceKernelCreateThread_opt);
     options->stack_size = stack_size;
     options->attr = attr;
     options->cpu_affinity_mask = cpu_affinity_mask;
     options->option = option;
+    options->caller = read_lr(*thread->cpu);
     SceUID res = CALL_EXPORT(sceKernelCreateThreadForUser, name, entry, init_priority, options);
     stack_free(*thread->cpu, sizeof(SceKernelCreateThread_opt));
     return res;
@@ -1444,14 +1447,23 @@ EXPORT(int, sceKernelExitProcess, int res) {
     return SCE_KERNEL_OK;
 }
 
+// SceLibKernel 3.74 passes the info syscalls the record's size word (0
+// without a record).
+template <typename Info>
+static SceSize info_size(EmuEnvState &emuenv, Ptr<Info> info) {
+    return info ? info.get(emuenv.mem)->size : 0;
+}
+
 EXPORT(SceInt32, sceKernelGetCallbackInfo, SceUID callbackId, Ptr<SceKernelCallbackInfo> pInfo) {
     TRACY_FUNC(sceKernelGetCallbackInfo, callbackId, pInfo);
-    return CALL_EXPORT(_sceKernelGetCallbackInfo, callbackId, pInfo.get(emuenv.mem));
+    const SceSize size = info_size(emuenv, pInfo);
+    return CALL_EXPORT(_sceKernelGetCallbackInfo, callbackId, pInfo.get(emuenv.mem), &size);
 }
 
 EXPORT(SceInt32, sceKernelGetCondInfo, SceUID condId, Ptr<SceKernelCondInfo> pInfo) {
     TRACY_FUNC(sceKernelGetCondInfo, condId, pInfo);
-    return CALL_EXPORT(_sceKernelGetCondInfo, condId, pInfo);
+    const SceSize size = info_size(emuenv, pInfo);
+    return CALL_EXPORT(_sceKernelGetCondInfo, condId, pInfo, &size);
 }
 
 EXPORT(int, sceKernelGetCurrentThreadVfpException) {
@@ -1461,7 +1473,8 @@ EXPORT(int, sceKernelGetCurrentThreadVfpException) {
 
 EXPORT(SceInt32, sceKernelGetEventFlagInfo, SceUID evfId, Ptr<SceKernelEventFlagInfo> pInfo) {
     TRACY_FUNC(sceKernelGetEventFlagInfo, evfId, pInfo);
-    return CALL_EXPORT(_sceKernelGetEventFlagInfo, evfId, pInfo);
+    const SceSize size = info_size(emuenv, pInfo);
+    return CALL_EXPORT(_sceKernelGetEventFlagInfo, evfId, pInfo, &size);
 }
 
 EXPORT(int, sceKernelGetEventInfo) {
@@ -1479,20 +1492,16 @@ EXPORT(SceInt32, sceKernelGetLwCondInfo, Ptr<SceKernelLwCondWork> workarea, Ptr<
     return CALL_EXPORT(_sceKernelGetLwCondInfo, workarea, pInfo);
 }
 
-// SceLibKernel 3.74 passes the syscall the record's size word (0 without a record).
 EXPORT(SceInt32, sceKernelGetLwCondInfoById, SceUID lwCondId, Ptr<SceKernelLwCondInfo> pInfo) {
     TRACY_FUNC(sceKernelGetLwCondInfoById, lwCondId, pInfo);
-    const SceSize size = pInfo ? pInfo.get(emuenv.mem)->size : 0;
+    const SceSize size = info_size(emuenv, pInfo);
     return CALL_EXPORT(_sceKernelGetLwCondInfoById, lwCondId, pInfo, &size);
 }
 
-EXPORT(int, sceKernelGetLwMutexInfoById, SceUID lightweight_mutex_id, Ptr<SceKernelLwMutexInfo> info) {
+EXPORT(SceInt32, sceKernelGetLwMutexInfoById, SceUID lightweight_mutex_id, Ptr<SceKernelLwMutexInfo> info) {
     TRACY_FUNC(sceKernelGetLwMutexInfoById, lightweight_mutex_id, info);
-    SceSize size = 0;
-    if (info) {
-        size = info.get(emuenv.mem)->size;
-    }
-    return CALL_EXPORT(_sceKernelGetLwMutexInfoById, lightweight_mutex_id, info, size);
+    const SceSize size = info_size(emuenv, info);
+    return CALL_EXPORT(_sceKernelGetLwMutexInfoById, lightweight_mutex_id, info, &size);
 }
 
 EXPORT(int, sceKernelGetLwMutexInfo, Ptr<SceKernelLwMutexWork> workarea, Ptr<SceKernelLwMutexInfo> info) {
@@ -1516,9 +1525,10 @@ EXPORT(int, sceKernelGetMsgPipeInfo) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceKernelGetMutexInfo, SceUID mutexId, SceKernelMutexInfo *info) {
-    TRACY_FUNC(sceKernelGetMutexInfo, mutexId, info);
-    return CALL_EXPORT(_sceKernelGetMutexInfo, mutexId, info);
+EXPORT(SceInt32, sceKernelGetMutexInfo, SceUID mutexId, Ptr<SceKernelMutexInfo> pInfo) {
+    TRACY_FUNC(sceKernelGetMutexInfo, mutexId, pInfo);
+    const SceSize size = info_size(emuenv, pInfo);
+    return CALL_EXPORT(_sceKernelGetMutexInfo, mutexId, pInfo, &size);
 }
 
 EXPORT(int, sceKernelGetOpenPsId) {
@@ -1549,14 +1559,16 @@ EXPORT(SceUInt64, sceKernelGetProcessTimeWide) {
     return rtc_get_ticks(emuenv.kernel.base_tick.tick) - emuenv.kernel.start_tick;
 }
 
-EXPORT(int, sceKernelGetRWLockInfo, SceUID rwlockId, SceKernelRWLockInfo *info) {
-    TRACY_FUNC(sceKernelGetRWLockInfo, rwlockId, info);
-    return CALL_EXPORT(_sceKernelGetRWLockInfo, rwlockId, info);
+EXPORT(SceInt32, sceKernelGetRWLockInfo, SceUID rwlockId, Ptr<SceKernelRWLockInfo> pInfo) {
+    TRACY_FUNC(sceKernelGetRWLockInfo, rwlockId, pInfo);
+    const SceSize size = info_size(emuenv, pInfo);
+    return CALL_EXPORT(_sceKernelGetRWLockInfo, rwlockId, pInfo, &size);
 }
 
 EXPORT(SceInt32, sceKernelGetSemaInfo, SceUID semaId, Ptr<SceKernelSemaInfo> pInfo) {
     TRACY_FUNC(sceKernelGetSemaInfo, semaId, pInfo);
-    return CALL_EXPORT(_sceKernelGetSemaInfo, semaId, pInfo);
+    const SceSize size = info_size(emuenv, pInfo);
+    return CALL_EXPORT(_sceKernelGetSemaInfo, semaId, pInfo, &size);
 }
 
 EXPORT(int, sceKernelGetSystemInfo) {
@@ -1608,19 +1620,10 @@ EXPORT(int, sceKernelGetThreadEventInfo) {
     return UNIMPLEMENTED();
 }
 
+// SceLibKernel 3.74 forwards to the syscall.
 EXPORT(int, sceKernelGetThreadExitStatus, SceUID thid, SceInt32 *pExitStatus) {
     TRACY_FUNC(sceKernelGetThreadExitStatus, thid, pExitStatus);
-    const ThreadStatePtr thread = emuenv.kernel.get_thread(thid ? thid : thread_id);
-    if (!thread) {
-        return SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID;
-    }
-    if (thread->status != ThreadStatus::dormant) {
-        return SCE_KERNEL_ERROR_NOT_DORMANT;
-    }
-    if (pExitStatus) {
-        *pExitStatus = thread->returned_value;
-    }
-    return 0;
+    return CALL_EXPORT(_sceKernelGetThreadExitStatus, thid, pExitStatus);
 }
 
 EXPORT(int, sceKernelGetThreadId) {
@@ -1628,10 +1631,9 @@ EXPORT(int, sceKernelGetThreadId) {
     return thread_id;
 }
 
-// SceLibKernel 3.74 passes the syscall the record's size word (0 without a record).
 EXPORT(SceInt32, sceKernelGetThreadInfo, SceUID threadId, Ptr<SceKernelThreadInfo> pInfo) {
     TRACY_FUNC(sceKernelGetThreadInfo, threadId, pInfo);
-    const SceSize size = pInfo ? pInfo.get(emuenv.mem)->size : 0;
+    const SceSize size = info_size(emuenv, pInfo);
     return CALL_EXPORT(_sceKernelGetThreadInfo, threadId, pInfo, &size);
 }
 
@@ -1642,7 +1644,7 @@ EXPORT(int, sceKernelGetThreadRunStatus) {
 
 EXPORT(int, sceKernelGetTimerBase, SceUID timer_handle, SceKernelSysClock *time) {
     TRACY_FUNC(sceKernelGetTimerBase, timer_handle, time);
-    const TimerPtr timer_info = lock_and_find(timer_handle, emuenv.kernel.timers, emuenv.kernel.mutex);
+    const TimerPtr timer_info = timer_find(emuenv.kernel, timer_handle);
 
     if (!timer_info)
         return SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID;
@@ -1664,7 +1666,7 @@ EXPORT(int, sceKernelGetTimerInfo) {
 
 EXPORT(int, sceKernelGetTimerTime, SceUID timer_handle, SceKernelSysClock *time) {
     TRACY_FUNC(sceKernelGetTimerTime, timer_handle, time);
-    const TimerPtr timer_info = lock_and_find(timer_handle, emuenv.kernel.timers, emuenv.kernel.mutex);
+    const TimerPtr timer_info = timer_find(emuenv.kernel, timer_handle);
 
     if (!timer_info)
         return SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID;

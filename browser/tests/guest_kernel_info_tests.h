@@ -9,6 +9,9 @@ DECL_EXPORT(SceUID, sceKernelGetProcessId);
 DECL_EXPORT(SceInt32, _sceKernelGetThreadInfo, SceUID threadId, Ptr<SceKernelThreadInfo> pInfo, const SceSize *pSize);
 DECL_EXPORT(int, sceKernelCreateThreadForUser, const char *name, SceKernelThreadEntry entry, int init_priority, SceKernelCreateThread_opt *options);
 DECL_EXPORT(SceInt32, sceKernelChangeThreadPriority, SceUID thid, SceInt32 priority);
+DECL_EXPORT(int, _sceKernelGetThreadExitStatus, SceUID thid, SceInt32 *pExitStatus);
+DECL_EXPORT(int, sceKernelGetThreadExitStatus, SceUID thid, SceInt32 *pExitStatus);
+DECL_EXPORT(SceInt32, ksceKernelGetThreadInfo, SceUID thid, SceKernelThreadInfo *pInfo);
 DECL_EXPORT(SceInt32, ksceKernelSetPermission, SceInt32 permission);
 DECL_EXPORT(int, SceThreadmgrForDriver_20C228E4);
 DECL_EXPORT(int, SceQafMgrForDriver_B9770A13);
@@ -93,6 +96,66 @@ inline void test_guest_kernel_info(EmuEnvState &env, vita3k::web::GuestThreadRun
         SceKernelThreadEntry(entry), 0x50, &options);
     REQUIRE(target_id > 0);
     const auto target = env.kernel.get_thread(target_id);
+    // sceKernelCreateThreadForUser (0x8102e7a0, core 0x810061d8): options of
+    // at most 0x1c bytes, affinity within the four cores, and attributes a
+    // game may ask for (0x05002000) or, from a system module, any outside
+    // 0x797f5fff; the user bit is added.
+    {
+        const auto create = [&](SceKernelCreateThread_opt &opt) {
+            return export_sceKernelCreateThreadForUser(env, caller->id, "fixture", "checked thread", SceKernelThreadEntry(entry), 0x50, &opt);
+        };
+        auto *option = Ptr<SceKernelThreadOptParam>(data + 0x700).get(env.mem);
+        option->size = 0x1d;
+        option->attr = 0;
+        SceKernelCreateThread_opt checked = options;
+        checked.option = Ptr<SceKernelThreadOptParam>(data + 0x700);
+        REQUIRE(create(checked) == SCE_KERNEL_ERROR_ILLEGAL_SIZE);
+        option->size = 0x1c;
+        checked.cpu_affinity_mask = 0x100000;
+        REQUIRE(create(checked) == SCE_KERNEL_ERROR_ILLEGAL_CPU_AFFINITY_MASK);
+        checked.cpu_affinity_mask = 0xf0000;
+        checked.attr = 0x4000;
+        REQUIRE(create(checked) == SCE_KERNEL_ERROR_ILLEGAL_ATTR);
+        checked.attr = 0x02000000;
+        REQUIRE(create(checked) == SCE_KERNEL_ERROR_ILLEGAL_ATTR);
+        checked.attr = SCE_KERNEL_THREAD_ATTR_USER | 0x05002000;
+        const SceUID game_thread = create(checked);
+        REQUIRE(game_thread > 0);
+        const auto made = env.kernel.get_thread(game_thread);
+        REQUIRE(made->attr == (SCE_KERNEL_THREAD_ATTR_USER | 0x05002000) && made->affinity_mask == 0xf0000);
+        made->exit_delete(false);
+        // A caller in a system-loaded module.
+        auto module = std::make_shared<KernelModule>();
+        std::strcpy(module->info.path, "vs0:sys/external/libfixture.suprx");
+        module->info.segments[0].vaddr = Ptr<const void>(code + 0xf00);
+        module->info.segments[0].memsz = 0x100;
+        module->system_loaded = true;
+        const SceUID module_id = env.kernel.get_next_uid();
+        env.kernel.loaded_modules[module_id] = module;
+        checked.caller = code + 0xf10;
+        REQUIRE(create(checked) == SCE_KERNEL_ERROR_ILLEGAL_ATTR);
+        checked.attr = 0x4000;
+        REQUIRE(create(checked) == SCE_KERNEL_ERROR_ILLEGAL_ATTR);
+        checked.attr = 0x02000000 | 0x8000 | SCE_KERNEL_ATTR_TH_PRIO;
+        const SceUID system_thread = create(checked);
+        REQUIRE(system_thread > 0);
+        REQUIRE(env.kernel.get_thread(system_thread)->attr == (SCE_KERNEL_THREAD_ATTR_USER | 0x02000000 | 0x8000 | SCE_KERNEL_ATTR_TH_PRIO));
+        env.kernel.get_thread(system_thread)->exit_delete(false);
+        env.kernel.loaded_modules.erase(module_id);
+    }
+    // GetThreadExitStatus (syscall 0x8102ea4c, core 0x81004638): an unknown
+    // thread, then 0 or the caller itself, then a null status pointer; a
+    // thread that never started has no exit status yet (DORMANT).
+    SceInt32 exit_status = 0x12345678;
+    const auto exit_status_of = [&](SceUID thid, SceInt32 *status) {
+        return export__sceKernelGetThreadExitStatus(env, caller->id, "fixture", thid, status);
+    };
+    REQUIRE(exit_status_of(0x7ffffff0, nullptr) == SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+    REQUIRE(exit_status_of(0, &exit_status) == SCE_KERNEL_ERROR_ILLEGAL_THREAD_ID);
+    REQUIRE(exit_status_of(caller->id, &exit_status) == SCE_KERNEL_ERROR_ILLEGAL_THREAD_ID);
+    REQUIRE(exit_status_of(target_id, nullptr) == SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+    REQUIRE(export_sceKernelGetThreadExitStatus(env, caller->id, "fixture", target_id, &exit_status) == SCE_KERNEL_ERROR_DORMANT);
+    REQUIRE(exit_status == 0x12345678);
     REQUIRE(export_sceKernelChangeThreadPriority(env, caller->id, "fixture", target_id, 0x60) == 0);
     reset(sizeof(*info));
     REQUIRE(get_info(caller->id, target_id, sizeof(*info)) == 0);
@@ -131,6 +194,18 @@ inline void test_guest_kernel_info(EmuEnvState &env, vita3k::web::GuestThreadRun
     reset(sizeof(*info));
     REQUIRE(get_info(caller->id, target_id, sizeof(*info)) == 0);
     REQUIRE(info->status == SCE_THREAD_DORMANT && info->exitStatus == target_id && word(0) == uint32_t(target_id));
+    REQUIRE(exit_status_of(target_id, &exit_status) == 0 && exit_status == target_id);
+    // ksceKernelGetThreadInfo is the record fill itself (0x810059cc).
+    reset(sizeof(*info));
+    REQUIRE(export_ksceKernelGetThreadInfo(env, caller->id, "fixture", target_id, info) == 0);
+    REQUIRE(info->size == 0x80 && std::strcmp(info->name, "info target") == 0 && info->exitStatus == target_id && untouched_from(sizeof(*info)));
+    reset(0x10);
+    REQUIRE(export_ksceKernelGetThreadInfo(env, caller->id, "fixture", 0, info) == 0);
+    REQUIRE(std::memcmp(info->name, "info cal", 8) == 0 && untouched_from(0x10));
+    reset(sizeof(*info) + 1);
+    REQUIRE(export_ksceKernelGetThreadInfo(env, caller->id, "fixture", target_id, info) == SCE_KERNEL_ERROR_ILLEGAL_SIZE);
+    REQUIRE(export_ksceKernelGetThreadInfo(env, caller->id, "fixture", target_id, nullptr) == SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+    REQUIRE(export_ksceKernelGetThreadInfo(env, 0, "fixture", 0, info) == SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
 
     // A running guest asks about itself through SceLibKernel (thid 0).
     const Address self_info = data + 0x300;
@@ -153,6 +228,7 @@ inline void test_guest_kernel_info(EmuEnvState &env, vita3k::web::GuestThreadRun
     reset(sizeof(*info));
     REQUIRE(get_info(caller->id, waiter->id, sizeof(*info)) == 0);
     REQUIRE(info->status == SCE_THREAD_WAITING && info->exitStatus == SCE_KERNEL_ERROR_NOT_DORMANT);
+    REQUIRE(exit_status_of(waiter->id, &exit_status) == SCE_KERNEL_ERROR_NOT_DORMANT);
     REQUIRE(semaphore_signal(env.kernel, "fixture", 0, sema, 1) == 0);
     REQUIRE(get_info(caller->id, waiter->id, sizeof(*info)) == 0);
     REQUIRE(info->status == SCE_THREAD_READY);

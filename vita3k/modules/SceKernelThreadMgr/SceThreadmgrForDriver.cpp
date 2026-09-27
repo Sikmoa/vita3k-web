@@ -25,6 +25,7 @@ TRACY_MODULE_NAME(SceThreadmgrForDriver);
 #include <kernel/state.h>
 #include <kernel/sync_primitives.h>
 #include <kernel/thread/thread_state.h>
+#include <util/lock_and_find.h>
 
 #include <utility>
 
@@ -109,8 +110,13 @@ EXPORT(int, ksceKernelDeleteCond) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, ksceKernelDeleteEventFlag) {
-    return UNIMPLEMENTED();
+// SceKernelThreadMgr 3.74: a uid that is not an event flag, unknown ones
+// included, is DIFFERENT_UID_CLASS; a kernel caller closes any handle.
+EXPORT(int, ksceKernelDeleteEventFlag, SceUID evfId) {
+    TRACY_FUNC(ksceKernelDeleteEventFlag, evfId);
+    if (!lock_and_find(evfId, emuenv.kernel.eventflags, emuenv.kernel.mutex))
+        return RET_ERROR(SCE_KERNEL_ERROR_DIFFERENT_UID_CLASS);
+    return eventflag_close(emuenv.kernel, emuenv.mem, export_name, thread_id, evfId, HandleClose::Any);
 }
 
 EXPORT(int, ksceKernelDeleteFastMutex) {
@@ -183,8 +189,9 @@ EXPORT(int, ksceKernelGetThreadIdList) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, ksceKernelGetThreadInfo) {
-    return UNIMPLEMENTED();
+EXPORT(SceInt32, ksceKernelGetThreadInfo, SceUID thid, SceKernelThreadInfo *pInfo) {
+    TRACY_FUNC(ksceKernelGetThreadInfo, thid, pInfo);
+    return get_thread_info(emuenv, export_name, thread_id, thid, pInfo);
 }
 
 EXPORT(int, ksceKernelGetThreadStackFreeSize) {
