@@ -125,18 +125,24 @@ function colorFormat(guest) {
   return format;
 }
 
-function targetFor(address, format, width, height) {
+// A target is `scale` times its guest size in each dimension (BEGIN_PASS,
+// chosen by the producer); the stream keeps guest coordinates, scaled here
+// (viewport, scissor, fills, region copies). Its depth surfaces and snapshot
+// share its GPU size.
+function targetFor(address, format, width, height, scale) {
   let target = targets.get(address);
-  if (target && target.width === width && target.height === height && target.guestFormat === format)
+  if (target && target.width === width && target.height === height && target.guestFormat === format
+      && target.scale === scale)
     return target;
   target?.texture.destroy();
   target?.snapshot?.texture.destroy();
   const gpuFormat = colorFormat(format);
-  const texture = device.createTexture({ size: [width, height], format: gpuFormat,
+  const gpuWidth = width * scale, gpuHeight = height * scale;
+  const texture = device.createTexture({ size: [gpuWidth, gpuHeight], format: gpuFormat,
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
       | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST });
-  target = { address, width, height, guestFormat: format, gpuFormat, texture, view: texture.createView(),
-    depth: null, fresh: true };
+  target = { address, width, height, scale, gpuWidth, gpuHeight, guestFormat: format, gpuFormat, texture,
+    view: texture.createView(), depth: null, fresh: true };
   targets.set(address, target);
   return target;
 }
@@ -151,10 +157,10 @@ const depthFormats = new Map([
 function depthAttachmentFor(target, mode, format, depthAddress, stencilAddress) {
   const gpuFormat = depthFormats.get(format >>> 0) ?? 'depth24plus-stencil8';
   if (mode === 1) {
-    const key = `${target.width}x${target.height}:${gpuFormat}`;
+    const key = `${target.gpuWidth}x${target.gpuHeight}:${gpuFormat}`;
     let texture = depthScratch.get(key);
     if (!texture) {
-      texture = device.createTexture({ size: [target.width, target.height], format: gpuFormat,
+      texture = device.createTexture({ size: [target.gpuWidth, target.gpuHeight], format: gpuFormat,
         usage: GPUTextureUsage.RENDER_ATTACHMENT });
       depthScratch.set(key, texture);
     }
@@ -162,11 +168,11 @@ function depthAttachmentFor(target, mode, format, depthAddress, stencilAddress) 
   }
   const key = `${depthAddress >>> 0}:${stencilAddress >>> 0}`;
   let surface = depthSurfaces.get(key);
-  if (!surface || surface.format !== gpuFormat || surface.width !== target.width || surface.height !== target.height) {
+  if (!surface || surface.format !== gpuFormat || surface.width !== target.gpuWidth || surface.height !== target.gpuHeight) {
     surface?.texture.destroy();
-    const texture = device.createTexture({ size: [target.width, target.height], format: gpuFormat,
+    const texture = device.createTexture({ size: [target.gpuWidth, target.gpuHeight], format: gpuFormat,
       usage: GPUTextureUsage.RENDER_ATTACHMENT });
-    surface = { texture, view: texture.createView(), format: gpuFormat, width: target.width, height: target.height, fresh: true };
+    surface = { texture, view: texture.createView(), format: gpuFormat, width: target.gpuWidth, height: target.gpuHeight, fresh: true };
     depthSurfaces.set(key, surface);
   }
   return surface;
@@ -398,17 +404,17 @@ function encodeScene(words, data) {
       const address = word(), format = word(), width = word(), height = word();
       const depthMode = word(), depthFormat = word(), depthLoad = word(), depthStore = word();
       const clearDepth = floats[cursor++], clearStencil = word();
-      const depthAddress = word(), stencilAddress = word(), snapshot = word();
-      target = targetFor(address, format, width, height);
+      const depthAddress = word(), stencilAddress = word(), snapshot = word(), scale = word();
+      target = targetFor(address, format, width, height, scale);
       if (snapshot) {
         // A draw samples this target: give it the contents from before the pass.
         if (!target.snapshot) {
-          const texture = device.createTexture({ size: [target.width, target.height], format: target.gpuFormat,
+          const texture = device.createTexture({ size: [target.gpuWidth, target.gpuHeight], format: target.gpuFormat,
             usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
           target.snapshot = { texture, view: texture.createView() };
         }
         encoder.copyTextureToTexture({ texture: target.texture }, { texture: target.snapshot.texture },
-          [target.width, target.height]);
+          [target.gpuWidth, target.gpuHeight]);
       }
       depth = depthMode ? depthAttachmentFor(target, depthMode, depthFormat, depthAddress, stencilAddress) : null;
       // Guest depth contents exist only once this surface was stored.
@@ -464,8 +470,9 @@ function encodeScene(words, data) {
       pass.setBindGroup(3, textureGroupFor(0));
       for (let i = 0; i < streamCount; ++i) pass.setVertexBuffer(i, sceneBuffer, streamOffsets[i], streamSizes[i]);
       pass.setIndexBuffer(sceneBuffer, indexSize === 2 ? 'uint16' : 'uint32', indexOffset, indexCount * indexSize);
-      pass.setViewport(vx, vy, Math.max(vw, 0), Math.max(vh, 0), 0, 1);
-      pass.setScissorRect(sx, sy, sw, sh);
+      const scale = target.scale;
+      pass.setViewport(vx * scale, vy * scale, Math.max(vw, 0) * scale, Math.max(vh, 0) * scale, 0, 1);
+      pass.setScissorRect(sx * scale, sy * scale, sw * scale, sh * scale);
       pass.setStencilReference(stencilRef);
       pass.drawIndexed(indexCount);
       ++stats.draws;
@@ -496,16 +503,18 @@ function encodeScene(words, data) {
       const id = word(), address = word(), x = word(), y = word(), width = word(), height = word();
       const source = targets.get(address);
       if (!source) { warnOnce('region of a render target that was never rendered'); break; }
+      const w = width * source.scale, h = height * source.scale;
       let entry = textures.get(id);
-      if (!entry || entry.width !== width || entry.height !== height || entry.format !== source.gpuFormat) {
+      if (!entry || entry.width !== w || entry.height !== h || entry.format !== source.gpuFormat) {
         entry?.texture.destroy();
-        const texture = device.createTexture({ size: [width, height], format: source.gpuFormat,
+        const texture = device.createTexture({ size: [w, h], format: source.gpuFormat,
           usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-        entry = { texture, view: texture.createView(), width, height, levels: 1, format: source.gpuFormat };
+        entry = { texture, view: texture.createView(), width: w, height: h, levels: 1, format: source.gpuFormat };
         textures.set(id, entry);
         textureGroups.clear();
       }
-      encoder.copyTextureToTexture({ texture: source.texture, origin: { x, y } }, { texture: entry.texture }, [width, height]);
+      encoder.copyTextureToTexture({ texture: source.texture, origin: { x: x * source.scale, y: y * source.scale } },
+        { texture: entry.texture }, [w, h]);
       break;
     }
     case 4: // END_PASS
@@ -520,8 +529,8 @@ function encodeScene(words, data) {
         encoder.beginRenderPass({ colorAttachments: [{ view: cleared.view, loadOp: 'clear', storeOp: 'store',
           clearValue: rgba.map(v => v / 255) }] }).end();
       } else {
-        const w = Math.min(width, cleared.width - Math.min(x, cleared.width));
-        const h = Math.min(height, cleared.height - Math.min(y, cleared.height));
+        const w = Math.min(width, cleared.width - Math.min(x, cleared.width)) * cleared.scale;
+        const h = Math.min(height, cleared.height - Math.min(y, cleared.height)) * cleared.scale;
         if (w > 0 && h > 0) {
           // Through the encoder, so the fill stays ordered with this stream's passes.
           const texel = packColor(cleared.gpuFormat, rgba);
@@ -531,7 +540,8 @@ function encodeScene(words, data) {
           for (let row = 0; row < h; ++row)
             for (let i = 0; i < w; ++i) bytes.set(texel, row * bytesPerRow + i * texel.length);
           staging.unmap();
-          encoder.copyBufferToTexture({ buffer: staging, bytesPerRow }, { texture: cleared.texture, origin: { x, y } }, [w, h]);
+          encoder.copyBufferToTexture({ buffer: staging, bytesPerRow },
+            { texture: cleared.texture, origin: { x: x * cleared.scale, y: y * cleared.scale } }, [w, h]);
           stagingBuffers.push(staging);
         }
       }
@@ -589,23 +599,23 @@ export function presentTarget(address, onFrame, readbackEvery) {
   const generation = ++presentGeneration;
   ++stats.presents;
   if (canvasContext) {
-    if (canvas.width !== target.width || canvas.height !== target.height) {
-      canvas.width = target.width; canvas.height = target.height;
+    if (canvas.width !== target.gpuWidth || canvas.height !== target.gpuHeight) {
+      canvas.width = target.gpuWidth; canvas.height = target.gpuHeight;
     }
     blit(target.texture, canvasContext.getCurrentTexture().createView(), canvasFormat);
   }
   if (readbackEvery > 0 && generation % readbackEvery === 1 % readbackEvery) {
     // RGBA8 copy of the displayed target, asynchronously; never blocks the guest.
-    const copy = device.createTexture({ size: [target.width, target.height], format: 'rgba8unorm',
+    const width = target.gpuWidth, height = target.gpuHeight;
+    const copy = device.createTexture({ size: [width, height], format: 'rgba8unorm',
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
     blit(target.texture, copy.createView(), 'rgba8unorm');
-    const bytesPerRow = Math.ceil(target.width * 4 / 256) * 256;
-    const buffer = device.createBuffer({ size: bytesPerRow * target.height,
+    const bytesPerRow = Math.ceil(width * 4 / 256) * 256;
+    const buffer = device.createBuffer({ size: bytesPerRow * height,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const encoder = device.createCommandEncoder();
-    encoder.copyTextureToBuffer({ texture: copy }, { buffer, bytesPerRow }, [target.width, target.height]);
+    encoder.copyTextureToBuffer({ texture: copy }, { buffer, bytesPerRow }, [width, height]);
     device.queue.submit([encoder.finish()]);
-    const { width, height } = target;
     buffer.mapAsync(GPUMapMode.READ).then(() => {
       const mapped = new Uint8Array(buffer.getMappedRange());
       const pixels = new Uint8Array(width * height * 4);
@@ -615,7 +625,7 @@ export function presentTarget(address, onFrame, readbackEvery) {
       onFrame(generation, width, height, pixels);
     }, error => warnOnce(`frame readback failed: ${error}`));
   } else {
-    onFrame(generation, target.width, target.height, null);
+    onFrame(generation, target.gpuWidth, target.gpuHeight, null);
   }
   return true;
 }

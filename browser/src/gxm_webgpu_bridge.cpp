@@ -115,6 +115,24 @@ struct Timing {
 };
 // VITA3K_TEXTURE_VERIFY=1: hash every bound texture even when no write was
 // tracked, and report changes the write tracking missed.
+// Internal resolution: surfaces at least the display size are rendered at
+// VITA3K_RESOLUTION_SCALE times their guest size in each dimension (default
+// 2: 960x544 -> 1920x1088). Smaller intermediate surfaces (blur and bloom
+// chains) stay at guest resolution: titles sample them with offsets of one
+// guest texel, which upscaled would skip rows (Limbo's blur atlas streaks).
+// gxm_scene.js scales the GPU resources; shaders divide gl_FragCoord by the
+// surface's scale (res_multiplier).
+uint32_t resolution_scale() {
+    static const uint32_t scale = [] {
+        const char *value = std::getenv("VITA3K_RESOLUTION_SCALE");
+        const unsigned long parsed = value ? std::strtoul(value, nullptr, 10) : 2;
+        return static_cast<uint32_t>(parsed >= 1 && parsed <= 4 ? parsed : 2);
+    }();
+    return scale;
+}
+uint32_t surface_scale(uint32_t width, uint32_t height) {
+    return width >= 960 && height >= 544 ? resolution_scale() : 1;
+}
 bool texture_verify() {
     static const bool enabled = std::getenv("VITA3K_TEXTURE_VERIFY") != nullptr;
     return enabled;
@@ -1036,6 +1054,7 @@ static void begin_pass(WebContext &ctx, scene::Writer &out) {
     // target: the tile-based GPU reads what memory held before the scene.
     out.pass_snapshot_word = out.words.size();
     out.word(0);
+    out.word(surface_scale(color.width, color.height));
     out.pass_address = color.data.address();
     out.pass_open = true;
     const uint32_t pixel_bytes = uint32_t(gxm::bits_per_pixel(
@@ -1153,7 +1172,7 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
     const float fs_info[8] = {
         ctx.record.back_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED ? 1.0f : 0.0f,
         ctx.record.front_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED ? 1.0f : 0.0f,
-        ctx.record.writing_mask, 0.0f, 1.0f, 0, 0, 0};
+        ctx.record.writing_mask, 0.0f, float(surface_scale(surface.width, surface.height)), 0, 0, 0}; // [4] res_multiplier
     const uint32_t vs_info_offset = out.bytes(vs_info, sizeof(vs_info), scene::kUniformAlign);
     const uint32_t fs_info_offset = out.bytes(fs_info, sizeof(fs_info), scene::kUniformAlign);
     const uint32_t vs_uniforms = out.bytes(ctx.uniforms[0].data(), ctx.uniforms[0].size(), scene::kUniformAlign);

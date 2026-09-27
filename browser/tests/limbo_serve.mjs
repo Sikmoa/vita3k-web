@@ -12,6 +12,7 @@
 // titles such as Limbo then run faster than real time); ?fpsHack=1 is Vita3K's
 // fps-hack (display waits use one vblank; Limbo's logic is frame-locked, so it
 // also runs up to twice as fast);
+// ?scale=N renders at N times the Vita resolution (1-4; default 2 = 1920x1088);
 // ?inlineMutex=0 disables the inline-mutex optimization for A/B testing; ?auto=1 (start
 // immediately); ?present=readback keeps the canvas on the page and has the worker
 // read every GPU frame back instead (slower; for tools that read the page canvas,
@@ -102,8 +103,7 @@ const page = `<!doctype html>
   body { margin: 0; background: #111; color: #ddd; font: 13px/1.45 ui-monospace, monospace; }
   header { padding: 10px 14px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
   #display { display: grid; justify-content: center; }
-  #display > canvas { grid-area: 1 / 1; width: min(100vw, 960px); height: auto; background: #000;
-    image-rendering: pixelated; }
+  #display > canvas { grid-area: 1 / 1; width: min(100vw, calc(85vh * 960 / 544)); height: auto; background: #000; }
   #display > canvas[hidden] { display: none; }
   #keys { margin: 0; padding: 0 14px 6px; color: #999; }
   #log { margin: 0; padding: 10px 14px; height: 30vh; overflow: auto; white-space: pre-wrap; color: #9c9; }
@@ -301,7 +301,7 @@ async function run() {
   if (webgpuBlocked) log('warning: ' + webgpuBlocked);
   runButton.disabled = true; stopButton.disabled = false;
   ensureAudio();
-  worker = new Worker(\`./worker.js?backend=\${backend}&memory=\${memory}&inlineMutex=\${params.get('inlineMutex') === '0' ? '0' : '1'}\${params.get('fpsHack') === '1' ? '&fpsHack=1' : ''}\`, { type: 'module' });
+  worker = new Worker(\`./worker.js?backend=\${backend}&memory=\${memory}&inlineMutex=\${params.get('inlineMutex') === '0' ? '0' : '1'}\${params.get('fpsHack') === '1' ? '&fpsHack=1' : ''}\${params.get('scale') ? '&scale=' + params.get('scale') : ''}\`, { type: 'module' });
   worker.onerror = (event) => { log('worker error: ' + event.message); status.textContent = 'worker error'; };
   worker.onmessage = async ({ data }) => {
     if (!data || typeof data !== 'object') return;

@@ -106,6 +106,8 @@ try {
         VITA3K_GUEST_CORES: workerParams.get('cores') ?? undefined,
         // Vita3K's fps-hack: display waits use one vblank (vita_app.cpp).
         VITA3K_FPS_HACK: workerParams.get('fpsHack') === '1' ? '1' : undefined,
+        // Internal render resolution multiplier (gxm_webgpu_bridge.cpp); unset = 2.
+        VITA3K_RESOLUTION_SCALE: workerParams.get('scale') ?? undefined,
         // Check cached textures and vertex streams against guest memory and
         // report changes the write tracking missed (gxm_webgpu_bridge.cpp).
         VITA3K_TEXTURE_VERIFY: workerParams.get('textureVerify') === '1' ? '1' : undefined,
