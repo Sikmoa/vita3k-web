@@ -18,12 +18,15 @@ let device, compiler;
 const programs = new Map();  // id -> { wgsl, fragment, module }
 const targets = new Map();   // guest color address -> target
 const textures = new Map();  // producer texture id -> { texture, view }
-const pipelines = new Map(); // pipeline key -> GPURenderPipeline
+const pipelines = new Map(); // pipeline words hash -> [{ words, pipeline }]
 const samplers = new Map();
-const bindGroups = new Map();
+const bufferGroups = new Map(); // vs uniform size -> fs uniform size -> group
+const textureGroups = new Map(); // unit words hash -> [{ words, group }]
+const streamOffsets = new Uint32Array(16), streamSizes = new Uint32Array(16);
+const dynamicOffsets = new Uint32Array(4);
 const depthScratch = new Map(); // `${w}x${h}` -> transient on-chip depth texture
 const depthSurfaces = new Map(); // `${depth}:${stencil}` guest addresses -> kept depth/stencil texture
-let layouts, sceneBuffer, sceneBufferSize = 0, bufferGeneration = 0;
+let layouts, sceneBuffer, sceneBufferSize = 0;
 let canvas, canvasContext, canvasFormat, blitPipeline, blitSampler;
 let presentGeneration = 0;
 const stagingBuffers = []; // per-submission fill sources, destroyed after submit
@@ -189,7 +192,7 @@ const filters = ['nearest', 'linear'];
 const addressModes = ['repeat', 'mirror-repeat', 'clamp-to-edge', 'clamp-to-edge', 'clamp-to-edge',
   'clamp-to-edge', 'repeat', 'clamp-to-edge'];
 function samplerFor(min, mag, mip, u, v, lodMax) {
-  const key = `${min}|${mag}|${mip}|${u}|${v}|${lodMax}`;
+  const key = (min & 1) | (mag & 1) << 1 | (mip & 1) << 2 | (u & 7) << 3 | (v & 7) << 6 | (lodMax & 0xffff) << 9;
   let sampler = samplers.get(key);
   if (!sampler) {
     sampler = device.createSampler({ minFilter: filters[min & 1], magFilter: filters[mag & 1],
@@ -200,10 +203,57 @@ function samplerFor(min, mag, mip, u, v, lodMax) {
   return sampler;
 }
 
-function pipelineFor(d, target, depth) {
-  const key = d.pipelineKey + '|' + target.gpuFormat + '|' + (depth ? depth.format : '-');
-  let pipeline = pipelines.get(key);
-  if (pipeline) return pipeline;
+// The draw loop runs ~20k times a second, so decoding a draw allocates
+// nothing: its pipeline words (everything but per-draw offsets, viewport,
+// scissor and stencil reference) go to a scratch array and are looked up
+// by hash, compared word for word; a descriptor object is built only on a miss.
+const topologies = ['triangle-list', 'triangle-strip', 'line-list', 'line-strip', 'point-list'];
+const pipelineWords = new Uint32Array(256);
+let pipelineLength = 0;
+const formatIds = new Map();
+function formatId(format) {
+  let id = formatIds.get(format);
+  if (id === undefined) formatIds.set(format, id = formatIds.size + 1);
+  return id;
+}
+function hashWords(words, length, seed) {
+  let hash = seed | 0;
+  for (let i = 0; i < length; ++i) hash = Math.imul(hash ^ words[i], 16777619);
+  return hash & 0x3fffffff;
+}
+function sameWords(stored, words, length) {
+  if (stored.length !== length) return false;
+  for (let i = 0; i < length; ++i) if (stored[i] !== words[i]) return false;
+  return true;
+}
+function cachedPipeline(target, depth) {
+  pipelineWords[pipelineLength++] = formatId(target.gpuFormat);
+  pipelineWords[pipelineLength++] = depth ? formatId(depth.format) : 0;
+  const key = hashWords(pipelineWords, pipelineLength, 0x811c9dc5);
+  let bucket = pipelines.get(key);
+  if (bucket) {
+    for (let i = 0; i < bucket.length; ++i)
+      if (sameWords(bucket[i].words, pipelineWords, pipelineLength)) return bucket[i].pipeline;
+  } else pipelines.set(key, bucket = []);
+  const pipeline = createPipeline(describePipeline(), target, depth);
+  bucket.push({ words: pipelineWords.slice(0, pipelineLength), pipeline });
+  return pipeline;
+}
+function describePipeline() {
+  const w = pipelineWords;
+  const d = { vs: w[0], fs: w[1], cull: w[2], topology: topologies[w[3]], blend: Array.from(w.subarray(4, 11)),
+    fragmentDisabled: w[11] !== 0, depthFunc: w[12], depthWrite: w[13] !== 0,
+    stencilFront: Array.from(w.subarray(14, 18)), stencilBack: Array.from(w.subarray(18, 22)),
+    stencilReadMask: w[22], stencilWriteMask: w[23], streams: [], attributes: [] };
+  let i = 24;
+  for (let n = w[i++]; n > 0; --n) d.streams.push({ stride: w[i++] });
+  for (let n = w[i++]; n > 0; --n)
+    d.attributes.push({ location: w[i++], stream: w[i++], offset: w[i++], format: w[i++], components: w[i++] });
+  d.indexSize = w[i++];
+  return d;
+}
+
+function createPipeline(d, target, depth) {
   const vertex = programs.get(d.vs), fragment = programs.get(d.fs);
   if (!vertex || !fragment) throw new Error(`draw with unregistered program ${d.vs}/${d.fs}`);
   const buffers = d.streams.map(stream => ({ arrayStride: stream.stride, stepMode: 'vertex', attributes: [] }));
@@ -234,8 +284,7 @@ function pipelineFor(d, target, depth) {
       ...(hasStencil ? { stencilFront: face(d.stencilFront), stencilBack: face(d.stencilBack),
         stencilReadMask: d.stencilReadMask, stencilWriteMask: d.stencilWriteMask } : {}) } } : {}),
   };
-  pipeline = device.createRenderPipeline(descriptor);
-  pipelines.set(key, pipeline);
+  const pipeline = device.createRenderPipeline(descriptor);
   ++stats.pipelines;
   return pipeline;
 }
@@ -246,13 +295,13 @@ function ensureSceneBuffer(size) {
   sceneBufferSize = Math.max(1 << 20, 2 ** Math.ceil(Math.log2(size)));
   sceneBuffer = device.createBuffer({ size: sceneBufferSize, usage: GPUBufferUsage.VERTEX
     | GPUBufferUsage.INDEX | GPUBufferUsage.UNIFORM | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-  ++bufferGeneration;
-  bindGroups.clear();
+  bufferGroups.clear();
 }
 
 function bufferGroupFor(vsSize, fsSize) {
-  const key = `${bufferGeneration}|${vsSize}|${fsSize}`;
-  let group = bindGroups.get(key);
+  let bySize = bufferGroups.get(vsSize);
+  if (!bySize) bufferGroups.set(vsSize, bySize = new Map());
+  let group = bySize.get(fsSize);
   if (!group) {
     ++stats.bindGroups;
     group = device.createBindGroup({ layout: layouts.buffers, entries: [
@@ -261,7 +310,7 @@ function bufferGroupFor(vsSize, fsSize) {
       { binding: 2, resource: { buffer: sceneBuffer, size: Math.max(16, vsSize) } },
       { binding: 3, resource: { buffer: sceneBuffer, size: Math.max(16, fsSize) } },
     ] });
-    bindGroups.set(key, group);
+    bySize.set(fsSize, group);
   }
   return group;
 }
@@ -278,20 +327,36 @@ function textureView(id) {
   return textures.get(id)?.view ?? layouts.dummyView;
 }
 
-function textureGroupFor(layout, units) {
-  const key = (layout === layouts.fragmentTextures ? 'f' : 'v') + units.map(t => t.key).join(';');
-  let group = bindGroups.get(key);
-  if (!group) {
-    const entries = [];
-    for (let unit = 0; unit < 16; ++unit) {
-      const t = units.find(u => u.unit === unit);
-      entries.push({ binding: unit * 2, resource: t ? textureView(t.id) : layouts.dummyView });
-      entries.push({ binding: unit * 2 + 1, resource: t ? t.sampler : samplerFor(0, 0, 0, 2, 2, 0) });
-    }
-    ++stats.bindGroups;
-    group = device.createBindGroup({ layout, entries });
-    // Render-target aliases can be recreated; do not keep their groups.
-    if (!units.some(t => t.id & 0x80000000)) bindGroups.set(key, group);
+// Texture units of the draw being decoded: per unit the 8 stream words
+// unit, id, min, mag, mip, u, v, lodMax; fragment and vertex stages apart.
+const unitWords = [new Uint32Array(16 * 8), new Uint32Array(16 * 8)];
+const unitCounts = [0, 0];
+function textureGroupFor(stage) {
+  const layout = stage ? layouts.vertexTextures : layouts.fragmentTextures;
+  const words = unitWords[stage], length = unitCounts[stage] * 8;
+  let alias = false;
+  for (let i = 1; i < length; i += 8) if (words[i] & 0x80000000) alias = true;
+  const key = hashWords(words, length, stage + 1);
+  let bucket = alias ? undefined : textureGroups.get(key);
+  if (bucket) {
+    for (let i = 0; i < bucket.length; ++i)
+      if (sameWords(bucket[i].words, words, length)) return bucket[i].group;
+  }
+  const entries = [];
+  for (let unit = 0; unit < 16; ++unit) {
+    let at = -1;
+    for (let i = 0; i < length; i += 8) if ((words[i] & 15) === unit) at = i;
+    entries.push({ binding: unit * 2, resource: at >= 0 ? textureView(words[at + 1]) : layouts.dummyView });
+    entries.push({ binding: unit * 2 + 1, resource: at >= 0
+      ? samplerFor(words[at + 2], words[at + 3], words[at + 4], words[at + 5], words[at + 6], words[at + 7])
+      : samplerFor(0, 0, 0, 2, 2, 0) });
+  }
+  ++stats.bindGroups;
+  const group = device.createBindGroup({ layout, entries });
+  // Render-target aliases can be recreated; do not keep their groups.
+  if (!alias) {
+    if (!bucket) textureGroups.set(key, bucket = []);
+    bucket.push({ words: words.slice(0, length), group });
   }
   return group;
 }
@@ -311,7 +376,7 @@ export function submitScene(words, data) {
     if (now - statsReportedAt >= 5000) {
       statsReportedAt = now;
       log(`[gxm-scene] stats ${JSON.stringify({ ...stats, submitMs: Math.round(stats.submitMs),
-        targets: targets.size, textures: textures.size, pipelinesCached: pipelines.size, groupsCached: bindGroups.size })}`);
+        targets: targets.size, textures: textures.size, pipelinesCached: pipelines.size, groupsCached: textureGroups.size })}`);
     }
   }
 }
@@ -363,45 +428,45 @@ function encodeScene(words, data) {
       break;
     }
     case 2: { // DRAW
-      const d = { vs: word(), fs: word(), cull: word(), topology: ['triangle-list', 'triangle-strip', 'line-list', 'line-strip', 'point-list'][word()],
-        blend: [word(), word(), word(), word(), word(), word(), word()], fragmentDisabled: word() !== 0,
-        depthFunc: word(), depthWrite: word() !== 0,
-        stencilFront: [word(), word(), word(), word()], stencilBack: [word(), word(), word(), word()],
-        stencilReadMask: word(), stencilWriteMask: word(), stencilRef: word() };
+      pipelineLength = 0;
+      // vs fs cull topology blend[7] fragmentDisabled depthFunc depthWrite
+      // stencilFront[4] stencilBack[4] stencilReadMask stencilWriteMask
+      for (let i = 0; i < 24; ++i) pipelineWords[pipelineLength++] = word();
+      const stencilRef = word();
       const streamCount = word();
-      d.streams = [];
-      for (let i = 0; i < streamCount; ++i) d.streams.push({ stride: word(), offset: word(), size: word() });
+      pipelineWords[pipelineLength++] = streamCount;
+      for (let i = 0; i < streamCount; ++i) {
+        pipelineWords[pipelineLength++] = word(); // stride
+        streamOffsets[i] = word();
+        streamSizes[i] = word();
+      }
       const attributeCount = word();
-      d.attributes = [];
-      for (let i = 0; i < attributeCount; ++i)
-        d.attributes.push({ location: word(), stream: word(), offset: word(), format: word(), components: word() });
-      d.indexSize = word(); const indexCount = word(), indexOffset = word();
-      const viewport = [floats[cursor++], floats[cursor++], floats[cursor++], floats[cursor++]];
-      const scissor = [word(), word(), word(), word()];
+      pipelineWords[pipelineLength++] = attributeCount;
+      for (let i = 0; i < attributeCount * 5; ++i) pipelineWords[pipelineLength++] = word();
+      const indexSize = word();
+      pipelineWords[pipelineLength++] = indexSize;
+      const indexCount = word(), indexOffset = word();
+      const vx = floats[cursor++], vy = floats[cursor++], vw = floats[cursor++], vh = floats[cursor++];
+      const sx = word(), sy = word(), sw = word(), sh = word();
       const vsInfo = word(), fsInfo = word(), vsUniforms = word(), vsUniformSize = word(),
         fsUniforms = word(), fsUniformSize = word();
-      const textureCount = word();
-      const fragmentUnits = [], vertexUnits = [];
-      for (let i = 0; i < textureCount; ++i) {
-        const unit = word(), id = word(), min = word(), mag = word(), mip = word(), u = word(), v = word(), lodMax = word();
-        const sampler = samplerFor(min, mag, mip, u, v, lodMax);
-        const entry = { unit: unit & 15, id, sampler, key: `${unit}:${id}:${min}${mag}${mip}${u}${v}${lodMax}` };
-        (unit & 16 ? vertexUnits : fragmentUnits).push(entry);
+      unitCounts[0] = unitCounts[1] = 0;
+      for (let n = word(); n > 0; --n) {
+        const stage = words[cursor] & 16 ? 1 : 0, at = unitCounts[stage]++ * 8;
+        for (let i = 0; i < 8; ++i) unitWords[stage][at + i] = word();
       }
-      d.pipelineKey = `${d.vs}|${d.fs}|${d.cull}|${d.topology}|${d.blend}|${d.fragmentDisabled}|${d.depthFunc}|${d.depthWrite}|`
-        + `${d.stencilFront}|${d.stencilBack}|${d.stencilReadMask}|${d.stencilWriteMask}|${d.indexSize}|`
-        + d.streams.map(s => s.stride).join(',') + '|' + d.attributes.map(a => `${a.location}:${a.stream}:${a.offset}:${a.format}:${a.components}`).join(',');
       if (!pass) throw new Error('draw outside a pass');
-      pass.setPipeline(pipelineFor(d, target, depth));
-      pass.setBindGroup(0, bufferGroupFor(vsUniformSize, fsUniformSize), [vsInfo, fsInfo, vsUniforms, fsUniforms]);
+      pass.setPipeline(cachedPipeline(target, depth));
+      dynamicOffsets[0] = vsInfo; dynamicOffsets[1] = fsInfo; dynamicOffsets[2] = vsUniforms; dynamicOffsets[3] = fsUniforms;
+      pass.setBindGroup(0, bufferGroupFor(vsUniformSize, fsUniformSize), dynamicOffsets, 0, 4);
       pass.setBindGroup(1, emptyGroup());
-      pass.setBindGroup(2, textureGroupFor(layouts.vertexTextures, vertexUnits));
-      pass.setBindGroup(3, textureGroupFor(layouts.fragmentTextures, fragmentUnits));
-      d.streams.forEach((stream, i) => pass.setVertexBuffer(i, sceneBuffer, stream.offset, stream.size));
-      pass.setIndexBuffer(sceneBuffer, d.indexSize === 2 ? 'uint16' : 'uint32', indexOffset, indexCount * d.indexSize);
-      pass.setViewport(viewport[0], viewport[1], Math.max(viewport[2], 0), Math.max(viewport[3], 0), 0, 1);
-      pass.setScissorRect(...scissor);
-      pass.setStencilReference(d.stencilRef);
+      pass.setBindGroup(2, textureGroupFor(1));
+      pass.setBindGroup(3, textureGroupFor(0));
+      for (let i = 0; i < streamCount; ++i) pass.setVertexBuffer(i, sceneBuffer, streamOffsets[i], streamSizes[i]);
+      pass.setIndexBuffer(sceneBuffer, indexSize === 2 ? 'uint16' : 'uint32', indexOffset, indexCount * indexSize);
+      pass.setViewport(vx, vy, Math.max(vw, 0), Math.max(vh, 0), 0, 1);
+      pass.setScissorRect(sx, sy, sw, sh);
+      pass.setStencilReference(stencilRef);
       pass.drawIndexed(indexCount);
       ++stats.draws;
       break;
@@ -416,7 +481,7 @@ function encodeScene(words, data) {
         entry = { texture, view: texture.createView(), width, height, levels };
         textures.set(id, entry);
         // Texture groups referencing a destroyed texture must be rebuilt.
-        for (const key of bindGroups.keys()) if (!key.includes('|')) bindGroups.delete(key);
+        textureGroups.clear();
       }
       for (let level = 0; level < levels; ++level) {
         const offset = word(), size = word();
@@ -438,7 +503,7 @@ function encodeScene(words, data) {
           usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
         entry = { texture, view: texture.createView(), width, height, levels: 1, format: source.gpuFormat };
         textures.set(id, entry);
-        for (const key of bindGroups.keys()) if (!key.includes('|')) bindGroups.delete(key);
+        textureGroups.clear();
       }
       encoder.copyTextureToTexture({ texture: source.texture, origin: { x, y } }, { texture: entry.texture }, [width, height]);
       break;
