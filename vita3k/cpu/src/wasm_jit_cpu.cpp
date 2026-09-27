@@ -38,6 +38,8 @@
 #include <vector>
 
 namespace {
+// Address width of the linear memory an AOT image imports (32 or 64).
+constexpr uint32_t aot_memory_bits = vita3k::wasmjit::memory_address_type == vita3k::wasmjit::MemoryAddressType::I64 ? 64 : 32;
 using JitState = vita3k::wasmjit::JitState;
 using MemoryFunction = uint32_t (*)(JitState *, uint32_t, uint32_t) noexcept;
 
@@ -1090,6 +1092,7 @@ private:
         std::vector<uint8_t> metadata;
         put(metadata, WasmJitCPU::aot_magic);
         put(metadata, WasmJitCPU::aot_version);
+        put(metadata, aot_memory_bits);
         put(metadata, static_cast<uint32_t>(ranges.size()));
         for (const auto &range : ranges) {
             std::vector<uint8_t> bytes(range.size);
@@ -2346,9 +2349,19 @@ int WasmJitCPU::load_aot(MemState &mem, std::string &report) {
         cursor += 4;
         return true;
     };
-    uint32_t magic = 0, version = 0, range_count = 0;
-    if (!word(magic) || !word(version) || !word(range_count) || magic != aot_magic || version != aot_version) {
+    uint32_t magic = 0, version = 0, memory_bits = 0, range_count = 0;
+    if (!word(magic) || !word(version) || magic != aot_magic || version != aot_version) {
         report = "AOT metadata has the wrong magic/version";
+        return -1;
+    }
+    // The image imports the linear memory of the runtime that built it.
+    if (!word(memory_bits) || memory_bits != aot_memory_bits) {
+        report = "AOT image was built for wasm" + std::to_string(memory_bits) + " memory; this runtime uses wasm"
+            + std::to_string(aot_memory_bits) + " memory: rebuild it with this runtime (AOT.md)";
+        return -1;
+    }
+    if (!word(range_count)) {
+        report = "AOT metadata is truncated";
         return -1;
     }
     AotRuntime runtime;

@@ -141,7 +141,7 @@ public:
     // fp64 helper operations generated code calls (fp64.h), and when the
     // emitted semantics of already-lowered IR change (an old image would
     // keep the old results).
-    static constexpr uint32_t aot_version = 5;
+    static constexpr uint32_t aot_version = 6;
     // Translates and emits the module from the currently loaded guest code.
     static bool build_aot(MemState &mem, const AotBuildSpec &spec, std::vector<uint8_t> &out, std::string &report);
     // Loads the module the host supplied (Module.vita3kAotModule or the Node

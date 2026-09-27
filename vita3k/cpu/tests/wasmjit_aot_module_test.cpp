@@ -11,6 +11,7 @@
 #include <cpu/impl/interpreter_cpu.h>
 #include <kernel/relocation.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -204,6 +205,16 @@ void build_and_load() {
     vita3k::wasmjit::set_ablate_flags(0);
     CHECK(WasmJitCPU::build_aot(fixture.mem, spec, image, report));
     std::printf("AOT module: %s\n", report.c_str());
+    // An image for the other memory width is refused by name before the
+    // runtime would fail to link it (memory64 cannot import as memory32).
+    std::vector<uint8_t> other = image;
+    const uint8_t magic[] = { 'V', 'A', 'O', 'T' };
+    const auto header = std::search(other.begin(), other.end(), std::begin(magic), std::end(magic));
+    CHECK(header != other.end() && header[8] == aot_memory_bits);
+    header[8] = aot_memory_bits == 64 ? 32 : 64;
+    aot_test_supply(other.data(), other.size());
+    CHECK(WasmJitCPU::load_aot(fixture.mem, report) == -1);
+    CHECK(report.find("this runtime uses wasm") != std::string::npos);
     aot_test_supply(image.data(), image.size());
     CHECK(WasmJitCPU::load_aot(fixture.mem, report) == 1);
     std::printf("%s\n", report.c_str());

@@ -40,8 +40,10 @@ against the build-time hash and refuses the module on any mismatch.
 
 ## Module ABI
 
-Imports: `env.memory`, `env.mem_read`, `env.mem_write`, `env.fp64` (as for
-regions) and the immutable global `env.aot_lut` (host pointer to the lookup
+Imports: `env.memory` (the building runtime's linear memory: Memory64 from the
+web64 build, 32-bit from web32; the metadata records the width and
+`load_aot` refuses an image for the other one), `env.mem_read`,
+`env.mem_write`, `env.fp64` (as for regions) and the immutable global `env.aot_lut` (host pointer to the lookup
 table). Functions: 3 `entry`, 4 region fault helper, 5 `lookup`, 6 `transfer`,
 then one region-shaped `run(state, budget)` per AOT function, in table order.
 
