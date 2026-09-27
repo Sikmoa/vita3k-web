@@ -112,6 +112,18 @@ inline void test_guest_appmgr_rtc(EmuEnvState &env, ThreadState &thread) {
     std::memset(bytes + 0x780, 0, 4);
     *Ptr<uint32_t>(block + 0x790).get(env.mem) = 0x12345678;
     REQUIRE(call(memcpy_to_user, { block + 0x780, block + 0x790, 4 }) == 0 && *Ptr<uint32_t>(block + 0x780).get(env.mem) == 0x12345678);
+    // System software version and the system clock's low word.
+    constexpr uint32_t sw_version = 0x5182E212, time_low = 0x47F6DE49;
+    auto *version = Ptr<uint32_t>(block + 0x700).get(env.mem);
+    std::memset(version, 0xcc, 0x28);
+    version[0] = 0x24;
+    REQUIRE(call(sw_version, { block + 0x700 }) == 0x80020005);
+    version[0] = 0x28;
+    REQUIRE(call(sw_version, { block + 0x700 }) == 0);
+    REQUIRE(version[0] == 0x28 && text(block + 0x704) == "3.74" && version[8] == 0x03740011 && version[9] == 0);
+    REQUIRE(call(sw_version, { 0 }) == 0x80022005);
+    const uint32_t first_low = call(time_low, {});
+    REQUIRE(call(time_low, {}) - first_low < 10000000u); // microseconds, monotonic within the test
     free(env.mem, block);
     std::puts("Guest AppMgr/RTC: system events, game program, vs0 drives, RFC 3339/1123 and sysmodule kernel imports passed");
 }

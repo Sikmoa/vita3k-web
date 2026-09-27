@@ -173,9 +173,28 @@ EXPORT(int, sceKernelGetModuleList, int flags, SceUID *modids, int *num) {
     return SCE_KERNEL_OK;
 }
 
-EXPORT(int, sceKernelGetSystemSwVersion) {
-    TRACY_FUNC(sceKernelGetSystemSwVersion);
-    return UNIMPLEMENTED();
+struct SceKernelSystemSwVersion {
+    SceSize size;
+    char versionString[0x1C];
+    SceUInt version;
+    SceUInt unk_24;
+};
+static_assert(sizeof(SceKernelSystemSwVersion) == 0x28);
+
+// Firmware 3.74 modulemgr: the installed version (read from secure storage,
+// 0x03740011 on a 3.74 console, the value of every 3.74 module's SDK version)
+// and "major.minor" from its BCD digits.
+EXPORT(int, sceKernelGetSystemSwVersion, SceKernelSystemSwVersion *version) {
+    TRACY_FUNC(sceKernelGetSystemSwVersion, version);
+    if (!version) // the copy-in faults; user callers see the fault without bit 30
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_MEMORY_ACCESS);
+    if (version->size != sizeof(SceKernelSystemSwVersion))
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    *version = {};
+    version->size = sizeof(SceKernelSystemSwVersion);
+    version->version = 0x03740011;
+    strcpy(version->versionString, "3.74");
+    return 0;
 }
 
 EXPORT(int, sceKernelInhibitLoadingModule) {

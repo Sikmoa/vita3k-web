@@ -139,6 +139,16 @@ struct KernelState {
     std::mutex mutex;
     CodecEngineBlocks codec_blocks;
 
+    // sceClibMspace* usage counters, kept in the mspace header by firmware
+    // 3.74: bytes in use as dlmalloc counts them (its own state included),
+    // their peak, and the count of an empty mspace.
+    struct MspaceUsage {
+        size_t in_use;
+        size_t peak;
+        size_t empty;
+    };
+    std::map<Address, MspaceUsage> mspace_usage;
+
     Ptr<const void> tls_address = Ptr<const void>(0);
     unsigned int tls_psize = 0;
     unsigned int tls_msize = 0;

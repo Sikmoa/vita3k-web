@@ -150,8 +150,11 @@ EXPORT(int, ksceKernelGetProcessIdFromTLS) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, ksceKernelGetSystemTimeLow) {
-    return UNIMPLEMENTED();
+// Firmware 3.74 exports this NID to user code too (SceThreadmgr): the low
+// word of the counter sceKernelGetSystemTimeWide reads.
+EXPORT(SceUInt32, ksceKernelGetSystemTimeLow) {
+    TRACY_FUNC(ksceKernelGetSystemTimeLow);
+    return static_cast<SceUInt32>(CALL_EXPORT(sceKernelGetSystemTimeWide));
 }
 
 EXPORT(int, ksceKernelGetTLSAddr) {

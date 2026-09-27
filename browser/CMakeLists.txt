@@ -69,7 +69,7 @@ if(EMSCRIPTEN)
     add_executable(vita3k_guest_thread_tests
         tests/guest_thread_lifecycle_test.cpp
     )
-    target_link_libraries(vita3k_guest_thread_tests PRIVATE vita3k_guest_thread_runtime)
+    target_link_libraries(vita3k_guest_thread_tests PRIVATE vita3k_guest_thread_runtime vita3k_web_mspace)
     target_link_options(vita3k_guest_thread_tests PRIVATE
         ${VITA3K_WEB_GROWTH_LINK_OPTION} "SHELL:-sSTACK_SIZE=1048576")
     target_link_options(vita3k_web_app_bench PRIVATE

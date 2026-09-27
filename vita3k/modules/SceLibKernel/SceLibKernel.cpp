@@ -234,11 +234,43 @@ EXPORT(int, sceClibMemsetChk) {
     return UNIMPLEMENTED();
 }
 
+// dlmalloc's per-chunk overhead: what a chunk adds to mallinfo's uordblks
+// beyond mspace_usable_size (a build constant, measured once).
+static size_t mspace_chunk_overhead() {
+    static const size_t overhead = [] {
+        alignas(16) static unsigned char probe[16 * 1024];
+        const mspace space = create_mspace_with_base(probe, sizeof(probe), 0);
+        const size_t empty = mspace_mallinfo(space).uordblks;
+        const void *block = mspace_malloc(space, 1);
+        const size_t result = mspace_mallinfo(space).uordblks - empty - mspace_usable_size(block);
+        destroy_mspace(space);
+        return result;
+    }();
+    return overhead;
+}
+
+// Counts an allocation (+) or a release (-) of the block at `address`.
+static void account_mspace(KernelState &kernel, Address space, const void *block, bool allocated) {
+    if (!block)
+        return;
+    const auto usage = kernel.mspace_usage.find(space);
+    if (usage == kernel.mspace_usage.end())
+        return;
+    const size_t bytes = mspace_usable_size(block) + mspace_chunk_overhead();
+    if (allocated) {
+        usage->second.in_use += bytes;
+        usage->second.peak = std::max(usage->second.peak, usage->second.in_use);
+    } else {
+        usage->second.in_use -= bytes;
+    }
+}
+
 EXPORT(Ptr<void>, sceClibMspaceCalloc, Ptr<void> space, uint32_t elements, uint32_t size) {
     TRACY_FUNC(sceClibMspaceCalloc, space, elements, size);
     const std::lock_guard<std::mutex> guard(emuenv.kernel.mutex);
 
     void *address = mspace_calloc(space.get(emuenv.mem), elements, size);
+    account_mspace(emuenv.kernel, space.address(), address, true);
     return Ptr<void>(address, emuenv.mem);
 }
 
@@ -247,6 +279,10 @@ EXPORT(Ptr<void>, sceClibMspaceCreate, Ptr<void> base, uint32_t capacity) {
     const std::lock_guard<std::mutex> guard(emuenv.kernel.mutex);
 
     mspace space = create_mspace_with_base(base.get(emuenv.mem), capacity, 0);
+    if (space) {
+        const size_t empty = mspace_mallinfo(space).uordblks;
+        emuenv.kernel.mspace_usage[Ptr<void>(space, emuenv.mem).address()] = { empty, empty, empty };
+    }
     return Ptr<void>(space, emuenv.mem);
 }
 
@@ -254,6 +290,7 @@ EXPORT(uint32_t, sceClibMspaceDestroy, Ptr<void> space) {
     TRACY_FUNC(sceClibMspaceDestroy, space);
     const std::lock_guard<std::mutex> guard(emuenv.kernel.mutex);
 
+    emuenv.kernel.mspace_usage.erase(space.address());
     return static_cast<uint32_t>(destroy_mspace(space.get(emuenv.mem)));
 }
 
@@ -261,12 +298,21 @@ EXPORT(void, sceClibMspaceFree, Ptr<void> space, Ptr<void> address) {
     TRACY_FUNC(sceClibMspaceFree, space, address);
     const std::lock_guard<std::mutex> guard(emuenv.kernel.mutex);
 
+    account_mspace(emuenv.kernel, space.address(), address.get(emuenv.mem), false);
     mspace_free(space.get(emuenv.mem), address.get(emuenv.mem));
 }
 
-EXPORT(int, sceClibMspaceIsHeapEmpty) {
-    TRACY_FUNC(sceClibMspaceIsHeapEmpty);
-    return UNIMPLEMENTED();
+// Firmware 3.74: no block is allocated (the in-use counter is back at the
+// value of a new mspace). There is no NULL check.
+EXPORT(SceBool, sceClibMspaceIsHeapEmpty, Ptr<void> space) {
+    TRACY_FUNC(sceClibMspaceIsHeapEmpty, space);
+    const std::lock_guard<std::mutex> guard(emuenv.kernel.mutex);
+    const auto usage = emuenv.kernel.mspace_usage.find(space.address());
+    if (usage == emuenv.kernel.mspace_usage.end()) {
+        LOG_ERROR("sceClibMspaceIsHeapEmpty: {} is not an mspace", log_hex(space.address()));
+        return SCE_FALSE;
+    }
+    return usage->second.in_use == usage->second.empty ? SCE_TRUE : SCE_FALSE;
 }
 
 EXPORT(Ptr<void>, sceClibMspaceMalloc, Ptr<void> space, uint32_t size) {
@@ -274,12 +320,34 @@ EXPORT(Ptr<void>, sceClibMspaceMalloc, Ptr<void> space, uint32_t size) {
     const std::lock_guard<std::mutex> guard(emuenv.kernel.mutex);
 
     void *address = mspace_malloc(space.get(emuenv.mem), size);
+    account_mspace(emuenv.kernel, space.address(), address, true);
     return Ptr<void>(address, emuenv.mem);
 }
 
-EXPORT(int, sceClibMspaceMallocStats) {
-    TRACY_FUNC(sceClibMspaceMallocStats);
-    return UNIMPLEMENTED();
+struct SceClibMspaceStats {
+    SceSize max_system_bytes; // peak bytes taken from the arena
+    SceSize system_bytes; // bytes taken from the arena
+    SceSize max_in_use_bytes;
+    SceSize in_use_bytes;
+};
+
+// Firmware 3.74: 1 when the heap check fails (nothing written), else 0.
+// dlmalloc here is not the firmware allocator, so its byte counts differ
+// from a console's; they are consistent with each other.
+EXPORT(int, sceClibMspaceMallocStats, Ptr<void> space, SceClibMspaceStats *stats) {
+    TRACY_FUNC(sceClibMspaceMallocStats, space, stats);
+    const std::lock_guard<std::mutex> guard(emuenv.kernel.mutex);
+    const auto usage = emuenv.kernel.mspace_usage.find(space.address());
+    if (usage == emuenv.kernel.mspace_usage.end())
+        return 1;
+    if (!stats)
+        return 0;
+    const mspace host_space = space.get(emuenv.mem);
+    stats->max_system_bytes = static_cast<SceSize>(mspace_max_footprint(host_space));
+    stats->system_bytes = static_cast<SceSize>(mspace_footprint(host_space));
+    stats->max_in_use_bytes = static_cast<SceSize>(usage->second.peak);
+    stats->in_use_bytes = static_cast<SceSize>(usage->second.in_use);
+    return 0;
 }
 
 EXPORT(int, sceClibMspaceMallocStatsFast) {
@@ -297,6 +365,7 @@ EXPORT(Ptr<void>, sceClibMspaceMemalign, Ptr<void> space, uint32_t alignment, ui
     const std::lock_guard<std::mutex> guard(emuenv.kernel.mutex);
 
     void *address = mspace_memalign(space.get(emuenv.mem), alignment, size);
+    account_mspace(emuenv.kernel, space.address(), address, true);
     return Ptr<void>(address, emuenv.mem);
 }
 
@@ -304,7 +373,12 @@ EXPORT(Ptr<void>, sceClibMspaceRealloc, Ptr<void> space, Ptr<void> address, uint
     TRACY_FUNC(sceClibMspaceRealloc, space, address, size);
     const std::lock_guard<std::mutex> guard(emuenv.kernel.mutex);
 
-    void *new_address = mspace_realloc(space.get(emuenv.mem), address.get(emuenv.mem), size);
+    // A failed realloc keeps the old block (and dlmalloc here does not free
+    // on a zero size: it returns a minimum block).
+    void *old_block = address.get(emuenv.mem);
+    account_mspace(emuenv.kernel, space.address(), old_block, false);
+    void *new_address = mspace_realloc(space.get(emuenv.mem), old_block, size);
+    account_mspace(emuenv.kernel, space.address(), new_address ? new_address : old_block, true);
     return Ptr<void>(new_address, emuenv.mem);
 }
 
