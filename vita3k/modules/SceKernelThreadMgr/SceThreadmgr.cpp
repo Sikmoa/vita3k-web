@@ -1253,6 +1253,11 @@ EXPORT(int, sceKernelDeleteTimer, SceUID timer_handle) {
 EXPORT(int, sceKernelExitDeleteThread, int status) {
     TRACY_FUNC(sceKernelExitDeleteThread, status);
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    {
+        // Joiners and GetThreadExitStatus read the exit status from here.
+        const std::lock_guard<std::mutex> lock(thread->mutex);
+        thread->returned_value = static_cast<uint32_t>(status);
+    }
     thread->exit_delete();
 
     return status;

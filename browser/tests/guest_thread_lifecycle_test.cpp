@@ -15,6 +15,7 @@
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
 #include "guest_mspace_tests.h"
 #include "guest_msg_dialog_tests.h"
+#include "guest_fios_overlay_tests.h"
 #include "inline_mutex_fixture.h"
 
 int main() {
@@ -61,6 +62,7 @@ int main() {
     REQUIRE(parent && parent->status == ThreadStatus::dormant);
     test_guest_mspace(*env, *parent);
     test_guest_msg_dialog(*env, *parent);
+    test_guest_fios_overlay(*env, *parent);
     REQUIRE(parent->start(0, Ptr<void>{}, false) == 0);
     const auto progress = runtime.resume(256);
     REQUIRE(progress.failed == 0);
@@ -355,23 +357,25 @@ int main() {
         }
     }
     // sceKernelWaitThreadEnd through the production import and the runtime's
-    // import filter: join on exit, timeout, an already-dormant target, and a
-    // waiter deleted while parked.
-    for (unsigned scenario = 0; scenario < 4; ++scenario) {
+    // import filter: join on return, timeout, an already-dormant target, a
+    // waiter deleted while parked, a target ending in ExitDeleteThread, and a
+    // deleted waiter whose target goes dormant before the waiter is reaped.
+    for (unsigned scenario = 0; scenario < 6; ++scenario) {
         env->kernel.call_import = [&](CPUState &cpu, uint32_t nid, SceUID tid) {
             call_import(*env, cpu, nid, tid);
             REQUIRE(env->missing_nids.empty());
         };
         REQUIRE(runtime.attach(*env));
-        guest_thread_fixture::build_thread_end_pair(env->mem, code, data);
+        guest_thread_fixture::build_thread_end_pair(env->mem, code, data, scenario == 4);
         const auto word = [&](unsigned offset) -> uint32_t & { return *Ptr<uint32_t>(data + offset).get(env->mem); };
         word(0x60) = scenario == 2; // gate
         word(0x64) = 0xcccccccc; // stat
         word(0x68) = 0xcccccccc; // result
         word(0x70) = scenario == 1 ? data + 0x74 : 0; // timeout pointer
         word(0x74) = 50000;
+        // Scenario 5 needs the target dispatched first once both are woken.
         auto target = env->kernel.create_thread(env->mem, "join target", Ptr<const void>(code + 0x400),
-            SCE_KERNEL_DEFAULT_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT,
+            SCE_KERNEL_DEFAULT_PRIORITY_USER - (scenario == 5 ? 8 : 0), SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT,
             SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
         auto waiter = env->kernel.create_thread(env->mem, "join waiter", Ptr<const void>(code),
             SCE_KERNEL_DEFAULT_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT,
@@ -383,46 +387,61 @@ int main() {
             REQUIRE(runtime.resume(64).failed == 0);
             REQUIRE(target->status == ThreadStatus::dormant);
         }
+        // The target parks in DelayThread between gate polls, so drive the
+        // runtime (deadlines included) until the expected state is reached.
+        const auto run_until = [&](auto done) {
+            const auto limit = vita3k::web::GuestThreadRuntime::now_us() + 2000000;
+            while (!done()) {
+                REQUIRE(runtime.resume(64).failed == 0);
+                REQUIRE(vita3k::web::GuestThreadRuntime::now_us() < limit);
+            }
+        };
         REQUIRE(waiter->start(0, Ptr<void>{}, false) == 0);
-        const auto first = runtime.resume(64);
-        REQUIRE(first.failed == 0);
         if (scenario == 2) {
-            REQUIRE(waiter->status == ThreadStatus::dormant);
+            run_until([&] { return waiter->status == ThreadStatus::dormant; });
             REQUIRE(word(0x68) == 0 && word(0x64) == 43);
         } else {
+            run_until([&] { return !target->waiting_threads.empty(); });
             REQUIRE(waiter->status == ThreadStatus::wait);
-            REQUIRE(first.waiting == 1 && first.runnable == 1);
             REQUIRE(target->waiting_threads.size() == 1 && target->waiting_threads.front() == waiter);
             // The parked HLE frame must not retain either thread's lock.
             REQUIRE(target->mutex.try_lock()); target->mutex.unlock();
             REQUIRE(waiter->mutex.try_lock()); waiter->mutex.unlock();
             REQUIRE(word(0x68) == 0xcccccccc);
         }
-        if (scenario == 0) {
+        if (scenario == 0 || scenario == 4) {
             word(0x60) = 1;
-            REQUIRE(runtime.resume(256).failed == 0);
-            REQUIRE(target->status == ThreadStatus::dormant && waiter->status == ThreadStatus::dormant);
+            run_until([&] { return waiter->status == ThreadStatus::dormant; });
             REQUIRE(word(0x68) == 0 && word(0x64) == 43);
+            if (scenario == 4)
+                REQUIRE(!env->kernel.threads.contains(target->id));
+            else
+                REQUIRE(target->status == ThreadStatus::dormant);
+        } else if (scenario == 5) {
+            // Shutdown-style deletion of both while the target sleeps: the
+            // waiter is woken while still linked, and the more urgent target
+            // reaches its dormant transition first.
+            target->exit_delete(false);
+            waiter->exit_delete(false);
+            run_until([&] { return env->kernel.threads.empty(); });
+            REQUIRE(target->waiting_threads.empty());
         } else if (scenario == 1) {
-            REQUIRE(first.next_deadline_us);
-            while (vita3k::web::GuestThreadRuntime::now_us() < *first.next_deadline_us) {}
-            REQUIRE(runtime.resume(64).failed == 0);
-            REQUIRE(waiter->status == ThreadStatus::dormant);
+            run_until([&] { return waiter->status == ThreadStatus::dormant; });
             REQUIRE(word(0x68) == uint32_t(SCE_KERNEL_ERROR_WAIT_TIMEOUT));
             REQUIRE(word(0x74) == 0 && word(0x64) == 0xcccccccc);
-            REQUIRE(target->waiting_threads.empty() && target->status == ThreadStatus::run);
+            REQUIRE(target->waiting_threads.empty() && target->status != ThreadStatus::dormant);
         } else if (scenario == 3) {
             waiter->exit_delete(false);
-            REQUIRE(runtime.resume(64).failed == 0);
-            REQUIRE(!env->kernel.threads.contains(waiter->id));
-            REQUIRE(target->waiting_threads.empty() && target->status == ThreadStatus::run);
+            run_until([&] { return !env->kernel.threads.contains(waiter->id); });
+            REQUIRE(target->waiting_threads.empty() && target->status != ThreadStatus::dormant);
         }
-        if (scenario != 0) {
+        if (scenario == 1 || scenario == 3) {
             word(0x60) = 1;
-            REQUIRE(runtime.resume(256).failed == 0);
-            REQUIRE(target->status == ThreadStatus::dormant && target->waiting_threads.empty());
+            run_until([&] { return target->status == ThreadStatus::dormant; });
+            REQUIRE(target->waiting_threads.empty());
         }
-        REQUIRE(target->returned_value == 43);
+        if (scenario != 5)
+            REQUIRE(target->returned_value == 43);
         REQUIRE(runtime.shutdown());
         REQUIRE(env->kernel.threads.empty());
         REQUIRE(get_current_cpu_state() == nullptr);

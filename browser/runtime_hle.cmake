@@ -304,11 +304,13 @@ set(_hle_exports
     sceClibMemcmp sceClibMemmove sceClibMemcpy_safe sceClibLookCtypeTable
     sceClibStrchr sceClibStrrchr sceClibStrncmp sceClibStrncasecmp sceClibStrnlen
     sceClibStrncpy sceClibStrncat sceClibTolower sceClibToupper
-    sceClibPrintf sceClibSnprintf
     # Keep sceClibStrlcpy/Strlcat (strncpy/strncat bodies: wrong return value,
     # no terminator guarantee), sceClibVsnprintf (returns 0, not the length)
     # and sceClibStrtoll (stores a host char* through the guest endptr)
     # unselected: their upstream bodies are wrong, not merely incomplete.
+    # Every utils::snprintf user (sceClibPrintf/Snprintf/Vprintf/Vsnprintf,
+    # sceDbg handlers) also stays unselected: external/printf reads %ld/%lu/%z
+    # arguments with the host's 8-byte long/size_t on wasm64, not the guest's 4.
     # LwCond signal/delete: condvar_wait returns ILLEGAL_CONTEXT under the
     # fiber host, so no waiter is ever queued and these only update or erase
     # the kernel object (no host condition variable is reached).

@@ -123,7 +123,10 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
 void ThreadState::raise_waiting_threads() {
     for (const auto &t : waiting_threads) {
         const std::unique_lock<std::mutex> lock(t->mutex);
-        assert(t->status == ThreadStatus::wait);
+        // exit_delete already set a deleted waiter running; it may still be
+        // linked here if this thread ends before the waiter resumes.
+        if (t->status != ThreadStatus::wait)
+            continue;
         t->status = ThreadStatus::run;
         t->status_cond.notify_all();
         // Enqueue only: a waiter parked on the fiber host has no condition

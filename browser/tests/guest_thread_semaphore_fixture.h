@@ -180,12 +180,19 @@ inline void build_lwmutex_pair(MemState &mem, Address code, Address data) {
     c.finish(mem);
 }
 // Thread-end join pair. Target (code+0x400): poll the host gate at data+0x60,
-// return 43. Waiter (code): sceKernelWaitThreadEnd(id at data+0x6c,
-// stat=data+0x64, timeout pointer at data+0x70), result to data+0x68, return 42.
-inline void build_thread_end_pair(MemState &mem, Address code, Address data) {
-    const Address stub = code + 0x300;
+// sleeping in sceKernelDelayThread(1000) between polls (so it parks rather
+// than spins), then return 43 or, with exit_delete, call
+// sceKernelExitDeleteThread(43).
+// Waiter (code): sceKernelWaitThreadEnd(id at data+0x6c, stat=data+0x64,
+// timeout pointer at data+0x70), result to data+0x68, return 42.
+inline void build_thread_end_pair(MemState &mem, Address code, Address data, bool exit_delete) {
+    const Address stub = code + 0x300, exit_stub = code + 0x320, delay_stub = code + 0x340;
+    const uint32_t delay_words[] = {0xef000000, 0xe1a0f00e, 0x4b675d05}; // sceKernelDelayThread
+    std::memcpy(Ptr<void>(delay_stub).get(mem), delay_words, sizeof(delay_words));
     const uint32_t words[] = {0xef000000, 0xe1a0f00e, 0xddb395a9}; // sceKernelWaitThreadEnd
+    const uint32_t exit_words[] = {0xef000000, 0xe1a0f00e, 0x1d17decf}; // sceKernelExitDeleteThread
     std::memcpy(Ptr<void>(stub).get(mem), words, sizeof(words));
+    std::memcpy(Ptr<void>(exit_stub).get(mem), exit_words, sizeof(exit_words));
     Arm w(code);
     w.emit(0xe92d4010); // push {r4,lr}
     w.constant(4, data);
@@ -200,8 +207,14 @@ inline void build_thread_end_pair(MemState &mem, Address code, Address data) {
     t.emit(0xe92d4010);
     t.constant(4, data);
     const Address gate_loop = t.pc();
-    t.load(0, 0x60); t.emit(0xe3500000); t.emit(0x0a000000u | ((static_cast<uint32_t>(static_cast<int32_t>(gate_loop - (t.pc() + 8))) >> 2) & 0xffffffu)); // beq gate_loop
+    t.load(0, 0x60); t.emit(0xe3500000);
+    t.emit(0x1a000003); // bne past the delay (+3 instructions)
+    t.constant(0, 1000);
+    t.call(delay_stub);
+    t.emit(0xea000000u | ((static_cast<uint32_t>(static_cast<int32_t>(gate_loop - (t.pc() + 8))) >> 2) & 0xffffffu)); // b gate_loop
     t.constant(0, 43);
+    if (exit_delete)
+        t.call(exit_stub);
     t.emit(0xe8bd8010);
     t.finish(mem);
 }
