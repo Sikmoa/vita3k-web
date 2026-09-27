@@ -1805,6 +1805,35 @@ private:
         }
     }
 
+    // VQMOVN.U: each unsigned `2 * bits` lane clamped to the unsigned
+    // `bits` range, packed into the low 64 bits (upper 64 bits zero).
+    // Saturating any lane sets the sticky FPSCR.QC (bit 27), like Dynarmic's
+    // EmitVectorUnsignedSaturatedNarrow*.
+    bool vector_unsigned_saturated_narrow(const Inst &inst, unsigned bits) {
+        const auto saturated = next_local + 4, wide = next_local + 5;
+        imm(0); set(saturated);
+        if (bits == 32) {
+            for (unsigned lane = 0; lane < 2; ++lane) {
+                value_word(inst.GetArg(0), 2 * lane + 1); op(Eqz); op(Eqz); set(wide);
+                get(saturated); get(wide); op(Or); set(saturated);
+                imm(UINT32_MAX); value_word(inst.GetArg(0), 2 * lane); get(wide); op(Select);
+                set(next_local + lane);
+            }
+            imm(0); set(next_local + 2); imm(0); set(next_local + 3);
+        } else {
+            const uint32_t max = (1u << bits) - 1;
+            pack_lanes(bits, 2, [&](unsigned i) {
+                vector_element_word(inst.GetArg(0), 2 * bits, i); set(wide);
+                get(saturated); get(wide); imm(max); op(GtU); op(Or); set(saturated);
+                imm(max); get(wide); get(wide); imm(max); op(GtU); op(Select);
+            });
+        }
+        get(saturated);
+        begin_if();
+        get(0); load(offsetof(JitState, fpscr)); imm(0x08000000u); op(Or); store(offsetof(JitState, fpscr));
+        end_if();
+        return ok;
+    }
     // VMUL.P8: the low byte of each carry-less byte product, four lanes per
     // word; the shift masks drop the bits a left shift moves into the next
     // byte.
@@ -3319,6 +3348,9 @@ private:
         case Op::VectorMultiplyUnsignedWiden8: return vector_multiply_widen(inst, 8, false);
         case Op::VectorMultiplyUnsignedWiden16: return vector_multiply_widen(inst, 16, false);
         case Op::VectorMultiplyUnsignedWiden32: return vector_multiply_widen(inst, 32, false);
+        case Op::VectorUnsignedSaturatedNarrow16: return vector_unsigned_saturated_narrow(inst, 8);
+        case Op::VectorUnsignedSaturatedNarrow32: return vector_unsigned_saturated_narrow(inst, 16);
+        case Op::VectorUnsignedSaturatedNarrow64: return vector_unsigned_saturated_narrow(inst, 32);
         case Op::VectorPolynomialMultiply8: polynomial_multiply8(inst); return ok;
         case Op::VectorPolynomialMultiplyLong8: polynomial_multiply_long8(inst); return ok;
         case Op::VectorArithmeticVShift32: {
@@ -4225,6 +4257,16 @@ private:
         case Op::VectorEqual8: return vector_integer_select(inst, 8, VectorLaneOp::Equal, false);
         case Op::VectorEqual16: return vector_integer_select(inst, 16, VectorLaneOp::Equal, false);
         case Op::VectorEqual32: return vector_integer_select(inst, 32, VectorLaneOp::Equal, false);
+        case Op::VectorEqual64:
+            // Both words equal -> all-ones lane (VQRSHRN's rounding correction).
+            for (unsigned word = 0; word < 4; word += 2) {
+                imm(0);
+                value_word(inst.GetArg(0), word); value_word(inst.GetArg(1), word); op(Eq);
+                value_word(inst.GetArg(0), word + 1); value_word(inst.GetArg(1), word + 1); op(Eq);
+                op(And); op(Sub); set(next_local + word);
+                get(next_local + word); set(next_local + word + 1);
+            }
+            return ok;
         case Op::VectorGreaterS8: return vector_integer_select(inst, 8, VectorLaneOp::Greater, true);
         case Op::VectorGreaterS16: return vector_integer_select(inst, 16, VectorLaneOp::Greater, true);
         case Op::VectorGreaterS32: return vector_integer_select(inst, 32, VectorLaneOp::Greater, true);

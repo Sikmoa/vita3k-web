@@ -1,5 +1,6 @@
 // Lane-rearranging, widening and pairwise NEON IR (VPADD, VPADDL, VZIP,
-// VUZP, VPMIN/VPMAX, VMOVL, VHADD, VSHL register, VMULL/VMLAL, VMUL.P8).
+// VUZP, VPMIN/VPMAX, VMOVL, VHADD, VSHL register, VMULL/VMLAL, VMUL.P8,
+// VQMOVN.U, VQ(R)SHRN.U64).
 // References are byte-lane models of Dynarmic's IR definitions
 // (backend/x64/emit_x64_vector.cpp and ir/opt/polyfill_pass.cpp),
 // independent of the emitter's i32-word lowering. Guest cases run real
@@ -139,6 +140,54 @@ void ir_lanes() {
             });
         }
     }
+    // VQMOVN.U: clamp to the narrow range; any clamp sets the sticky QC.
+    // Harness pattern 0 starts with FPSCR clear, so constant saturating
+    // inputs prove QC is set and non-saturating ones that it is left alone.
+    const Op narrow[] = {Op::VectorUnsignedSaturatedNarrow16, Op::VectorUnsignedSaturatedNarrow32,
+        Op::VectorUnsignedSaturatedNarrow64};
+    for (unsigned k = 0; k < 3; ++k) {
+        const unsigned bits = 8u << k; // result lane width
+        const uint64_t max = truncate(~uint64_t(0), bits);
+        const auto expect_narrow = [&](JitState &s, const JitState &source) {
+            bool saturated = false;
+            for (unsigned i = 0; i < 128 / bits; ++i) {
+                const uint64_t wide = i < 64 / bits ? lane(source, 2 * bits, i) : 0;
+                saturated |= wide > max;
+                set_lane(s, bits, i, std::min(wide, max));
+            }
+            if (saturated) s.fpscr |= 0x08000000u;
+        };
+        h.test(narrow[k], [&](auto &b) {
+            write_q(b, append(b, narrow[k], {read_q(b)}));
+        }, [&](auto &s) { const auto before = s; expect_narrow(s, before); });
+        const std::array<std::array<uint64_t, 2>, 2> constants{{
+            {0x0001fffe00ff0100ull, 0x0000ffff00000000ull}, // every width saturates
+            {0x00000000000000ffull, 0x0000000000000001ull}}}; // every width fits
+        for (const auto &words : constants) {
+            h.test(narrow[k], [&](auto &b) {
+                write_q(b, append(b, narrow[k], {append(b, Op::Pack2x64To1x128, {Value{words[0]}, Value{words[1]}})}));
+            }, [&](auto &s) {
+                JitState source{};
+                set_lane(source, 64, 0, words[0]);
+                set_lane(source, 64, 1, words[1]);
+                expect_narrow(s, source);
+            });
+        }
+        h.test(narrow[k], [&](auto &b) {
+            write_q(b, append(b, narrow[k], {append(b, Op::Pack2x64To1x128,
+                {Value{0x0000000100000000ull}, Value{0ull}})}));
+        }, [&](auto &s) {
+            JitState source{};
+            set_lane(source, 64, 0, 0x0000000100000000ull);
+            expect_narrow(s, source);
+        });
+    }
+    binary(Op::VectorEqual64, 64, [](const JitState &s, unsigned i) {
+        return lane(s, 64, i, 0) == lane(s, 64, i, 1) ? ~uint64_t(0) : 0;
+    });
+    h.test(Op::VectorEqual64, [&](auto &b) {
+        write_q(b, append(b, Op::VectorEqual64, {read_q(b), read_q(b)}));
+    }, [&](auto &s) { set_lane(s, 64, 0, ~uint64_t(0)); set_lane(s, 64, 1, ~uint64_t(0)); });
     binary(Op::VectorPolynomialMultiply8, 8, [](const JitState &s, unsigned i) {
         return polynomial_multiply(lane(s, 8, i, 0), lane(s, 8, i, 1));
     });
@@ -271,6 +320,26 @@ void guest_lanes(MemState &mem) {
                     const auto before = s;
                     for (unsigned i = 0; i < 64 / bits; ++i)
                         set_dlane(s, d, bits, i, logical_vshift(dlane(before, m, bits, i), dlane(before, n, bits, i), bits));
+                });
+            }
+            // VQMOVN.U<2*bits> Dd, Qm; VQSHRN/VQRSHRN.U64 Dd, Qm, #5. QC is
+            // already set in the harness state; the IR fixtures pin setting it.
+            for (unsigned size = 0; size < 3; ++size) {
+                const unsigned bits = 8u << size;
+                run(neon3(0xf3b202c0u | (size << 18), d, 0, 4), [&](auto &s) {
+                    const auto before = s;
+                    for (unsigned i = 0; i < 64 / bits; ++i)
+                        set_dlane(s, d, bits, i, std::min(lane(before, 2 * bits, i, 2), truncate(~uint64_t(0), bits)));
+                });
+            }
+            for (bool rounding : {false, true}) {
+                run(neon3((rounding ? 0xf3800950u : 0xf3800910u) | (59u << 16), d, 0, 4), [&](auto &s) {
+                    const auto before = s;
+                    for (unsigned i = 0; i < 2; ++i) {
+                        const uint64_t x = lane(before, 64, i, 2);
+                        const uint64_t shifted = (x >> 5) + (rounding ? (x >> 4) & 1 : 0);
+                        set_dlane(s, d, 32, i, std::min<uint64_t>(shifted, 0xffffffffu));
+                    }
                 });
             }
             // VMUL.P8 Qd, Qn, Qm
