@@ -11,6 +11,7 @@
 //
 //   ux0/app/<title>/eboot.bin + sce_module/*.suprx + game data
 //   vs0/sys/external/*.suprx + os0:kd/*.skprx (from the user's firmware)
+//   os0/kd/registry.db0 (firmware registry template behind SceRegMgr reads)
 //   ux0/license/<title>/*.rif (or the 16-byte klic via the setter below)
 //
 // SELF segments must already be decrypted offline (see
@@ -38,6 +39,7 @@
 #include <modules/module_parent.h>
 #include <nids/functions.h>
 #include <packages/license.h>
+#include <regmgr/functions.h>
 #include <emscripten/emscripten.h>
 
 #include "msg_dialog_bridge.h"
@@ -531,6 +533,8 @@ static int run_app_impl() {
 #endif
         init_device_paths(env->io);
         init_savedata_app_path(env->io, env->vita_fs_path);
+        // SceRegMgr values: firmware template defaults, then vd0/registry/system.dreg.
+        regmgr::init_regmgr(env->regmgr, env->vita_fs_path);
         init_libraries(*env);
         init_exported_vars(*env);
 

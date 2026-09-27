@@ -344,9 +344,13 @@ int32_t get_int_value(RegMgrState &regmgr, const std::string &category, const st
 
     std::lock_guard<std::mutex> lock(regmgr.mutex);
 
-    const auto cat = fix_category(category);
+    const auto &value = regmgr.system_dreg[fix_category(category)][name];
+    if (value.size() < sizeof(uint32_t)) {
+        LOG_ERROR("Registry has no int value {}{}", category, name);
+        return 0;
+    }
 
-    return byte_swap(*reinterpret_cast<const uint32_t *>(regmgr.system_dreg[cat][name].data()));
+    return byte_swap(*reinterpret_cast<const uint32_t *>(value.data()));
 }
 
 void set_int_value(RegMgrState &regmgr, const std::string &category, const std::string &name, const int32_t value) {

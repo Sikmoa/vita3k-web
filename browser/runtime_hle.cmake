@@ -335,6 +335,10 @@ set(_hle_exports
     sceNetHtonl sceNetHtons sceNetNtohl sceNetNtohs sceNetErrnoLoc sceNetInetNtop
     # NP ID comparison: pure struct comparison.
     sceNpCmpNpId
+    # Registry reads (libhttp asks /CONFIG/NET/ssl_cert_ignorable): production
+    # regmgr over the staged firmware template os0/kd/registry.db0, loaded at
+    # launch as desktop does (vita_app.cpp).
+    sceRegMgrSystemParamGetInt
 )
 
 # Take NID values from the one authoritative database, never a second resolver.
@@ -402,6 +406,7 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceCommonDialog/SceCommonDialog.cpp"
     # No LIBRARY_INIT; startup_libraries.inc stays LIBRARY(SceSysmem).
     "${_HLE_ROOT}/modules/SceCtrl/SceCtrl.cpp"
+    "${_HLE_ROOT}/modules/SceRegistryMgr/SceRegMgrForGame.cpp"
     # ctrl_get implementation behind the selected SceCtrl bridges (chrono +
     # controller-state reads only; no host input device needed).
     "${_HLE_ROOT}/ctrl/src/ctrl.cpp"
@@ -511,6 +516,7 @@ add_library(vita3k_web_runtime_hle STATIC
     "${_HLE_ROOT}/io/src/filesystem.cpp"
     "${_HLE_ROOT}/io/src/state_functions.cpp"
     "${_HLE_ROOT}/util/src/net_utils.cpp"
+    "${_HLE_ROOT}/regmgr/src/regmgr.cpp"
     "${_HLE_ROOT}/np/src/init.cpp"
     # Trophy context lifecycle for sceNpTrophyCreateContext and friends:
     # upstream production bodies over the staged TRP files (pugixml parses
