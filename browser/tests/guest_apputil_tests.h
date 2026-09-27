@@ -2,6 +2,7 @@
 // firmware 3.74 (apputil.suprx, livearea_util.suprx, libcdlg.suprx).
 #pragma once
 #include <gxm/state.h>
+#include <rtc/rtc.h>
 #include <cstring>
 #include <string>
 
@@ -34,6 +35,14 @@ inline void test_guest_apputil(EmuEnvState &env, ThreadState &thread) {
     boot[0] = boot[1] = 0xcccccccc;
     REQUIRE(call(init, { init_param, boot_param }) == 0 && boot[0] == 0 && boot[1] == 0);
     REQUIRE(call(system_param_int, { 1, value }) == 0);
+    // Time zone (minutes, without daylight saving time) and summertime come
+    // from the date and time settings; ids 3 (user name) and 8 are not ints.
+    REQUIRE(call(system_param_int, { 7, value }) == 0);
+    const int32_t summertime = *Ptr<int32_t>(value).get(env.mem);
+    REQUIRE(summertime == 0 || summertime == 1);
+    REQUIRE(call(system_param_int, { 6, value }) == 0);
+    REQUIRE(*Ptr<int32_t>(value).get(env.mem) == rtc_local_offset_minutes() - summertime * 60);
+    REQUIRE(call(system_param_int, { 3, value }) == 0x80100600 && call(system_param_int, { 8, value }) == 0x80100600);
 
     // No app event is queued: the event is cleared and the queue answers empty.
     std::memset(Ptr<uint8_t>(event).get(env.mem), 0xcc, 0x404);

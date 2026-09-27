@@ -29,6 +29,7 @@
 #include <packages/license.h>
 #include <packages/sfo.h>
 
+#include <rtc/rtc.h>
 #include <util/safe_time.h>
 #include <util/tracy.h>
 
@@ -577,6 +578,9 @@ EXPORT(SceInt32, sceAppUtilSystemParamGetInt, SceSystemParamId paramId, SceInt32
     switch (paramId) {
     case SCE_SYSTEM_PARAM_ID_LANG:
         *value = (SceSystemParamLang)emuenv.cfg.sys_lang;
+        // Before SDK 2.00 there was no language 19 (Turkish): it reads as 18.
+        if (*value == 19 && CALL_EXPORT(sceKernelGetMainModuleSdkVersion) < 0x02000000)
+            *value = 18;
         return 0;
     case SCE_SYSTEM_PARAM_ID_ENTER_BUTTON:
         *value = (SceSystemParamEnterButtonAssign)emuenv.cfg.sys_button;
@@ -587,10 +591,14 @@ EXPORT(SceInt32, sceAppUtilSystemParamGetInt, SceSystemParamId paramId, SceInt32
     case SCE_SYSTEM_PARAM_ID_TIME_FORMAT:
         *value = (SceSystemParamTimeFormat)emuenv.cfg.sys_time_format;
         return 0;
+    // The date and time settings (sceAppMgrSystemParamDateTimeGetConf): the
+    // host's time zone in minutes without daylight saving time, and whether
+    // daylight saving time is on, as local time conversions use them.
     case SCE_SYSTEM_PARAM_ID_TIME_ZONE:
+        *value = rtc_local_offset_minutes() - (rtc_local_summertime() ? 60 : 0);
+        return 0;
     case SCE_SYSTEM_PARAM_ID_SUMMERTIME:
-        STUBBED("No support Time Zone and Summer Time, give 0 value");
-        *value = 0;
+        *value = rtc_local_summertime() ? 1 : 0;
         return 0;
     default:
         return RET_ERROR(SCE_APPUTIL_ERROR_PARAMETER);

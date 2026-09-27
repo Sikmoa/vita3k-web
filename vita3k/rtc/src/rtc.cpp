@@ -117,3 +117,10 @@ int rtc_local_offset_minutes() {
     SAFE_GMTIME(&t, &gmt_tm);
     return static_cast<int>((std::mktime(&local_tm) - std::mktime(&gmt_tm)) / 60);
 }
+
+bool rtc_local_summertime() {
+    const std::time_t t = std::time(nullptr);
+    tm local_tm = {};
+    SAFE_LOCALTIME(&t, &local_tm);
+    return local_tm.tm_isdst > 0;
+}

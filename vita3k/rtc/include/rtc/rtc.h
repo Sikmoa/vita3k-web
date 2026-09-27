@@ -101,6 +101,8 @@ std::uint64_t __RtcPspTimeToTicks(const SceDateTime *pt);
 // Host time-zone offset (local - UTC) in minutes, now: the local time of
 // sceRtcConvertUtcToLocalTime and the RFC 3339 local-time formatters.
 int rtc_local_offset_minutes();
+// Whether the host's local time is in daylight saving time now.
+bool rtc_local_summertime();
 
 // Firmware 3.74 date/time rules (SceRtcUser in driver_us.suprx, SceRtc).
 // sceRtcCheckValid: year 1..9999, Gregorian day, second <= 59, usec <= 999999.
