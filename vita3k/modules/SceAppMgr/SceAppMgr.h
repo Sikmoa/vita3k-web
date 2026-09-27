@@ -43,6 +43,10 @@ typedef struct SceAppMgrSystemEvent {
     SceUInt8 reserved[60]; //!< Reserved data
 } SceAppMgrSystemEvent;
 
+// Firmware 3.74 SceAppMgr answers of a normally launched game process with no
+// pending system event (the kernel zeroes the whole struct either way).
+int receive_system_event(SceAppMgrSystemEvent *system_event);
+
 typedef struct SceAppMgrAppState {
     SceUInt32 systemEventNum; //!< Number of system events
     SceUInt32 appEventNum; //!< Number of application events

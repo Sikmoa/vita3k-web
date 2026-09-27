@@ -17,6 +17,13 @@
 
 #include <module/module.h>
 
-EXPORT(int, _sceSblACMgrIsGameProgram) {
-    return UNIMPLEMENTED();
+#include <kernel/state.h>
+
+// Firmware 3.74 acmgr: writes ksceSblACMgrIsGameProgram of the caller.
+EXPORT(int, _sceSblACMgrIsGameProgram, SceInt32 *result) {
+    constexpr uint32_t SCE_SBL_ERROR_INVALID_ARGUMENT = 0x800F0916; // name unknown
+    if (!result)
+        return RET_ERROR(SCE_SBL_ERROR_INVALID_ARGUMENT);
+    *result = emuenv.kernel.process_is_game_program();
+    return 0;
 }

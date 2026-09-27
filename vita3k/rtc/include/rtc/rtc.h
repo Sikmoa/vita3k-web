@@ -97,3 +97,17 @@ std::uint64_t rtc_get_ticks(uint64_t base_tick);
 void __RtcPspTimeToTm(tm *val, const SceDateTime *pt);
 void __RtcTicksToPspTime(SceDateTime *t, std::uint64_t ticks);
 std::uint64_t __RtcPspTimeToTicks(const SceDateTime *pt);
+
+// Host time-zone offset (local - UTC) in minutes, now: the local time of
+// sceRtcConvertUtcToLocalTime and the RFC 3339 local-time formatters.
+int rtc_local_offset_minutes();
+
+// Firmware 3.74 date/time rules (SceRtcUser in driver_us.suprx, SceRtc).
+// sceRtcCheckValid: year 1..9999, Gregorian day, second <= 59, usec <= 999999.
+int rtc_check_valid(const SceDateTime *date);
+// RFC 3339 "YYYY-MM-DDTHH:MM:SS.CC" + "Z" or "+HH:MM" for utc_tick shifted by
+// offset_minutes (-1439..1439); `out` needs 32 bytes. 0 or an SCE_RTC error.
+int rtc_format_rfc3339(char *out, std::uint64_t utc_tick, int offset_minutes);
+// sceRtcParseRFC3339 / sceRtcParseDateTime: 0 and *utc_tick, or an error.
+int rtc_parse_rfc3339(std::uint64_t *utc_tick, const char *text);
+int rtc_parse_date_time(std::uint64_t *utc_tick, const char *text);

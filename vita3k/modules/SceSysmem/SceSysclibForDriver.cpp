@@ -23,6 +23,8 @@
 
 #include <module/guest_format.h>
 
+#include <stdexcept>
+
 TRACY_MODULE_NAME(SceSysclibForDriver);
 
 EXPORT(int, __aeabi_idiv, SceInt numerator, SceInt denominator) {
@@ -118,7 +120,11 @@ EXPORT(int, __memset_chk) {
     return UNIMPLEMENTED();
 }
 
+// Firmware 3.74 sysmem __kstack_chk_fail is `bkpt 0x81`: it never returns.
 EXPORT(int, __kstack_chk_fail) {
+#ifdef __EMSCRIPTEN__
+    throw std::runtime_error("__kstack_chk_fail: kernel stack corruption (bkpt 0x81)");
+#endif
     return UNIMPLEMENTED();
 }
 

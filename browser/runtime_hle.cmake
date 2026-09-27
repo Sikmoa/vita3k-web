@@ -92,10 +92,11 @@ set(_hle_exports
     # SceSysmodule imports: whether the calling thread runs its callbacks, a
     # QA flag (clear on retail) and the per-thread permission swap.
     SceThreadmgrForDriver_20C228E4 SceQafMgrForDriver_B9770A13 ksceKernelSetPermission
-    # Remaining SceSysmodule static imports, resolved by one-pass enumeration
-    # (VITA3K_TRACE_MODULE_IMPORTS). Named exports reuse the upstream bodies:
-    # UNIMPLEMENTED() warning stubs below are stub parity with desktop Vita3K,
-    # not implemented semantics; production bodies are noted per name.
+    # Remaining SceSysmodule static imports (VITA3K_TRACE_MODULE_IMPORTS),
+    # with firmware 3.74 semantics: GetThreadId is the caller,
+    # MemcpyKernelToUser copies, the retail DIPSW table is clear,
+    # __kstack_chk_fail (bkpt) fails the thread; the module ForPid wrappers
+    # and ksceDebugPrintf forward to production bodies.
     ksceKernelGetThreadId
     __kstack_chk_fail
     ksceKernelMemcpyKernelToUser ksceKernelMemcpyUserToKernel
@@ -379,6 +380,19 @@ set(_hle_exports
     # queue is empty and the browser has no LiveArea (a valid update
     # completes at once).
     sceAppUtilBgdlGetStatus sceLiveAreaUpdateFrameAsync
+    # SceAppMgr of a game process (firmware 3.74): no system event is ever
+    # pending; the vs0 user drives are per-app "sd<hex>:" names the IO layer
+    # resolves. RTC RFC 3339 / RFC 1123 formatting and parsing, checked
+    # against the firmware code run in an emulator.
+    sceAppMgrReceiveSystemEvent sceAppMgrConvertVs0UserDrivePath
+    sceAppMgrGetVs0UserDataDrive sceAppMgrGetVs0UserModuleDrive
+    sceRtcParseDateTime sceRtcParseRFC3339 sceRtcFormatRFC3339 sceRtcFormatRFC3339LocalTime
+    sceRtcCheckValid
+    # Kernel imports of the LLE sysmodule.skprx, from firmware 3.74 threadmgr,
+    # processmgr and acmgr (retail console: DIPSW and QA flags clear).
+    SceThreadmgrForDriver_1AAFA818 SceThreadmgrForDriver_5053B005
+    SceProcessmgrForDriver_61B9B6FA SceProcessmgrForDriver_B1C3EFCA
+    ksceSblACMgrIsDevelopmentMode ksceSblACMgrIsGameProgram ksceSblACMgrIsPSMDevAssistant
 )
 
 # Take NID values from the one authoritative database, never a second resolver.
@@ -435,6 +449,7 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceRtc/SceRtc.cpp"
     "${_HLE_ROOT}/modules/SceDriverUser/SceRtcUser.cpp"
     "${_HLE_ROOT}/rtc/src/rtc.cpp"
+    "${_HLE_ROOT}/rtc/src/rtc_format.cpp"
     "${_HLE_ROOT}/modules/SceNet/SceNet.cpp"
     "${_HLE_ROOT}/modules/SceNetCtl/SceNetCtl.cpp"
     "${_HLE_ROOT}/modules/SceNetInternal/SceNetInternal.cpp"
@@ -446,6 +461,7 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceNpSignaling/SceNpSignaling.cpp"
     "${_HLE_ROOT}/modules/SceNpActivity/SceNpActivity.cpp"
     "${_HLE_ROOT}/modules/SceLiveArea/SceLiveAreaUtil.cpp"
+    "${_HLE_ROOT}/modules/SceSblACMgr/SceSblACMgrForDriver.cpp"
     "${_HLE_ROOT}/modules/SceNpTrophy/SceNpTrophy.cpp"
     "${_HLE_ROOT}/modules/SceAppUtil/SceAppUtil.cpp"
     "${_HLE_ROOT}/modules/SceCommonDialog/SceCommonDialog.cpp"

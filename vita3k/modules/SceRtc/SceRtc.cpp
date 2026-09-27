@@ -33,17 +33,7 @@ EXPORT(int, _sceRtcConvertLocalTimeToUtc, const SceRtcTick *pLocalTime, SceRtcTi
     if (pUtc == nullptr || pLocalTime == nullptr) {
         return RET_ERROR(SCE_RTC_ERROR_INVALID_POINTER);
     }
-    std::time_t t = std::time(nullptr);
-
-    tm local_tm = {};
-    tm gmt_tm = {};
-
-    SAFE_LOCALTIME(&t, &local_tm);
-    SAFE_GMTIME(&t, &gmt_tm);
-
-    std::time_t local = std::mktime(&local_tm);
-    std::time_t gmt = std::mktime(&gmt_tm);
-    pUtc->tick = pLocalTime->tick - (local - gmt) * VITA_CLOCKS_PER_SEC;
+    pUtc->tick = pLocalTime->tick - static_cast<std::int64_t>(rtc_local_offset_minutes()) * 60 * VITA_CLOCKS_PER_SEC;
 
     return 0;
 }
@@ -54,17 +44,7 @@ EXPORT(int, _sceRtcConvertUtcToLocalTime, const SceRtcTick *pUtc, SceRtcTick *pL
         return RET_ERROR(SCE_RTC_ERROR_INVALID_POINTER);
     }
 
-    std::time_t t = std::time(nullptr);
-
-    tm local_tm = {};
-    tm gmt_tm = {};
-
-    SAFE_LOCALTIME(&t, &local_tm);
-    SAFE_GMTIME(&t, &gmt_tm);
-
-    std::time_t local = std::mktime(&local_tm);
-    std::time_t gmt = std::mktime(&gmt_tm);
-    pLocalTime->tick = pUtc->tick + (local - gmt) * VITA_CLOCKS_PER_SEC;
+    pLocalTime->tick = pUtc->tick + static_cast<std::int64_t>(rtc_local_offset_minutes()) * 60 * VITA_CLOCKS_PER_SEC;
     return 0;
 }
 
@@ -78,14 +58,30 @@ EXPORT(int, _sceRtcFormatRFC2822LocalTime) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, _sceRtcFormatRFC3339) {
-    TRACY_FUNC(_sceRtcFormatRFC3339);
-    return UNIMPLEMENTED();
+// Firmware 3.74 ksceRtcFormatRFC3339: a NULL tick formats the current time;
+// on error the output is not written.
+static int format_rfc3339(EmuEnvState &emuenv, char *out, const SceRtcTick *utc, int offset_minutes) {
+    const std::uint64_t tick = utc ? utc->tick : rtc_get_ticks(emuenv.kernel.base_tick.tick);
+    char text[32];
+    if (!out)
+        return SCE_RTC_ERROR_INVALID_POINTER;
+    if (const int error = rtc_format_rfc3339(text, tick, offset_minutes))
+        return error;
+    strcpy(out, text);
+    return 0;
 }
 
-EXPORT(int, _sceRtcFormatRFC3339LocalTime) {
-    TRACY_FUNC(_sceRtcFormatRFC3339LocalTime);
-    return UNIMPLEMENTED();
+EXPORT(int, _sceRtcFormatRFC3339, char *pszDateTime, const SceRtcTick *utc, int iTimeZoneMinutes) {
+    TRACY_FUNC(_sceRtcFormatRFC3339, pszDateTime, utc, iTimeZoneMinutes);
+    const int result = format_rfc3339(emuenv, pszDateTime, utc, iTimeZoneMinutes);
+    return result ? RET_ERROR(result) : 0;
+}
+
+// The local offset is the one sceRtcConvertUtcToLocalTime applies.
+EXPORT(int, _sceRtcFormatRFC3339LocalTime, char *pszDateTime, const SceRtcTick *utc) {
+    TRACY_FUNC(_sceRtcFormatRFC3339LocalTime, pszDateTime, utc);
+    const int result = format_rfc3339(emuenv, pszDateTime, utc, rtc_local_offset_minutes());
+    return result ? RET_ERROR(result) : 0;
 }
 
 EXPORT(int, _sceRtcGetCurrentAdNetworkTick) {

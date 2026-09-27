@@ -1950,9 +1950,14 @@ EXPORT(int, sceKernelWaitThreadEndCB, SceUID thid, int *stat, SceUInt *timeout) 
     return CALL_EXPORT(_sceKernelWaitThreadEndCB, thid, stat, timeout);
 }
 
-EXPORT(int, sceSblACMgrIsGameProgram) {
-    TRACY_FUNC(sceSblACMgrIsGameProgram);
-    return UNIMPLEMENTED();
+// SceLibKernel forwards to the _sceSblACMgrIsGameProgram syscall.
+EXPORT(int, sceSblACMgrIsGameProgram, SceInt32 *result) {
+    TRACY_FUNC(sceSblACMgrIsGameProgram, result);
+    constexpr uint32_t SCE_SBL_ERROR_INVALID_ARGUMENT = 0x800F0916; // name unknown
+    if (!result)
+        return RET_ERROR(SCE_SBL_ERROR_INVALID_ARGUMENT);
+    *result = emuenv.kernel.process_is_game_program();
+    return 0;
 }
 
 EXPORT(int, sceSblGcAuthMgrAdhocBB160Auth1) {

@@ -121,8 +121,9 @@ EXPORT(int, ksceKernelDeleteMsgPipe) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, ksceKernelDeleteMutex) {
-    return UNIMPLEMENTED();
+EXPORT(int, ksceKernelDeleteMutex, SceUID mutexid) {
+    TRACY_FUNC(ksceKernelDeleteMutex, mutexid);
+    return CALL_EXPORT(sceKernelDeleteMutex, mutexid);
 }
 
 EXPORT(int, ksceKernelDeleteSema) {
@@ -171,7 +172,8 @@ EXPORT(int, ksceKernelGetThreadCurrentPriority) {
 }
 
 EXPORT(int, ksceKernelGetThreadId) {
-    return UNIMPLEMENTED();
+    TRACY_FUNC(ksceKernelGetThreadId);
+    return thread_id;
 }
 
 EXPORT(int, ksceKernelGetThreadIdList) {
@@ -403,4 +405,15 @@ EXPORT(int, SceThreadmgrForDriver_20C228E4) {
     TRACY_FUNC(SceThreadmgrForDriver_20C228E4);
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
     return thread && thread->is_processing_callbacks;
+}
+
+// Firmware 3.74 threadmgr 0x81013405 / 0x81013329: store a value in each
+// thread of the process and in the CP15 performance-monitor register
+// (PMUSERENR / PMCR). The emulated CPU has no performance monitor.
+EXPORT(int, SceThreadmgrForDriver_1AAFA818, SceUID pid, SceUInt32 value) {
+    return 0;
+}
+
+EXPORT(int, SceThreadmgrForDriver_5053B005, SceUID pid, SceUInt32 value) {
+    return 0;
 }

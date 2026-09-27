@@ -58,11 +58,12 @@ static_assert(sizeof(SceProcEventHandler) == 0x1C, "Size of SceProcEventHandler 
 
 EXPORT(int, ksceKernelRegisterProcEventHandler, char *name, SceProcEventHandler *handler, Ptr<void> a3) {
     TRACY_FUNC(ksceKernelRegisterProcEventHandler, name, handler, a3);
+    // The firmware only records the handler; the kernel then calls create
+    // when a process is created. The one process here already exists, so
+    // create runs now, as cb(pid, param, a3); stop/start/exit/kill events do
+    // not occur.
     if (handler->create)
         emuenv.kernel.get_thread(thread_id)->run_callback(handler->create.address(), { 1, 0, a3.address() });
-    if (handler->start)
-        emuenv.kernel.get_thread(thread_id)->run_callback(handler->start.address(), { 1, 0, a3.address() });
-    STUBBED("Immediately run create and start callbacks on current thread");
     // Stub: return a unique UID per registration. kubridge registers a process
     // event handler for cleanup on exit, but in the emulator we don't need it.
     return emuenv.kernel.get_next_uid();

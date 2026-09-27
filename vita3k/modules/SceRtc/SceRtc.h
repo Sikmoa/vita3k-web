@@ -24,6 +24,8 @@ struct SceDateTime;
 
 DECL_EXPORT(int, _sceRtcConvertLocalTimeToUtc, const SceRtcTick *pLocalTime, SceRtcTick *pUtc);
 DECL_EXPORT(int, _sceRtcConvertUtcToLocalTime, const SceRtcTick *pUtc, SceRtcTick *pLocalTime);
+DECL_EXPORT(int, _sceRtcFormatRFC3339, char *pszDateTime, const SceRtcTick *utc, int iTimeZoneMinutes);
+DECL_EXPORT(int, _sceRtcFormatRFC3339LocalTime, char *pszDateTime, const SceRtcTick *utc);
 DECL_EXPORT(int, _sceRtcGetCurrentClock, SceDateTime *datePtr, int iTimeZone);
 DECL_EXPORT(int, _sceRtcGetCurrentClockLocalTime, SceDateTime *datePtr);
 DECL_EXPORT(int, _sceRtcGetCurrentNetworkTick, SceRtcTick *tick);

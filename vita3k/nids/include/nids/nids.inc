@@ -2490,6 +2490,8 @@ NID(ksceKernelWaitSema, 0x3C8B55A9)
 NID(ksceKernelWaitThreadEnd, 0x3E20216F)
 NID(ksceKernelWaitThreadEndCB, 0x9EF4F62C)
 NID(SceThreadmgrForDriver_20C228E4, 0x20C228E4)
+NID(SceThreadmgrForDriver_1AAFA818, 0x1AAFA818)
+NID(SceThreadmgrForDriver_5053B005, 0x5053B005)
 // Library "SceThreadmgrForKernel"
 NID(ksceKernelGetFaultingProcess, 0xD8B9AC8D)
 // Module "SceKubridge"
@@ -6126,6 +6128,8 @@ NID(sceKernelPowerUnlock, 0x466C0CBD)
 NID(sceKernelRegisterProcessTerminationCallback, 0x5EC77870)
 NID(sceKernelUnregisterProcessTerminationCallback, 0x973A4527)
 // Library "SceProcessmgrForDriver"
+NID(SceProcessmgrForDriver_61B9B6FA, 0x61B9B6FA)
+NID(SceProcessmgrForDriver_B1C3EFCA, 0xB1C3EFCA)
 NID(ksceKernelCreateProcessLocalStorage, 0x3801D7D6)
 NID(ksceKernelGetProcessInfo, 0x0AFF3EAE)
 NID(ksceKernelGetProcessLocalStorageAddr, 0xEE694840)
@@ -6435,6 +6439,10 @@ NID(sceSasSetVolume, 0x0BE8204D)
 // Module "SceSblACMgr"
 // Library "SceSblACMgr"
 NID(_sceSblACMgrIsGameProgram, 0x3C17A7F7)
+// Library "SceSblACMgrForDriver"
+NID(ksceSblACMgrIsDevelopmentMode, 0xE87D1777)
+NID(ksceSblACMgrIsGameProgram, 0x1298C647)
+NID(ksceSblACMgrIsPSMDevAssistant, 0xC98D82EE)
 // Module "SceSblGcAuthMgr"
 // Library "SceSblGcAuthMgr"
 NID(_sceSblGcAuthMgrAdhocBB160Auth1, 0x5E56F845)

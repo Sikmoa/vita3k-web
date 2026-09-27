@@ -39,7 +39,9 @@
 #include <cassert>
 #include <iostream>
 #include <iterator>
+#include <random>
 #include <string>
+#include <string_view>
 
 #if defined(__aarch64__) && defined(__APPLE__)
 #define stat64 stat
@@ -160,6 +162,27 @@ void init_device_paths(IOState &io) {
     io.device_paths.savedata0 = "user/" + io.user_id + "/savedata/" + io.savedata;
     io.device_paths.app0 = "app/" + io.app_path;
     io.device_paths.addcont0 = "addcont/" + io.addcont;
+    // SceAppMgr mounts vs0:sys/external and vs0:data/external for each app
+    // under "sd" + 12 random lowercase hex digits + ':'.
+    std::random_device random;
+    const auto drive = [&] {
+        char name[16];
+        std::snprintf(name, sizeof(name), "sd%04x%04x%04x:", random() & 0xffff, random() & 0xffff, random() & 0xffff);
+        return std::string(name);
+    };
+    io.vs0_module_drive = drive();
+    io.vs0_data_drive = drive();
+}
+
+std::string resolve_user_mount(const IOState &io, const char *path) {
+    if (!path)
+        return {};
+    const std::string_view view(path);
+    for (const auto &[drive, target] : { std::pair{ &io.vs0_module_drive, "vs0:sys/external" }, std::pair{ &io.vs0_data_drive, "vs0:data/external" } }) {
+        if (!drive->empty() && view.starts_with(*drive))
+            return target + std::string(view.substr(drive->size()));
+    }
+    return path;
 }
 
 bool init_savedata_app_path(IOState &io, const fs::path &vita_fs_path) {
@@ -316,14 +339,18 @@ std::string translate_path(const char *path, VitaIoDevice &device, const IOState
     return relative_path;
 }
 
-fs::path expand_path(IOState &io, const char *path, const fs::path &vita_fs_path) {
+fs::path expand_path(IOState &io, const char *path_in, const fs::path &vita_fs_path) {
+    const std::string path_resolved = resolve_user_mount(io, path_in);
+    const char *path = path_in ? path_resolved.c_str() : nullptr;
     auto device = device::get_device(path);
 
     const auto translated_path = translate_path(path, device, io.device_paths);
     return device::construct_emulated_path(device, translated_path, vita_fs_path, io.redirect_stdio).string();
 }
 
-SceUID open_file(IOState &io, const char *path, const int flags, const fs::path &vita_fs_path, const char *export_name) {
+SceUID open_file(IOState &io, const char *path_in, const int flags, const fs::path &vita_fs_path, const char *export_name) {
+    const std::string path_resolved = resolve_user_mount(io, path_in);
+    const char *path = path_in ? path_resolved.c_str() : nullptr;
     auto device = device::get_device(path);
     auto device_for_icase = device;
     if (device == VitaIoDevice::_INVALID) {
@@ -522,7 +549,9 @@ SceOff tell_file(IOState &io, const SceUID fd, const char *export_name) {
     return std_file->second.tell();
 }
 
-int stat_file(IOState &io, const char *file, SceIoStat *statp, const fs::path &vita_fs_path, const char *export_name, const SceUID fd) {
+int stat_file(IOState &io, const char *file_in, SceIoStat *statp, const fs::path &vita_fs_path, const char *export_name, const SceUID fd) {
+    const std::string file_resolved = resolve_user_mount(io, file_in);
+    const char *file = file_in ? file_resolved.c_str() : nullptr;
     assert(statp != nullptr);
 
     memset(statp, '\0', sizeof(SceIoStat));
@@ -642,7 +671,9 @@ int close_file(IOState &io, const SceUID fd, const char *export_name) {
     return 0;
 }
 
-int remove_file(IOState &io, const char *file, const fs::path &vita_fs_path, const char *export_name) {
+int remove_file(IOState &io, const char *file_in, const fs::path &vita_fs_path, const char *export_name) {
+    const std::string file_resolved = resolve_user_mount(io, file_in);
+    const char *file = file_in ? file_resolved.c_str() : nullptr;
     auto device = device::get_device(file);
     if (device == VitaIoDevice::_INVALID) {
         LOG_ERROR("Cannot find device for path: {}", file);
@@ -674,7 +705,10 @@ int remove_file(IOState &io, const char *file, const fs::path &vita_fs_path, con
     return 0;
 }
 
-int rename(IOState &io, const char *old_name, const char *new_name, const fs::path &vita_fs_path, const char *export_name) {
+int rename(IOState &io, const char *old_name_in, const char *new_name_in, const fs::path &vita_fs_path, const char *export_name) {
+    const std::string old_resolved = resolve_user_mount(io, old_name_in), new_resolved = resolve_user_mount(io, new_name_in);
+    const char *old_name = old_name_in ? old_resolved.c_str() : nullptr;
+    const char *new_name = new_name_in ? new_resolved.c_str() : nullptr;
     auto device = device::get_device(old_name);
     if (device == VitaIoDevice::_INVALID) {
         LOG_ERROR("Cannot find device for path: {}", old_name);
@@ -715,7 +749,9 @@ int rename(IOState &io, const char *old_name, const char *new_name, const fs::pa
     return 0;
 }
 
-SceUID open_dir(IOState &io, const char *path, const fs::path &vita_fs_path, const char *export_name) {
+SceUID open_dir(IOState &io, const char *path_in, const fs::path &vita_fs_path, const char *export_name) {
+    const std::string path_resolved = resolve_user_mount(io, path_in);
+    const char *path = path_in ? path_resolved.c_str() : nullptr;
     auto device = device::get_device(path);
     auto device_for_icase = device;
     const auto translated_path = translate_path(path, device, io.device_paths);
@@ -810,7 +846,9 @@ bool copy_path(const fs::path &src_path, const fs::path &vita_fs_path, const std
     return true;
 }
 
-int create_dir(IOState &io, const char *dir, int mode, const fs::path &vita_fs_path, const char *export_name, const bool recursive) {
+int create_dir(IOState &io, const char *dir_in, int mode, const fs::path &vita_fs_path, const char *export_name, const bool recursive) {
+    const std::string dir_resolved = resolve_user_mount(io, dir_in);
+    const char *dir = dir_in ? dir_resolved.c_str() : nullptr;
     auto device = device::get_device(dir);
     const auto translated_path = translate_path(dir, device, io.device_paths);
     if (translated_path.empty()) {
@@ -852,7 +890,9 @@ int close_dir(IOState &io, const SceUID fd, const char *export_name) {
     return 0;
 }
 
-int remove_dir(IOState &io, const char *dir, const fs::path &vita_fs_path, const char *export_name) {
+int remove_dir(IOState &io, const char *dir_in, const fs::path &vita_fs_path, const char *export_name) {
+    const std::string dir_resolved = resolve_user_mount(io, dir_in);
+    const char *dir = dir_in ? dir_resolved.c_str() : nullptr;
     auto device = device::get_device(dir);
     if (device == VitaIoDevice::_INVALID) {
         LOG_ERROR("Cannot find device for path: {}", dir);

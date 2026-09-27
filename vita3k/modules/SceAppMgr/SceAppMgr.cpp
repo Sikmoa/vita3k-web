@@ -533,10 +533,19 @@ EXPORT(int, _sceAppMgrReceiveShellEvent) {
     return UNIMPLEMENTED();
 }
 
+int receive_system_event(SceAppMgrSystemEvent *system_event) {
+    constexpr int SCE_APPMGR_ERROR_NULL_POINTER = 0x80802016, SCE_APPMGR_ERROR_NO_EVENT = 0x80802013; // names unknown
+    if (!system_event)
+        return SCE_APPMGR_ERROR_NULL_POINTER;
+    // Resume, activation, quit and store events come from the shell; none is
+    // ever raised here, so every poll answers "no event".
+    memset(system_event, 0, sizeof(*system_event));
+    return SCE_APPMGR_ERROR_NO_EVENT;
+}
+
 EXPORT(int, _sceAppMgrReceiveSystemEvent, SceAppMgrSystemEvent *systemEvent) {
     TRACY_FUNC(_sceAppMgrReceiveSystemEvent, systemEvent);
-    systemEvent->systemEvent = SCE_APPMGR_SYSTEMEVENT_ON_RESUME;
-    return UNIMPLEMENTED();
+    return receive_system_event(systemEvent);
 }
 
 EXPORT(int, _sceAppMgrSaveDataAddMount) {
@@ -879,9 +888,10 @@ EXPORT(int, sceAppMgrIsGameBudgetAppPresent) {
     return UNIMPLEMENTED();
 }
 
+// ksceSblACMgrIsGameProgram of the calling process (its program authority id).
 EXPORT(int, sceAppMgrIsGameProgram) {
     TRACY_FUNC(sceAppMgrIsGameProgram);
-    return 0;
+    return emuenv.kernel.process_is_game_program();
 }
 
 EXPORT(int, sceAppMgrIsNonGameProgram) {

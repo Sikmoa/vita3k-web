@@ -32,54 +32,8 @@ TRACY_MODULE_NAME(SceRtcUser);
 
 EXPORT(int, sceRtcCheckValid, const SceDateTime *pTime) {
     TRACY_FUNC(sceRtcCheckValid, pTime);
-    if (pTime == nullptr) {
-        return RET_ERROR(SCE_RTC_ERROR_INVALID_POINTER);
-    }
-    if (pTime->month < 1 || pTime->month > 12) {
-        return RET_ERROR(SCE_RTC_ERROR_INVALID_MONTH);
-    }
-    if (pTime->day < 1) {
-        return RET_ERROR(SCE_RTC_ERROR_INVALID_DAY);
-    }
-    switch (pTime->month) {
-    case 4: // April
-    case 6: // June
-    case 9: // September
-    case 11: // November
-        if (pTime->day > 30) {
-            return RET_ERROR(SCE_RTC_ERROR_INVALID_DAY);
-        }
-        break;
-    case 2: // February
-        if ((pTime->year % 400 == 0) || (pTime->year % 100 != 0 && pTime->year % 4 == 0)) {
-            if (pTime->day > 29) {
-                return RET_ERROR(SCE_RTC_ERROR_INVALID_DAY);
-            }
-        } else {
-            if (pTime->day > 28) {
-                return RET_ERROR(SCE_RTC_ERROR_INVALID_DAY);
-            }
-        }
-        break;
-    default:
-        if (pTime->day > 31) {
-            return RET_ERROR(SCE_RTC_ERROR_INVALID_DAY);
-        }
-        break;
-    }
-    if (pTime->hour > 23) {
-        return RET_ERROR(SCE_RTC_ERROR_INVALID_HOUR);
-    }
-    if (pTime->minute > 59) {
-        return RET_ERROR(SCE_RTC_ERROR_INVALID_MINUTE);
-    }
-    if (pTime->second > 59) {
-        return RET_ERROR(SCE_RTC_ERROR_INVALID_SECOND);
-    }
-    if (pTime->microsecond > 99999) {
-        return RET_ERROR(SCE_RTC_ERROR_INVALID_MICROSECOND);
-    }
-    return 0;
+    const int result = rtc_check_valid(pTime);
+    return result ? RET_ERROR(result) : 0;
 }
 
 EXPORT(int, sceRtcCompareTick, const SceRtcTick *tick1, const SceRtcTick *tick2) {
@@ -169,14 +123,14 @@ EXPORT(int, sceRtcFormatRFC2822LocalTime, char *pszDateTime, const SceRtcTick *u
     return 0;
 }
 
-EXPORT(int, sceRtcFormatRFC3339) {
-    TRACY_FUNC(sceRtcFormatRFC3339);
-    return UNIMPLEMENTED();
+EXPORT(int, sceRtcFormatRFC3339, char *pszDateTime, const SceRtcTick *utc, int iTimeZoneMinutes) {
+    TRACY_FUNC(sceRtcFormatRFC3339, pszDateTime, utc, iTimeZoneMinutes);
+    return CALL_EXPORT(_sceRtcFormatRFC3339, pszDateTime, utc, iTimeZoneMinutes);
 }
 
-EXPORT(int, sceRtcFormatRFC3339LocalTime) {
-    TRACY_FUNC(sceRtcFormatRFC3339LocalTime);
-    return UNIMPLEMENTED();
+EXPORT(int, sceRtcFormatRFC3339LocalTime, char *pszDateTime, const SceRtcTick *utc) {
+    TRACY_FUNC(sceRtcFormatRFC3339LocalTime, pszDateTime, utc);
+    return CALL_EXPORT(_sceRtcFormatRFC3339LocalTime, pszDateTime, utc);
 }
 
 EXPORT(int, sceRtcGetCurrentClock, SceDateTime *datePtr, int iTimeZone) {
@@ -395,14 +349,23 @@ EXPORT(int, sceRtcIsLeapYear, int year) {
     return 0;
 }
 
-EXPORT(int, sceRtcParseDateTime) {
-    TRACY_FUNC(sceRtcParseDateTime);
-    return UNIMPLEMENTED();
+// Firmware 3.74 parses in user mode (driver_us); *utc is written only on success.
+EXPORT(int, sceRtcParseDateTime, SceRtcTick *utc, const char *dateTime) {
+    TRACY_FUNC(sceRtcParseDateTime, utc, dateTime);
+    std::uint64_t tick;
+    if (const int error = rtc_parse_date_time(utc ? &tick : nullptr, dateTime))
+        return RET_ERROR(error);
+    utc->tick = tick;
+    return 0;
 }
 
-EXPORT(int, sceRtcParseRFC3339) {
-    TRACY_FUNC(sceRtcParseRFC3339);
-    return UNIMPLEMENTED();
+EXPORT(int, sceRtcParseRFC3339, SceRtcTick *utc, const char *dateTime) {
+    TRACY_FUNC(sceRtcParseRFC3339, utc, dateTime);
+    std::uint64_t tick;
+    if (const int error = rtc_parse_rfc3339(utc ? &tick : nullptr, dateTime))
+        return RET_ERROR(error);
+    utc->tick = tick;
+    return 0;
 }
 
 EXPORT(int, sceRtcSetDosTime) {

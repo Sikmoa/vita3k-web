@@ -457,8 +457,13 @@ EXPORT(int, ksceKernelMemRangeRetainWithPerm) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, ksceKernelMemcpyKernelToUser) {
-    return UNIMPLEMENTED();
+EXPORT(int, ksceKernelMemcpyKernelToUser, Ptr<void> dst, Ptr<const void> src, SceSize len) {
+    constexpr uint32_t SCE_KERNEL_ERROR_INVALID_MEMORY_ACCESS_FAULT = 0xC0022005; // bit 30: a fault
+    if (len && (!dst || !is_valid_addr_range(emuenv.mem, dst.address(), dst.address() + len)))
+        return SCE_KERNEL_ERROR_INVALID_MEMORY_ACCESS_FAULT;
+    memcpy(dst.get(emuenv.mem), src.get(emuenv.mem), len);
+    mem_mark_written(emuenv.mem, dst.address(), len);
+    return 0;
 }
 
 EXPORT(int, ksceKernelMemcpyKernelToUserForPid) {

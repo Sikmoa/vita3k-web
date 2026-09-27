@@ -1009,6 +1009,11 @@ static SceUID load_self_impl(KernelState &kernel, MemState &mem, const void *sel
     kernelModuleInfo->absolute_relocations = std::move(absolute_relocations);
     kernelModuleInfo->info_segment_address = module_info_segment_address;
     kernelModuleInfo->info_offset = module_info_offset;
+    if (is_self && has_bytes(self_header.appinfo_offset, sizeof(SCE_appinfo))) {
+        SCE_appinfo appinfo;
+        std::memcpy(&appinfo, image_bytes + self_header.appinfo_offset, sizeof(appinfo));
+        kernelModuleInfo->program_authority_id = appinfo.authid;
+    }
 
     auto *sceKernelModuleInfo = &kernelModuleInfo->info;
     sceKernelModuleInfo->size = sizeof(*sceKernelModuleInfo);

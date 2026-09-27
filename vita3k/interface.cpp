@@ -477,6 +477,7 @@ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const
 
     if (main_module_id >= 0) {
         const auto module = emuenv.kernel.loaded_modules[main_module_id];
+        emuenv.kernel.process_program_authority_id = module->program_authority_id;
         LOG_INFO("Main executable {} ({}) loaded", module->info.module_name, emuenv.self_path);
         const Patches patches = get_patches(emuenv.patch_path, emuenv.io.title_id, "app0:" + emuenv.self_path);
         if (!patches.empty()) {

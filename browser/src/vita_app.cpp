@@ -551,7 +551,10 @@ static int run_app_impl() {
             }
             std::printf("[vita3k-web] load_module %s -> uid %d (%s)\n",
                 path, uid, env->kernel.loaded_modules[uid]->info.module_name);
-            if (!std::strcmp(path, "app0:eboot.bin")) eboot_uid = uid;
+            if (!std::strcmp(path, "app0:eboot.bin")) {
+                eboot_uid = uid;
+                env->kernel.process_program_authority_id = env->kernel.loaded_modules[uid]->program_authority_id;
+            }
             if (needs_module_start(path)) {
                 const auto &info = env->kernel.loaded_modules[uid]->info;
                 if (info.start_entry) {

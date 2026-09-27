@@ -155,6 +155,7 @@ static int run_vita(const uint8_t *bytes, uint32_t size) {
         init_exported_vars(*env);
         const auto uid = load_self_sized(env->kernel, env->mem, bytes, size, "app0:eboot.bin", {});
         if (uid < 0) return -4;
+        env->kernel.process_program_authority_id = env->kernel.loaded_modules.at(uid)->program_authority_id;
         const auto &module = env->kernel.loaded_modules.at(uid)->info;
         std::printf("[vita3k-web] Vita module: %.28s entry=%08x\n", module.module_name, module.start_entry.address());
         if (!module.start_entry) return -5;

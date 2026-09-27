@@ -158,6 +158,7 @@ set(SOURCE_LIST
 	SceRudp/SceLibRudp.cpp
 	SceSas/SceSas.cpp
 	SceSblACMgr/SceSblACMgr.cpp
+	SceSblACMgr/SceSblACMgrForDriver.cpp
 	SceSblGcAuthMgr/SceSblGcAuthMgr.cpp
 	SceSblPostSsMgr/SceSblLicMgr.cpp
 	SceSblPostSsMgr/SceSblPmMgr.cpp

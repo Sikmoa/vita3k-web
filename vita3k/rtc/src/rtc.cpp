@@ -18,6 +18,7 @@
 #include <rtc/rtc.h>
 
 #include <util/log.h>
+#include <util/safe_time.h>
 
 static std::uint64_t rtc_ticks_since_epoch() {
     const auto now = std::chrono::high_resolution_clock::now();
@@ -106,4 +107,13 @@ std::uint64_t __RtcPspTimeToTicks(const SceDateTime *pt) {
     std::uint64_t result = RTC_OFFSET + (std::uint64_t)seconds * VITA_CLOCKS_PER_SEC;
     result += pt->microsecond;
     return result + tickOffset;
+}
+
+int rtc_local_offset_minutes() {
+    const std::time_t t = std::time(nullptr);
+    tm local_tm = {};
+    tm gmt_tm = {};
+    SAFE_LOCALTIME(&t, &local_tm);
+    SAFE_GMTIME(&t, &gmt_tm);
+    return static_cast<int>((std::mktime(&local_tm) - std::mktime(&gmt_tm)) / 60);
 }

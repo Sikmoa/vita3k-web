@@ -17,8 +17,11 @@
 
 #include <module/module.h>
 
-EXPORT(int, ksceKernelCheckDipsw) {
-    return UNIMPLEMENTED();
+// Firmware 3.74 sysmem: a bit of the 256-bit DIPSW table the bootloader
+// fills. Its values are not in the firmware images; a retail console is
+// modelled with every bit clear.
+EXPORT(int, ksceKernelCheckDipsw, SceUInt32 bit) {
+    return 0;
 }
 
 EXPORT(int, ksceKernelClearDipsw) {

@@ -42,6 +42,8 @@ bool find_case_isens_path(IOState &io, VitaIoDevice &device, const fs::path &tra
 fs::path find_in_cache(IOState &io, const std::string &system_path);
 
 fs::path expand_path(IOState &io, const char *path, const fs::path &vita_fs_path);
+// Rewrites a path on one of the app's vs0 user drives to its vs0: path.
+std::string resolve_user_mount(const IOState &io, const char *path);
 std::string translate_path(const char *path, VitaIoDevice &device, const IOState::DevicePaths &device_paths);
 
 /**

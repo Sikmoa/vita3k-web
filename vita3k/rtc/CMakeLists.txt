@@ -3,6 +3,7 @@ add_library(
     STATIC
     include/rtc/rtc.h
     src/rtc.cpp
+    src/rtc_format.cpp
 )
 
 target_include_directories(rtc PUBLIC include)

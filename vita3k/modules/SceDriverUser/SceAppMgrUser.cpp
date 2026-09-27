@@ -169,10 +169,57 @@ EXPORT(int, sceAppMgrContentInstallPeriodStop) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceAppMgrConvertVs0UserDrivePath, char *source_path, char *dest_path, int dest_len) {
+constexpr SceSize appmgr_path_max = 0x124;
+
+// Firmware 3.74 _sceAppMgrConvertVs0UserDrivePath: vs0:sys/external and
+// vs0:data/external become the app's vs0 user drives (IOState, resolved by
+// the IO layer); other paths are copied. The kernel formats into a zeroed
+// 0x124-byte buffer and copies strnlen + 1 bytes of it back, whatever the
+// result. The access check (program attribute 0x81) is assumed to pass: it
+// depends on the title's signed metadata.
+EXPORT(int, sceAppMgrConvertVs0UserDrivePath, const char *source_path, Ptr<char> dest_path, SceSize dest_len) {
     TRACY_FUNC(sceAppMgrConvertVs0UserDrivePath, source_path, dest_path, dest_len);
-    STUBBED("Using strncpy");
-    strncpy(dest_path, source_path, dest_len);
+    constexpr int SCE_KERNEL_ERROR_STRING_TOO_LONG = 0x8002710B; // name unknown: no NUL in 0x124 bytes
+    if (source_path && strnlen(source_path, appmgr_path_max) == appmgr_path_max)
+        return RET_ERROR(SCE_KERNEL_ERROR_STRING_TOO_LONG);
+    if (!dest_path)
+        return RET_ERROR(SCE_APPMGR_ERROR_INVALID_PARAMETER);
+    char out[appmgr_path_max] = {};
+    const SceSize n = std::min<SceSize>(dest_len, appmgr_path_max);
+    int result = 0;
+    const auto drive = [&]() -> const std::string * {
+        for (const auto &[prefix, target] : { std::pair{ "vs0:sys/external", &emuenv.io.vs0_module_drive }, std::pair{ "vs0:/sys/external", &emuenv.io.vs0_module_drive },
+                 std::pair{ "vs0:data/external", &emuenv.io.vs0_data_drive }, std::pair{ "vs0:/data/external", &emuenv.io.vs0_data_drive } }) {
+            if (!strncmp(source_path, prefix, strlen(prefix))) {
+                source_path += strlen(prefix);
+                return target;
+            }
+        }
+        return nullptr;
+    };
+    if (!source_path || n < 64) {
+        result = SCE_APPMGR_ERROR_INVALID_PARAMETER;
+    } else if (const auto *mount = drive()) {
+        strncpy(out, mount->c_str(), n);
+        strncat(out, source_path, n - 16); // at most n - 1 characters in all
+    } else {
+        strncpy(out, source_path, n);
+        if (out[n - 1])
+            result = SCE_APPMGR_ERROR_INVALID_PARAMETER;
+    }
+    // A passthrough truncated at n < 0x124 copies n + 1 bytes, as the kernel
+    // does: its terminator lands at dest_path[dest_len].
+    const size_t copied = std::min<size_t>(strnlen(out, appmgr_path_max) + 1, appmgr_path_max);
+    memcpy(dest_path.get(emuenv.mem), out, copied);
+    return result ? RET_ERROR(result) : 0;
+}
+
+static int copy_vs0_drive(EmuEnvState &emuenv, Ptr<char> drive, const std::string &name) {
+    if (!drive)
+        return SCE_APPMGR_ERROR_INVALID_PARAMETER;
+    char out[16] = {};
+    strncpy(out, name.c_str(), sizeof(out) - 1);
+    memcpy(drive.get(emuenv.mem), out, sizeof(out));
     return 0;
 }
 
@@ -388,14 +435,17 @@ EXPORT(int, sceAppMgrGetUserDirPathById) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceAppMgrGetVs0UserDataDrive) {
-    TRACY_FUNC(sceAppMgrGetVs0UserDataDrive);
-    return UNIMPLEMENTED();
+// The kernel copies the 16-byte drive name, e.g. "sd1a2b3c4d5e6f:".
+EXPORT(int, sceAppMgrGetVs0UserDataDrive, Ptr<char> drive) {
+    TRACY_FUNC(sceAppMgrGetVs0UserDataDrive, drive);
+    const int result = copy_vs0_drive(emuenv, drive, emuenv.io.vs0_data_drive);
+    return result ? RET_ERROR(result) : 0;
 }
 
-EXPORT(int, sceAppMgrGetVs0UserModuleDrive) {
-    TRACY_FUNC(sceAppMgrGetVs0UserModuleDrive);
-    return UNIMPLEMENTED();
+EXPORT(int, sceAppMgrGetVs0UserModuleDrive, Ptr<char> drive) {
+    TRACY_FUNC(sceAppMgrGetVs0UserModuleDrive, drive);
+    const int result = copy_vs0_drive(emuenv, drive, emuenv.io.vs0_module_drive);
+    return result ? RET_ERROR(result) : 0;
 }
 
 EXPORT(int, sceAppMgrInitSafeMemoryById) {
@@ -544,8 +594,7 @@ EXPORT(int, sceAppMgrReceiveShellEvent) {
 
 EXPORT(int, sceAppMgrReceiveSystemEvent, SceAppMgrSystemEvent *systemEvent) {
     TRACY_FUNC(sceAppMgrReceiveSystemEvent, systemEvent);
-    systemEvent->systemEvent = SCE_APPMGR_SYSTEMEVENT_ON_RESUME;
-    return UNIMPLEMENTED();
+    return receive_system_event(systemEvent);
 }
 
 EXPORT(int, sceAppMgrSaveDataAddMount) {

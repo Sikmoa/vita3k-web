@@ -31,6 +31,19 @@ EXPORT(int, ksceKernelCreateProcessLocalStorage, const char *name, SceSize size)
     return pls_data;
 }
 
+// Firmware 3.74 processmgr 0x8100618d / 0x810060ed: set a process field only
+// when DIPSW bit 0xE4 is on, else fail with 0x80029008. The DIPSW table of
+// the modelled retail console is clear (ksceKernelCheckDipsw).
+EXPORT(int, SceProcessmgrForDriver_61B9B6FA, SceUID pid, SceUInt32 value) {
+    constexpr uint32_t dipsw_off = 0x80029008; // name unknown
+    return RET_ERROR(dipsw_off);
+}
+
+EXPORT(int, SceProcessmgrForDriver_B1C3EFCA, SceUID pid, SceUInt32 value) {
+    constexpr uint32_t dipsw_off = 0x80029008; // name unknown
+    return RET_ERROR(dipsw_off);
+}
+
 EXPORT(int, ksceKernelGetProcessInfo) {
     return UNIMPLEMENTED();
 }

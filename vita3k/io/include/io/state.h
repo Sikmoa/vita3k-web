@@ -104,6 +104,10 @@ struct IOState {
         std::string savedata0;
         std::string addcont0;
     } device_paths;
+    // Drive names SceAppMgr gives the app for vs0:sys/external (module) and
+    // vs0:data/external (data), e.g. "sd1a2b3c4d5e6f:" (init_device_paths).
+    std::string vs0_module_drive;
+    std::string vs0_data_drive;
 
     std::string addcont;
     std::string content_id;

@@ -55,6 +55,7 @@ struct KernelModule {
     // Addresses the module's own relocations wrote as absolute values: the
     // pointers its code and data hold (see relocate()).
     std::vector<Address> absolute_relocations;
+    uint64_t program_authority_id = 0; // SELF app info auth id (0 for a plain ELF)
 };
 typedef std::shared_ptr<KernelModule> SceKernelModulePtr;
 
@@ -180,6 +181,13 @@ struct KernelState {
     CorenumAllocator corenum_allocator;
     CallImportFunc call_import;
     KernelExecutionHost *execution_host = nullptr; // borrowed; opt-in only
+    // Program authority id (PAID) of the process: its main module's.
+    uint64_t process_program_authority_id = 0;
+    // ksceSblACMgrIsGameProgram (firmware 3.74 acmgr): a game has PAID class
+    // 0x210 (bits 52..63), or is the fake-SELF id 0x2F00000000000001.
+    bool process_is_game_program() const {
+        return (process_program_authority_id >> 52) == 0x210 || process_program_authority_id == 0x2F00000000000001ULL;
+    }
 
     // HOST linear-memory inline-mutex table (vita3k::wasmjit::InlineMutexTable).
     // Allocated by the cooperative runtime on attach; nullptr on desktop.

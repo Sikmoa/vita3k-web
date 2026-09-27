@@ -22,6 +22,7 @@
 #include "guest_regmgr_tests.h"
 #include "guest_np_offline_tests.h"
 #include "guest_apputil_tests.h"
+#include "guest_appmgr_rtc_tests.h"
 #include "inline_mutex_fixture.h"
 #include "guest_sync_delete_tests.h"
 #include "guest_kernel_info_tests.h"
@@ -80,6 +81,7 @@ int main() {
     test_guest_regmgr(*env, *parent);
     test_guest_np_offline(*env, *parent);
     test_guest_apputil(*env, *parent);
+    test_guest_appmgr_rtc(*env, *parent);
     REQUIRE(parent->start(0, Ptr<void>{}, false) == 0);
     const auto progress = runtime.resume(256);
     REQUIRE(progress.failed == 0);
