@@ -167,6 +167,8 @@ public:
     License &license;
     RegMgrState &regmgr;
     bool app_util_inited = false; // sceAppUtilInit ran and sceAppUtilShutdown did not
+    // SceAppMgr add-on content install period of the app (Start ran, Stop did not).
+    bool content_install_period = false;
     SfoFile &sfo_handle;
     NIDSet missing_nids;
     float system_dpi_scale = 1.f;

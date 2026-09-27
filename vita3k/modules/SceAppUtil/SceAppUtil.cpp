@@ -19,12 +19,16 @@
 #include "app_event_parse.h"
 #include "../SceProcessmgr/SceProcessmgr.h"
 
+#include <cpu/functions.h>
 #include <emuenv/app_util.h>
 
 #include <io/device.h>
 #include <io/functions.h>
 #include <io/io.h>
 #include <io/vfs.h>
+
+#include <kernel/state.h>
+#include <kernel/thread/thread_state.h>
 
 #include <packages/license.h>
 #include <packages/sfo.h>
@@ -40,7 +44,9 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
+#include <string_view>
 
 TRACY_MODULE_NAME(SceAppUtil);
 
@@ -564,9 +570,59 @@ EXPORT(int, sceAppUtilShutdown) {
     return 0;
 }
 
-EXPORT(int, sceAppUtilStoreBrowse) {
-    TRACY_FUNC(sceAppUtilStoreBrowse);
-    return UNIMPLEMENTED();
+struct SceAppUtilStoreBrowseParam {
+    SceUInt32 type;
+    Ptr<const char> id;
+};
+
+// A redemption code reads XXXX-XXXX-XXXX (letters and digits); what follows
+// the fourteenth character is not looked at.
+static bool is_store_redeem_code(const char *code) {
+    for (int i = 0; i < 14; ++i) {
+        const char c = code[i];
+        if (i == 4 || i == 9 ? c != '-' : !std::isalnum(static_cast<unsigned char>(c)))
+            return false;
+    }
+    return true;
+}
+
+// Firmware 3.74 apputil 0x81004eaa: the Store is opened with a psts: URI
+// that SceAppMgr queues for the shell (0 for a foreground game); types 3-5
+// run inside an add-on content install period and wait until the Store's
+// process starts. The Store runs outside the calling game; here it closes
+// at once.
+EXPORT(int, sceAppUtilStoreBrowse, const SceAppUtilStoreBrowseParam *param) {
+    TRACY_FUNC(sceAppUtilStoreBrowse, param);
+    REQUIRE_APPUTIL_INIT();
+    if (!param)
+        return RET_ERROR(SCE_APPUTIL_ERROR_PARAMETER);
+    // The library needs 0xc00 bytes of stack below its own 0x110.
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    if (read_sp(*thread->cpu) - thread->stack.get() < 0x110 + 0xc00)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE);
+    const bool install_period = param->type >= 3 && param->type <= 5;
+    if (install_period) {
+        // Start unmounts addcont0:-addcont2:, which fails while a file there
+        // is open; a period already running is refused as well (0x80800041).
+        const auto on_addcont = [](const auto &entry) {
+            return std::string_view(entry.second.get_vita_loc()).starts_with("addcont");
+        };
+        if (emuenv.content_install_period || std::ranges::any_of(emuenv.io.std_files, on_addcont)
+            || std::ranges::any_of(emuenv.io.dir_entries, on_addcont))
+            return RET_ERROR(SCE_APPUTIL_ERROR_BUSY);
+        emuenv.content_install_period = true;
+    }
+    if (param->type > 5)
+        return RET_ERROR(SCE_APPUTIL_ERROR_PARAMETER);
+    if (param->type == 2 || param->type == 5) {
+        const char *code = param->id.get(emuenv.mem);
+        // A bad code of type 5 leaves the install period running.
+        if (code && *code && !is_store_redeem_code(code))
+            return RET_ERROR(SCE_APPUTIL_ERROR_PARAMETER);
+    }
+    if (install_period)
+        emuenv.content_install_period = false;
+    return 0;
 }
 
 EXPORT(SceInt32, sceAppUtilSystemParamGetInt, SceSystemParamId paramId, SceInt32 *value) {

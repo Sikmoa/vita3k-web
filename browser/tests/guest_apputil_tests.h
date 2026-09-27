@@ -99,7 +99,50 @@ inline void test_guest_apputil(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(parse_live_area, { event, parsed }) == 0x80100620);
     REQUIRE(call(parse_live_area, { event, 0 }) == 0x80100600);
 
+    // Store browsing: checks, then a queued launch; types 3-5 hold an add-on
+    // content install period around it.
+    constexpr uint32_t store_browse = 0x85FA94EE;
+    const Address browse = block + 0x700, code = block + 0x710;
+    auto *browse_param = Ptr<uint32_t>(browse).get(env.mem);
+    auto set_code = [&](const char *text) { std::strcpy(Ptr<char>(code).get(env.mem), text); };
+    browse_param[1] = code;
+    set_code("NPXS00001");
+    REQUIRE(call(store_browse, { 0 }) == 0x80100600);
+    for (uint32_t type = 0; type < 5; ++type) {
+        browse_param[0] = type;
+        REQUIRE(call(store_browse, { browse }) == (type == 2 ? 0x80100600 : 0)); // type 2 wants a code
+    }
+    REQUIRE(!env.content_install_period);
+    browse_param[0] = 6;
+    REQUIRE(call(store_browse, { browse }) == 0x80100600);
+    browse_param[0] = 2;
+    set_code("AB12-CD34-EF56 and more");
+    REQUIRE(call(store_browse, { browse }) == 0);
+    set_code("AB12-CD34-EF5");
+    REQUIRE(call(store_browse, { browse }) == 0x80100600);
+    set_code("AB12_CD34-EF56");
+    REQUIRE(call(store_browse, { browse }) == 0x80100600);
+    browse_param[1] = 0;
+    REQUIRE(call(store_browse, { browse }) == 0); // no code: the redeem page
+    browse_param[1] = code;
+    // A bad code of type 5 leaves the install period running: the next one is busy.
+    browse_param[0] = 5;
+    REQUIRE(call(store_browse, { browse }) == 0x80100600 && env.content_install_period);
+    browse_param[0] = 3;
+    REQUIRE(call(store_browse, { browse }) == 0x80100603);
+    env.content_install_period = false;
+    REQUIRE(call(store_browse, { browse }) == 0 && !env.content_install_period);
+    // The library wants 0xc00 bytes of stack below its own frames.
+    const Address browse_sp = read_sp(cpu);
+    write_sp(cpu, thread.stack.get() + 0xd0f);
+    REQUIRE(call(store_browse, { browse }) == 0x80028024);
+    write_sp(cpu, thread.stack.get() + 0xd10);
+    REQUIRE(call(store_browse, { browse }) == 0);
+    write_sp(cpu, browse_sp);
+
     REQUIRE(call(shutdown, {}) == 0 && call(shutdown, {}) == 0x80100601);
+    browse_param[0] = 0;
+    REQUIRE(call(store_browse, { browse }) == 0x80100601);
     REQUIRE(call(parse_live_area, { event, parsed }) == 0x80100601); // after sceAppUtilShutdown
 
     const auto put = [&](Address at, const char *value) { std::strcpy(Ptr<char>(at).get(env.mem), value); return at; };
@@ -130,5 +173,5 @@ inline void test_guest_apputil(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(dialog_update, { 0 }) == 0x80020406);
     env.gxm.display_queue_thread = saved_display_thread;
     free(env.mem, block);
-    std::puts("Guest AppUtil: init/shutdown, app event and its parsers, bgdl, LiveArea update and dialog config checks passed");
+    std::puts("Guest AppUtil: init/shutdown, app event and its parsers, bgdl, LiveArea update, Store browsing and dialog config checks passed");
 }

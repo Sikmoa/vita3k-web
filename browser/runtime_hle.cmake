@@ -415,6 +415,9 @@ set(_hle_exports
     # queue is empty and the browser has no LiveArea (a valid update
     # completes at once).
     sceAppUtilBgdlGetStatus sceLiveAreaUpdateFrameAsync
+    # Store browsing: firmware 3.74's checks, then the psts: launch SceAppMgr
+    # queues; the Store app itself runs outside the game (closes at once).
+    sceAppUtilStoreBrowse
     # SceAppMgr of a game process (firmware 3.74): no system event is ever
     # pending; the vs0 user drives are per-app "sd<hex>:" names the IO layer
     # resolves. RTC RFC 3339 / RFC 1123 formatting and parsing, checked

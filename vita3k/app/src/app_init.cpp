@@ -506,6 +506,7 @@ void shutdown_app_runtime(EmuEnvState &state) {
 
     state.ime.deinit();
     state.app_util_inited = false;
+    state.content_install_period = false;
 
     state.touch.reset_runtime();
 
