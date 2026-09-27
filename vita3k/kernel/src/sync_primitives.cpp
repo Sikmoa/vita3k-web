@@ -567,7 +567,8 @@ static void set_timer_event(Timer &timer, SceUInt32 pattern, SceUInt64 user_data
     timer.last_user_data = user_data;
     for (auto it = timer.waiting_threads->begin(); it != timer.waiting_threads->end();) {
         const auto data = *it;
-        if (!(timer.pattern & data.pattern)) {
+        const SceUInt32 matched = timer_pattern(timer) & data.pattern;
+        if (!matched) {
             ++it;
             continue;
         }
@@ -575,8 +576,11 @@ static void set_timer_event(Timer &timer, SceUInt32 pattern, SceUInt64 user_data
             *data.result_pattern = timer_pattern(timer);
         if (data.user_data)
             *data.user_data = timer.last_user_data;
-        if (timer.attr & SCE_KERNEL_EVENT_ATTR_AUTO_RESET)
-            timer.pattern &= ~data.pattern;
+        if (timer.attr & SCE_KERNEL_EVENT_ATTR_AUTO_RESET) {
+            timer.pattern &= ~matched;
+            if (matched & SCE_KERNEL_EVENT_TIMER)
+                timer.event_set = false;
+        }
         const std::lock_guard<std::mutex> thread_lock(data.thread->mutex);
         data.thread->update_status(ThreadStatus::run);
         timer.waiting_threads->erase(it++);
@@ -687,6 +691,9 @@ SceInt32 timer_waitorpoll(KernelState &kernel, const char *export_name, SceUID t
     const ThreadStatePtr thread = kernel.get_thread(thread_id);
 
     std::unique_lock<std::mutex> lock(timer->mutex);
+    // Deleted meanwhile: its waiters were already woken.
+    if (timer->deleted)
+        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
     const bool auto_reset = timer->attr & SCE_KERNEL_EVENT_ATTR_AUTO_RESET;
 
     uint64_t current_time = get_current_time();

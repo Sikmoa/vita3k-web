@@ -174,7 +174,7 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
         }
         static_cast<WasmJitCPU &>(*thread->cpu->cpu).set_aot_enabled(aot);
         std::printf("[guest-runtime] thread %d %s priority=%d affinity=%#x%s\n", thread->id,
-            thread->name.c_str(), thread->priority, static_cast<unsigned>(thread->affinity_mask), aot ? "" : " aot=off");
+            thread->name.c_str(), thread->priority.load(), static_cast<unsigned>(thread->affinity_mask), aot ? "" : " aot=off");
         return true;
     }
 

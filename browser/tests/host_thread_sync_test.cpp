@@ -144,5 +144,54 @@ int main() {
         REQUIRE(bounded([&] { return timer_close(kernel, "fixture", deleter->id, timer, HandleClose::Delete); }) == 0);
     }
     std::puts("Process exit with a timer waiter passed");
+
+    // A timer destroyed after the wait found it but before the wait took its
+    // lock: the wait fails instead of sleeping on a timer nobody wakes.
+    {
+        const SceUID timer = timer_create(kernel, env->mem, "fixture", "vanishing timer", deleter->id, 0);
+        const TimerPtr object = kernel.timers.at(timer);
+        std::future<SceInt32> result;
+        {
+            std::unique_lock<std::mutex> held(object->mutex);
+            result = std::async(std::launch::async, [&] {
+                SceUInt32 pattern = 0;
+                return simple_event_waitorpoll(kernel, "fixture", waiter_thread->id, timer, SCE_KERNEL_EVENT_TIMER, &pattern, nullptr, nullptr, true);
+            });
+            REQUIRE(result.wait_for(100ms) == std::future_status::timeout);
+            // What the last handle's close does under the timer's lock.
+            {
+                const std::lock_guard<std::mutex> lock(kernel.mutex);
+                kernel.timers.erase(timer);
+            }
+            object->deleted = true;
+        }
+        REQUIRE(result.wait_for(2s) == std::future_status::ready);
+        REQUIRE(result.get() == SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID && object->waiting_threads->empty());
+    }
+    std::puts("Timer destroyed before the wait passed");
+
+    // An event bit that wakes a waiter for the timer's bit as well takes the
+    // expiry it reports with it on an auto-reset timer.
+    {
+        const SceUID timer = timer_create(kernel, env->mem, "fixture", "reset timer", deleter->id,
+            SCE_KERNEL_ATTR_OPENABLE | SCE_KERNEL_EVENT_ATTR_AUTO_RESET);
+        const SceUID opened = timer_open(kernel, "fixture", deleter->id, "reset timer");
+        const TimerPtr object = kernel.timers.at(timer);
+        Waiter waiter;
+        wait_on(*env, waiter_thread, timer, SCE_KERNEL_EVENT_TIMER | SCE_KERNEL_EVENT_CLOSE, waiter);
+        {
+            // An expiry a poll saw without taking it.
+            const std::lock_guard<std::mutex> lock(object->mutex);
+            object->event_set = true;
+        }
+        REQUIRE(bounded([&] { return timer_close(kernel, "fixture", deleter->id, opened, HandleClose::Close); }) == 0);
+        REQUIRE(waiter.result.wait_for(2s) == std::future_status::ready && waiter.result.get() == 0);
+        REQUIRE(waiter.pattern == (SCE_KERNEL_EVENT_TIMER | SCE_KERNEL_EVENT_OPEN | SCE_KERNEL_EVENT_CLOSE));
+        SceUInt32 pattern = 0;
+        REQUIRE(simple_event_waitorpoll(kernel, "fixture", deleter->id, timer, SCE_KERNEL_EVENT_TIMER | SCE_KERNEL_EVENT_CLOSE, &pattern, nullptr, nullptr, false)
+            == SCE_KERNEL_ERROR_EVENT_COND);
+        REQUIRE(bounded([&] { return timer_close(kernel, "fixture", deleter->id, timer, HandleClose::Delete); }) == 0);
+    }
+    std::puts("Event bits take the timer's expiry passed");
     return 0;
 }

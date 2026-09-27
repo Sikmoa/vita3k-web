@@ -23,6 +23,7 @@
 #include <mem/block.h>
 #include <mem/ptr.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <optional>
@@ -71,8 +72,9 @@ struct ThreadState {
 
     // The current priority: the base priority, raised to the ceiling of each
     // priority-ceiling mutex the thread owns. Only set_base_priority and the
-    // ceiling calls change it.
-    int priority;
+    // ceiling calls change it. Atomic: another thread's ceiling change
+    // publishes it while its readers hold other locks.
+    std::atomic<int> priority;
     int init_priority;
     bool fios_overlays_disabled = false; // sceFiosOverlayThreadSetDisabled02
     SceInt32 affinity_mask;
