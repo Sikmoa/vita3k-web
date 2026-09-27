@@ -50,6 +50,10 @@ bool classify_unsupported_import(uint32_t nid) {
     // seconds in semaphore waits trying to pace itself some other way.
     if (n.find("DisplayWait") != n.npos && n.find("CB") == n.npos)
         return false;
+    // Parks until the target's dormant transition unlinks the waiter
+    // (SceThreadmgr execution_host branch); the CB variant stays rejected.
+    if (n == "sceKernelWaitThreadEnd")
+        return false;
     // Parks and rechecks the notification (SceGxm execution_host branch).
     if (n == "sceGxmNotificationWait")
         return false;

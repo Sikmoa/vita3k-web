@@ -354,6 +354,80 @@ int main() {
             std::printf("%s edge case %u passed\n", light ? "LwMutex" : "Mutex", scenario);
         }
     }
+    // sceKernelWaitThreadEnd through the production import and the runtime's
+    // import filter: join on exit, timeout, an already-dormant target, and a
+    // waiter deleted while parked.
+    for (unsigned scenario = 0; scenario < 4; ++scenario) {
+        env->kernel.call_import = [&](CPUState &cpu, uint32_t nid, SceUID tid) {
+            call_import(*env, cpu, nid, tid);
+            REQUIRE(env->missing_nids.empty());
+        };
+        REQUIRE(runtime.attach(*env));
+        guest_thread_fixture::build_thread_end_pair(env->mem, code, data);
+        const auto word = [&](unsigned offset) -> uint32_t & { return *Ptr<uint32_t>(data + offset).get(env->mem); };
+        word(0x60) = scenario == 2; // gate
+        word(0x64) = 0xcccccccc; // stat
+        word(0x68) = 0xcccccccc; // result
+        word(0x70) = scenario == 1 ? data + 0x74 : 0; // timeout pointer
+        word(0x74) = 50000;
+        auto target = env->kernel.create_thread(env->mem, "join target", Ptr<const void>(code + 0x400),
+            SCE_KERNEL_DEFAULT_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT,
+            SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
+        auto waiter = env->kernel.create_thread(env->mem, "join waiter", Ptr<const void>(code),
+            SCE_KERNEL_DEFAULT_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT,
+            SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
+        REQUIRE(target && waiter);
+        word(0x6c) = static_cast<uint32_t>(target->id);
+        REQUIRE(target->start(0, Ptr<void>{}, false) == 0);
+        if (scenario == 2) {
+            REQUIRE(runtime.resume(64).failed == 0);
+            REQUIRE(target->status == ThreadStatus::dormant);
+        }
+        REQUIRE(waiter->start(0, Ptr<void>{}, false) == 0);
+        const auto first = runtime.resume(64);
+        REQUIRE(first.failed == 0);
+        if (scenario == 2) {
+            REQUIRE(waiter->status == ThreadStatus::dormant);
+            REQUIRE(word(0x68) == 0 && word(0x64) == 43);
+        } else {
+            REQUIRE(waiter->status == ThreadStatus::wait);
+            REQUIRE(first.waiting == 1 && first.runnable == 1);
+            REQUIRE(target->waiting_threads.size() == 1 && target->waiting_threads.front() == waiter);
+            // The parked HLE frame must not retain either thread's lock.
+            REQUIRE(target->mutex.try_lock()); target->mutex.unlock();
+            REQUIRE(waiter->mutex.try_lock()); waiter->mutex.unlock();
+            REQUIRE(word(0x68) == 0xcccccccc);
+        }
+        if (scenario == 0) {
+            word(0x60) = 1;
+            REQUIRE(runtime.resume(256).failed == 0);
+            REQUIRE(target->status == ThreadStatus::dormant && waiter->status == ThreadStatus::dormant);
+            REQUIRE(word(0x68) == 0 && word(0x64) == 43);
+        } else if (scenario == 1) {
+            REQUIRE(first.next_deadline_us);
+            while (vita3k::web::GuestThreadRuntime::now_us() < *first.next_deadline_us) {}
+            REQUIRE(runtime.resume(64).failed == 0);
+            REQUIRE(waiter->status == ThreadStatus::dormant);
+            REQUIRE(word(0x68) == uint32_t(SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+            REQUIRE(word(0x74) == 0 && word(0x64) == 0xcccccccc);
+            REQUIRE(target->waiting_threads.empty() && target->status == ThreadStatus::run);
+        } else if (scenario == 3) {
+            waiter->exit_delete(false);
+            REQUIRE(runtime.resume(64).failed == 0);
+            REQUIRE(!env->kernel.threads.contains(waiter->id));
+            REQUIRE(target->waiting_threads.empty() && target->status == ThreadStatus::run);
+        }
+        if (scenario != 0) {
+            word(0x60) = 1;
+            REQUIRE(runtime.resume(256).failed == 0);
+            REQUIRE(target->status == ThreadStatus::dormant && target->waiting_threads.empty());
+        }
+        REQUIRE(target->returned_value == 43);
+        REQUIRE(runtime.shutdown());
+        REQUIRE(env->kernel.threads.empty());
+        REQUIRE(get_current_cpu_state() == nullptr);
+        std::printf("WaitThreadEnd case %u passed\n", scenario);
+    }
     // A throwing HLE import must be diagnosed at the fiber boundary, counted
     // once, and reaped without executing guest writeback or acknowledging it
     // as success. Exercise standard and non-standard C++ exceptions alike.

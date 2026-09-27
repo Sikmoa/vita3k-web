@@ -184,7 +184,10 @@ set(_hle_exports
     # Limbo sleep frontier: sceKernelDelayThread parks cooperatively until
     # the deadline (SceThreadmgr execution_host branch, no host sleep).
     sceKernelDelayThread sceKernelDelayThread200
-    # Keep DelayThreadCB, WaitThreadEnd/CB, WaitEventFlagCB and WaitLwCond/CB
+    # Thread join: _sceKernelWaitThreadEnd parks cooperatively until the
+    # target goes dormant (SceThreadmgr execution_host branch).
+    sceKernelWaitThreadEnd
+    # Keep DelayThreadCB, WaitThreadEndCB, WaitEventFlagCB and WaitLwCond/CB
     # unselected: their production paths wait on host condition variables
     # (or sleep) and cannot yield guest threads.
     # GetSystemTime and GetThreadRunStatus are UNIMPLEMENTED upstream. There

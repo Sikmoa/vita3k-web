@@ -179,4 +179,30 @@ inline void build_lwmutex_pair(MemState &mem, Address code, Address data) {
     c.emit(0xe8bd8010);
     c.finish(mem);
 }
+// Thread-end join pair. Target (code+0x400): poll the host gate at data+0x60,
+// return 43. Waiter (code): sceKernelWaitThreadEnd(id at data+0x6c,
+// stat=data+0x64, timeout pointer at data+0x70), result to data+0x68, return 42.
+inline void build_thread_end_pair(MemState &mem, Address code, Address data) {
+    const Address stub = code + 0x300;
+    const uint32_t words[] = {0xef000000, 0xe1a0f00e, 0xddb395a9}; // sceKernelWaitThreadEnd
+    std::memcpy(Ptr<void>(stub).get(mem), words, sizeof(words));
+    Arm w(code);
+    w.emit(0xe92d4010); // push {r4,lr}
+    w.constant(4, data);
+    w.load(0, 0x6c); w.constant(1, data + 0x64); w.load(2, 0x70);
+    w.call(stub);
+    w.store(0, 0x68);
+    w.constant(0, 42);
+    w.emit(0xe8bd8010); // pop {r4,pc}
+    w.finish(mem);
+
+    Arm t(code + 0x400);
+    t.emit(0xe92d4010);
+    t.constant(4, data);
+    const Address gate_loop = t.pc();
+    t.load(0, 0x60); t.emit(0xe3500000); t.emit(0x0a000000u | ((static_cast<uint32_t>(static_cast<int32_t>(gate_loop - (t.pc() + 8))) >> 2) & 0xffffffu)); // beq gate_loop
+    t.constant(0, 43);
+    t.emit(0xe8bd8010);
+    t.finish(mem);
+}
 } // namespace guest_thread_fixture

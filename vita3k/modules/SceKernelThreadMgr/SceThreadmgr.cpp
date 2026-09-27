@@ -26,7 +26,9 @@
 
 #include <util/lock_and_find.h>
 
+#include <algorithm>
 #include <chrono>
+#include <optional>
 #include <thread>
 
 #include <util/tracy.h>
@@ -844,6 +846,58 @@ EXPORT(int, _sceKernelWaitSignalCB, uint32_t unknown, uint32_t delay, uint32_t t
     return CALL_EXPORT(_sceKernelWaitSignal, unknown, delay, timeout);
 }
 
+// Browser fiber runtime: park instead of blocking the host thread. The
+// target's dormant transition (raise_waiting_threads) unlinks the waiter and
+// wakes it; a waiter still linked afterwards timed out or was cancelled.
+static int wait_thread_end_cooperative(KernelState &kernel, const ThreadStatePtr &waiter, const ThreadStatePtr &target, int *stat, SceUInt *timeout) {
+    // Same order as raise_waiting_threads: target, then waiter.
+    const auto unlink = [&] {
+        const std::lock_guard<std::mutex> target_lock(target->mutex);
+        const auto it = std::find(target->waiting_threads.begin(), target->waiting_threads.end(), waiter);
+        const bool linked = it != target->waiting_threads.end();
+        if (linked)
+            target->waiting_threads.erase(it);
+        const std::lock_guard<std::mutex> waiter_lock(waiter->mutex);
+        if (waiter->status != ThreadStatus::run)
+            waiter->update_status(ThreadStatus::run);
+        return linked;
+    };
+    {
+        const std::lock_guard<std::mutex> target_lock(target->mutex);
+        if (target->status == ThreadStatus::dormant) {
+            if (stat)
+                *stat = target->returned_value;
+            return SCE_KERNEL_OK;
+        }
+        const std::lock_guard<std::mutex> waiter_lock(waiter->mutex);
+        waiter->update_status(ThreadStatus::wait);
+        target->waiting_threads.push_back(waiter);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const auto duration = timeout ? std::optional<uint32_t>(*timeout) : std::nullopt;
+    KernelExecutionHost::WaitResult result;
+    try {
+        result = kernel.execution_host->wait_sync(*waiter, duration);
+    } catch (...) {
+        unlink();
+        throw;
+    }
+    const bool still_linked = unlink();
+    if (timeout) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start)
+                                 .count();
+        *timeout = elapsed >= *duration ? 0 : *duration - static_cast<uint32_t>(elapsed);
+    }
+    if (still_linked)
+        return result == KernelExecutionHost::WaitResult::timeout
+            ? SCE_KERNEL_ERROR_WAIT_TIMEOUT
+            : SCE_KERNEL_ERROR_WAIT_CANCEL;
+    if (stat)
+        *stat = target->returned_value;
+    return SCE_KERNEL_OK;
+}
+
 static int wait_thread_end(KernelState &kernel, ThreadStatePtr &waiter, ThreadStatePtr &target, int *stat) {
     std::unique_lock<std::mutex> waiter_lock(waiter->mutex);
     {
@@ -871,6 +925,8 @@ EXPORT(int, _sceKernelWaitThreadEnd, SceUID thid, int *stat, SceUInt *timeout) {
     if (!target) {
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
     }
+    if (emuenv.kernel.execution_host)
+        return wait_thread_end_cooperative(emuenv.kernel, waiter, target, stat, timeout);
     return wait_thread_end(emuenv.kernel, waiter, target, stat);
 }
 

@@ -126,6 +126,10 @@ void ThreadState::raise_waiting_threads() {
         assert(t->status == ThreadStatus::wait);
         t->status = ThreadStatus::run;
         t->status_cond.notify_all();
+        // Enqueue only: a waiter parked on the fiber host has no condition
+        // variable to observe.
+        if (kernel.execution_host)
+            kernel.execution_host->notify(*t);
     }
     waiting_threads.clear();
 }
