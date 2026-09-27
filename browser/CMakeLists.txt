@@ -195,17 +195,29 @@ set_target_properties(vita3k_web PROPERTIES
 # edits to the web assets or the fixture (not link inputs) would never reach
 # dist. The module's own js/wasm outputs are staged by POST_BUILD below,
 # which runs exactly when those files change.
-set(_staged_assets
-    "${VITA3K_GUEST_PROBE_ELF}|${CMAKE_BINARY_DIR}/dist/guest.elf"
-    "${CMAKE_CURRENT_SOURCE_DIR}/web/index.html|${CMAKE_BINARY_DIR}/dist/index.html"
-    "${CMAKE_CURRENT_SOURCE_DIR}/web/display.html|${CMAKE_BINARY_DIR}/dist/display.html"
-    "${CMAKE_CURRENT_SOURCE_DIR}/web/display.js|${CMAKE_BINARY_DIR}/dist/display.js"
-    "${CMAKE_CURRENT_SOURCE_DIR}/web/worker.js|${CMAKE_BINARY_DIR}/dist/worker.js"
-    "${CMAKE_CURRENT_SOURCE_DIR}/web/capabilities.js|${CMAKE_BINARY_DIR}/dist/capabilities.js"
-    "${CMAKE_CURRENT_SOURCE_DIR}/web/storage.js|${CMAKE_BINARY_DIR}/dist/storage.js"
-    "${CMAKE_CURRENT_SOURCE_DIR}/web/audio_input.js|${CMAKE_BINARY_DIR}/dist/audio_input.js"
+#
+# Every file in web/ is deployed; check_web_imports.cmake fails the stage when
+# a script loaded by relative URL (from web/ or an EM_JS import) is not there.
+file(GLOB _web_assets LIST_DIRECTORIES false CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/web/*")
+file(GLOB _em_js_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
+set(_web_imports_stamp "${CMAKE_CURRENT_BINARY_DIR}/web_imports.stamp")
+add_custom_command(
+    OUTPUT "${_web_imports_stamp}"
+    COMMAND ${CMAKE_COMMAND}
+        "-DWEB_DIR=${CMAKE_CURRENT_SOURCE_DIR}/web"
+        "-DSOURCES=${_em_js_sources}"
+        "-DSTAMP=${_web_imports_stamp}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/check_web_imports.cmake"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/check_web_imports.cmake" ${_web_assets} ${_em_js_sources}
+    COMMENT "Checking that web/ holds every script the browser loads"
+    VERBATIM
 )
-set(_stage_outputs "")
+set(_staged_assets "${VITA3K_GUEST_PROBE_ELF}|${CMAKE_BINARY_DIR}/dist/guest.elf")
+foreach(_asset IN LISTS _web_assets)
+    get_filename_component(_name "${_asset}" NAME)
+    list(APPEND _staged_assets "${_asset}|${CMAKE_BINARY_DIR}/dist/${_name}")
+endforeach()
+set(_stage_outputs "${_web_imports_stamp}")
 foreach(_pair IN LISTS _staged_assets)
     string(REGEX REPLACE "^([^|]+)\\|(.+)$" "\\1;\\2" _paths "${_pair}")
     list(GET _paths 0 _src)
