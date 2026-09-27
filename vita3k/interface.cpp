@@ -697,11 +697,15 @@ ExitCode run_app(EmuEnvState &emuenv, int32_t main_module_id, const AppLaunchReq
         param.size = static_cast<SceSize>(buf.size());
         param.attr = arr.address();
     }
+    // The main thread is the module's entry; it can reach sceKernelCallModuleExit
+    // as soon as it starts, so the module counts as started before that.
+    auto &main_module = *emuenv.kernel.loaded_modules[main_module_id];
+    main_module.started = true;
     if (main_thread->start(param.size, Ptr<void>(param.attr), true) < 0) {
+        main_module.started = false;
         LOG_ERROR("Failed to run main thread.");
         return RunThreadFailed;
     }
-    emuenv.kernel.loaded_modules[main_module_id]->started = true; // its entry is the main thread
 
     start_sync_thread(emuenv);
 

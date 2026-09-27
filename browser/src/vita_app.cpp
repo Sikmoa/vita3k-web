@@ -624,8 +624,14 @@ static int run_app_impl() {
         env->kernel.threads.emplace(thread->id, thread);
 #endif
         env->main_thread_id = thread->id;
-        if (thread->start(0, Ptr<void>{}, true) < 0) return -7;
-        env->kernel.loaded_modules.at(eboot_uid)->started = true; // its entry is the main thread
+        // The main thread is the module's entry: the module counts as started
+        // before its thread can reach sceKernelCallModuleExit.
+        auto &main_module = *env->kernel.loaded_modules.at(eboot_uid);
+        main_module.started = true;
+        if (thread->start(0, Ptr<void>{}, true) < 0) {
+            main_module.started = false;
+            return -7;
+        }
 #ifdef VITA3K_USE_WASM_JIT
         vita3k::web::GuestThreadRuntime::Progress progress;
         std::size_t dispatched = 0;
