@@ -5,6 +5,8 @@
 #include "guest_sync_delete_tests.h"
 #include <np/state.h>
 #include <algorithm>
+#include <kernel/sync_primitives.h>
+#include <set>
 #include <vector>
 
 inline void test_guest_np_signaling(EmuEnvState &env, vita3k::web::GuestThreadRuntime &runtime) {
@@ -173,33 +175,71 @@ inline void test_guest_np_signaling(EmuEnvState &env, vita3k::web::GuestThreadRu
         c.emit(0xe12fff1e); // bx lr
         c.finish(env.mem);
     }
+    // The first event's handler holds SceNpSignalingMain on a semaphore, so
+    // the ring stays full while threads wait for room.
+    const SceUID hold = semaphore_create(env.kernel, "fixture", "signaling hold", host->id, 0, 0, 1);
+    REQUIRE(hold >= 0);
+    const Address blocker = code + 0xc00, wait_stub = code + 0xd00;
+    {
+        const uint32_t stub[] = { 0xef000000, 0xe1a0f00e, 0x0C7B834B };
+        std::memcpy(Ptr<void>(wait_stub).get(env.mem), stub, sizeof(stub));
+        guest_thread_fixture::Arm b(blocker);
+        b.emit(0xe92d4010); // push {r4, lr}
+        b.constant(0, uint32_t(hold));
+        b.constant(1, 1);
+        b.constant(2, 0);
+        b.call(wait_stub);
+        b.constant(0, 0);
+        b.emit(0xe8bd8010); // pop {r4, pc}
+        b.finish(env.mem);
+    }
+    REQUIRE(call(create_ctx, { own, blocker, 0, ctx_out }) == 0);
+    const uint32_t blocking = word(0x10);
     REQUIRE(call(create_ctx, { own, counter, 0, ctx_out }) == 0);
     const uint32_t counting = word(0x10);
     word(0x30) = 0;
     for (uint32_t i = 0; i < 64; ++i) {
         const std::string peer_name = "many" + std::to_string(i);
         set_id(peers + i * sizeof(np::SceNpId), peer_name.c_str(), 1);
-        REQUIRE(call(activate, { counting, peers + i * uint32_t(sizeof(np::SceNpId)), conn_out }) == 0);
+        REQUIRE(call(activate, { i ? counting : blocking, peers + i * uint32_t(sizeof(np::SceNpId)), conn_out }) == 0);
     }
     REQUIRE(call(activate, { ctx, peer3, conn_out }) == 0x800201b3); // full, and a host call cannot wait
     REQUIRE(word(0x30) == 0);
-    // Two threads waiting for room get connections of their own.
-    const Address peer_a = data + 0x8f0, peer_b = data + 0x920, out_a = data + 0x24, out_b = data + 0x28;
+    // Threads waiting for room get connections of their own; a context
+    // destroyed while its activation waits gets no event, nor does a new
+    // context that took its id.
+    const Address peer_a = data + 0x8f0, peer_b = data + 0x920, peer_c = data + 0x950;
+    const Address out_a = data + 0x24, out_b = data + 0x28, out_c = data + 0x38;
     set_id(peer_a, "waiting a", 1);
     set_id(peer_b, "waiting b", 1);
+    set_id(peer_c, "waiting c", 1);
+    REQUIRE(call(create_ctx, { own, handler, 0xdddd, ctx_out }) == 0);
+    const uint32_t doomed = word(0x10);
     guest_sync_delete::build_call(env.mem, code + 0x800, activate, { counting, peer_a, out_a, 0, 0 }, data + 0x2c);
     guest_sync_delete::build_call(env.mem, code + 0xa00, activate, { counting, peer_b, out_b, 0, 0 }, data + 0x34);
-    word(0x2c) = word(0x34) = 0xcccccccc;
+    guest_sync_delete::build_call(env.mem, code + 0xe00, activate, { doomed, peer_c, out_c, 0, 0 }, data + 0x3c0);
+    word(0x2c) = word(0x34) = word(0x3c0) = 0xcccccccc;
     std::vector<ThreadStatePtr> waiting;
-    for (const Address entry : { code + 0x800, code + 0xa00 }) {
+    for (const Address entry : { code + 0x800, code + 0xa00, code + 0xe00 }) {
         auto t = env.kernel.create_thread(env.mem, "signaling waiter", Ptr<const void>(entry), SCE_KERNEL_DEFAULT_PRIORITY_USER,
             SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
         REQUIRE(t && t->start(0, Ptr<void>{}, false) == 0);
         waiting.push_back(t);
     }
-    run_until([&] { return waiting[0]->status == ThreadStatus::dormant && waiting[1]->status == ThreadStatus::dormant && word(0x30) == 66; });
-    REQUIRE(word(0x2c) == 0 && word(0x34) == 0 && word(0x24) != word(0x28));
-    REQUIRE(std::min(word(0x24), word(0x28)) > 0 && std::max(word(0x24), word(0x28)) == std::min(word(0x24), word(0x28)) + 1);
+    run_until([&] {
+        return main_waiting() && std::ranges::all_of(waiting, [](const auto &t) { return t->status == ThreadStatus::wait; });
+    });
+    REQUIRE(call(destroy_ctx, { doomed }) == 0 && call(create_ctx, { own, handler, 0xeeee, ctx_out }) == 0 && word(0x10) == doomed);
+    word(0x3c) = 1;
+    REQUIRE(semaphore_signal(env.kernel, "fixture", host->id, hold, 1) == 0);
+    run_until([&] {
+        return std::ranges::all_of(waiting, [](const auto &t) { return t->status == ThreadStatus::dormant; }) && word(0x30) == 65
+            && main_waiting();
+    });
+    REQUIRE(word(0x2c) == 0 && word(0x34) == 0 && word(0x3c0) == 0 && word(0x3c) == 1);
+    const std::set<uint32_t> waited_ids{ word(0x24), word(0x28), word(0x38) };
+    REQUIRE(waited_ids.size() == 3);
+    REQUIRE(semaphore_delete(env.kernel, "fixture", host->id, hold) == 0);
     // A context without a handler is attached once, however often it
     // activates; a context with one activating the same peer then gets it.
     REQUIRE(call(create_ctx, { own, 0, 0, ctx_out }) == 0);

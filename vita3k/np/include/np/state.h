@@ -116,7 +116,9 @@ struct NpState {
         np::SceNpId own_id;
         Address handler;
         Address arg;
+        uint32_t serial; // tells a context from a later one with its id
     };
+    uint32_t signaling_ctx_serial = 0;
     std::map<int, SignalingCtx> signaling_ctxs; // context id (1..8)
     // SceNpSignalingMain (created by sceNpSignalingInit) runs guest code that
     // waits on a semaphore for dead-connection events in a guest ring and

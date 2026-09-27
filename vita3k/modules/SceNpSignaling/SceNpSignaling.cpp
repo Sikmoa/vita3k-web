@@ -207,6 +207,7 @@ EXPORT(int, sceNpSignalingActivateConnection, SceInt32 ctx_id, np::SceNpId *peer
     if (found == np.signaling_ctxs.end())
         return RET_ERROR(SCE_NP_SIGNALING_ERROR_CTX_NOT_FOUND);
     const np::SceNpId own_id = found->second.own_id;
+    const uint32_t serial = found->second.serial;
     if (same_np_id(emuenv, export_name, thread_id, own_id, *peer_id))
         return RET_ERROR(SCE_NP_SIGNALING_ERROR_OWN_NP_ID);
     // Every activation sends a message: wait for room first, then decide on
@@ -221,8 +222,11 @@ EXPORT(int, sceNpSignalingActivateConnection, SceInt32 ctx_id, np::SceNpId *peer
         // Terminated meanwhile, with room left in the ring.
         return RET_ERROR(SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED);
     }
-    // The context holds a reference: destroyed meanwhile, it gets no event.
-    const auto ctx = np.signaling_ctxs.find(ctx_id);
+    // The context holds a reference: destroyed meanwhile, it gets no event,
+    // nor does a new context that took its id.
+    auto ctx = np.signaling_ctxs.find(ctx_id);
+    if (ctx != np.signaling_ctxs.end() && ctx->second.serial != serial)
+        ctx = np.signaling_ctxs.end();
     const uint32_t handler = ctx != np.signaling_ctxs.end() ? ctx->second.handler : 0;
     const uint32_t arg = ctx != np.signaling_ctxs.end() ? ctx->second.arg : 0;
     auto &ring = signaling_ring(emuenv);
@@ -276,7 +280,7 @@ EXPORT(int, sceNpSignalingCreateCtx, const np::SceNpId *np_id, Ptr<void> handler
     if (np_id->isIdValid != 1)
         return RET_ERROR(SCE_NP_ERROR_INVALID_NPID);
     for (int id = 1; id <= max_signaling_ctxs; ++id) {
-        if (emuenv.np.signaling_ctxs.emplace(id, NpState::SignalingCtx{ *np_id, handler.address(), arg.address() }).second) {
+        if (emuenv.np.signaling_ctxs.emplace(id, NpState::SignalingCtx{ *np_id, handler.address(), arg.address(), ++emuenv.np.signaling_ctx_serial }).second) {
             *ctx_id = id;
             return 0;
         }
