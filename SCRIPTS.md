@@ -228,7 +228,8 @@ header of `limbo_serve.mjs`; the ones that change what is measured:
   OffscreenCanvas.
 
 A guest message dialog (`sceMsgDialog`) is drawn over the screen and answered
-with the keys. Restart the Node server after editing its inline page or the staged content;
+with the keys; a guest on-screen keyboard (`SceIme`) is a text field over the
+screen (Enter presses its enter key, Escape closes it). Restart the Node server after editing its inline page or the staged content;
 runtime files are read per request.
 
 Rendering: the runtime encodes each GXM command list as a GXS1 scene stream
@@ -262,7 +263,8 @@ is the file header; commonly used:
 - `LIMBO_FPS_HACK=1`, `LIMBO_SCALE=N`, `LIMBO_SURFACE_SYNC=1`: as `?fpsHack=1`,
   `?scale=N`, `?surfaceSync=1`.
 - `LIMBO_DIALOG=cross|circle|none` answers every guest message dialog
-  (default `cross`).
+  (default `cross`); `LIMBO_IME=<text>` types the text into every guest
+  on-screen keyboard and presses Enter (unset: left open).
 - `LIMBO_TEXTURE_VERIFY=1` checks cached textures and vertex streams against
   guest memory and logs writes the tracking missed (`[gxm-verify]`).
 - `LIMBO_INPUT="<ms>:<input>[+<input>]:<hold ms>,..."` scripts pad input.
@@ -275,6 +277,23 @@ is the file header; commonly used:
   [`INLINE_MUTEX.md`](vita3k/cpu/src/wasmjit/INLINE_MUTEX.md)).
 
 Raw assets, frames and logs stay in the ignored `.limbo_work/`.
+
+### Page-bridge and offline-network fixtures
+
+```sh
+cmake --build build/web64 --target vita3k_web_dist vita3k_vita_msg_dialog_fixture \
+  vita3k_vita_ime_fixture vita3k_vita_net_offline_fixture
+node browser/tests/msg_dialog_chromium.mjs   # sceMsgDialog: probe answers and page keys
+node browser/tests/ime_chromium.mjs          # SceIme: LIMBO_IME and the page text field
+node browser/tests/net_offline_chromium.mjs  # SceNet/SceNetCtl on the offline stack
+```
+
+Each stages a genuine VitaSDK fixture as an app (with `PLAYWRIGHT_MODULE_URL`
+as above) and checks its exit code. The browser has no host sockets: SceNet
+runs on `vita3k/net/include/net/offline_socket.h`, a Vita without a
+connection (loopback only, no route, no DNS). SceRegMgr reads come from the
+staged firmware's `os0/kd/registry.db0`; without it they return 0, as desktop
+Vita3K does without firmware.
 
 ## Ahead-of-time module (AOT) for a retail app
 

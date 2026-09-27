@@ -35,6 +35,10 @@ globalThis.vita3kWebOnGpuFrame = (generation, width, height, pixels) => {
 // { id, state: 'open' | 'update', message, buttons, progress, enterButton } or
 // { id, state: 'close', buttonId, result }. The page answers with 'dialog-press'.
 globalThis.vita3kWebOnDialog = (dialog) => post({ type: 'vita-dialog', dialog });
+// SceIme text field shown to the page (browser/src/ime_bridge.cpp):
+// { id, state: 'open', text, caret, maxLength, type, option, enterLabel } or
+// { id, state: 'close' }. The page reports its field with 'ime-input'.
+globalThis.vita3kWebOnIme = (ime) => post({ type: 'vita-ime', ime });
 // A canvas transferred by the page ('attach-canvas'); bound once the GXM
 // device exists.
 let pendingCanvas = null;
@@ -239,6 +243,12 @@ self.onmessage = async ({ data }) => {
     // SCE_CTRL_CROSS / SCE_CTRL_CIRCLE pressed on dialog `id` with button
     // `selected` highlighted; the runtime applies it at the next HLE call.
     module?._vita3k_web_msg_dialog_press?.(data.id >>> 0, data.button >>> 0, data.selected >>> 0);
+    break;
+  case 'ime-input':
+    // { id, kind: 0 text (whole field + caret) | 1 enter | 2 close, text, caret },
+    // taken in order by the runtime after the next HLE call.
+    (globalThis.vita3kWebImeInputs ??= []).push(data.input);
+    module?._vita3k_web_ime_input_ready?.();
     break;
   case 'attach-canvas': {
     globalThis.vita3kHasCanvas = true;

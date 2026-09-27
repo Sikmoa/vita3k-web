@@ -4,6 +4,7 @@
 // (vita3k/overlay/src/common_dialog.cpp). The Worker forwards both directions:
 // vita3kWebOnDialog posts 'vita-dialog', 'dialog-press' calls the export below.
 #include "msg_dialog_bridge.h"
+#include "page_json.h"
 
 #include <config/state.h>
 #include <ctrl/ctrl.h>
@@ -38,23 +39,6 @@ PageDialog &page() {
     return state;
 }
 
-void quote(std::string &out, const std::string &text) {
-    out += '"';
-    for (const char c : text) {
-        if (c == '"' || c == '\\') {
-            out += '\\';
-            out += c;
-        } else if (static_cast<unsigned char>(c) < 0x20) {
-            char escaped[8];
-            std::snprintf(escaped, sizeof(escaped), "\\u%04x", static_cast<unsigned>(c));
-            out += escaped;
-        } else {
-            out += c;
-        }
-    }
-    out += '"';
-}
-
 void post(const std::string &json) {
     web_msg_dialog_post(json.data(), static_cast<uint32_t>(json.size()));
 }
@@ -62,11 +46,11 @@ void post(const std::string &json) {
 void post_shown(const EmuEnvState &env, uint32_t id, const char *state) {
     const auto &msg = env.common_dialog.msg;
     std::string json = "{\"id\":" + std::to_string(id) + ",\"state\":\"" + state + "\",\"message\":";
-    quote(json, msg.message);
+    browser::json_quote(json, msg.message);
     json += ",\"buttons\":[";
     for (uint8_t i = 0; i < msg.btn_num && i < 3; ++i) {
         if (i) json += ',';
-        quote(json, msg.btn[i]);
+        browser::json_quote(json, msg.btn[i]);
     }
     json += "],\"progress\":";
     json += msg.has_progress_bar ? std::to_string(msg.bar_percent) : "null";

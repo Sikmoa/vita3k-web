@@ -43,6 +43,8 @@ EXPORT(void, SceImeEventHandler, Ptr<void> arg, const SceImeEvent *e) {
 
 EXPORT(SceInt32, sceImeClose) {
     TRACY_FUNC(sceImeClose);
+    if (!emuenv.ime.state)
+        return RET_ERROR(SCE_IME_ERROR_NOT_OPENED);
     emuenv.ime.state = false;
 
     if (emuenv.ime.param.inputTextBuffer.address())
@@ -58,6 +60,10 @@ EXPORT(SceInt32, sceImeClose) {
 
 EXPORT(SceInt32, sceImeOpen, SceImeParam *param) {
     TRACY_FUNC(sceImeOpen, param);
+    if (!param)
+        return RET_ERROR(SCE_IME_ERROR_INVALID_POINTER);
+    if (emuenv.ime.state)
+        return RET_ERROR(SCE_IME_ERROR_ALREADY_OPENED);
     emuenv.ime.caps_level = 0;
     emuenv.ime.caretIndex = 0;
     emuenv.ime.edit_text = {};
@@ -84,6 +90,9 @@ EXPORT(SceInt32, sceImeOpen, SceImeParam *param) {
     emuenv.ime.edit_text.str = emuenv.ime.param.inputTextBuffer;
     emuenv.ime.param.inputTextBuffer = Ptr<SceWChar16>(alloc(emuenv.mem, SCE_IME_MAX_PREEDIT_LENGTH + emuenv.ime.param.maxTextLength + 1, "ime_str"));
     emuenv.ime.str = emuenv.ime.param.initialText ? reinterpret_cast<char16_t *>(emuenv.ime.param.initialText.get(emuenv.mem)) : u"";
+    // sceImeUpdate copies str into inputTextBuffer (maxTextLength + 1 units).
+    if (emuenv.ime.str.size() > emuenv.ime.param.maxTextLength)
+        emuenv.ime.str.resize(emuenv.ime.param.maxTextLength);
     if (!emuenv.ime.str.empty())
         emuenv.ime.caretIndex = emuenv.ime.edit_text.caretIndex = emuenv.ime.edit_text.preeditIndex = static_cast<SceUInt32>(emuenv.ime.str.length());
     else

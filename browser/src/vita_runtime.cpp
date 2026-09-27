@@ -15,6 +15,7 @@
 #include <nids/functions.h>
 #include <emscripten/emscripten.h>
 
+#include "ime_bridge.h"
 #include "msg_dialog_bridge.h"
 #include "vita_runtime.h"
 
@@ -135,6 +136,7 @@ static int run_vita(const uint8_t *bytes, uint32_t size) {
                 trace_cpu(cpu, nid);
                 ::call_import(*env, cpu, nid, tid);
                 browser::sync_message_dialog(*env);
+                browser::sync_ime(*env);
                 // Present exactly once per real sceDisplaySetFrameBuf call: one
                 // frame/update generation, matching the real API semantics.
                 if (nid == 0x7A410B64 /* sceDisplaySetFrameBuf */

@@ -42,6 +42,7 @@
 #include <regmgr/functions.h>
 #include <emscripten/emscripten.h>
 
+#include "ime_bridge.h"
 #include "msg_dialog_bridge.h"
 #include "vita_runtime.h"
 
@@ -501,6 +502,7 @@ static int run_app_impl() {
                     ::call_import(*env, cpu, nid, tid);
                 }
                 browser::sync_message_dialog(*env);
+                browser::sync_ime(*env);
                 if (trace_hle) {
                     std::fprintf(stderr, "[vita3k-web] HLE return #%u tid=%d NID=%08x PC=%08x r0=%08x\n",
                         import_sequence, tid, nid, read_pc(cpu), read_reg(cpu, 0));

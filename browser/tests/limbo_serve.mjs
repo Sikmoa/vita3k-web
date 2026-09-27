@@ -28,6 +28,9 @@
 // right stick. A guest message dialog (sceMsgDialog) is drawn over the screen
 // and takes the keys while it is open: left/right select a button, cross and
 // circle answer it as on the Vita (the runtime applies the enter-button rule).
+// A guest on-screen keyboard (SceIme) is a text field over the screen that
+// takes the keyboard while it is open: Enter presses the keyboard's enter
+// key, Escape closes it.
 //
 // Requires a WebGPU browser **on a secure origin**: WebGPU is
 // exposed only to secure contexts, so a page served over plain HTTP from a
@@ -101,6 +104,12 @@ const page = `<!doctype html>
   #dialog-buttons button { min-width: 10ch; }
   #dialog-buttons button.selected { outline: 3px solid #36f; }
   #dialog-hint { display: block; margin-top: 10px; color: #666; font-size: 12px; }
+  #ime { grid-area: 1 / 1; align-self: end; justify-self: center; z-index: 1; width: min(90%, 70ch);
+    margin-bottom: 4%; padding: 12px 14px; background: #eee; color: #111; border-radius: 8px;
+    font: 15px/1.4 system-ui, sans-serif; box-shadow: 0 4px 24px #000a; display: flex; gap: 8px; flex-wrap: wrap; }
+  #ime[hidden] { display: none; }
+  #ime-text { flex: 1; font: inherit; padding: 4px 6px; }
+  #ime-hint { flex-basis: 100%; color: #666; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -124,6 +133,12 @@ const page = `<!doctype html>
     <div id="dialog-buttons"></div>
     <small id="dialog-hint"></small>
   </div>
+  <form id="ime" hidden>
+    <input id="ime-text" autocomplete="off" spellcheck="false">
+    <button id="ime-enter" type="submit">Enter</button>
+    <button id="ime-close" type="button">Close</button>
+    <small id="ime-hint">Enter presses the keyboard's enter key · Esc closes it</small>
+  </form>
 </div>
 <pre id="log"></pre>
 <script type="module">
@@ -301,6 +316,36 @@ function dialogKey(event) {
     pressDialog(button, dialog.selected);
   }
 }
+// Guest on-screen keyboard (worker 'vita-ime'); null when none is shown.
+let ime = null;
+const imeBox = document.querySelector('#ime');
+const imeText = document.querySelector('#ime-text');
+// kind 0: the field's text and caret, 1: enter, 2: close (ime_bridge.cpp).
+function sendIme(kind) {
+  worker.postMessage({ type: 'ime-input', input: { id: ime.id, kind, text: imeText.value,
+    caret: imeText.selectionStart ?? imeText.value.length } });
+}
+function onIme(message) {
+  if (message.state === 'close') {
+    log(\`ime \${message.id} closed\`);
+    if (ime?.id === message.id) { ime = null; imeBox.hidden = true; imeText.blur(); }
+    return;
+  }
+  log(\`ime \${message.id}: \${JSON.stringify(message.text)} max=\${message.maxLength}\`);
+  // The keyboard takes the keys, as the Vita's does: release what the guest holds.
+  held.clear(); sendPad();
+  ime = { id: message.id };
+  imeText.value = message.text;
+  imeText.maxLength = message.maxLength;
+  document.querySelector('#ime-enter').textContent = message.enterLabel || 'Enter';
+  imeBox.hidden = false;
+  imeText.focus();
+  imeText.setSelectionRange(message.caret, message.caret);
+}
+imeText.addEventListener('input', () => { if (ime) sendIme(0); });
+imeText.addEventListener('keyup', (event) => { if (ime && event.key.startsWith('Arrow')) sendIme(0); });
+imeBox.addEventListener('submit', (event) => { event.preventDefault(); if (ime) { sendIme(0); sendIme(1); } });
+document.querySelector('#ime-close').onclick = () => { if (ime) sendIme(2); };
 function sendPad() {
   if (!running) return;
   let buttons = 0;
@@ -313,6 +358,11 @@ function sendPad() {
   worker.postMessage({ type: 'input', buttons, axes: axes.map((value) => Math.max(-1, Math.min(1, value))) });
 }
 function onKey(event) {
+  if (ime) {
+    // Keys belong to the text field; Escape closes the keyboard.
+    if (event.type === 'keydown' && event.code === 'Escape') sendIme(2);
+    return;
+  }
   if (!running || !(event.code in keyMap)) return;
   // While the guest runs, mapped keys are its input: no scrolling or button activation.
   event.preventDefault();
@@ -329,6 +379,7 @@ addEventListener('blur', () => { held.clear(); sendPad(); });
 function stop(keepsStatus) {
   worker?.terminate(); worker = null; running = false; held.clear();
   dialog = null; dialogBox.hidden = true;
+  ime = null; imeBox.hidden = true;
   runButton.disabled = false; stopButton.disabled = true;
   if (!keepsStatus) status.textContent = 'stopped';
 }
@@ -402,6 +453,7 @@ async function run() {
         playAudioPCM(data.freq, data.channels, data.frames, data.data);
         break;
       case 'vita-dialog': onDialog(data.dialog); break;
+      case 'vita-ime': onIme(data.ime); break;
       case 'vita-exit':
         // Report first, then release the worker: stop() must not overwrite the
         // outcome the viewer is waiting to read.

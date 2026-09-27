@@ -352,6 +352,10 @@ set(_hle_exports
     sceNetResolverAbort sceNetResolverDestroy
     sceNetInetPton sceNetInternalInetPton
     sceNetCtlInetGetState sceNetCtlInetGetInfo
+    # On-screen keyboard: production SceIme bodies; the page shows the text
+    # field (ime_bridge.cpp) and sceImeUpdate runs the guest's event handler
+    # on the calling thread (run_callback), as on desktop.
+    sceImeOpen sceImeUpdate sceImeClose
 )
 
 # Take NID values from the one authoritative database, never a second resolver.
@@ -410,6 +414,7 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceNet/SceNet.cpp"
     "${_HLE_ROOT}/modules/SceNetCtl/SceNetCtl.cpp"
     "${_HLE_ROOT}/modules/SceNetInternal/SceNetInternal.cpp"
+    "${_HLE_ROOT}/modules/SceIme/SceIme.cpp"
     "${_HLE_ROOT}/modules/SceNpManager/SceNpManager.cpp"
     "${_HLE_ROOT}/modules/SceNpCommerce2/SceNpCommerce2.cpp"
     "${_HLE_ROOT}/modules/SceNpBasic/SceNpBasic.cpp"
@@ -499,6 +504,7 @@ add_library(vita3k_web_runtime_hle STATIC
     "${_HLE_BROWSER_ROOT}/src/vita_self_decrypt.cpp"
     "${_HLE_BROWSER_ROOT}/src/gxm_webgpu_bridge.cpp"
     "${_HLE_BROWSER_ROOT}/src/msg_dialog_bridge.cpp"
+    "${_HLE_BROWSER_ROOT}/src/ime_bridge.cpp"
     "${_lang_root}/src/lang.cpp"
     "${_lang_generated}/generated_catalog.cpp"
     "${_HLE_ROOT}/renderer/src/renderer.cpp"

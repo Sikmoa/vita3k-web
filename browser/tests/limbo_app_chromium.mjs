@@ -35,6 +35,8 @@
 //   LIMBO_DIALOG            answer to every guest message dialog (sceMsgDialog):
 //                           cross (default; the highlighted first button), circle
 //                           (the last of several buttons) or none (leave it open)
+//   LIMBO_IME               text typed into every guest on-screen keyboard (SceIme),
+//                           then Enter; unset leaves the keyboard open
 //   LIMBO_AOT               ahead-of-time module to supply to the run (AOT.md)
 //   LIMBO_LOG_OUT           write the retained worker log tail (4000 lines) to this file
 import { createServer } from 'node:http';
@@ -94,6 +96,7 @@ const regionCache = process.env.LIMBO_REGION_CACHE || '';
 const aotPath = process.env.LIMBO_AOT ? resolve(process.env.LIMBO_AOT) : '';
 const dialogAnswer = process.env.LIMBO_DIALOG || 'cross';
 assert(['cross', 'circle', 'none'].includes(dialogAnswer), `LIMBO_DIALOG=${dialogAnswer}: use cross, circle or none`);
+const imeAnswer = process.env.LIMBO_IME ?? null;
 
 if (frameEvery === 1)
   throw new Error('LIMBO_FRAME_EVERY=1 saves no files (generations start at 1); use 2 or more');
@@ -313,12 +316,12 @@ try {
     });
   }
 
-  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale, surfaceSync, dialogAnswer, ctrlButtons }) => {
+  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale, surfaceSync, dialogAnswer, ctrlButtons, imeAnswer }) => {
     const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}${textureVerify ? '&textureVerify=1' : ''}${scale ? '&scale=' + scale : ''}${surfaceSync ? '&surfaceSync=1' : ''}`, { type: 'module' });
     const state = { logs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
       backend: null, memory: null, workerErrors: [], ready: false, timedOut: false,
       gxmSceneStats: null, gxmFailures: [], gxmSkips: [],
-      latestProgress: null, profiles: {}, jitThreads: {}, runStartedAt: null, dialogs: [],
+      latestProgress: null, profiles: {}, jitThreads: {}, runStartedAt: null, dialogs: [], imes: [],
       phase: 'boot', phaseTrace: [], windows: {}, lastElapsed: 0, latestScene: null,
       audio: { chunks: 0, bytes: 0, peak: 0, nonzero: 0, scanned: 0, freqs: {}, channels: {}, first: null } };
     const hex = (bytes) => Array.from(bytes.slice(0, 64), (v) => v.toString(16).padStart(2, '0')).join(' ');
@@ -503,6 +506,25 @@ try {
             worker.postMessage({ type: 'dialog-press', id: dialog.id, button: ctrlButtons[dialogAnswer], selected: 0 });
           break;
         }
+        case 'vita-ime': {
+          // Every keyboard is logged; LIMBO_IME types its text and presses Enter.
+          const ime = data.ime;
+          const sinceRunMs = Math.round(performance.now() - state.runStartedAt);
+          if (ime.state === 'close') {
+            const entry = state.imes.find((i) => i.id === ime.id);
+            if (entry) entry.closedMs = sinceRunMs;
+            state.logs.push(`[limbo-probe] ime ${ime.id} closed`);
+            break;
+          }
+          state.imes.push({ id: ime.id, text: ime.text, maxLength: ime.maxLength, type: ime.type,
+            enterLabel: ime.enterLabel, openedMs: sinceRunMs, answer: imeAnswer });
+          state.logs.push(`[limbo-probe] ime ${ime.id}: ${JSON.stringify(ime.text)} max=${ime.maxLength} answer=${JSON.stringify(imeAnswer)}`);
+          if (imeAnswer !== null) {
+            worker.postMessage({ type: 'ime-input', input: { id: ime.id, kind: 0, text: imeAnswer, caret: imeAnswer.length } });
+            worker.postMessage({ type: 'ime-input', input: { id: ime.id, kind: 1 } });
+          }
+          break;
+        }
         case 'vita-exit':
           state.exit = { exitCode: data.exitCode, ok: data.ok, message: data.message };
           finish(null, state);
@@ -516,7 +538,7 @@ try {
       };
     });
     return result;
-  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot: Boolean(aotPath), fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '', surfaceSync: process.env.LIMBO_SURFACE_SYNC === '1', dialogAnswer, ctrlButtons });
+  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot: Boolean(aotPath), fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '', surfaceSync: process.env.LIMBO_SURFACE_SYNC === '1', dialogAnswer, ctrlButtons, imeAnswer });
 
   const saved = [];
   for (const frame of outcome.saved) {
@@ -551,6 +573,7 @@ try {
     gxmFailures: outcome.gxmFailures,
     gxmSkips: outcome.gxmSkips,
     dialogs: outcome.dialogs,
+    imes: outcome.imes,
     moduleLoads: outcome.logs.filter((line) => line.includes('load_module')).slice(-12),
     threadErrors: outcome.logs.filter((line) => line.includes('failed:')).slice(-6),
     scheduler: outcome.logs.filter((line) => line.includes('Guest scheduler')).slice(-3),
