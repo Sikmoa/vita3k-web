@@ -1760,7 +1760,9 @@ struct WasmJitCPU::Impl {
             ++post_hle_entries;
             last_svc_at_entry = svc_exits;
         }
-        if (parent->mem->direct_host_memory) {
+        // Both checks below hold in every memory mode: regions chain through
+        // the shared hint map in direct and page-table memory alike.
+        {
             // Hint ownership, independent of the sweep gate below. The hint
             // map/table are process-global: discard hints from any other
             // cooperatively scheduled CPU before this CPU chains through the
@@ -1795,7 +1797,7 @@ struct WasmJitCPU::Impl {
         // the call (backend test foreign_code_write). Guest writes by this CPU
         // take the checked path, set smc_dirty and drop the affected regions;
         // no host mutator runs inside the cooperative pump.
-        if (parent->mem->direct_host_memory) {
+        {
             // Two-level filter, because the unconditional form was 14-16% of
             // wall clock and had never once found anything (entry_evicted was
             // 0 in every measured run):
