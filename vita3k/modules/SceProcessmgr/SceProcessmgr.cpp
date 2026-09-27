@@ -99,9 +99,31 @@ EXPORT(int, sceKernelCDialogSetLeaseLimit) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceKernelCallAbortHandler, uint32_t param1, uint32_t param2) {
-    TRACY_FUNC(sceKernelCallAbortHandler, param1, param2);
-    return UNIMPLEMENTED();
+// Firmware 3.74 processmgr 0x81006e29, which libc calls on its abort,
+// assert and terminate paths (codes 0x102..0x109): only a zero second
+// argument is accepted; for a game the process abort event is raised and the
+// calling thread never returns, and the system ends the process. Other
+// programs just return.
+EXPORT(int, sceKernelCallAbortHandler, SceInt32 code, SceInt32 arg) {
+    TRACY_FUNC(sceKernelCallAbortHandler, code, arg);
+    if (arg != 0)
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    if (!emuenv.kernel.process_is_game_program())
+        return 0;
+    LOG_CRITICAL("The process aborts: sceKernelCallAbortHandler({})", log_hex(code));
+    emuenv.kernel.request_process_exit(code);
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    {
+        const std::lock_guard<std::mutex> lock(thread->mutex);
+        thread->update_status(ThreadStatus::wait);
+    }
+    if (emuenv.kernel.execution_host) {
+        emuenv.kernel.execution_host->wait_sync(*thread, std::nullopt);
+    } else {
+        std::unique_lock<std::mutex> lock(thread->mutex);
+        thread->status_cond.wait(lock, [&] { return thread->status != ThreadStatus::wait; });
+    }
+    return 0;
 }
 
 EXPORT(int, sceKernelGetCurrentProcess) {

@@ -19,6 +19,7 @@
 
 #include <mem/functions.h>
 #include <io/functions.h>
+#include <io/state.h>
 #include <kernel/types.h>
 
 #include <util/tracy.h>
@@ -309,9 +310,15 @@ EXPORT(int, sceIoSetThreadDefaultPriorityForSystem) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceIoSyncByFd) {
-    TRACY_FUNC(sceIoSyncByFd);
-    return UNIMPLEMENTED();
+// Firmware 3.74 iofilemgr 0x81017061: an unknown fd is EBADF (0x80010009
+// once the syscall exit clears the kernel bit). Host files are written
+// through, so there is nothing to flush.
+EXPORT(int, sceIoSyncByFd, SceUID fd, SceUInt32 flags) {
+    TRACY_FUNC(sceIoSyncByFd, fd, flags);
+    constexpr uint32_t SCE_ERROR_ERRNO_EBADF = 0x80010009;
+    if (!emuenv.io.std_files.contains(fd) && !emuenv.io.tty_files.contains(fd))
+        return RET_ERROR(SCE_ERROR_ERRNO_EBADF);
+    return 0;
 }
 
 EXPORT(int, sceIoSyncByFdAsync) {

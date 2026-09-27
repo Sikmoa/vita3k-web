@@ -95,6 +95,8 @@ set(_hle_exports
     # CALL_EXPORT dependency of sceCommonDialogUpdate: the immediate context's
     # scene state.
     sceGxmRenderingContextIsWithinSceneInternal
+    # libc's abort path: a game's calling thread never returns and the
+    # process ends (firmware 3.74 processmgr).
     sceKernelCallAbortHandler
     sceIoWrite
     sceKernelUnlockLwMutex2

@@ -137,6 +137,13 @@ inline void test_guest_appmgr_rtc(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(set_pmuserenr, { 0, 0 }) == 0 && call(get_pmuserenr, {}) == 0);
     REQUIRE(call(set_pmuserenr, { 7, 1 }) == 0x80029001);
 
+    // Abort handler: a non-zero argument is refused; a program that is not a
+    // game returns (a game's thread would never return).
+    constexpr uint32_t abort_handler = 0xEB6E50BB, sync_by_fd = 0x16512F59;
+    REQUIRE(call(abort_handler, { 0x102, 1 }) == 0x80020005);
+    REQUIRE(!env.kernel.process_is_game_program() && call(abort_handler, { 0x102, 0 }) == 0);
+    REQUIRE(call(sync_by_fd, { 0x7fff1234, 0 }) == 0x80010009);
+
     // Thread event handlers: one UID per registration; libc's exit handler
     // covers every user thread (0x10027) with END.
     constexpr uint32_t register_handler = 0x6D8C0F13, unregister_handler = 0x2C8ED6F0;
