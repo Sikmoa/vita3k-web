@@ -46,10 +46,10 @@ struct FP64Result {
 // Operation 10 is the scalar binary64 square root (vsqrt.f64) of `a` under the
 // live FPSCR (all four rounding modes, FZ, DN), integer-only like 0..3.
 // Operations 11 (signed) and 12 (unsigned) are the vector float-to-int
-// conversions of 6/7 with an explicit rounding mode in `b`
+// conversions of 6/7 with an explicit rounding mode in the low 32 bits of `b`
 // (Dynarmic::FP::RoundingMode 0..4; VCVT{A,N,P,M}.S32/U32.F32): the vendored
-// FPToFixed(ibits=32, fbits=0) under ASIMDStandardValue(). Other `b` values
-// return the default NaN with IOC.
+// FPToFixed(ibits=32, fbits=0) under ASIMDStandardValue(). Other modes return
+// the default NaN with IOC.
 FP64Result fp64_arithmetic(uint32_t operation, uint64_t a, uint64_t b, uint32_t fpscr) noexcept;
 
 } // namespace vita3k::wasmjit

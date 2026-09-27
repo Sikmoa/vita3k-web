@@ -3547,7 +3547,8 @@ private:
             // always runs under the standard FPSCR value; the native helper
             // re-derives every result from the vendored Dynarmic FPToFixed
             // (operations 6/7 towards zero, 11/12 with the rounding mode in
-            // memory_value[2]). Any other immediate shape rejects the block,
+            // memory_value[2]; memory_value[3] is not read and may be stale).
+            // Any other immediate shape rejects the block,
             // as does any live exception enable.
             if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0
                 || !inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU8() > 4

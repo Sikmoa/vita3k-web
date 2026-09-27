@@ -48,6 +48,9 @@ void write_q(IR::Block &block, Value value, unsigned q = 0) {
 
 JitState base_state() {
     JitState state{};
+    // Stale helper scratch, as an earlier binary64 op leaves it: only the
+    // words an operation's contract names may matter.
+    std::fill_n(state.memory_value, 4, 0xdeadbeefu);
     for (unsigned r = 0; r < 15; ++r) state.regs[r] = 0xabc00000 + r;
     state.regs[15] = code;
     state.cpsr = 0x10;
@@ -202,9 +205,10 @@ void helper_differential() {
             CHECK(result.flags == oracle_flags);
         }
     }
-    // Operations 11/12 take the rounding mode in b; ToOdd (5) and the first
-    // selector past them must still reject.
-    for (const auto &[operation, b] : {std::pair{11u, 5ull}, std::pair{12u, 1ull << 32}, std::pair{13u, 0ull}}) {
+    // Operations 11/12 take the rounding mode in the low word of b (the high
+    // word is stale scratch); ToOdd (5) and the first selector past them
+    // must still reject.
+    for (const auto &[operation, b] : {std::pair{11u, 5ull}, std::pair{12u, 0xffffffffull}, std::pair{13u, 0ull}}) {
         const auto invalid = fp64_arithmetic(operation, 0x3fc00000u, b, 0);
         CHECK(invalid.bits == 0x7ff8000000000000ull && invalid.flags == 1);
     }
@@ -213,7 +217,7 @@ void helper_differential() {
         rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
         const uint32_t lane = iteration < sizeof(edges) / sizeof(edges[0]) ? edges[iteration] : rng;
         for (uint32_t operation : {11u, 12u}) for (uint32_t rounding = 0; rounding <= 4; ++rounding) {
-            const auto result = fp64_arithmetic(operation, lane, rounding, 0);
+            const auto result = fp64_arithmetic(operation, lane, rounding | uint64_t(rng) << 32, 0);
             uint32_t oracle_flags = 0;
             const uint32_t oracle = oracle_tofixed(lane, operation == 12, oracle_flags,
                 static_cast<Dynarmic::FP::RoundingMode>(rounding));
