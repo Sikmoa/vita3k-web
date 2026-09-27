@@ -353,8 +353,13 @@ void cache_mutations(Suite &suite, Fixture &fixture) {
 #endif
             auto *trusted = Ptr<uint8_t>(code_address).get(fixture.memory.state);
             REQUIRE(trusted != nullptr);
+            // Host writes that bypass MemState tracking must invalidate, as with
+            // desktop Dynarmic (load_self.cpp and debugger.cpp do).
             std::memcpy(trusted, thumb ? thumb_patch_13 : arm_patch_13, width);
-            check(13); // Trusted Ptr bypass: entry-time source-byte validation is required.
+#ifdef __EMSCRIPTEN__
+            invalidate_jit_cache(*fixture.generated, code_address, width);
+#endif
+            check(13);
 #ifdef __EMSCRIPTEN__
             REQUIRE(code_units() > compiled);
 #endif
@@ -377,11 +382,14 @@ void cache_mutations(Suite &suite, Fixture &fixture) {
             check(17);
             REQUIRE(code_units() > compiled);
 
-            // Generated modules share the SAME Memory object across growth.
-            REQUIRE(emscripten_resize_heap(emscripten_get_heap_size() + 65536));
-            compiled = code_units();
-            check(17);
-            REQUIRE(code_units() == compiled);
+            // Generated modules share the SAME Memory object across growth
+            // (builds with growable memory; the Memory64 build's is fixed).
+            if (emscripten_get_heap_max() > emscripten_get_heap_size()) {
+                REQUIRE(emscripten_resize_heap(emscripten_get_heap_size() + 65536));
+                compiled = code_units();
+                check(17);
+                REQUIRE(code_units() == compiled);
+            }
 
             // Unmapping a hot page must fail, not execute stale translated code.
             const auto saved_bytes = read_bytes(fixture.memory.state, code_address, mapped_size);
