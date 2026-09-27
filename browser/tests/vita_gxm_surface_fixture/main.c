@@ -465,6 +465,13 @@ int main(void) {
     begin(rt6432, &s_linear64b); texture_quad(64, 32, &t); end();
     read_surface(linear64b, SCE_GXM_TRANSFER_LINEAR, 0, 0, 64, 32, 64);
     if (check(64, 32, blue_marked, 86)) return failed;
+    // A transfer reading those shared rows sees the later render too, and
+    // leaves it in the later target.
+    read_surface(linear64, SCE_GXM_TRANSFER_LINEAR, 0, 32, 64, 32, 64);
+    if (check(64, 32, blue_marked, 87)) return failed;
+    begin(rt6432, &s_linear64b); texture_quad(64, 32, &t); end();
+    read_surface(linear64b, SCE_GXM_TRANSFER_LINEAR, 0, 0, 64, 32, 64);
+    if (check(64, 32, blue_marked, 88)) return failed;
 
     // 7. sceCommonDialogUpdate: the host draws dialogs, so any frame is fine.
     if (sceCommonDialogUpdate(0) != (int)SCE_COMMON_DIALOG_ERROR_NULL) return 80;

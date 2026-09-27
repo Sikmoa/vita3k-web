@@ -1746,8 +1746,8 @@ static bool overlaps(Address a, uint64_t a_size, Address b, uint64_t b_size) {
 }
 // Before a transfer touches guest bytes: pending draws read memory from
 // before it; without surface sync, rendered targets under the source are
-// read back into memory (reconciled with newer guest writes, oldest target
-// first), and so are targets under the destination whose texels the
+// read back into memory (reconciled with newer guest writes), and so are
+// targets under the destination whose texels the
 // transfer covers only in part (other texel size or alignment), so the bytes
 // it leaves alone are current when refresh_targets uploads whole texels.
 static void prepare_transfer(MemState &mem, scene::Writer &out, const TransferImage *source, const TransferImage &dest) {
@@ -1767,7 +1767,10 @@ static void prepare_transfer(MemState &mem, scene::Writer &out, const TransferIm
         if (under_source || split_texels)
             read.emplace_back(target.render_order, base);
     }
-    std::sort(read.begin(), read.end());
+    // Newest first: an older target over the same bytes then finds them
+    // written after its render and keeps them (and takes them into its GPU
+    // copy), so the last render wins as it does in memory.
+    std::sort(read.begin(), read.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
     for (const auto &[order, base] : read) {
         if (!submit_scene(out, mem)) // the scenes rendering it, before the read
             unsupported("scene submission failed (see browser log)");
