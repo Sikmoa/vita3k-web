@@ -165,6 +165,17 @@ function webgpuProblem() {
 }
 const webgpuBlocked = webgpuProblem();
 if (webgpuBlocked) { warningBox.textContent = webgpuBlocked; warningBox.style.display = 'block'; }
+// navigator.gpu can still come without an adapter, or with only the CPU
+// fallback (SwiftShader), on which the game runs at a few frames per second.
+if (!webgpuBlocked) navigator.gpu.requestAdapter().then((adapter) => {
+  const info = adapter?.info ?? {};
+  const flags = 'Chrome on Linux needs --enable-unsafe-webgpu --enable-features=Vulkan, and --disable-gpu-sandbox on NixOS.';
+  const problem = !adapter ? 'WebGPU has no adapter: the browser blocks this GPU. ' + flags
+    : adapter.isFallbackAdapter || info.isFallbackAdapter || /swiftshader/i.test(info.architecture + ' ' + info.description)
+      ? 'WebGPU runs on the CPU (' + info.vendor + ' ' + info.architecture + '), so the game will be very slow. ' + flags
+      : null;
+  if (problem) { warningBox.textContent = problem; warningBox.style.display = 'block'; }
+});
 let worker = null, running = false, frames = 0, gpuFrames = 0, pixelFrames = 0, firstFrameAt = 0, startedAt = 0;
 let fps = 0, fpsSince = 0, fpsFrames = 0;
 // Web Audio sink: guest PCM (int16 interleaved; 48 kHz stereo on the MAIN
