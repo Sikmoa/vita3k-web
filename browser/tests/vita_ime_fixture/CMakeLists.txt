@@ -28,5 +28,5 @@ add_custom_command(
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
     COMMENT "Building genuine VitaSDK on-screen keyboard fixture"
     VERBATIM)
-add_custom_target(vita3k_vita_ime_fixture
+add_custom_target(vita3k_vita_ime_fixture ALL
     DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/eboot.bin")

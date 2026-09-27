@@ -28,5 +28,5 @@ add_custom_command(
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
     COMMENT "Building genuine VitaSDK message-dialog fixture"
     VERBATIM)
-add_custom_target(vita3k_vita_msg_dialog_fixture
+add_custom_target(vita3k_vita_msg_dialog_fixture ALL
     DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/eboot.bin")
