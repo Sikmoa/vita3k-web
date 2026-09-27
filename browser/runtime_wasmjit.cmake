@@ -52,7 +52,9 @@ target_link_options(vita3k_web_jit PRIVATE
     "-sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_vita3k_web_set_app_paths','_vita3k_web_set_license_key','_vita3k_web_run_app']"
     "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','cwrap']")
 
-# The guest hot path must not call through invoke_* exception wrappers.
+# The guest hot path must not call through invoke_* exception wrappers. The
+# symbol map names functions for the check without shipping a name section.
+target_link_options(vita3k_web_jit PRIVATE --emit-symbol-map)
 find_program(VITA3K_WASM_OBJDUMP wasm-objdump REQUIRED)
 add_custom_command(TARGET vita3k_web_jit POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E env "WASM_OBJDUMP=${VITA3K_WASM_OBJDUMP}"

@@ -12,9 +12,21 @@
 // Needs wasm-objdump (wabt): $WASM_OBJDUMP or on PATH. Runs after every
 // vita3k_web_jit link (browser/runtime_wasmjit.cmake).
 import { spawn } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 const wasm = process.argv[2] || 'build/web64/browser/vita3k_web_jit.wasm';
+// Function names by index: the module's name section when it has one
+// (--profiling-funcs), otherwise the linker's symbol map (--emit-symbol-map).
+const symbols = new Map();
+const symbolMap = wasm.replace(/\.wasm$/, '.js.symbols');
+if (existsSync(symbolMap)) {
+  for (const line of readFileSync(symbolMap, 'utf8').split('\n')) {
+    const colon = line.indexOf(':');
+    if (colon > 0) symbols.set(Number(line.slice(0, colon)),
+      line.slice(colon + 1).replace(/\\([0-9a-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16))));
+  }
+}
 // Function name (as in the name section) -> calls allowed through invoke_*.
 const hot = new Map([
   ['ThreadState::run_host_active_loop()', 0],
@@ -29,16 +41,18 @@ const objdump = spawn(process.env.WASM_OBJDUMP || 'wasm-objdump', ['-d', wasm], 
 const found = new Map();
 let current = null, callImportLines = null;
 for await (const line of createInterface({ input: objdump.stdout })) {
-  const header = /^[0-9a-f]+ func\[\d+\] <(.*)>:$/.exec(line);
+  const header = /^[0-9a-f]+ func\[(\d+)\](?: <(.*)>)?:$/.exec(line);
   if (header) {
-    current = header[1];
+    current = header[2] ?? symbols.get(Number(header[1])) ?? null;
     if (hot.has(current)) found.set(current, []);
     if (current === callImport) callImportLines = [];
     continue;
   }
   if (!current) continue;
-  const call = /\|\s+(call(?:_indirect)? .*)$/.exec(line)?.[1];
+  let call = /\|\s+(call(?:_indirect)? .*)$/.exec(line)?.[1];
   if (!call) continue;
+  const callee = /^call (\d+)$/.exec(call);
+  if (callee && symbols.has(Number(callee[1]))) call += ` <${symbols.get(Number(callee[1]))}>`;
   if (hot.has(current) && /<invoke_/.test(call)) found.get(current).push(call);
   if (current === callImport) callImportLines.push(call);
 }
