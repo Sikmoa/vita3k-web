@@ -40,10 +40,10 @@
 import { createServer } from 'node:http';
 import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
 import assert from 'node:assert/strict';
-import { readRuntimeFile, readStageFile, stageFiles, stageManifest } from './runtime_routes.mjs';
+import { readRuntimeFile, readStageFile, runtimeRoot, stageFiles, stageManifest } from './runtime_routes.mjs';
 
 const stage = resolve(process.env.LIMBO_STAGE || '.limbo_work/stage');
 const title = process.env.LIMBO_TITLE || 'PCSE00268';
@@ -138,8 +138,31 @@ function crc32(buffer) {
 }
 // CPU profile of the Worker -> milliseconds per category. Each sample goes to
 // the innermost frame with a category, so libc called from HLE counts as HLE.
+// Wasm frames of a module built without a name section (no --profiling-funcs)
+// arrive as wasm-function[N]; the linker's symbol map next to the build
+// (vita3k_web_jit.js.symbols, not staged into dist) names them.
+const symbolMaps = new Map();
+function wasmFunctionName(url, name) {
+  const index = /^wasm-function\[(\d+)\]$/.exec(name)?.[1];
+  const module = /\/(vita3k_web(?:_jit)?)\.wasm$/.exec(url)?.[1];
+  if (index === undefined || !module) return name;
+  if (!symbolMaps.has(module)) {
+    const names = new Map();
+    const file = resolve(runtimeRoot, '../browser', `${module}.js.symbols`);
+    if (existsSync(file)) {
+      for (const line of readFileSync(file, 'utf8').split('\n')) {
+        const colon = line.indexOf(':');
+        if (colon > 0) names.set(line.slice(0, colon),
+          line.slice(colon + 1).replace(/\\([0-9a-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16))));
+      }
+    }
+    symbolMaps.set(module, names);
+  }
+  return symbolMaps.get(module).get(index) ?? name;
+}
 function categorize(frame) {
-  const { url, functionName: name } = frame;
+  const { url } = frame;
+  const name = wasmFunctionName(url, frame.functionName);
   if (name === '(idle)') return 'idle';
   if (name === '(garbage collector)') return 'gc';
   if (name === '(program)' || name === '(root)') return null;
@@ -192,7 +215,7 @@ function summarizeProfile(profile) {
   profile.samples.forEach((id, i) => self.set(id, (self.get(id) ?? 0) + (profile.timeDeltas[i + 1] ?? 0) / 1000));
   for (const [id, ms] of [...self].sort((a, b) => b[1] - a[1]).slice(0, 25)) {
     const frame = nodes.get(id).callFrame;
-    top[`${frame.functionName || '(anonymous)'} @${frame.url.split('/').pop()}`] = Math.round(ms);
+    top[`${wasmFunctionName(frame.url, frame.functionName) || '(anonymous)'} @${frame.url.split('/').pop()}`] = Math.round(ms);
   }
   return { totalMs: Math.round(totalMs),
     categories: Object.fromEntries(Object.entries(totals).sort((a, b) => b[1] - a[1]).map(([k, v]) => [k, Math.round(v)])),
