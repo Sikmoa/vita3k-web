@@ -36,6 +36,9 @@ set(_hle_exports
     sceKernelGetProcessTime sceKernelGetProcessTimeLow sceKernelGetProcessTimeWide
     sceKernelGetSystemTimeWide sceKernelLibcClock sceKernelLibcTime
     sceKernelLibcGettimeofday sceKernelGetProcessParam
+    # Limbo gameplay: resets the power-save timer; the production body only
+    # returns SCE_KERNEL_OK.
+    sceKernelPowerTick
     sceKernelGetMainModuleSdkVersion
     sceKernelGetThreadCurrentPriority sceKernelGetThreadExitStatus
     sceKernelGetThreadCpuAffinityMask sceKernelGetThreadCpuAffinityMask2
