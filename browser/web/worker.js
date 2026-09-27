@@ -104,6 +104,8 @@ try {
         VITA3K_HLE_PROFILE: workerParams.get('hleProfile') === '1' ? '1' : undefined,
         // Emulated guest CPU cores (vita_app.cpp); unset keeps the default.
         VITA3K_GUEST_CORES: workerParams.get('cores') ?? undefined,
+        // Vita3K's fps-hack: display waits use one vblank (vita_app.cpp).
+        VITA3K_FPS_HACK: workerParams.get('fpsHack') === '1' ? '1' : undefined,
       });
       break;
     } catch (error) {

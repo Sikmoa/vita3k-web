@@ -345,6 +345,10 @@ static int run_app_impl() {
     // Same vblank headroom as run_vita: without it the guest spends real time
     // in frame pacing instead of executing.
     env->display.fast_vblank = vita3k_web_fast_vblank_enabled();
+    // Desktop Vita3K's fps-hack option: display waits of N vblanks wait one,
+    // so titles that pace at 30 FPS through the display API present at 60.
+    if (const char *fps_hack = std::getenv("VITA3K_FPS_HACK"))
+        env->display.fps_hack = std::strcmp(fps_hack, "1") == 0;
     bool exited = false;
     int exit_code = 0;
     unsigned imports = 0;

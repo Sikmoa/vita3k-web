@@ -8,6 +8,10 @@
 //   PORT=9000 LIMBO_MEMORY=w32 node browser/tests/limbo_serve.mjs
 //
 // Query parameters: ?backend=jit|interp  ?memory=auto|w64|w32
+// ?fastvblank=1 free-runs the vblank clock (measures headroom; frame-locked
+// titles such as Limbo then run faster than real time); ?fpsHack=1 is Vita3K's
+// fps-hack (display waits use one vblank; Limbo's logic is frame-locked, so it
+// also runs up to twice as fast);
 // ?inlineMutex=0 disables the inline-mutex optimization for A/B testing; ?auto=1 (start
 // immediately); ?present=readback keeps the canvas on the page and has the worker
 // read every GPU frame back instead (slower; for tools that read the page canvas,
@@ -134,6 +138,7 @@ const TITLE = ${JSON.stringify(title)}, APP = ${JSON.stringify(app)}, AOT = ${JS
 // A transferred canvas can no longer be drawn or read from this page, so GPU
 // frames get their own element and pixel frames the 2D canvas over it.
 const presentToCanvas = params.get('present') !== 'readback';
+const fastVblank = params.get('fastvblank') === '1';
 const screen = document.querySelector('#screen'), ctx = screen.getContext('2d');
 const status = document.querySelector('#status'), stats = document.querySelector('#stats');
 const logBox = document.querySelector('#log'), runButton = document.querySelector('#run');
@@ -296,7 +301,7 @@ async function run() {
   if (webgpuBlocked) log('warning: ' + webgpuBlocked);
   runButton.disabled = true; stopButton.disabled = false;
   ensureAudio();
-  worker = new Worker(\`./worker.js?backend=\${backend}&memory=\${memory}&inlineMutex=\${params.get('inlineMutex') === '0' ? '0' : '1'}\`, { type: 'module' });
+  worker = new Worker(\`./worker.js?backend=\${backend}&memory=\${memory}&inlineMutex=\${params.get('inlineMutex') === '0' ? '0' : '1'}\${params.get('fpsHack') === '1' ? '&fpsHack=1' : ''}\`, { type: 'module' });
   worker.onerror = (event) => { log('worker error: ' + event.message); status.textContent = 'worker error'; };
   worker.onmessage = async ({ data }) => {
     if (!data || typeof data !== 'object') return;
@@ -319,7 +324,7 @@ async function run() {
       case 'staged':
         status.textContent = 'running';
         log(\`staged \${data.files} files (\${(data.bytes / 1048576).toFixed(1)} MiB) — launching\`);
-        worker.postMessage({ type: 'run-app', vitaFs: data.root, title: TITLE, app: APP, fastVblank: true,
+        worker.postMessage({ type: 'run-app', vitaFs: data.root, title: TITLE, app: APP, fastVblank,
           ...(AOT ? { aotUrl: '/aot.wasm' } : {}) });
         running = true;
         sendPad();

@@ -27,6 +27,7 @@
 //   LIMBO_GPU=1             drop the SwiftShader flags (use a real GPU)
 //   LIMBO_HEADED=1          headed browser (headless Chrome only has SwiftShader WebGPU)
 //   LIMBO_GUEST_CORES=N     emulated guest CPU cores (default 3; 1 = single-core scheduler)
+//   LIMBO_FPS_HACK=1        Vita3K fps-hack: display waits use one vblank
 //   LIMBO_AOT               ahead-of-time module to supply to the run (AOT.md)
 //   LIMBO_LOG_OUT           write the retained worker log tail (4000 lines) to this file
 import { createServer } from 'node:http';
@@ -306,8 +307,8 @@ try {
     });
   }
 
-  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver, useAot, fastVblank, hleProfile, inputScript, measure, guestCores }) => {
-    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&revalidateAll=${revalidateAll ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}`, { type: 'module' });
+  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver, useAot, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack }) => {
+    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&revalidateAll=${revalidateAll ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}`, { type: 'module' });
     const state = { logs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
       backend: null, memory: null, workerErrors: [], ready: false, timedOut: false,
       gxmDraws: 0, latestProgress: null, profiles: {}, jitThreads: {}, runStartedAt: null,
@@ -476,14 +477,14 @@ try {
       };
     });
     return result;
-  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver, useAot: Boolean(aotPath), fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '' });
+  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, revalidateAll, regionCache, writeObserver, useAot: Boolean(aotPath), fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1' });
 
   const saved = [];
   for (const frame of outcome.saved) {
     const path = `${frameOut}_${String(frame.generation).padStart(6, '0')}_` +
       `${frame.width}x${frame.height}.png`;
     await writeFile(path, png(frame.width, frame.height, Buffer.from(frame.base64, 'base64')));
-    saved.push(path);
+    saved.push({ path, sinceRunMs: frame.sinceRunMs });
   }
 
   const diagnostics = {
