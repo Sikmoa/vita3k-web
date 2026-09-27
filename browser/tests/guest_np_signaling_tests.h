@@ -240,6 +240,38 @@ inline void test_guest_np_signaling(EmuEnvState &env, vita3k::web::GuestThreadRu
     const std::set<uint32_t> waited_ids{ word(0x24), word(0x28), word(0x38) };
     REQUIRE(waited_ids.size() == 3);
     REQUIRE(semaphore_close(env.kernel, "fixture", host->id, hold, HandleClose::Delete) == 0);
+    // A context attaching to an event while its first handler blocks is told
+    // too, once: the delivery loop rereads the event's context count.
+    const SceUID hold2 = semaphore_create(env.kernel, "fixture", "signaling hold 2", host->id, 0, 0, 1);
+    REQUIRE(hold2 >= 0);
+    const Address marking_blocker = code + 0xf00; // new code: the JIT keeps the old blocker
+    {
+        guest_thread_fixture::Arm b(marking_blocker);
+        b.emit(0xe92d4010); // push {r4, lr}
+        b.constant(0, data + 0x70);
+        b.constant(1, 1);
+        b.emit(0xe5801000); // str r1, [r0]: in the handler
+        b.constant(0, uint32_t(hold2));
+        b.constant(1, 1);
+        b.constant(2, 0);
+        b.call(wait_stub);
+        b.constant(0, 0);
+        b.emit(0xe8bd8010); // pop {r4, pc}
+        b.finish(env.mem);
+    }
+    const Address peer_d = data + 0x980;
+    set_id(peer_d, "attach during", 1);
+    REQUIRE(call(create_ctx, { own, marking_blocker, 0, ctx_out }) == 0);
+    const uint32_t marking = word(0x10);
+    word(0x30) = word(0x70) = 0;
+    REQUIRE(call(activate, { marking, peer_d, conn_out }) == 0);
+    run_until([&] { return word(0x70) == 1 && main_waiting(); });
+    REQUIRE(call(activate, { counting, peer_d, conn_out }) == 0);
+    REQUIRE(semaphore_signal(env.kernel, "fixture", host->id, hold2, 1) == 0);
+    run_until([&] { return word(0x30) == 1 && main_waiting(); });
+    run_until(main_waiting);
+    REQUIRE(word(0x30) == 1);
+    REQUIRE(semaphore_close(env.kernel, "fixture", host->id, hold2, HandleClose::Delete) == 0);
     // A context without a handler is attached once, however often it
     // activates; a context with one activating the same peer then gets it.
     REQUIRE(call(create_ctx, { own, 0, 0, ctx_out }) == 0);

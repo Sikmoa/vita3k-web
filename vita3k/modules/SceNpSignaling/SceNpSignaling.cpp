@@ -118,9 +118,13 @@ static std::vector<uint32_t> signaling_main_code(Address code, SceUID sema, Addr
     w.push_back(0xe3780001); // cmn r8, #1
     const size_t exit_on_marker = w.size();
     w.push_back(0); // beq done (patched)
+    // r8 counts delivered contexts; the count is reread every time, as a
+    // handler may block while another context attaches to this event.
+    w.push_back(0xe3a08000); // mov r8, #0
     w.push_back(0xe286700c); // add r7, r6, #12
     const size_t inner = w.size();
-    w.push_back(0xe3580000); // cmp r8, #0
+    w.push_back(0xe596c008); // ldr r12, [r6, #8]: count
+    w.push_back(0xe158000c); // cmp r8, r12
     const size_t to_next = w.size();
     w.push_back(0); // beq next (patched)
     w.push_back(0xe597c000); // ldr r12, [r7]: handler
@@ -134,7 +138,7 @@ static std::vector<uint32_t> signaling_main_code(Address code, SceUID sema, Addr
     w.push_back(0xe5963004); // ldr r3, [r6, #4]: error
     w.push_back(0xe12fff3c); // blx r12
     w.push_back(0xe287700c); // skip: add r7, r7, #12
-    w.push_back(0xe2488001); // sub r8, r8, #1
+    w.push_back(0xe2888001); // add r8, r8, #1
     branch(0xea000000, inner); // b inner
     const size_t next = w.size();
     w.push_back(0xe2855001); // add r5, r5, #1
@@ -236,8 +240,8 @@ EXPORT(int, sceNpSignalingActivateConnection, SceInt32 ctx_id, np::SceNpId *peer
     for (const auto &live : np.signaling_pending) {
         if (!same_np_id(emuenv, export_name, thread_id, live.own_id, own_id) || !same_np_id(emuenv, export_name, thread_id, live.peer_id, peer))
             continue;
-        // Attached before its event is handled, the context gets it too;
-        // while it is being handled, no longer. A destroyed context's entry
+        // Attached before its event's delivery ends, the context gets it too
+        // (the delivery loop rereads the count). A destroyed context's entry
         // (id 0) frees its place.
         auto &event = ring.events[live.seq % signaling_ring_events];
         const auto contexts = event.contexts, end = event.contexts + event.count;
