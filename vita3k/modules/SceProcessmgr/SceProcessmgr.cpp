@@ -294,10 +294,5 @@ EXPORT(int, sceKernelUnregisterProcessTerminationCallback) {
 
 EXPORT(int, sceKernelGetMainModuleSdkVersion) {
     TRACY_FUNC(sceKernelGetMainModuleSdkVersion);
-    SceProcessParam *process_param = emuenv.kernel.process_param.get(emuenv.mem);
-    if (process_param && (process_param->magic == '2PSP') && (process_param->version != 0)) {
-        return process_param->fw_version;
-    } else {
-        return 0;
-    }
+    return emuenv.kernel.main_module_sdk_version(emuenv.mem);
 }

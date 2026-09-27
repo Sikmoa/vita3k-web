@@ -760,6 +760,17 @@ struct SceKernelCondInfo {
     SceUInt32 numWaitThreads;
 };
 
+struct SceKernelLwCondInfo {
+    SceSize size;
+    SceUID uid;
+    char name[KERNELOBJECT_MAX_NAME_LENGTH + 1];
+    SceUInt32 attr;
+    Ptr<SceKernelLwCondWork> pWork;
+    Ptr<SceKernelLwMutexWork> pLwMutex;
+    SceUInt32 numWaitThreads;
+};
+static_assert(sizeof(SceKernelLwCondInfo) == 0x38);
+
 struct SceKernelEventFlagInfo {
     SceSize size;
     SceUID evfId;

@@ -54,9 +54,22 @@ EXPORT(int, _sceKernelCancelEvent) {
     return UNIMPLEMENTED();
 }
 
+// The ThreadMgr cancel syscalls copy the woken-thread count out even when the
+// cancel fails; the caller's word then reads 0.
+template <typename Cancel>
+static int cancel_and_report(SceUInt32 *num_wait_threads, Cancel cancel) {
+    SceUInt32 count = 0;
+    const int result = cancel(&count);
+    if (num_wait_threads)
+        *num_wait_threads = count;
+    return result;
+}
+
 EXPORT(SceInt32, _sceKernelCancelEventFlag, SceUID event_id, SceUInt pattern, SceUInt32 *num_wait_thread) {
     TRACY_FUNC(_sceKernelCancelEventFlag, event_id, pattern, num_wait_thread);
-    return eventflag_cancel(emuenv.kernel, export_name, thread_id, event_id, pattern, num_wait_thread);
+    return cancel_and_report(num_wait_thread, [&](SceUInt32 *count) {
+        return eventflag_cancel(emuenv.kernel, export_name, thread_id, event_id, pattern, count);
+    });
 }
 
 EXPORT(int, _sceKernelCancelEventWithSetPattern) {
@@ -69,9 +82,11 @@ EXPORT(int, _sceKernelCancelMsgPipe) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, _sceKernelCancelMutex) {
-    TRACY_FUNC(_sceKernelCancelMutex);
-    return UNIMPLEMENTED();
+EXPORT(int, _sceKernelCancelMutex, SceUID mutexId, SceInt32 newCount, SceUInt32 *pNumWaitThreads) {
+    TRACY_FUNC(_sceKernelCancelMutex, mutexId, newCount, pNumWaitThreads);
+    return cancel_and_report(pNumWaitThreads, [&](SceUInt32 *count) {
+        return mutex_cancel(emuenv.kernel, export_name, thread_id, mutexId, newCount, count);
+    });
 }
 
 EXPORT(int, _sceKernelCancelRWLock) {
@@ -81,7 +96,9 @@ EXPORT(int, _sceKernelCancelRWLock) {
 
 EXPORT(int, _sceKernelCancelSema, SceUID semaId, SceInt32 setCount, SceUInt32 *pNumWaitThreads) {
     TRACY_FUNC(_sceKernelCancelSema, semaId, setCount, pNumWaitThreads);
-    return semaphore_cancel(emuenv.kernel, export_name, thread_id, semaId, setCount, pNumWaitThreads);
+    return cancel_and_report(pNumWaitThreads, [&](SceUInt32 *count) {
+        return semaphore_cancel(emuenv.kernel, export_name, thread_id, semaId, setCount, count);
+    });
 }
 
 EXPORT(int, _sceKernelCancelTimer) {
@@ -93,7 +110,7 @@ EXPORT(SceUID, _sceKernelCreateCond, const char *pName, SceUInt32 attr, SceUID m
     TRACY_FUNC(_sceKernelCreateCond, pName, attr, mutexId, pOptParam);
     SceUID uid;
 
-    if (auto error = condvar_create(&uid, emuenv.kernel, export_name, pName, thread_id, attr, mutexId, SyncWeight::Heavy)) {
+    if (auto error = condvar_create(&uid, emuenv.kernel, export_name, pName, thread_id, attr, mutexId, Ptr<SceKernelLwCondWork>{}, SyncWeight::Heavy)) {
         return error;
     }
 
@@ -107,10 +124,20 @@ EXPORT(SceUID, _sceKernelCreateEventFlag, const char *pName, SceUInt32 attr, Sce
 
 EXPORT(int, _sceKernelCreateLwCond, Ptr<SceKernelLwCondWork> workarea, const char *name, SceUInt attr, Ptr<SceKernelCreateLwCond_opt> opt) {
     TRACY_FUNC(_sceKernelCreateLwCond, workarea, name, attr, opt);
-    const auto uid_out = &workarea.get(emuenv.mem)->uid;
-    const auto assoc_mutex_uid = opt.get(emuenv.mem)->workarea_mutex.get(emuenv.mem)->uid;
+    // Checked in SceKernelThreadMgr 3.74 order: the copied-in options, the
+    // pointers, the attributes, the option size and then the mutex.
+    const SceKernelCreateLwCond_opt *options = opt.get(emuenv.mem);
+    if (!options)
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_MEMORY_ACCESS);
+    if (!workarea || !name || !options->workarea_mutex)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+    if (attr & ~SCE_KERNEL_ATTR_TH_PRIO)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ATTR);
+    if (options->opt_param && options->opt_param.get(emuenv.mem)->size > sizeof(SceKernelLwCondOptParam))
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_SIZE);
 
-    return condvar_create(uid_out, emuenv.kernel, export_name, name, thread_id, attr, assoc_mutex_uid, SyncWeight::Light);
+    const SceUID assoc_mutex_uid = options->workarea_mutex.get(emuenv.mem)->uid;
+    return condvar_create(&workarea.get(emuenv.mem)->uid, emuenv.kernel, export_name, name, thread_id, attr, assoc_mutex_uid, workarea, SyncWeight::Light);
 }
 
 EXPORT(int, _sceKernelCreateMsgPipeWithLR) {
@@ -275,14 +302,73 @@ EXPORT(SceInt32, _sceKernelGetEventPattern, SceUID event_id, SceUInt32 *get_patt
     return SCE_KERNEL_OK;
 }
 
-EXPORT(int, _sceKernelGetLwCondInfo) {
-    TRACY_FUNC(_sceKernelGetLwCondInfo);
-    return UNIMPLEMENTED();
+// SceKernelThreadMgr 3.74: a zeroed record carrying its own size, of which the
+// first info->size bytes reach the caller. The mutex workarea stays reported
+// after the mutex is deleted.
+static SceInt32 get_lw_cond_info(const char *export_name, Condvar &condvar, SceKernelLwCondInfo *info) {
+    if (!info)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+    if (info->size > sizeof(SceKernelLwCondInfo))
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_SIZE);
+
+    SceKernelLwCondInfo record{};
+    record.size = sizeof(record);
+    {
+        const std::lock_guard<std::mutex> condvar_lock(condvar.mutex);
+        if (condvar.deleted)
+            return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID);
+        record.uid = condvar.uid;
+        strncpy(record.name, condvar.name, KERNELOBJECT_MAX_NAME_LENGTH);
+        record.attr = condvar.attr;
+        record.pWork = condvar.workarea;
+        record.pLwMutex = condvar.lwmutex_workarea;
+        record.numWaitThreads = static_cast<SceUInt32>(condvar.waiting_threads->size());
+    }
+    memcpy(info, &record, info->size);
+    return SCE_KERNEL_OK;
 }
 
-EXPORT(int, _sceKernelGetLwCondInfoById) {
-    TRACY_FUNC(_sceKernelGetLwCondInfoById);
-    return UNIMPLEMENTED();
+EXPORT(SceInt32, _sceKernelGetLwCondInfo, Ptr<SceKernelLwCondWork> workarea, Ptr<SceKernelLwCondInfo> pInfo) {
+    TRACY_FUNC(_sceKernelGetLwCondInfo, workarea, pInfo);
+    const SceKernelLwCondWork *work = workarea.get(emuenv.mem);
+    if (!work)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+    const SceUID uid = work->uid;
+    const CondvarPtr condvar = lock_and_find(uid, emuenv.kernel.lwcondvars, emuenv.kernel.mutex);
+    if (!condvar)
+        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID);
+
+    SceKernelLwCondInfo *info = pInfo.get(emuenv.mem);
+    const SceInt32 result = get_lw_cond_info(export_name, *condvar, info);
+    // The syscall stores the workarea's uid and copies the whole record back,
+    // so the uid arrives even below a size of 8.
+    if (result == SCE_KERNEL_OK)
+        info->uid = uid;
+    return result;
+}
+
+EXPORT(SceInt32, _sceKernelGetLwCondInfoById, SceUID lwCondId, Ptr<SceKernelLwCondInfo> pInfo, const SceSize *pSize) {
+    TRACY_FUNC(_sceKernelGetLwCondInfoById, lwCondId, pInfo, pSize);
+    // The syscall copies the caller's size word in first, then that many
+    // bytes of the record in and back out.
+    if (!pSize)
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_MEMORY_ACCESS);
+    SceKernelLwCondInfo *info = pInfo.get(emuenv.mem);
+    const SceSize size = *pSize;
+    if (info && size > sizeof(SceKernelLwCondInfo))
+        return RET_ERROR(SCE_KERNEL_ERROR_NO_MEMORY);
+
+    const CondvarPtr condvar = lock_and_find(lwCondId, emuenv.kernel.lwcondvars, emuenv.kernel.mutex);
+    if (!condvar)
+        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID);
+    if (!info)
+        return get_lw_cond_info(export_name, *condvar, nullptr);
+
+    SceKernelLwCondInfo copy{};
+    memcpy(&copy, info, size);
+    const SceInt32 result = get_lw_cond_info(export_name, *condvar, &copy);
+    memcpy(info, &copy, size);
+    return result;
 }
 
 EXPORT(int, _sceKernelGetLwMutexInfoById, SceUID lightweight_mutex_id, Ptr<SceKernelLwMutexInfo> info, SceSize size) {
@@ -1075,7 +1161,7 @@ EXPORT(int, sceKernelCloseCond) {
 
 EXPORT(int, sceKernelCloseEventFlag, SceUID evfId) {
     TRACY_FUNC(sceKernelCloseEventFlag, evfId);
-    return UNIMPLEMENTED();
+    return eventflag_close(emuenv.kernel, emuenv.mem, export_name, thread_id, evfId);
 }
 
 EXPORT(int, sceKernelCloseMsgPipe) {
@@ -1228,7 +1314,7 @@ EXPORT(int, sceKernelDeleteCond, SceUID condition_variable_id) {
 
 EXPORT(int, sceKernelDeleteEventFlag, SceUID event_id) {
     TRACY_FUNC(sceKernelDeleteEventFlag, event_id);
-    return eventflag_delete(emuenv.kernel, export_name, thread_id, event_id);
+    return eventflag_delete(emuenv.kernel, emuenv.mem, export_name, thread_id, event_id);
 }
 
 EXPORT(SceInt32, sceKernelDeleteMsgPipe, SceUID msgPipeId) {
@@ -1371,7 +1457,7 @@ EXPORT(int, sceKernelOpenCond) {
 
 EXPORT(SceUID, sceKernelOpenEventFlag, const char *pName) {
     TRACY_FUNC(sceKernelOpenEventFlag, pName);
-    return eventflag_find(emuenv.kernel, export_name, pName);
+    return eventflag_open(emuenv.kernel, export_name, pName);
 }
 
 EXPORT(SceUID, sceKernelOpenMsgPipe, const char *pName) {

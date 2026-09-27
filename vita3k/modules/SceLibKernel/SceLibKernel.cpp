@@ -1155,9 +1155,9 @@ EXPORT(int, sceKernelCancelMsgPipe) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceKernelCancelMutex) {
-    TRACY_FUNC(sceKernelCancelMutex);
-    return UNIMPLEMENTED();
+EXPORT(int, sceKernelCancelMutex, SceUID mutexId, SceInt32 newCount, SceUInt32 *pNumWaitThreads) {
+    TRACY_FUNC(sceKernelCancelMutex, mutexId, newCount, pNumWaitThreads);
+    return CALL_EXPORT(_sceKernelCancelMutex, mutexId, newCount, pNumWaitThreads);
 }
 
 EXPORT(int, sceKernelCancelRWLock) {
@@ -1345,14 +1345,16 @@ EXPORT(SceInt32, sceKernelGetEventPattern, SceUID event_id, SceUInt32 *get_patte
     return CALL_EXPORT(_sceKernelGetEventPattern, event_id, get_pattern);
 }
 
-EXPORT(int, sceKernelGetLwCondInfo) {
-    TRACY_FUNC(sceKernelGetLwCondInfo);
-    return UNIMPLEMENTED();
+EXPORT(SceInt32, sceKernelGetLwCondInfo, Ptr<SceKernelLwCondWork> workarea, Ptr<SceKernelLwCondInfo> pInfo) {
+    TRACY_FUNC(sceKernelGetLwCondInfo, workarea, pInfo);
+    return CALL_EXPORT(_sceKernelGetLwCondInfo, workarea, pInfo);
 }
 
-EXPORT(int, sceKernelGetLwCondInfoById) {
-    TRACY_FUNC(sceKernelGetLwCondInfoById);
-    return UNIMPLEMENTED();
+// SceLibKernel 3.74 passes the syscall the record's size word (0 without a record).
+EXPORT(SceInt32, sceKernelGetLwCondInfoById, SceUID lwCondId, Ptr<SceKernelLwCondInfo> pInfo) {
+    TRACY_FUNC(sceKernelGetLwCondInfoById, lwCondId, pInfo);
+    const SceSize size = pInfo ? pInfo.get(emuenv.mem)->size : 0;
+    return CALL_EXPORT(_sceKernelGetLwCondInfoById, lwCondId, pInfo, &size);
 }
 
 EXPORT(int, sceKernelGetLwMutexInfoById, SceUID lightweight_mutex_id, Ptr<SceKernelLwMutexInfo> info) {

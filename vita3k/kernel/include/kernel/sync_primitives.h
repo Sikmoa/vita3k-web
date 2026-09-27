@@ -163,6 +163,10 @@ typedef std::map<SceUID, RWLockPtr> RWLockPtrs;
 struct EventFlag : SyncPrimitive {
     WaitingThreadQueuePtr waiting_threads;
     int flags;
+    // Entries in KernelState::eventflags: the creating uid (SyncPrimitive::uid)
+    // and every opened one. Guarded by the kernel mutex; the flag is destroyed
+    // with its last handle.
+    unsigned handles = 1;
 };
 
 typedef std::shared_ptr<EventFlag> EventFlagPtr;
@@ -189,6 +193,9 @@ struct Condvar : SyncPrimitive {
     WaitingThreadQueuePtr waiting_threads;
     // Null once the mutex is deleted: firmware dissociates the condition.
     MutexPtr associated_mutex;
+    // Lightweight only. The mutex workarea stays reported after the mutex is deleted.
+    Ptr<SceKernelLwCondWork> workarea;
+    Ptr<SceKernelLwMutexWork> lwmutex_workarea;
 };
 typedef std::shared_ptr<Condvar> CondvarPtr;
 typedef std::map<SceUID, CondvarPtr> CondvarPtrs;
@@ -243,6 +250,8 @@ int mutex_lock(KernelState &kernel, MemState &mem, const char *export_name, SceU
 int mutex_try_lock(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID mutexid, int lock_count, SyncWeight weight);
 int mutex_unlock(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID mutexid, int unlock_count, SyncWeight weight);
 int mutex_delete(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID mutexid, SyncWeight weight);
+// Heavy mutexes only. Writes the number of woken waiters only on success.
+int mutex_cancel(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID mutexid, int new_count, SceUInt32 *num_wait_threads);
 MutexPtr mutex_get(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID mutexid, SyncWeight weight);
 
 // RWLock
@@ -260,7 +269,7 @@ int semaphore_delete(KernelState &kernel, const char *export_name, SceUID thread
 int semaphore_cancel(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID semaid, SceInt32 setCount, SceUInt32 *pNumWaitThreads);
 
 // Condition Variable
-SceUID condvar_create(SceUID *uid_out, KernelState &kernel, const char *export_name, const char *name, SceUID thread_id, SceUInt attr, SceUID assoc_mutexid, SyncWeight weight);
+SceUID condvar_create(SceUID *uid_out, KernelState &kernel, const char *export_name, const char *name, SceUID thread_id, SceUInt attr, SceUID assoc_mutexid, Ptr<SceKernelLwCondWork> workarea, SyncWeight weight);
 int condvar_wait(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID condid, SceUInt *timeout, SyncWeight weight);
 int condvar_signal(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID condid, Condvar::SignalTarget signal_target, SyncWeight weight);
 int condvar_delete(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID condid, SyncWeight weight);
@@ -268,12 +277,14 @@ int condvar_delete(KernelState &kernel, const char *export_name, SceUID thread_i
 // Event Flag
 SceUID eventflag_clear(KernelState &kernel, const char *export_name, SceUID evfId, SceUInt32 bitPattern);
 SceUID eventflag_create(KernelState &kernel, const char *export_name, SceUID thread_id, const char *pName, SceUInt32 attr, SceUInt32 initPattern);
-SceUID eventflag_find(KernelState &kernel, const char *export_name, const char *pName);
+SceUID eventflag_open(KernelState &kernel, const char *export_name, const char *pName);
 SceInt32 eventflag_wait(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID evfId, SceUInt32 bitPattern, SceUInt32 waitMode, SceUInt32 *pResultPat, SceUInt32 *pTimeout);
 int eventflag_poll(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID event_id, unsigned int flags, unsigned int wait, unsigned int *outBits);
 SceInt32 eventflag_set(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID evfId, SceUInt32 bitPattern);
 SceInt32 eventflag_cancel(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID event_id, SceUInt32 pattern, SceUInt32 *num_wait_threads);
-int eventflag_delete(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID event_id);
+// Delete closes the creating handle and Close an opened one.
+int eventflag_delete(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID event_id);
+int eventflag_close(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID event_id);
 
 // Message Pipe
 SceUID msgpipe_create(KernelState &kernel, const char *export_name, const char *name, SceUID thread_id, SceUInt attr, SceSize bufSize);

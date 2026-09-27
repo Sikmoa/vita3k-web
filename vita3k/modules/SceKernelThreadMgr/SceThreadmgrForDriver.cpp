@@ -23,6 +23,7 @@
 TRACY_MODULE_NAME(SceThreadmgrForDriver);
 
 #include <kernel/state.h>
+#include <kernel/sync_primitives.h>
 
 EXPORT(int, ksceKernelCancelCallback) {
     return UNIMPLEMENTED();
@@ -32,8 +33,9 @@ EXPORT(int, ksceKernelCancelMsgPipe) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, ksceKernelCancelMutex) {
-    return UNIMPLEMENTED();
+EXPORT(int, ksceKernelCancelMutex, SceUID mutexId, SceInt32 newCount, SceUInt32 *pNumWaitThreads) {
+    TRACY_FUNC(ksceKernelCancelMutex, mutexId, newCount, pNumWaitThreads);
+    return mutex_cancel(emuenv.kernel, export_name, thread_id, mutexId, newCount, pNumWaitThreads);
 }
 
 EXPORT(int, ksceKernelChangeCurrentThreadAttr) {

@@ -80,11 +80,11 @@ inline static int find_condvar(CondvarPtr &condvar_out, CondvarPtrs **condvars_o
     return SCE_KERNEL_OK;
 }
 
-// Dequeues every waiter and wakes it with `error`. The caller holds the
-// primitive lock. Firmware deletes waitable objects this way (SceKernel-
-// ThreadMgr 3.74 destructors call the wake-all at 0x81010740 with
-// SCE_KERNEL_ERROR_WAIT_DELETE) and the deleter itself succeeds.
-static void wake_waiters_with_error(KernelState &kernel, ThreadDataQueue<WaitingThreadData> &queue, SceInt32 error) {
+// Dequeues every waiter and wakes it with `error`, returning how many were
+// still waiting. The caller holds the primitive lock. Firmware deletes and
+// cancels waitable objects with this one wake-all (WAIT_DELETE, WAIT_CANCEL).
+static SceUInt32 wake_waiters_with_error(KernelState &kernel, ThreadDataQueue<WaitingThreadData> &queue, SceInt32 error) {
+    SceUInt32 woken = 0;
     while (!queue.empty()) {
         const auto data = *queue.begin();
         const std::lock_guard<std::mutex> thread_lock(data.thread->mutex);
@@ -94,9 +94,12 @@ static void wake_waiters_with_error(KernelState &kernel, ThreadDataQueue<Waiting
         const bool cancelled = kernel.execution_host && data.thread->status != ThreadStatus::wait;
         if (data.wake_error)
             *data.wake_error = cancelled ? SCE_KERNEL_ERROR_WAIT_CANCEL : error;
-        if (!cancelled)
+        if (!cancelled) {
             data.thread->update_status(ThreadStatus::run);
+            ++woken;
+        }
     }
+    return woken;
 }
 
 // SceKernelThreadMgr 3.74 lock/unlock (kernel 0x810232c8/0x8102356c and
@@ -1157,6 +1160,47 @@ int mutex_delete(KernelState &kernel, const char *export_name, SceUID thread_id,
     return SCE_KERNEL_OK;
 }
 
+int mutex_cancel(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID mutexid, int new_count, SceUInt32 *num_wait_threads) {
+    // Only a thread can become the new owner.
+    const ThreadStatePtr thread = kernel.get_thread(thread_id);
+    if (!thread && new_count != 0)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
+
+    MutexPtr mutex;
+    if (auto error = find_mutex(mutex, nullptr, kernel, export_name, mutexid, SyncWeight::Heavy))
+        return error;
+
+    const std::lock_guard<std::mutex> mutex_lock(mutex->mutex);
+    if (mutex->deleted)
+        return unknown_mutex_id(export_name, SyncWeight::Heavy);
+    const InlineMutexAccessGuard inline_access(kernel, *mutex);
+
+    if (LOG_SYNC_PRIMITIVES) {
+        LOG_DEBUG("{}: uid: {} thread_id: {} name: \"{}\" attr: {} lock_count: {} new_count: {} waiting_threads: {}",
+            export_name, mutexid, thread_id, mutex->name, mutex->attr, mutex->lock_count, new_count,
+            mutex->waiting_threads->size());
+    }
+
+    // A negative count restores the initial one.
+    if (new_count < 0)
+        new_count = mutex->init_count;
+    if (new_count > 1 && !(mutex->attr & SCE_KERNEL_MUTEX_ATTR_RECURSIVE))
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_COUNT);
+
+    // The owner loses the mutex without handing it on; every waiter fails and
+    // the caller owns it with the new count, if any.
+    mutex->owner = nullptr;
+    mutex->lock_count = 0;
+    const SceUInt32 woken = wake_waiters_with_error(kernel, *mutex->waiting_threads, SCE_KERNEL_ERROR_WAIT_CANCEL);
+    if (new_count > 0) {
+        mutex->owner = thread;
+        mutex->lock_count = new_count;
+    }
+    if (num_wait_threads)
+        *num_wait_threads = woken;
+    return SCE_KERNEL_OK;
+}
+
 MutexPtr mutex_get(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID mutexid, SyncWeight weight) {
     assert(mutexid >= 0);
 
@@ -1553,7 +1597,6 @@ int semaphore_cancel(KernelState &kernel, const char *export_name, SceUID thread
             semaphore->waiting_threads->size());
     }
 
-    SceUInt32 nb_threads = 0;
     const std::lock_guard<std::mutex> semaphore_lock(semaphore->mutex);
     if (semaphore->deleted)
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID);
@@ -1561,21 +1604,7 @@ int semaphore_cancel(KernelState &kernel, const char *export_name, SceUID thread
     // the maximum before waking anyone; a negative count restores the initial one.
     if (setCount > semaphore->max)
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_COUNT);
-    while (!semaphore->waiting_threads->empty()) {
-        const auto &waiting_thread_data = *semaphore->waiting_threads->begin();
-        const auto waiting_thread = waiting_thread_data.thread;
-
-        const std::lock_guard<std::mutex> waiting_thread_lock(waiting_thread->mutex);
-
-        *waiting_thread_data.wake_error = SCE_KERNEL_ERROR_WAIT_CANCEL;
-        semaphore->waiting_threads->erase(semaphore->waiting_threads->begin());
-        // A deleted browser waiter is no longer waiting: not counted.
-        if (kernel.execution_host && waiting_thread->status != ThreadStatus::wait)
-            continue;
-
-        waiting_thread->update_status(ThreadStatus::run, ThreadStatus::wait);
-        nb_threads++;
-    }
+    const SceUInt32 nb_threads = wake_waiters_with_error(kernel, *semaphore->waiting_threads, SCE_KERNEL_ERROR_WAIT_CANCEL);
 
     if (setCount < 0) {
         semaphore->val = semaphore->init_val;
@@ -1591,7 +1620,7 @@ int semaphore_cancel(KernelState &kernel, const char *export_name, SceUID thread
 // * Condition Variable *
 // **********************
 
-SceUID condvar_create(SceUID *uid_out, KernelState &kernel, const char *export_name, const char *name, SceUID thread_id, SceUInt attr, SceUID assoc_mutexid, SyncWeight weight) {
+SceUID condvar_create(SceUID *uid_out, KernelState &kernel, const char *export_name, const char *name, SceUID thread_id, SceUInt attr, SceUID assoc_mutexid, Ptr<SceKernelLwCondWork> workarea, SyncWeight weight) {
     if ((strlen(name) > 31) && ((attr & 0x80) == 0x80)) {
         return RET_ERROR(SCE_KERNEL_ERROR_UID_NAME_TOO_LONG);
     }
@@ -1609,6 +1638,8 @@ SceUID condvar_create(SceUID *uid_out, KernelState &kernel, const char *export_n
     const CondvarPtr condvar = std::make_shared<Condvar>();
     condvar->uid = uid;
     condvar->attr = attr;
+    condvar->workarea = workarea;
+    condvar->lwmutex_workarea = assoc_mutex->workarea;
     condvar->associated_mutex = std::move(assoc_mutex);
     strncpy(condvar->name, name, KERNELOBJECT_MAX_NAME_LENGTH);
 
@@ -1894,7 +1925,7 @@ SceUID eventflag_create(KernelState &kernel, const char *export_name, SceUID thr
     return uid;
 }
 
-SceUID eventflag_find(KernelState &kernel, const char *export_name, const char *pName) {
+SceUID eventflag_open(KernelState &kernel, const char *export_name, const char *pName) {
     if (strlen(pName) > KERNELOBJECT_MAX_NAME_LENGTH)
         return RET_ERROR(SCE_KERNEL_ERROR_UID_NAME_TOO_LONG);
 
@@ -1906,11 +1937,15 @@ SceUID eventflag_find(KernelState &kernel, const char *export_name, const char *
     const auto it = std::find_if(kernel.eventflags.begin(), kernel.eventflags.end(), [=](const auto &evf) {
         return strncmp(evf.second->name, pName, KERNELOBJECT_MAX_NAME_LENGTH) == 0;
     });
+    if (it == kernel.eventflags.end())
+        return RET_ERROR(SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_NAME);
 
-    if (it != kernel.eventflags.end())
-        return it->first;
-
-    return RET_ERROR(SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_NAME);
+    // Opening adds a handle to the same flag.
+    const EventFlagPtr event = it->second;
+    const SceUID uid = kernel.get_next_uid();
+    kernel.eventflags.emplace(uid, event);
+    ++event->handles;
+    return uid;
 }
 
 static int eventflag_waitorpoll(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID event_id, unsigned int flags, unsigned int wait, unsigned int *outBits, SceUInt *timeout, bool dowait) {
@@ -2121,12 +2156,23 @@ SceInt32 eventflag_cancel(KernelState &kernel, const char *export_name, SceUID t
     return SCE_KERNEL_OK;
 }
 
-int eventflag_delete(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID event_id) {
-    assert(event_id >= 0);
-
-    const EventFlagPtr event = lock_and_find(event_id, kernel.eventflags, kernel.mutex);
-    if (!event) {
-        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
+// SceKernelThreadMgr 3.74 DeleteEventFlag and CloseEventFlag close one handle.
+// Delete expects the creating handle and Close an opened one; titles built
+// before SDK 3.10 may use either on any handle.
+static int eventflag_close_handle(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID event_id, bool deleting) {
+    EventFlagPtr event;
+    {
+        const std::lock_guard<std::mutex> kernel_lock(kernel.mutex);
+        const auto it = kernel.eventflags.find(event_id);
+        if (it == kernel.eventflags.end())
+            return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
+        event = it->second;
+        const bool opened = event_id != event->uid;
+        if (opened == deleting && kernel.main_module_sdk_version(mem) >= 0x03100000)
+            return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
+        kernel.eventflags.erase(it);
+        if (--event->handles != 0)
+            return SCE_KERNEL_OK;
     }
 
     if (LOG_SYNC_PRIMITIVES) {
@@ -2134,17 +2180,19 @@ int eventflag_delete(KernelState &kernel, const char *export_name, SceUID thread
             export_name, event->uid, thread_id, event->name, event->attr, event->flags, event->waiting_threads->size());
     }
 
-    {
-        const std::lock_guard<std::mutex> event_lock(event->mutex);
-        if (event->deleted)
-            return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
-        event->deleted = true;
-        wake_waiters_with_error(kernel, *event->waiting_threads, SCE_KERNEL_ERROR_WAIT_DELETE);
-    }
-    const std::lock_guard<std::mutex> kernel_lock(kernel.mutex);
-    kernel.eventflags.erase(event_id);
-
+    // The last handle destroys the flag.
+    const std::lock_guard<std::mutex> event_lock(event->mutex);
+    event->deleted = true;
+    wake_waiters_with_error(kernel, *event->waiting_threads, SCE_KERNEL_ERROR_WAIT_DELETE);
     return SCE_KERNEL_OK;
+}
+
+int eventflag_delete(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID event_id) {
+    return eventflag_close_handle(kernel, mem, export_name, thread_id, event_id, true);
+}
+
+int eventflag_close(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID event_id) {
+    return eventflag_close_handle(kernel, mem, export_name, thread_id, event_id, false);
 }
 
 // *************

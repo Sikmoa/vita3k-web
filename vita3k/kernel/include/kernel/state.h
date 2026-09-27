@@ -220,6 +220,8 @@ struct KernelState {
     bool init(MemState &mem, const CallImportFunc &call_import, bool cpu_opt);
     void deinit(MemState &mem);
     void load_process_param(MemState &mem, Ptr<uint32_t> ptr);
+    // SDK version the main module was built with; 0 without a process parameter.
+    SceUInt32 main_module_sdk_version(MemState &mem) const;
     ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point = Ptr<const void>(0));
     ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option);
 

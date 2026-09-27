@@ -539,7 +539,8 @@ int main() {
             REQUIRE(mutex_create(&mutex_id, env->kernel, env->mem, "fixture", "lwcond mutex", 0, 0, 0,
                 Ptr<SceKernelLwMutexWork>(lw_data + lw::kMutex), SyncWeight::Light) == 0);
             Ptr<SceKernelLwMutexWork>(lw_data + lw::kMutex).get(env->mem)->uid = mutex_id;
-            REQUIRE(condvar_create(&cond_id, env->kernel, "fixture", "lwcond", 0, 0, mutex_id, SyncWeight::Light) == 0);
+            REQUIRE(condvar_create(&cond_id, env->kernel, "fixture", "lwcond", 0, 0, mutex_id,
+                Ptr<SceKernelLwCondWork>(lw_data + lw::kCond), SyncWeight::Light) == 0);
             Ptr<SceKernelLwCondWork>(lw_data + lw::kCond).get(env->mem)->uid = cond_id;
             const auto mutex = env->kernel.lwmutexes.at(mutex_id);
             const auto cond = env->kernel.lwcondvars.at(cond_id);
@@ -586,6 +587,12 @@ int main() {
                 // The parked HLE frame must not retain either production lock.
                 REQUIRE(cond->mutex.try_lock()); cond->mutex.unlock();
                 REQUIRE(mutex->mutex.try_lock()); mutex->mutex.unlock();
+                // GetLwCondInfo counts the parked waiters.
+                auto *info = Ptr<SceKernelLwCondInfo>(lw_data + 0x900).get(env->mem);
+                info->size = sizeof(*info);
+                REQUIRE(lw_export(export__sceKernelGetLwCondInfo, Ptr<SceKernelLwCondInfo>(lw_data + 0x900)) == 0);
+                REQUIRE(info->uid == cond_id && info->numWaitThreads == waiters);
+                REQUIRE(info->pWork.address() == lw_data + lw::kCond && info->pLwMutex.address() == lw_data + lw::kMutex);
             }
             if (scenario == 0 || scenario == 1) {
                 auto signaler = thread("lwcond signaler", lw_code + (scenario == 1 ? 0x600 : 0x400));

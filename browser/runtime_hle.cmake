@@ -113,6 +113,8 @@ set(_hle_exports
     # Lifecycle/semaphore integration under test; requires GuestThreadRuntime.
     sceKernelCreateThread sceKernelStartThread sceKernelDeleteThread
     sceKernelWaitSema sceKernelCancelSema
+    # Mutex cancel and LwCond info: production kernel objects, no waits.
+    sceKernelCancelMutex sceKernelGetLwCondInfo sceKernelGetLwCondInfoById
     # Network init/term: production bodies are net-state writes only
     # (SceNet.cpp:471/698); net_utils gets a loopback Emscripten branch.
     sceNetInit sceNetTerm
@@ -153,9 +155,8 @@ set(_hle_exports
     sceKernelCreateEventFlag sceKernelDeleteEventFlag
     sceKernelSetEventFlag sceKernelClearEventFlag
     sceKernelWaitEventFlag sceKernelPollEventFlag sceKernelCancelEventFlag
-    # Limbo AK::IOThread teardown after the FP vector comparison frontier:
-    # upstream UNIMPLEMENTED/no-op body, desktop parity only. This does not
-    # implement per-open event-flag handle ownership or close semantics.
+    # Limbo AK::IOThread teardown: closes an event-flag handle; the last
+    # handle destroys the flag and wakes its waiters with WAIT_DELETE.
     sceKernelCloseEventFlag
     # Limbo eventflag-info frontier (imports=40059 missing_nids=1 PC=8126c330):
     # production struct fill in the already-sourced SceThreadmgr; both the

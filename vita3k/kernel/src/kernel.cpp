@@ -118,6 +118,13 @@ void KernelState::load_process_param(MemState &mem, Ptr<uint32_t> ptr) {
     export_nids[0xDF084DFA] = process_param.get(mem)->sce_libc_param.address();
 }
 
+SceUInt32 KernelState::main_module_sdk_version(MemState &mem) const {
+    const SceProcessParam *param = process_param ? process_param.get(mem) : nullptr;
+    if (param && param->magic == '2PSP' && param->version != 0)
+        return param->fw_version;
+    return 0;
+}
+
 void KernelState::set_memory_watch(bool enabled) {
     std::lock_guard<std::mutex> lock(mutex);
     for (const auto &thread : threads) {
