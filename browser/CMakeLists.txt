@@ -201,6 +201,9 @@ set_target_properties(vita3k_web PROPERTIES
 file(GLOB _web_assets LIST_DIRECTORIES false CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/web/*")
 file(GLOB _em_js_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 set(_web_imports_stamp "${CMAKE_CURRENT_BINARY_DIR}/web_imports.stamp")
+# Rewritten only when a glob changes, so removing a file also reruns the check.
+set(_web_imports_inputs "${CMAKE_CURRENT_BINARY_DIR}/web_imports.inputs")
+file(CONFIGURE OUTPUT "${_web_imports_inputs}" CONTENT "${_web_assets}\n${_em_js_sources}\n")
 add_custom_command(
     OUTPUT "${_web_imports_stamp}"
     COMMAND ${CMAKE_COMMAND}
@@ -208,7 +211,8 @@ add_custom_command(
         "-DSOURCES=${_em_js_sources}"
         "-DSTAMP=${_web_imports_stamp}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/check_web_imports.cmake"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/check_web_imports.cmake" ${_web_assets} ${_em_js_sources}
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/check_web_imports.cmake" "${_web_imports_inputs}"
+        ${_web_assets} ${_em_js_sources}
     COMMENT "Checking that web/ holds every script the browser loads"
     VERBATIM
 )

@@ -4,9 +4,10 @@
 # the deployable set (every file in WEB_DIR): static and dynamic ES imports and
 # Worker scripts in the web files, and EM_JS imports in the module SOURCES
 # (gxm_webgpu_bridge.cpp imports gxm_scene.js next to the Worker).
+cmake_minimum_required(VERSION 3.22) # policies for `-P`: IN_LIST needs CMP0057
 file(GLOB _deployed LIST_DIRECTORIES false RELATIVE "${WEB_DIR}" "${WEB_DIR}/*")
 file(GLOB _web_files "${WEB_DIR}/*.js" "${WEB_DIR}/*.html")
-set(_pattern "(from|import\\((new URL\\()?|new Worker\\() *['\"](\\./)?([A-Za-z0-9_.-]+)['\"]")
+set(_pattern "(from|import|new Worker) *\\(? *(new URL\\( *)?['\"](\\./)?([A-Za-z0-9_.-]+)['\"]")
 set(_missing "")
 foreach(_file IN LISTS _web_files SOURCES)
     file(STRINGS "${_file}" _lines REGEX "${_pattern}")
