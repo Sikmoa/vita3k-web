@@ -4,9 +4,8 @@
 // full-scale by construction: anything downstream that zeroes, drops, mutes,
 // or misroutes PCM turns this run silent, and the runner asserts peak.
 //
-// Out-of-source build: cmake -S browser/tests/vita_audio_fixture
-//   -B build/vita-audio-fixture -DVITASDK=/opt/vitasdk/vitasdk, then build
-//   target vita3k_vita_audio_fixture. No libm: square wave, integer phase.
+// Built with the web runtime (target vita3k_vita_audio_fixture). No libm:
+// square wave, integer phase.
 #include <psp2/audioout.h>
 #include <stdint.h>
 

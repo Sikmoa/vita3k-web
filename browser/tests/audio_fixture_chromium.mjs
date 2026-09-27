@@ -4,7 +4,7 @@
 // A peak of 16000 proves the HLE->worker->page chain carries real audio;
 // retail silence is then a game-state fact (loading screen, no input), not a
 // routing bug. Usage: node browser/tests/audio_fixture_chromium.mjs
-//   [build/vita-audio-fixture/eboot.bin]
+//   [build/web64/browser/tests/vita_audio_fixture/eboot.bin]
 // The runtime is served by runtime_routes.mjs (GXM_RUNTIME_DIST selects the
 // module directory). Environment: PLAYWRIGHT_MODULE_URL,
 // PLAYWRIGHT_CHROMIUM_EXECUTABLE, JIT_FIXTURE_TIMEOUT_MS (default 120000).
@@ -16,7 +16,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readRuntimeFile } from './runtime_routes.mjs';
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const fixture = resolve(process.argv[2] || resolve(repository, 'build/vita-audio-fixture/eboot.bin'));
+const fixture = resolve(process.argv[2] || resolve(repository, 'build/web64/browser/tests/vita_audio_fixture/eboot.bin'));
 const timeoutMs = Number(process.env.JIT_FIXTURE_TIMEOUT_MS || 120000);
 const fixtureBytes = await readFile(fixture);
 assert.deepEqual([...fixtureBytes.subarray(0, 4)], [0x53, 0x43, 0x45, 0x00], 'expected a SELF eboot.bin');

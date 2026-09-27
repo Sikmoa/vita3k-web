@@ -78,9 +78,6 @@ every module. Expected last line: `Wasm execution passed: ...`.
 ## Audio audibility probe (square-wave homebrew through the Worker path)
 
 ```sh
-cmake -S browser/tests/vita_audio_fixture -B build/vita-audio-fixture \
-  -DVITASDK=/opt/vitasdk/vitasdk
-cmake --build build/vita-audio-fixture --target vita3k_vita_audio_fixture
 PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index.mjs \
   node browser/tests/audio_fixture_chromium.mjs
 ```

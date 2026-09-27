@@ -1,7 +1,6 @@
-# Genuine VitaSDK audio fixture: same SDK-default build pattern as
-# browser/tests/vita_homebrew_fixture (default crt0/libc, -Wl,-q, SELF output).
-# Out of source: cmake -S browser/tests/vita_audio_fixture
-#   -B build/vita-audio-fixture -DVITASDK=/opt/vitasdk/vitasdk
+# Genuine VitaSDK audio fixture (browser/tests/audio_fixture_chromium.mjs), built
+# like vita_display_fixture: the SDK's default crt0, libc and linker script, and
+# vita-elf-create + vita-make-fself, output in the binary directory.
 cmake_minimum_required(VERSION 3.24)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     project(vita_audio_fixture LANGUAGES NONE)
@@ -14,9 +13,6 @@ foreach(tool arm-vita-eabi-gcc vita-elf-create vita-make-fself)
     endif()
 endforeach()
 
-if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_CURRENT_BINARY_DIR)
-    message(FATAL_ERROR "Build the fixture out of source (cmake -S ... -B build/vita-audio-fixture)")
-endif()
 
 add_custom_command(
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/eboot.bin"
@@ -33,5 +29,5 @@ add_custom_command(
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
     COMMENT "Building genuine VitaSDK audio fixture with default crt0"
     VERBATIM)
-add_custom_target(vita3k_vita_audio_fixture
+add_custom_target(vita3k_vita_audio_fixture ALL
     DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/eboot.bin")
