@@ -22,6 +22,7 @@
 
 #include <mem/util.h> // Address.
 
+#include <array>
 #include <map>
 #include <set>
 #include <mutex>
@@ -74,6 +75,20 @@ enum SceNpServiceState : uint32_t {
     SCE_NP_SERVICE_STATE_ONLINE = 3
 };
 
+// SceNearUtil of firmware 3.74 over an empty near.db: no neighbour and no
+// discovered gift, so only the own gift (sceNearSetGift) is ever cached.
+struct NearState {
+    bool inited = false;
+    np::CommunicationID comm_id{};
+    uint32_t gift_version = 0;
+    bool has_gift = false;
+    uint32_t gift_id = 0;
+    std::array<uint8_t, 0x1a0> gift_text{}; // name length, name, description length, description
+    uint32_t gift_validity = 0;
+    std::array<uint8_t, 0x2c> gift_param{};
+    std::vector<uint8_t> gift_thumbnail, gift_data;
+};
+
 struct NpState {
     bool inited = false;
     np_callbacks cbs;
@@ -89,5 +104,6 @@ struct NpState {
     std::map<int, Address> signaling_ctxs; // context id (1..8) -> handler
 
     NpTrophyState trophy_state;
+    NearState near;
     np::CommunicationID comm_id;
 };

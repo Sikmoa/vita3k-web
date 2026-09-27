@@ -315,6 +315,16 @@ set(_hle_exports
     sceAppUtilAppEventParseNpInviteMessage sceAppUtilAppEventParseNpAppDataMessage
     sceAppUtilAppEventParseNpBasicJoinablePresence sceAppUtilAppEventParseNearGift
     sceAppUtilAppEventParseLiveArea
+    # SceNearUtil of firmware 3.74 over an empty near.db (its service answers
+    # locally, without PSN): the own gift is kept; the two Near app launches
+    # stay unselected.
+    sceNearInitialize sceNearFinalize sceNearRefresh
+    sceNearGetNeighbors sceNearGetDiscoveredGifts sceNearGetDiscoveredGiftInfo
+    sceNearGetDiscoveredGiftSender sceNearGetDiscoveredGiftStatus
+    sceNearConvertDiscoveredGiftParam sceNearDeleteDiscoveredGift
+    sceNearOpenDiscoveredGiftImage sceNearReadDiscoveredGiftImage sceNearCloseDiscoveredGiftImage
+    sceNearOpenReceivedGiftData sceNearReadReceivedGiftData sceNearCloseReceivedGiftData
+    sceNearSetGift sceNearGetGift sceNearDeleteGift
     sceNpTrophyUnlockTrophy
     # Files and directories:
     sceIoDopen sceIoDread sceIoDclose sceIoMkdir sceIoRmdir sceIoRemove sceIoRename
@@ -445,6 +455,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceGxm/SceGxm.cpp"
     "${_HLE_ROOT}/modules/SceGxm/SceGxmInternal.cpp"
+    "${_HLE_ROOT}/modules/SceNearUtil/SceNearUtil.cpp"
     "${_HLE_ROOT}/modules/SceLibKernel/SceLibKernel.cpp"
     "${_HLE_ROOT}/modules/SceLibDbg/SceDbg.cpp"
     "${_HLE_ROOT}/modules/SceKernelThreadMgr/SceThreadmgr.cpp"
