@@ -34,6 +34,7 @@ static unsigned int downscaled[32 * 32] ALIGNED; // 32x32, rendered as 64x64
 static unsigned int msaa_down[32 * 32] ALIGNED;  // 32x32 of a 4x MSAA 32x32 target
 static unsigned int msaa_full[64 * 64] ALIGNED;  // 64x64 of a 4x MSAA 32x32 target
 static unsigned int keyed[32 * 64] ALIGNED;      // transfer copy source
+static unsigned int halves[1024] ALIGNED; // F16x4 16x4 (and an RGBA8 surface 4 bytes in), a page of its own
 static unsigned int readback[64 * 64] ALIGNED;   // transfer copy destination
 
 static unsigned char patch_heap[256 * 1024] __attribute__((aligned(16)));
@@ -62,7 +63,7 @@ static unsigned color_used, tex_used;
 
 static SceGxmContext *context;
 static SceGxmVertexProgram *color_vp, *tex_vp;
-static SceGxmFragmentProgram *color_fp, *color_fp_msaa, *tex_fp;
+static SceGxmFragmentProgram *color_fp, *color_fp_msaa, *color_fp_half, *tex_fp;
 static int failed;
 
 static int fail(int code) {
@@ -78,6 +79,7 @@ static void corners(float w, float h, float x0, float y0, float x1, float y1, fl
     out[2][0] = cx1; out[2][1] = cy1;
     out[3][0] = cx1; out[3][1] = cy0;
 }
+static SceGxmFragmentProgram *next_color_fp; // overrides the color program for one draw
 static void color_rect(float w, float h, float x0, float y0, float x1, float y1, unsigned int abgr, int msaa) {
     float c[4][2];
     corners(w, h, x0, y0, x1, y1, c);
@@ -88,7 +90,8 @@ static void color_rect(float w, float h, float x0, float y0, float x1, float y1,
         v[i].b = ((abgr >> 16) & 255) / 255.0f; v[i].a = (abgr >> 24) / 255.0f;
     }
     sceGxmSetVertexProgram(context, color_vp);
-    sceGxmSetFragmentProgram(context, msaa ? color_fp_msaa : color_fp);
+    sceGxmSetFragmentProgram(context, next_color_fp ? next_color_fp : msaa ? color_fp_msaa : color_fp);
+    next_color_fp = 0;
     sceGxmSetVertexDefaultUniformBuffer(context, identity);
     sceGxmSetVertexStream(context, 0, v);
     if (sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, quad, 6)) fail(2);
@@ -210,6 +213,13 @@ static unsigned int p64_cyan_top(unsigned x, unsigned y) { return y < 16 ? CYAN 
 static unsigned int green_split(unsigned x, unsigned y) { return x == 0 && y == 0 ? (GREEN & 0xffff0000u) | 0xabcd : GREEN; }
 static unsigned int blue_marked(unsigned x, unsigned y) { return x == 0 && y == 8 ? YELLOW : BLUE; }
 static unsigned int blue_middle(unsigned x, unsigned y) { (void)x; return y >= 8 && y < 40 ? BLUE : RED; }
+// 32-bit words of a row: F16x4 texels (two words each) where the RGBA8
+// surface (words 1..16) did not overwrite them.
+static unsigned int halves_then_green(unsigned x, unsigned y) {
+    (void)y;
+    if (x >= 1 && x <= 16) return GREEN;
+    return x % 2 ? 0x3c003c00u : 0x00003c00u;
+}
 // The downscaled surface: the pattern at 64x64 plus a two-pixel blue column
 // at render x 31..32, box-filtered to 32x32: texels 15 and 16 mix it with
 // their other render column.
@@ -261,6 +271,8 @@ int main(void) {
             SCE_GXM_MULTISAMPLE_NONE, 0, cvp, &color_fp)) return 15;
     if (sceGxmShaderPatcherCreateFragmentProgram(patcher, cf, SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
             SCE_GXM_MULTISAMPLE_4X, 0, cvp, &color_fp_msaa)) return 16;
+    if (sceGxmShaderPatcherCreateFragmentProgram(patcher, cf, SCE_GXM_OUTPUT_REGISTER_FORMAT_HALF4,
+            SCE_GXM_MULTISAMPLE_NONE, 0, cvp, &color_fp_half)) return 19;
     attrs[0].regIndex = sceGxmProgramParameterGetResourceIndex(sceGxmProgramFindParameterByName(tvp, "aPosition"));
     attrs[1].regIndex = sceGxmProgramParameterGetResourceIndex(sceGxmProgramFindParameterByName(tvp, "aTexcoord"));
     attrs[1].componentCount = 2;
@@ -485,6 +497,20 @@ int main(void) {
     begin(rt64, &s_scratch64); texture_quad(64, 64, &t); end();
     read_surface(msaa_full, SCE_GXM_TRANSFER_LINEAR, 0, 0, 64, 64, 64);
     if (check(64, 64, blue_middle, 91)) return failed;
+
+    // An F16x4 surface under an RGBA8 one starting 4 bytes in (its rows the
+    // same 128 bytes): a transfer over both keeps, per byte, the later
+    // RGBA8 render where they overlap, even inside one F16x4 texel.
+    SceGxmColorSurface s_half, s_quarter;
+    if (sceGxmColorSurfaceInit(&s_half, SCE_GXM_COLOR_FORMAT_F16F16F16F16_ABGR, SCE_GXM_COLOR_SURFACE_LINEAR,
+            SCE_GXM_COLOR_SURFACE_SCALE_NONE, SCE_GXM_OUTPUT_REGISTER_SIZE_64BIT, 16, 4, 16, halves)) return 92;
+    surface(&s_quarter, SCE_GXM_COLOR_SURFACE_LINEAR, SCE_GXM_COLOR_SURFACE_SCALE_NONE, 16, 4, 32, halves + 1);
+    SceGxmRenderTarget *rt164 = target(16, 4, SCE_GXM_MULTISAMPLE_NONE);
+    // (1, 0, 1, 1) in half floats: 0x3c00 0x0000 0x3c00 0x3c00.
+    begin(rt164, &s_half); next_color_fp = color_fp_half; color_rect(16, 4, 0, 0, 16, 4, 0xffff00ffu, 0); end();
+    begin(rt164, &s_quarter); color_rect(16, 4, 0, 0, 16, 4, GREEN, 0); end();
+    read_surface(halves, SCE_GXM_TRANSFER_LINEAR, 0, 0, 32, 4, 32);
+    if (check(32, 4, halves_then_green, 93)) return failed;
 
     // 7. sceCommonDialogUpdate: the host draws dialogs, so any frame is fine.
     if (sceCommonDialogUpdate(0) != (int)SCE_COMMON_DIALOG_ERROR_NULL) return 80;

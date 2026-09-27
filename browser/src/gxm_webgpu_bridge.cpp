@@ -1749,7 +1749,6 @@ static void prepare_transfer(MemState &mem, scene::Writer &out, const TransferIm
     // transfer may run meanwhile.
     struct Read { uint64_t order; Address base; SurfaceGeometry geometry; uint32_t rendered; };
     std::vector<Read> reads;
-    uint64_t low = UINT64_MAX, high = 0;
     for (const auto &[base, target] : rendered_targets()) {
         const auto &g = target.geometry;
         const bool under_source = source && overlaps(base, g.footprint(), source->address + source->begin, source->end - source->begin);
@@ -1758,17 +1757,28 @@ static void prepare_transfer(MemState &mem, scene::Writer &out, const TransferIm
         if (!under_source && !split_texels)
             continue;
         reads.push_back({target.render_order, base, g, target.rendered_epoch});
-        low = std::min<uint64_t>(low, base);
-        high = std::max<uint64_t>(high, uint64_t(base) + g.footprint());
     }
     if (reads.empty())
         return;
     // Newest first. A texel keeps the bytes memory has when the guest wrote
-    // its page since the target was rendered, or when a newer target of this
-    // transfer already stored them (`claimed`, per byte); those bytes go to
-    // the GPU copy instead, so memory and every target agree afterwards.
+    // its page since the target was rendered; its bytes a newer target of
+    // this transfer already stored (`claimed`) keep theirs too. A texel that
+    // keeps any byte goes to the GPU copy from memory, so memory and every
+    // target agree afterwards.
     std::sort(reads.begin(), reads.end(), [](const Read &a, const Read &b) { return a.order > b.order; });
-    std::vector<uint8_t> claimed(size_t(high - low), 0);
+    // Claimed bytes by 4 KiB page: the targets may lie far apart.
+    struct Claims {
+        std::unordered_map<uint64_t, std::array<uint8_t, 4096>> pages;
+        uint8_t &at(uint64_t address) {
+            auto [page, inserted] = pages.try_emplace(address >> 12);
+            if (inserted) page->second.fill(0);
+            return page->second[address & 4095];
+        }
+        bool test(uint64_t address) const {
+            const auto page = pages.find(address >> 12);
+            return page != pages.end() && page->second[address & 4095];
+        }
+    } claimed;
     for (const auto &read : reads) {
         if (!submit_scene(out, mem)) // the scenes rendering it, before the read
             unsupported("scene submission failed (see browser log)");
@@ -1779,15 +1789,21 @@ static void prepare_transfer(MemState &mem, scene::Writer &out, const TransferIm
         TexelMarks memory_newer;
         for (uint32_t y = 0; y < g.height; ++y) {
             for (uint32_t x = 0; x < g.width; ++x) {
-                const uint64_t offset = g.byte_offset(x, y);
-                uint8_t *claim = claimed.data() + (read.base + offset - low);
-                if (claim[0] || mem_written_epoch(mem, Address(read.base + offset), g.pixel_bytes) >= read.rendered) {
+                const uint64_t offset = g.byte_offset(x, y), address = read.base + offset;
+                const uint8_t *texel = rows.data() + (size_t(y) * g.width + x) * g.pixel_bytes;
+                const bool guest_newer = mem_written_epoch(mem, Address(address), g.pixel_bytes) >= read.rendered;
+                bool keeps = guest_newer;
+                for (uint32_t byte = 0; byte < g.pixel_bytes; ++byte) {
+                    if (guest_newer || claimed.test(address + byte))
+                        keeps = true;
+                    else
+                        guest[offset + byte] = texel[byte];
+                    claimed.at(address + byte) = 1;
+                }
+                if (keeps) {
                     kept[size_t(y) * g.width + x] = 1;
                     memory_newer.add(x, y);
-                } else {
-                    std::memcpy(guest + offset, rows.data() + (size_t(y) * g.width + x) * g.pixel_bytes, g.pixel_bytes);
                 }
-                std::memset(claim, 1, g.pixel_bytes);
             }
         }
         if (memory_newer.count)
