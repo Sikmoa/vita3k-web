@@ -2425,7 +2425,7 @@ int WasmJitCPU::run() {
     }
     return impl->budget_exhausted();
 }
-int WasmJitCPU::run_slice(uint64_t instructions) noexcept {
+int WasmJitCPU::run_slice(uint64_t instructions) {
     const auto previous = impl->budget;
     const auto previous_slice = impl->scheduler_slice;
     impl->budget = instructions;

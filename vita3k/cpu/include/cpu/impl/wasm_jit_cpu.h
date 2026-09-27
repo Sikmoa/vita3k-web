@@ -46,7 +46,7 @@ public:
     static constexpr int slice_yield = 2;
     // Translation failures are reported through the result like other CPU
     // errors, never thrown.
-    int run_slice(uint64_t instructions) noexcept;
+    int run_slice(uint64_t instructions);
     // Region modules (many blocks, in-Wasm dispatch) vs single-block modules.
     // Default: region mode (M14c production path).
     void set_region_mode(bool value);

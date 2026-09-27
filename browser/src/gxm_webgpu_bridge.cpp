@@ -25,6 +25,7 @@
 #include <xxhash.h>
 #include <fmt/format.h>
 #include <algorithm>
+#include <memory>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -434,7 +435,33 @@ constexpr size_t kUniformAlign = 256;
 
 struct Writer {
     std::vector<uint32_t> words;
-    std::vector<uint8_t> data;
+    // Payload bytes. Appends stay inline; growth is the only call, so
+    // callers with cleanups do not reach every append through a JS invoke_*
+    // wrapper (Emscripten JS exceptions) as they did with vector::resize.
+    struct Bytes {
+        std::unique_ptr<uint8_t[]> buffer;
+        size_t used = 0, capacity = 0;
+        uint8_t *data() const { return buffer.get(); }
+        size_t size() const { return used; }
+        void clear() { used = 0; }
+        // Extends to offset + size (zero-filling the alignment gap) and
+        // returns the bytes at offset.
+        uint8_t *extend(size_t offset, size_t size) noexcept {
+            if (offset + size > capacity)
+                grow(offset + size);
+            std::memset(buffer.get() + used, 0, offset - used);
+            used = offset + size;
+            return buffer.get() + offset;
+        }
+        [[gnu::noinline]] void grow(size_t needed) {
+            const size_t grown = std::max(needed, capacity * 2 + 65536);
+            auto replacement = std::make_unique<uint8_t[]>(grown);
+            if (used)
+                std::memcpy(replacement.get(), buffer.get(), used);
+            buffer = std::move(replacement);
+            capacity = grown;
+        }
+    } data;
     bool pass_open = false;
     // Open pass: its color address and the index of its snapshot flag word.
     Address pass_address = 0;
@@ -483,22 +510,22 @@ struct Writer {
         streams.clear();
         stream_sites.clear();
     }
-    // noexcept: allocation failure is fatal anyway, and callers with cleanups
-    // would otherwise reach every append through a JS invoke wrapper.
+    // noexcept: allocation failure is fatal anyway, and it lets callers with
+    // cleanups call these directly instead of through an invoke_* wrapper;
+    // only the rare growth calls inside them go through one.
     void word(uint32_t value) noexcept { words.push_back(value); }
     void real(float value) noexcept { words.push_back(std::bit_cast<uint32_t>(value)); }
     uint32_t bytes(const void *source, size_t size, size_t alignment) noexcept {
         const size_t offset = align(data.size(), alignment);
-        data.resize(offset + size);
+        uint8_t *dest = data.extend(offset, size);
         if (size)
-            std::memcpy(data.data() + offset, source, size);
+            std::memcpy(dest, source, size);
         return static_cast<uint32_t>(offset);
     }
     // Reserve `size` bytes and return a pointer the caller fills in place.
     uint8_t *reserve(size_t size, size_t alignment, uint32_t &offset) noexcept {
         offset = static_cast<uint32_t>(align(data.size(), alignment));
-        data.resize(offset + size);
-        return data.data() + offset;
+        return data.extend(offset, size);
     }
 };
 Writer &writer() {
