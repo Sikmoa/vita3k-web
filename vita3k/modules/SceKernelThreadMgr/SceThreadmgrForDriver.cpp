@@ -84,7 +84,7 @@ EXPORT(int, ksceKernelCreateMsgPipe) {
 
 EXPORT(int, ksceKernelCreateMutex, const char *name, SceUInt attr, int init_count, SceKernelMutexOptParam *opt_param) {
     TRACY_FUNC(ksceKernelCreateMutex, name, attr, init_count, opt_param);
-    return CALL_EXPORT(_sceKernelCreateMutex, name, attr, init_count, opt_param);
+    return create_mutex(emuenv, export_name, thread_id, name, attr, init_count, opt_param, true);
 }
 
 EXPORT(int, ksceKernelCreateSema) {
@@ -106,34 +106,50 @@ EXPORT(int, ksceKernelDeleteCallback) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, ksceKernelDeleteCond) {
-    return UNIMPLEMENTED();
+// SceKernelThreadMgr 3.74 kernel deletes close any handle of their class;
+// another uid, unknown ones included, is DIFFERENT_UID_CLASS. Conditions need
+// a calling thread.
+EXPORT(int, ksceKernelDeleteCond, SceUID condId) {
+    TRACY_FUNC(ksceKernelDeleteCond, condId);
+    if (!emuenv.kernel.get_thread(thread_id))
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
+    if (!lock_and_find(condId, emuenv.kernel.condvars, emuenv.kernel.mutex))
+        return RET_ERROR(SCE_KERNEL_ERROR_DIFFERENT_UID_CLASS);
+    return condvar_delete(emuenv.kernel, export_name, thread_id, condId, SyncWeight::Heavy);
 }
 
-// SceKernelThreadMgr 3.74: a uid that is not an event flag, unknown ones
-// included, is DIFFERENT_UID_CLASS; a kernel caller closes any handle.
 EXPORT(int, ksceKernelDeleteEventFlag, SceUID evfId) {
     TRACY_FUNC(ksceKernelDeleteEventFlag, evfId);
     if (!lock_and_find(evfId, emuenv.kernel.eventflags, emuenv.kernel.mutex))
         return RET_ERROR(SCE_KERNEL_ERROR_DIFFERENT_UID_CLASS);
-    return eventflag_close(emuenv.kernel, emuenv.mem, export_name, thread_id, evfId, HandleClose::Any);
+    return eventflag_close(emuenv.kernel, export_name, thread_id, evfId, HandleClose::Any);
 }
 
 EXPORT(int, ksceKernelDeleteFastMutex) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, ksceKernelDeleteMsgPipe) {
-    return UNIMPLEMENTED();
+// Message pipes look the uid up in their class: another one is
+// UNKNOWN_MSG_PIPE_ID.
+EXPORT(int, ksceKernelDeleteMsgPipe, SceUID msgPipeId) {
+    TRACY_FUNC(ksceKernelDeleteMsgPipe, msgPipeId);
+    if (!emuenv.kernel.get_thread(thread_id))
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
+    return msgpipe_close(emuenv.kernel, export_name, thread_id, msgPipeId, HandleClose::Any);
 }
 
 EXPORT(int, ksceKernelDeleteMutex, SceUID mutexid) {
     TRACY_FUNC(ksceKernelDeleteMutex, mutexid);
-    return CALL_EXPORT(sceKernelDeleteMutex, mutexid);
+    if (!lock_and_find(mutexid, emuenv.kernel.mutexes, emuenv.kernel.mutex))
+        return RET_ERROR(SCE_KERNEL_ERROR_DIFFERENT_UID_CLASS);
+    return mutex_close(emuenv.kernel, export_name, thread_id, mutexid, SyncWeight::Heavy, HandleClose::Any);
 }
 
-EXPORT(int, ksceKernelDeleteSema) {
-    return UNIMPLEMENTED();
+EXPORT(int, ksceKernelDeleteSema, SceUID semaId) {
+    TRACY_FUNC(ksceKernelDeleteSema, semaId);
+    if (!lock_and_find(semaId, emuenv.kernel.semaphores, emuenv.kernel.mutex))
+        return RET_ERROR(SCE_KERNEL_ERROR_DIFFERENT_UID_CLASS);
+    return semaphore_close(emuenv.kernel, export_name, thread_id, semaId, HandleClose::Any);
 }
 
 EXPORT(int, ksceKernelDeleteThread) {

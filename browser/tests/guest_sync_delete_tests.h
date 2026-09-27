@@ -97,7 +97,7 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
         auto first = spawn("evf waiter", 0, kWaitEventFlag, { uint32_t(evf), 1, SCE_EVENT_WAITAND | SCE_EVENT_WAITCLEAR, data + 0x80, 0 });
         run_until([&] { return first->status == ThreadStatus::wait; });
         if (scenario == 0 || scenario == 3) {
-            REQUIRE((scenario == 0 ? eventflag_close(env.kernel, env.mem, "fixture", 0, evf, HandleClose::Delete)
+            REQUIRE((scenario == 0 ? eventflag_close(env.kernel, "fixture", 0, evf, HandleClose::Delete)
                                    : export_sceKernelCloseEventFlag(env, 0, "fixture", evf)) == 0);
             REQUIRE(!env.kernel.eventflags.contains(evf) && flag->waiting_threads->empty());
             run_until([&] { return first->status == ThreadStatus::dormant; });
@@ -119,7 +119,7 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
         }
         finish();
         if (scenario == 1 || scenario == 2)
-            REQUIRE(eventflag_close(env.kernel, env.mem, "fixture", 0, evf, HandleClose::Delete) == 0);
+            REQUIRE(eventflag_close(env.kernel, "fixture", 0, evf, HandleClose::Delete) == 0);
         std::printf("EventFlag deletion case %u passed\n", scenario);
     }
 
@@ -129,15 +129,9 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
     // is closed. Delete expects the creating handle and Close an opened one;
     // titles built before SDK 3.10 may use either.
     {
-        const Address param = data + 0x300;
-        auto *process = Ptr<SceProcessParam>(param).get(env.mem);
-        std::memset(process, 0, sizeof(*process));
-        process->magic = '2PSP';
-        process->version = 1;
-        process->fw_version = 0x03100000;
         for (const bool sdk_310 : {false, true}) {
-            env.kernel.process_param = sdk_310 ? Ptr<SceProcessParam>(param) : Ptr<SceProcessParam>();
-            const SceUID evf = eventflag_create(env.kernel, "fixture", 0, "handle evf", 0, 0);
+            env.kernel.process_sdk_version = sdk_310 ? 0x03100000 : 0x03000000;
+            const SceUID evf = eventflag_create(env.kernel, "fixture", 0, "handle evf", SCE_KERNEL_ATTR_OPENABLE, 0);
             REQUIRE(evf >= 0);
             const auto flag = env.kernel.eventflags.at(evf);
             REQUIRE(eventflag_open(env.kernel, "fixture", "no such evf") == SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_NAME);
@@ -146,11 +140,11 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
             SceUID survivor = opened;
             if (sdk_310) {
                 REQUIRE(export_sceKernelCloseEventFlag(env, 0, "fixture", evf) == SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
-                REQUIRE(eventflag_close(env.kernel, env.mem, "fixture", 0, opened, HandleClose::Delete) == SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
+                REQUIRE(eventflag_close(env.kernel, "fixture", 0, opened, HandleClose::Delete) == SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
                 REQUIRE(flag->handles == 2 && env.kernel.eventflags.contains(evf) && env.kernel.eventflags.contains(opened));
-                REQUIRE(eventflag_close(env.kernel, env.mem, "fixture", 0, evf, HandleClose::Delete) == 0);
+                REQUIRE(eventflag_close(env.kernel, "fixture", 0, evf, HandleClose::Delete) == 0);
             } else {
-                REQUIRE(eventflag_close(env.kernel, env.mem, "fixture", 0, opened, HandleClose::Delete) == 0);
+                REQUIRE(eventflag_close(env.kernel, "fixture", 0, opened, HandleClose::Delete) == 0);
                 survivor = evf;
             }
             // One handle left: the flag still works through it, not the closed one.
@@ -162,7 +156,7 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
             REQUIRE(flag->deleted && !env.kernel.eventflags.contains(survivor));
             REQUIRE(export_sceKernelCloseEventFlag(env, 0, "fixture", survivor) == SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
         }
-        env.kernel.process_param = Ptr<SceProcessParam>();
+        env.kernel.process_sdk_version = 0;
         std::puts("EventFlag handles passed");
     }
 
@@ -209,7 +203,7 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
         REQUIRE(export_ksceKernelCancelMutex(env, 0, "fixture", mutex_id, 0, &count) == 0);
         REQUIRE(count == 0 && !mutex->owner && mutex->lock_count == 0);
         finish();
-        REQUIRE(mutex_close(env.kernel, env.mem, "fixture", 0, mutex_id, SyncWeight::Heavy, HandleClose::Delete) == 0);
+        REQUIRE(mutex_close(env.kernel, "fixture", 0, mutex_id, SyncWeight::Heavy, HandleClose::Delete) == 0);
         count = 0xcccccccc;
         REQUIRE(export__sceKernelCancelMutex(env, 0, "fixture", mutex_id, 0, &count) == SCE_KERNEL_ERROR_UNKNOWN_MUTEX_ID);
         REQUIRE(count == 0);
@@ -220,7 +214,7 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
         REQUIRE(mutex_create(&lwmutex, env.kernel, env.mem, "fixture", "cancel lwmutex", 0, 0, 0,
             Ptr<SceKernelLwMutexWork>(data + 0x380), SyncWeight::Light) == 0);
         REQUIRE(export_ksceKernelCancelMutex(env, 0, "fixture", lwmutex, 0, nullptr) == SCE_KERNEL_ERROR_UNKNOWN_MUTEX_ID);
-        REQUIRE(mutex_close(env.kernel, env.mem, "fixture", 0, lwmutex, SyncWeight::Light, HandleClose::Delete) == 0);
+        REQUIRE(mutex_close(env.kernel, "fixture", 0, lwmutex, SyncWeight::Light, HandleClose::Delete) == 0);
         std::puts("CancelMutex passed");
     }
 
@@ -318,7 +312,7 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
         REQUIRE(full_record());
 
         // The mutex workarea stays reported after the mutex is deleted.
-        REQUIRE(mutex_close(env.kernel, env.mem, "fixture", 0, mutex_id, SyncWeight::Light, HandleClose::Delete) == 0);
+        REQUIRE(mutex_close(env.kernel, "fixture", 0, mutex_id, SyncWeight::Light, HandleClose::Delete) == 0);
         reset(sizeof(*info));
         REQUIRE(export__sceKernelGetLwCondInfo(env, 0, "fixture", work, info_ptr) == 0);
         REQUIRE(full_record());
@@ -365,7 +359,7 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
                 REQUIRE(condvar_delete(env.kernel, "fixture", 0, cond_id, SyncWeight::Heavy) == 0);
                 expected = SCE_KERNEL_ERROR_WAIT_DELETE_COND;
             } else {
-                REQUIRE(mutex_close(env.kernel, env.mem, "fixture", 0, mutex_id, SyncWeight::Heavy, HandleClose::Delete) == 0);
+                REQUIRE(mutex_close(env.kernel, "fixture", 0, mutex_id, SyncWeight::Heavy, HandleClose::Delete) == 0);
                 expected = SCE_KERNEL_ERROR_WAIT_DELETE_MUTEX;
                 REQUIRE(!cond->associated_mutex);
             }
@@ -390,7 +384,7 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
             == (scenario == 0 || scenario == 3 ? SCE_KERNEL_ERROR_UNKNOWN_COND_ID : 0));
         const SceSize cond_info_size = sizeof(SceKernelCondInfo);
         REQUIRE(export__sceKernelGetCondInfo(env, 0, "fixture", cond_id, Ptr<SceKernelCondInfo>(data + 0xa0), &cond_info_size) == SCE_KERNEL_ERROR_UNKNOWN_COND_ID);
-        REQUIRE(mutex_close(env.kernel, env.mem, "fixture", 0, mutex_id, SyncWeight::Heavy, HandleClose::Delete)
+        REQUIRE(mutex_close(env.kernel, "fixture", 0, mutex_id, SyncWeight::Heavy, HandleClose::Delete)
             == (scenario == 1 || scenario == 4 ? SCE_KERNEL_ERROR_UNKNOWN_MUTEX_ID : 0));
         std::printf("Cond deletion case %u passed\n", scenario);
     }
@@ -434,8 +428,8 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
                 == (light ? SCE_KERNEL_ERROR_LW_MUTEX_LOCK_OVF : SCE_KERNEL_ERROR_MUTEX_LOCK_OVF));
             REQUIRE(env.kernel.mutex.try_lock()); env.kernel.mutex.unlock();
             REQUIRE(mutex_unlock(env.kernel, "fixture", a->id, recursive, std::numeric_limits<int>::max(), weight) == 0);
-            REQUIRE(mutex_close(env.kernel, env.mem, "fixture", 0, plain, weight, HandleClose::Delete) == 0);
-            REQUIRE(mutex_close(env.kernel, env.mem, "fixture", 0, recursive, weight, HandleClose::Delete) == 0);
+            REQUIRE(mutex_close(env.kernel, "fixture", 0, plain, weight, HandleClose::Delete) == 0);
+            REQUIRE(mutex_close(env.kernel, "fixture", 0, recursive, weight, HandleClose::Delete) == 0);
         }
 
         // Desktop paths (no execution host) that complete without blocking,
@@ -460,7 +454,7 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
                 == (light ? SCE_KERNEL_ERROR_LW_MUTEX_NOT_OWNED : SCE_KERNEL_ERROR_MUTEX_NOT_OWNED));
             REQUIRE(mutex_unlock(env.kernel, "fixture", a->id, mutex_id, 1, weight) == 0);
             REQUIRE(condvar_delete(env.kernel, "fixture", 0, cond_id, weight) == 0);
-            REQUIRE(mutex_close(env.kernel, env.mem, "fixture", 0, mutex_id, weight, HandleClose::Delete) == 0);
+            REQUIRE(mutex_close(env.kernel, "fixture", 0, mutex_id, weight, HandleClose::Delete) == 0);
         }
         // _sceKernelWaitEventCB waits (it used to poll), and deletion removes
         // the simple event itself.
@@ -468,9 +462,9 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
         REQUIRE(event >= 0);
         SceUInt32 zero = 0;
         REQUIRE(export__sceKernelWaitEventCB(env, a->id, "fixture", event, 1, nullptr, nullptr, &zero) == SCE_KERNEL_ERROR_WAIT_TIMEOUT);
-        REQUIRE(simple_event_close(env.kernel, env.mem, "fixture", 0, event, HandleClose::Delete) == 0);
+        REQUIRE(simple_event_close(env.kernel, "fixture", 0, event, HandleClose::Delete) == 0);
         REQUIRE(!env.kernel.simple_events.contains(event));
-        REQUIRE(simple_event_close(env.kernel, env.mem, "fixture", 0, event, HandleClose::Delete) == SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
+        REQUIRE(simple_event_close(env.kernel, "fixture", 0, event, HandleClose::Delete) == SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
         // A waiting desktop thread that is deleted is only set running; its
         // wait must unlink itself instead of reporting an acquired semaphore.
         const SceUID sema = semaphore_create(env.kernel, "fixture", "desktop sema", 0, 0, 0, 1);
@@ -485,7 +479,7 @@ inline void test_guest_sync_deletion(EmuEnvState &env, vita3k::web::GuestThreadR
         REQUIRE(semaphore_cancel(env.kernel, "fixture", 0, sema, 2, &cancelled) == SCE_KERNEL_ERROR_ILLEGAL_COUNT);
         REQUIRE(semaphore_cancel(env.kernel, "fixture", 0, sema, 1, &cancelled) == 0);
         REQUIRE(cancelled == 0 && env.kernel.semaphores.at(sema)->val == 1);
-        REQUIRE(semaphore_close(env.kernel, env.mem, "fixture", 0, sema, HandleClose::Delete) == 0);
+        REQUIRE(semaphore_close(env.kernel, "fixture", 0, sema, HandleClose::Delete) == 0);
         a->status = ThreadStatus::dormant;
         env.kernel.execution_host = host;
     }

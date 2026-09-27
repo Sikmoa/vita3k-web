@@ -113,6 +113,10 @@ typedef std::map<SceUID, SimpleEventPtr> SimpleEventPtrs;
 struct Timer : SyncPrimitive {
     WaitingThreadQueuePtr waiting_threads;
     std::condition_variable condvar;
+    // Event bits other than SCE_KERNEL_EVENT_TIMER, which event_set holds,
+    // and the user data the last of them came with.
+    SceUInt32 pattern = 0;
+    SceUInt64 last_user_data = 0;
 
     bool is_started = false;
     bool is_repeat = false;
@@ -142,6 +146,8 @@ struct Mutex : SyncPrimitive {
     ThreadStatePtr owner;
     WaitingThreadQueuePtr waiting_threads;
     Ptr<SceKernelLwMutexWork> workarea;
+    // With SCE_KERNEL_MUTEX_ATTR_CEILING: the priority the owner runs at least.
+    int ceiling_priority = 0;
     // Overlapping cooperative HLE operations, including parked continuations.
     // Inline access is disabled until every operation has completed.
     unsigned inline_access_depth = 0;
@@ -245,16 +251,16 @@ SceUID simple_event_create(KernelState &kernel, MemState &mem, const char *expor
 SceInt32 simple_event_waitorpoll(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID event_id, SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout, bool is_wait);
 SceInt32 simple_event_setorpulse(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID event_id, SceUInt32 pattern, SceUInt64 user_data, bool is_set);
 SceInt32 simple_event_clear(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID event_id, SceUInt32 clear_pattern);
-SceUID simple_event_open(KernelState &kernel, const char *export_name, const char *name);
-SceInt32 simple_event_close(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID event_id, HandleClose how);
+SceUID simple_event_open(KernelState &kernel, const char *export_name, SceUID thread_id, const char *name);
+SceInt32 simple_event_close(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID event_id, HandleClose how);
 
 // Timer
 SceUID timer_create(KernelState &kernel, MemState &mem, const char *export_name, const char *name, SceUID thread_id, SceUInt32 attr);
-SceUID timer_open(KernelState &kernel, const char *export_name, const char *pName);
+SceUID timer_open(KernelState &kernel, const char *export_name, SceUID thread_id, const char *pName);
 // A deleted timer's other handles stay open but no longer resolve.
 TimerPtr timer_find(KernelState &kernel, SceUID timer_handle);
 // Delete destroys the timer whatever other handles are open.
-SceInt32 timer_close(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID timer_handle, HandleClose how);
+SceInt32 timer_close(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID timer_handle, HandleClose how);
 SceInt32 timer_waitorpoll(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID event_id, SceUInt32 bit_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout, bool is_wait);
 SceInt32 timer_clear(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID event_id, SceUInt32 clear_pattern);
 SceInt32 timer_set(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID timer_handle, SceUID type, SceKernelSysClock *interval, SceInt32 repeats);
@@ -267,13 +273,13 @@ SceInt32 timer_stop(KernelState &kernel, const char *export_name, SceUID thread_
 // stale kernel state. Only running_thread may have changed ownership inline.
 // Desktop (no table) is a no-op; callers must hold no kernel/primitive locks.
 void mutex_inline_commit(KernelState &kernel, const ThreadStatePtr &running_thread) noexcept;
-SceUID mutex_create(SceUID *uid_out, KernelState &kernel, MemState &mem, const char *export_name, const char *name, SceUID thread_id, SceUInt attr, int init_count, Ptr<SceKernelLwMutexWork> workarea, SyncWeight weight);
+SceUID mutex_create(SceUID *uid_out, KernelState &kernel, MemState &mem, const char *export_name, const char *name, SceUID thread_id, SceUInt attr, int init_count, Ptr<SceKernelLwMutexWork> workarea, SyncWeight weight, int ceiling_priority = 0);
 SceUID mutex_open(KernelState &kernel, const char *export_name, const char *pName);
 int mutex_lock(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID mutexid, int lock_count, unsigned int *timeout, SyncWeight weight);
 int mutex_try_lock(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID mutexid, int lock_count, SyncWeight weight);
 int mutex_unlock(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID mutexid, int unlock_count, SyncWeight weight);
 // Lightweight mutexes have only their creating handle.
-int mutex_close(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID mutexid, SyncWeight weight, HandleClose how);
+int mutex_close(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID mutexid, SyncWeight weight, HandleClose how);
 // Heavy mutexes only. Writes the number of woken waiters only on success.
 int mutex_cancel(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID mutexid, int new_count, SceUInt32 *num_wait_threads);
 MutexPtr mutex_get(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID mutexid, SyncWeight weight);
@@ -283,14 +289,14 @@ SceUID rwlock_create(KernelState &kernel, MemState &mem, const char *export_name
 SceInt32 rwlock_lock(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID lock_id, uint32_t *timeout, bool is_write);
 SceInt32 rwlock_unlock(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID lock_id, bool is_write);
 SceUID rwlock_open(KernelState &kernel, const char *export_name, const char *pName);
-SceInt32 rwlock_close(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID lock_id, HandleClose how);
+SceInt32 rwlock_close(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID lock_id, HandleClose how);
 
 // Semaphore
 SceUID semaphore_create(KernelState &kernel, const char *export_name, const char *name, SceUID thread_id, SceUInt attr, int init_val, int max_val);
 SceUID semaphore_open(KernelState &kernel, const char *export_name, const char *pName);
 SceInt32 semaphore_wait(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID semaId, SceInt32 needCount, SceUInt32 *pTimeout);
 int semaphore_signal(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID semaid, int signal);
-int semaphore_close(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID semaid, HandleClose how);
+int semaphore_close(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID semaid, HandleClose how);
 int semaphore_cancel(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID semaid, SceInt32 setCount, SceUInt32 *pNumWaitThreads);
 
 // Condition Variable
@@ -309,11 +315,11 @@ SceInt32 eventflag_wait(KernelState &kernel, const char *export_name, SceUID thr
 int eventflag_poll(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID event_id, unsigned int flags, unsigned int wait, unsigned int *outBits);
 SceInt32 eventflag_set(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID evfId, SceUInt32 bitPattern);
 SceInt32 eventflag_cancel(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID event_id, SceUInt32 pattern, SceUInt32 *num_wait_threads);
-int eventflag_close(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID event_id, HandleClose how);
+int eventflag_close(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID event_id, HandleClose how);
 
 // Message Pipe
 SceUID msgpipe_create(KernelState &kernel, const char *export_name, const char *name, SceUID thread_id, SceUInt attr, SceSize bufSize);
 SceUID msgpipe_open(KernelState &kernel, const char *export_name, const char *pName);
 SceSize msgpipe_recv(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID msgPipeId, SceUInt32 waitMode, void *pRecvBuf, SceSize recvSize, SceUInt32 *pTimeout);
 SceSize msgpipe_send(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID msgPipeId, SceUInt32 waitMode, const void *pSendBuf, SceSize sendSize, SceUInt32 *pTimeout);
-SceInt32 msgpipe_close(KernelState &kernel, MemState &mem, const char *export_name, SceUID thread_id, SceUID msgpipe_id, HandleClose how);
+SceInt32 msgpipe_close(KernelState &kernel, const char *export_name, SceUID thread_id, SceUID msgpipe_id, HandleClose how);

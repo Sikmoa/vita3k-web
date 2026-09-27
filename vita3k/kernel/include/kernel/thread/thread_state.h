@@ -26,6 +26,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 
 struct CPUContext;
@@ -68,6 +69,9 @@ struct ThreadState {
     int stack_size;
     Block tls;
 
+    // The current priority: the base priority, raised to the ceiling of each
+    // priority-ceiling mutex the thread owns. Only set_base_priority and the
+    // ceiling calls change it.
     int priority;
     int init_priority;
     bool fios_overlays_disabled = false; // sceFiosOverlayThreadSetDisabled02
@@ -102,6 +106,11 @@ struct ThreadState {
     void exit_delete(bool exit = true);
 
     void update_status(ThreadStatus status, std::optional<ThreadStatus> expected = std::nullopt);
+
+    void set_base_priority(int priority);
+    // A priority-ceiling mutex with this ceiling becomes owned or released.
+    void add_ceiling(int ceiling);
+    void remove_ceiling(int ceiling);
     Address stack_top() const;
 
     // Cooperative hosts drive an already-started thread synchronously and return
@@ -130,6 +139,12 @@ private:
     bool run_host_active_loop();
 
     KernelState &kernel;
+
+    // Guards base_priority, ceilings and the priority derived from them.
+    std::mutex priority_mutex;
+    int base_priority = 0;
+    std::multiset<int> ceilings;
+    void update_priority();
 
     CPUContext init_cpu_ctx;
     // sceKernelExitThread (or top-level guest function return): park at dormant, thread reusable via start() / run_guest_function().

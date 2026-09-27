@@ -122,7 +122,7 @@ EXPORT(SceUID, _sceKernelCreateCond, const char *pName, SceUInt32 attr, SceUID m
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
     if (attr & ~(SCE_KERNEL_ATTR_TH_PRIO | openable))
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ATTR);
-    if ((attr & openable) && emuenv.kernel.main_module_sdk_version(emuenv.mem) >= 0x02100000)
+    if ((attr & openable) && emuenv.kernel.process_sdk_version >= 0x02100000)
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ATTR);
     if (pOptParam && pOptParam->size > sizeof(SceKernelCondOptParam))
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_SIZE);
@@ -164,14 +164,56 @@ EXPORT(int, _sceKernelCreateMsgPipeWithLR) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, _sceKernelCreateMutex, const char *name, SceUInt attr, int init_count, SceKernelMutexOptParam *opt_param) {
-    TRACY_FUNC(_sceKernelCreateMutex, name, attr, init_count, opt_param);
-    SceUID uid;
+// SceKernelThreadMgr 3.74: the name, then a calling thread, the attributes,
+// options of at most their 8 bytes, which a priority-ceiling mutex needs, the
+// count and the ceiling. A ceiling of 0 is the creator's priority and one
+// relative to the default priority is converted; it must be a user priority
+// and, for a mutex the creator starts owning, not below the creator's. The
+// kernel may also use attribute 0x8000 and any ceiling up to 0xfe.
+SceInt32 create_mutex(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, const char *name, SceUInt32 attr, int init_count,
+    const SceKernelMutexOptParam *opt_param, bool kernel_caller) {
+    const SceUInt32 allowed_attr = (kernel_caller ? 0x8000 : 0) | SCE_KERNEL_ATTR_TH_PRIO | SCE_KERNEL_ATTR_OPENABLE | SCE_KERNEL_MUTEX_ATTR_RECURSIVE | SCE_KERNEL_MUTEX_ATTR_CEILING;
+    if (!name)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+    if ((attr & SCE_KERNEL_ATTR_OPENABLE) && strlen(name) > KERNELOBJECT_MAX_NAME_LENGTH)
+        return RET_ERROR(SCE_KERNEL_ERROR_UID_NAME_TOO_LONG);
+    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+    if (!thread)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
+    if (attr & ~allowed_attr)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ATTR);
+    if (opt_param && opt_param->size > sizeof(SceKernelMutexOptParam))
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_SIZE);
+    int ceiling = 0;
+    if (attr & SCE_KERNEL_MUTEX_ATTR_CEILING) {
+        if (!opt_param)
+            return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+        if (init_count < 0 || (init_count > 1 && !(attr & SCE_KERNEL_MUTEX_ATTR_RECURSIVE)))
+            return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_COUNT);
+        ceiling = opt_param->ceilingPriority;
+        const int relative = ceiling - SCE_KERNEL_HIGHEST_DEFAULT_PRIORITY;
+        if (ceiling == 0)
+            ceiling = thread->priority;
+        else if (ceiling >= 1 && ceiling <= 0xfe)
+            ;
+        else if (relative >= 0 && relative <= SCE_KERNEL_LOWEST_DEFAULT_PRIORITY - SCE_KERNEL_HIGHEST_DEFAULT_PRIORITY)
+            ceiling = ceiling - SCE_KERNEL_DEFAULT_PRIORITY + SCE_KERNEL_GAME_DEFAULT_PRIORITY_ACTUAL;
+        else
+            return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY);
+        if (!kernel_caller && (ceiling < SCE_KERNEL_HIGHEST_PRIORITY_USER || ceiling > SCE_KERNEL_LOWEST_PRIORITY_USER || (init_count > 0 && ceiling > thread->priority)))
+            return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY);
+    }
 
-    if (auto error = mutex_create(&uid, emuenv.kernel, emuenv.mem, export_name, name, thread_id, attr, init_count, Ptr<SceKernelLwMutexWork>(0), SyncWeight::Heavy)) {
+    SceUID uid;
+    if (auto error = mutex_create(&uid, emuenv.kernel, emuenv.mem, export_name, name, thread_id, attr, init_count, Ptr<SceKernelLwMutexWork>(0), SyncWeight::Heavy, ceiling)) {
         return error;
     }
     return uid;
+}
+
+EXPORT(int, _sceKernelCreateMutex, const char *name, SceUInt attr, int init_count, SceKernelMutexOptParam *opt_param) {
+    TRACY_FUNC(_sceKernelCreateMutex, name, attr, init_count, opt_param);
+    return create_mutex(emuenv, export_name, thread_id, name, attr, init_count, opt_param, false);
 }
 
 EXPORT(SceUID, _sceKernelCreateRWLock, const char *name, SceUInt32 attr, SceKernelMutexOptParam *opt_param) {
@@ -223,7 +265,7 @@ EXPORT(int, _sceKernelDeleteLwMutex, Ptr<SceKernelLwMutexWork> workarea) {
 
     const auto lightweight_mutex_id = workarea.get(emuenv.mem)->uid;
 
-    return mutex_close(emuenv.kernel, emuenv.mem, export_name, thread_id, lightweight_mutex_id, SyncWeight::Light, HandleClose::Delete);
+    return mutex_close(emuenv.kernel, export_name, thread_id, lightweight_mutex_id, SyncWeight::Light, HandleClose::Delete);
 }
 
 EXPORT(int, _sceKernelExitCallback) {
@@ -447,7 +489,6 @@ EXPORT(int, _sceKernelGetMsgPipeInfo) {
     return UNIMPLEMENTED();
 }
 
-// Priority-ceiling mutexes are not modelled, so the ceiling stays 0.
 EXPORT(SceInt32, _sceKernelGetMutexInfo, SceUID mutexId, Ptr<SceKernelMutexInfo> pInfo, const SceSize *pSize) {
     TRACY_FUNC(_sceKernelGetMutexInfo, mutexId, pInfo, pSize);
     return info_syscall(export_name, pInfo.get(emuenv.mem), pSize, [&](SceKernelMutexInfo *info) {
@@ -457,6 +498,8 @@ EXPORT(SceInt32, _sceKernelGetMutexInfo, SceUID mutexId, Ptr<SceKernelMutexInfo>
                 record.currentCount = mutex.lock_count;
                 record.currentOwnerId = mutex.owner ? mutex.owner->id : 0;
                 record.numWaitThreads = static_cast<SceUInt32>(mutex.waiting_threads->size());
+                if (mutex.attr & SCE_KERNEL_MUTEX_ATTR_CEILING)
+                    record.ceilingPriority = mutex.ceiling_priority;
             });
     });
 }
@@ -1128,8 +1171,7 @@ EXPORT(SceInt32, sceKernelChangeThreadPriority2, SceUID thid, SceInt32 priority)
     if (priority < SCE_KERNEL_HIGHEST_PRIORITY_USER || priority > SCE_KERNEL_LOWEST_PRIORITY_USER)
         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY);
 
-    thread->priority = priority;
-    thread->tls.get_ptr<int>().get(emuenv.mem)[TLS_CURRENT_PRIORITY] = priority;
+    thread->set_base_priority(priority);
 
     return old_priority;
 }
@@ -1185,42 +1227,42 @@ EXPORT(int, sceKernelCloseCond, SceUID condId) {
 
 EXPORT(int, sceKernelCloseEventFlag, SceUID evfId) {
     TRACY_FUNC(sceKernelCloseEventFlag, evfId);
-    return eventflag_close(emuenv.kernel, emuenv.mem, export_name, thread_id, evfId, HandleClose::Close);
+    return eventflag_close(emuenv.kernel, export_name, thread_id, evfId, HandleClose::Close);
 }
 
 EXPORT(int, sceKernelCloseMsgPipe, SceUID msgPipeId) {
     TRACY_FUNC(sceKernelCloseMsgPipe, msgPipeId);
-    return msgpipe_close(emuenv.kernel, emuenv.mem, export_name, thread_id, msgPipeId, HandleClose::Close);
+    return msgpipe_close(emuenv.kernel, export_name, thread_id, msgPipeId, HandleClose::Close);
 }
 
 EXPORT(int, sceKernelCloseMutex, SceUID mutexId) {
     TRACY_FUNC(sceKernelCloseMutex, mutexId);
-    return mutex_close(emuenv.kernel, emuenv.mem, export_name, thread_id, mutexId, SyncWeight::Heavy, HandleClose::Close);
+    return mutex_close(emuenv.kernel, export_name, thread_id, mutexId, SyncWeight::Heavy, HandleClose::Close);
 }
 
 EXPORT(int, sceKernelCloseMutex_089, SceUID mutexId) {
     TRACY_FUNC(sceKernelCloseMutex_089, mutexId);
-    return mutex_close(emuenv.kernel, emuenv.mem, export_name, thread_id, mutexId, SyncWeight::Heavy, HandleClose::Close);
+    return mutex_close(emuenv.kernel, export_name, thread_id, mutexId, SyncWeight::Heavy, HandleClose::Close);
 }
 
 EXPORT(int, sceKernelCloseRWLock, SceUID lockId) {
     TRACY_FUNC(sceKernelCloseRWLock, lockId);
-    return rwlock_close(emuenv.kernel, emuenv.mem, export_name, thread_id, lockId, HandleClose::Close);
+    return rwlock_close(emuenv.kernel, export_name, thread_id, lockId, HandleClose::Close);
 }
 
 EXPORT(int, sceKernelCloseSema, SceUID semaId) {
     TRACY_FUNC(sceKernelCloseSema, semaId);
-    return semaphore_close(emuenv.kernel, emuenv.mem, export_name, thread_id, semaId, HandleClose::Close);
+    return semaphore_close(emuenv.kernel, export_name, thread_id, semaId, HandleClose::Close);
 }
 
 EXPORT(int, sceKernelCloseSimpleEvent, SceUID eventId) {
     TRACY_FUNC(sceKernelCloseSimpleEvent, eventId);
-    return simple_event_close(emuenv.kernel, emuenv.mem, export_name, thread_id, eventId, HandleClose::Close);
+    return simple_event_close(emuenv.kernel, export_name, thread_id, eventId, HandleClose::Close);
 }
 
 EXPORT(int, sceKernelCloseTimer, SceUID timerId) {
     TRACY_FUNC(sceKernelCloseTimer, timerId);
-    return timer_close(emuenv.kernel, emuenv.mem, export_name, thread_id, timerId, HandleClose::Close);
+    return timer_close(emuenv.kernel, export_name, thread_id, timerId, HandleClose::Close);
 }
 
 EXPORT(SceUID, sceKernelCreateCallback, char *name, SceUInt32 attr, Ptr<SceKernelCallbackFunction> callbackFunc, Ptr<void> pCommon) {
@@ -1351,32 +1393,32 @@ EXPORT(int, sceKernelDeleteCond, SceUID condition_variable_id) {
 
 EXPORT(int, sceKernelDeleteEventFlag, SceUID event_id) {
     TRACY_FUNC(sceKernelDeleteEventFlag, event_id);
-    return eventflag_close(emuenv.kernel, emuenv.mem, export_name, thread_id, event_id, HandleClose::Delete);
+    return eventflag_close(emuenv.kernel, export_name, thread_id, event_id, HandleClose::Delete);
 }
 
 EXPORT(SceInt32, sceKernelDeleteMsgPipe, SceUID msgPipeId) {
     TRACY_FUNC(sceKernelDeleteMsgPipe, msgPipeId);
-    return msgpipe_close(emuenv.kernel, emuenv.mem, export_name, thread_id, msgPipeId, HandleClose::Delete);
+    return msgpipe_close(emuenv.kernel, export_name, thread_id, msgPipeId, HandleClose::Delete);
 }
 
 EXPORT(int, sceKernelDeleteMutex, SceUID mutexid) {
     TRACY_FUNC(sceKernelDeleteMutex, mutexid);
-    return mutex_close(emuenv.kernel, emuenv.mem, export_name, thread_id, mutexid, SyncWeight::Heavy, HandleClose::Delete);
+    return mutex_close(emuenv.kernel, export_name, thread_id, mutexid, SyncWeight::Heavy, HandleClose::Delete);
 }
 
 EXPORT(SceInt32, sceKernelDeleteRWLock, SceUID lock_id) {
     TRACY_FUNC(sceKernelDeleteRWLock, lock_id);
-    return rwlock_close(emuenv.kernel, emuenv.mem, export_name, thread_id, lock_id, HandleClose::Delete);
+    return rwlock_close(emuenv.kernel, export_name, thread_id, lock_id, HandleClose::Delete);
 }
 
 EXPORT(int, sceKernelDeleteSema, SceUID semaid) {
     TRACY_FUNC(sceKernelDeleteSema, semaid);
-    return semaphore_close(emuenv.kernel, emuenv.mem, export_name, thread_id, semaid, HandleClose::Delete);
+    return semaphore_close(emuenv.kernel, export_name, thread_id, semaid, HandleClose::Delete);
 }
 
 EXPORT(int, sceKernelDeleteSimpleEvent, SceUID event_id) {
     TRACY_FUNC(sceKernelDeleteSimpleEvent, event_id);
-    return simple_event_close(emuenv.kernel, emuenv.mem, export_name, thread_id, event_id, HandleClose::Delete);
+    return simple_event_close(emuenv.kernel, export_name, thread_id, event_id, HandleClose::Delete);
 }
 
 EXPORT(int, sceKernelDeleteThread, SceUID thid) {
@@ -1391,7 +1433,7 @@ EXPORT(int, sceKernelDeleteThread, SceUID thid) {
 
 EXPORT(int, sceKernelDeleteTimer, SceUID timer_handle) {
     TRACY_FUNC(sceKernelDeleteTimer, timer_handle);
-    return timer_close(emuenv.kernel, emuenv.mem, export_name, thread_id, timer_handle, HandleClose::Delete);
+    return timer_close(emuenv.kernel, export_name, thread_id, timer_handle, HandleClose::Delete);
 }
 
 EXPORT(int, sceKernelExitDeleteThread, int status) {
@@ -1520,12 +1562,12 @@ EXPORT(SceUID, sceKernelOpenSema, const char *pName) {
 
 EXPORT(SceUID, sceKernelOpenSimpleEvent, const char *pName) {
     TRACY_FUNC(sceKernelOpenSimpleEvent, pName);
-    return simple_event_open(emuenv.kernel, export_name, pName);
+    return simple_event_open(emuenv.kernel, export_name, thread_id, pName);
 }
 
 EXPORT(SceUID, sceKernelOpenTimer, const char *pName) {
     TRACY_FUNC(sceKernelOpenTimer, pName);
-    return timer_open(emuenv.kernel, export_name, pName);
+    return timer_open(emuenv.kernel, export_name, thread_id, pName);
 }
 
 EXPORT(int, sceKernelPollSema, SceUID semaid, int32_t needCount) {

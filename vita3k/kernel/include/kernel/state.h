@@ -239,6 +239,12 @@ struct KernelState {
     uint64_t start_tick;
     SceRtcTick base_tick;
     Ptr<SceProcessParam> process_param;
+    // The SDK version the kernel keeps for the process (processmgr), which
+    // ThreadMgr's SDK-dependent checks read: the main module's process
+    // parameter fw_version whatever its version field, 0 without a parameter.
+    // process_param stays null for a version-0 parameter, which SceLibKernel
+    // does not use.
+    SceUInt32 process_sdk_version = 0;
     // The emulated title runs as one process; its uid is reserved so that no
     // other kernel object can share it.
     static constexpr SceUID process_id = 1;
@@ -261,7 +267,8 @@ struct KernelState {
     bool init(MemState &mem, const CallImportFunc &call_import, bool cpu_opt);
     void deinit(MemState &mem);
     void load_process_param(MemState &mem, Ptr<uint32_t> ptr);
-    // SDK version the main module was built with; 0 without a process parameter.
+    // SceLibKernel's sceKernelGetMainModuleSdkVersion: 0 without a process
+    // parameter or with a version-0 one.
     SceUInt32 main_module_sdk_version(MemState &mem) const;
     ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point = Ptr<const void>(0));
     ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option);

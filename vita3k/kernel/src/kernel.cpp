@@ -107,6 +107,8 @@ bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cp
 
 void KernelState::load_process_param(MemState &mem, Ptr<uint32_t> ptr) {
     const SceProcessParam *param = ptr.cast<SceProcessParam>().get(mem);
+    // Firmware modulemgr fails the load on another magic.
+    process_sdk_version = param->magic == '2PSP' ? param->fw_version : 0;
     if (param->version == 0) {
         // Homebrews built with old vitasdk
         process_param = nullptr;
@@ -290,6 +292,7 @@ void KernelState::deinit(MemState &mem) {
     halt_instruction_pc = 0;
 
     process_param = nullptr;
+    process_sdk_version = 0;
     client_vtable = Ptr<void>(0);
     shellsvc_client = Ptr<Address>(0);
     libc_dso_handle_main = Ptr<void>(0);

@@ -72,6 +72,14 @@ if(EMSCRIPTEN)
     target_link_libraries(vita3k_guest_thread_tests PRIVATE vita3k_guest_thread_runtime vita3k_web_mspace)
     target_link_options(vita3k_guest_thread_tests PRIVATE
         ${VITA3K_WEB_GROWTH_LINK_OPTION} "SHELL:-sSTACK_SIZE=1048576")
+    # Desktop-path sync tests need concurrent host threads, so they exist only
+    # in a build compiled with -pthread (CMAKE_C_FLAGS and CMAKE_CXX_FLAGS).
+    if(CMAKE_CXX_FLAGS MATCHES "-pthread")
+        add_executable(vita3k_host_thread_sync_tests tests/host_thread_sync_test.cpp)
+        target_link_libraries(vita3k_host_thread_sync_tests PRIVATE vita3k_web_runtime_hle vita3k_web_mspace)
+        target_link_options(vita3k_host_thread_sync_tests PRIVATE
+            ${VITA3K_WEB_GROWTH_LINK_OPTION} "SHELL:-sSTACK_SIZE=1048576" "SHELL:-sPTHREAD_POOL_SIZE=8" -pthread)
+    endif()
     target_link_options(vita3k_web_app_bench PRIVATE
         ${VITA3K_WEB_GROWTH_LINK_OPTION}
         "SHELL:-sSTACK_SIZE=1048576"

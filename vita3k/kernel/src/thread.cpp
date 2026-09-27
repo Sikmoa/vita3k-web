@@ -24,6 +24,7 @@
 
 #include <util/log.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <memory>
@@ -67,6 +68,7 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
         priority = init_priority;
     }
     this->init_priority = priority;
+    base_priority = priority;
     this->affinity_mask = affinity_mask;
     this->init_affinity_mask = affinity_mask;
     this->stack_size = stack_size;
@@ -520,6 +522,32 @@ ThreadState::ThreadState(SceUID id, KernelState &kernel, MemState &mem)
     : id(id)
     , kernel(kernel)
     , mem(mem) {
+}
+
+// A lower number is a higher priority.
+void ThreadState::update_priority() {
+    priority = ceilings.empty() ? base_priority : std::min(base_priority, *ceilings.begin());
+    tls.get_ptr<int>().get(mem)[TLS_CURRENT_PRIORITY] = priority;
+}
+
+void ThreadState::set_base_priority(int new_priority) {
+    const std::lock_guard<std::mutex> lock(priority_mutex);
+    base_priority = new_priority;
+    update_priority();
+}
+
+void ThreadState::add_ceiling(int ceiling) {
+    const std::lock_guard<std::mutex> lock(priority_mutex);
+    ceilings.insert(ceiling);
+    update_priority();
+}
+
+void ThreadState::remove_ceiling(int ceiling) {
+    const std::lock_guard<std::mutex> lock(priority_mutex);
+    const auto it = ceilings.find(ceiling);
+    assert(it != ceilings.end());
+    ceilings.erase(it);
+    update_priority();
 }
 
 void ThreadState::update_status(ThreadStatus status, std::optional<ThreadStatus> expected) {

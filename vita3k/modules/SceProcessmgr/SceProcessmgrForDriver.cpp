@@ -50,14 +50,13 @@ static bool is_own_process(SceUID pid) {
     return pid == 0 || pid == KernelState::process_id;
 }
 
-// Processmgr 0x81000a69: the SDK version from the executable's
-// SceProcessParam (sysmodule compares it when loading NP message).
+// Processmgr 0x81000a69: the process's SDK version (sysmodule compares it
+// when loading NP message).
 EXPORT(int, SceProcessmgrForDriver_D141C076, SceUID pid, SceUInt32 *sdk_version) {
     TRACY_FUNC(SceProcessmgrForDriver_D141C076, pid, sdk_version);
     if (!is_own_process(pid))
         return RET_ERROR(SCE_KERNEL_ERROR_INVALID_PID);
-    const SceProcessParam *param = emuenv.kernel.process_param.get(emuenv.mem);
-    *sdk_version = param ? param->fw_version : 0;
+    *sdk_version = emuenv.kernel.process_sdk_version;
     return 0;
 }
 

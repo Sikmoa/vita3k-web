@@ -638,9 +638,9 @@ static bool validate_module_tables(const sce_module_info_raw &module, Address ba
             if (!guest_range(address & ~1u, 1, 1))
                 return false;
             if (i >= exports.num_syms_funcs && nid == NID_PROCESS_PARAM) {
-                // load_process_param always reads version, then sce_libc_param
-                // except for old homebrew (version zero).
-                if (!guest_range(address, offsetof(SceProcessParam, version) + sizeof(uint32_t)))
+                // load_process_param always reads magic, version and fw_version,
+                // then sce_libc_param except for old homebrew (version zero).
+                if (!guest_range(address, offsetof(SceProcessParam, fw_version) + sizeof(uint32_t)))
                     return false;
                 const auto *param = Ptr<const SceProcessParam>(address).get(mem);
                 if (param->version && !guest_range(address, offsetof(SceProcessParam, sce_libc_param) + sizeof(uint32_t)))

@@ -317,7 +317,7 @@ inline void test_guest_kernel_info(EmuEnvState &env, vita3k::web::GuestThreadRun
     env.gxm.initialized = initialized;
     std::puts("USSE map and unmap validation and the display queue thread passed");
 
-    REQUIRE(semaphore_close(env.kernel, env.mem, "fixture", 0, sema, HandleClose::Delete) == 0);
+    REQUIRE(semaphore_close(env.kernel, "fixture", 0, sema, HandleClose::Delete) == 0);
     REQUIRE(runtime.shutdown());
     REQUIRE(env.kernel.threads.empty());
     REQUIRE(get_current_cpu_state() == nullptr);

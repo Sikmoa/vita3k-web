@@ -67,6 +67,9 @@ DECL_EXPORT(int, _sceKernelGetThreadExitStatus, SceUID thid, SceInt32 *pExitStat
 // SceKernelThreadMgr 3.74 thread record fill, which ksceKernelGetThreadInfo
 // is: thread 0 is the caller.
 SceInt32 get_thread_info(EmuEnvState &emuenv, const char *export_name, SceUID caller, SceUID thid, SceKernelThreadInfo *info);
+// Mutex creation with SceKernelThreadMgr 3.74's checks for a user or a kernel caller.
+SceInt32 create_mutex(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, const char *name, SceUInt32 attr, int init_count,
+    const SceKernelMutexOptParam *opt_param, bool kernel_caller);
 
 DECL_EXPORT(SceInt32, _sceKernelGetLwCondInfo, Ptr<SceKernelLwCondWork> workarea, Ptr<SceKernelLwCondInfo> pInfo);
 DECL_EXPORT(SceInt32, _sceKernelGetLwCondInfoById, SceUID lwCondId, Ptr<SceKernelLwCondInfo> pInfo, const SceSize *pSize);

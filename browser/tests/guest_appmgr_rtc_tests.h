@@ -133,12 +133,10 @@ inline void test_guest_appmgr_rtc(EmuEnvState &env, ThreadState &thread) {
     // Processmgr for sysmodule: the executable's SDK version (Limbo:
     // 0x02000081) and the PMUSERENR word libkernel reads back.
     constexpr uint32_t sdk_version = 0xD141C076, set_pmuserenr = 0x6599E5D9, get_pmuserenr = 0xF8A99FDF;
-    const auto saved_param = env.kernel.process_param;
-    Ptr<SceProcessParam>(block + 0x500).get(env.mem)->fw_version = 0x02000081;
-    env.kernel.process_param = Ptr<SceProcessParam>(block + 0x500);
+    env.kernel.process_sdk_version = 0x02000081;
     REQUIRE(call(sdk_version, { 0, block + 0x5f0 }) == 0 && *Ptr<uint32_t>(block + 0x5f0).get(env.mem) == 0x02000081);
     REQUIRE(call(sdk_version, { 7, block + 0x5f0 }) == 0x80029001);
-    env.kernel.process_param = saved_param;
+    env.kernel.process_sdk_version = 0;
     REQUIRE(call(set_pmuserenr, { 0, 1 }) == 0 && call(get_pmuserenr, {}) == 1);
     REQUIRE(call(set_pmuserenr, { 0, 0 }) == 0 && call(get_pmuserenr, {}) == 0);
     REQUIRE(call(set_pmuserenr, { 7, 1 }) == 0x80029001);
