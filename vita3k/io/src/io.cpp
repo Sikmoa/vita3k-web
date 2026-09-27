@@ -67,11 +67,17 @@ static int io_error_impl(const int retval, const char *export_name, const char *
 #define IO_ERROR_UNK() IO_ERROR(-1)
 
 // A host path as the key of IOState's per-path state.
+// Equivalent spellings of a path (dot segments, trailing slashes) share a key.
 static std::string path_key(const fs::path &path) {
-    std::string key = path.generic_path().string();
-    while (key.size() > 1 && key.ends_with('/'))
-        key.pop_back();
-    return key;
+    std::string key = path.lexically_normal().generic_path().string();
+    while (true) {
+        if (key.size() > 1 && key.ends_with('/'))
+            key.pop_back();
+        else if (key.size() > 2 && key.ends_with("/."))
+            key.resize(key.size() - 2);
+        else
+            return key;
+    }
 }
 
 static bool is_under(const std::string &key, const std::string &root) {
@@ -795,11 +801,12 @@ int chstat_path(IOState &io, const char *path, const SceIoStat *stat, SceUInt32 
     if ((bits & SCE_CST_MODE) && access != (SCE_S_IROTH | SCE_S_IWOTH) && access != SCE_S_IROTH)
         return IO_ERROR(SCE_ERROR_ERRNO_EINVAL);
 
+    // Writes still buffered come first, as the guest made them: a later
+    // flush would undo the new size or modification time.
+    if ((bits & (SCE_CST_SIZE | SCE_CST_MODE | SCE_CST_AT | SCE_CST_MT)) && !flush_host_files(io, host_path, false))
+        return IO_ERROR(SCE_ERROR_ERRNO_EIO);
     boost::system::error_code error;
     if (bits & SCE_CST_SIZE) {
-        // Writes still buffered come first, as the guest made them.
-        if (!flush_host_files(io, host_path, false))
-            return IO_ERROR(SCE_ERROR_ERRNO_EIO);
         fs::resize_file(host_path, static_cast<uintmax_t>(stat->st_size), error);
         if (error)
             return IO_ERROR(SCE_ERROR_ERRNO_ENOSPC);

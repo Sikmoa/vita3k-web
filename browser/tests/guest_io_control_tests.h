@@ -171,6 +171,23 @@ inline void test_guest_io_control(EmuEnvState &env, ThreadState &thread) {
         REQUIRE(std::fread(tail, 1, 6, file) == 6 && std::memcmp(tail, "ab\0\0ab", 6) == 0);
         std::fclose(file);
     }
+    // Equivalent spellings share a file's state: a truncation through the
+    // plain path comes after writes buffered through a dot-dot path.
+    fs::create_directories(save / "sub");
+    const uint32_t alias = call(io_open, { put("savedata0:sub/../alias.bin"), SCE_O_WRONLY | SCE_O_CREAT, 0 });
+    REQUIRE(static_cast<int32_t>(alias) >= 0);
+    REQUIRE(call(io_write, { alias, block + 0x780, 4 }) == 4);
+    st->st_size = 0;
+    REQUIRE(call(io_chstat, { put("savedata0:alias.bin"), stat, SCE_CST_SIZE }) == 0);
+    REQUIRE(call(io_close, { alias }) == 0 && fs::file_size(save / "alias.bin") == 0);
+    // A modification time set while writes are buffered stays: they go first.
+    const uint32_t stamped = call(io_open, { put("savedata0:stamped.bin"), SCE_O_WRONLY | SCE_O_CREAT, 0 });
+    REQUIRE(static_cast<int32_t>(stamped) >= 0);
+    REQUIRE(call(io_write, { stamped, block + 0x780, 4 }) == 4);
+    st->st_mtime = modified;
+    REQUIRE(call(io_chstat, { put("savedata0:stamped.bin"), stat, SCE_CST_MT }) == 0);
+    REQUIRE(call(io_close, { stamped }) == 0);
+    REQUIRE(call(io_getstat, { put("savedata0:stamped.bin"), got }) == 0 && same_second(got_stat->st_mtime, modified));
     // Renaming a path to itself keeps its dates; removing a directory drops
     // the dates set under it.
     REQUIRE(call(io_chstat, { put("savedata0:save.bin"), stat, SCE_CST_CT }) == 0);
