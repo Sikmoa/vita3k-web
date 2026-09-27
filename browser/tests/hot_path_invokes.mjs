@@ -27,7 +27,10 @@ if (existsSync(symbolMap)) {
       line.slice(colon + 1).replace(/\\([0-9a-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16))));
   }
 }
-// Function name (as in the name section) -> calls allowed through invoke_*.
+// std::dynamic_extent is size_t(-1), which differs between wasm32 and wasm64.
+const normalize = (name) => name?.replace(/\b(?:18446744073709551615|4294967295)ul\b/g, 'dynamic_extent') ?? null;
+// Function name (as in the name section, dynamic_extent normalized) -> calls
+// allowed through invoke_*.
 const hot = new Map([
   ['ThreadState::run_host_active_loop()', 0],
   // One: the debugger's single-step path calls the virtual CPUInterface::step.
@@ -42,7 +45,7 @@ const hot = new Map([
   ['renderer::set_program(renderer::State&, renderer::Context*, Ptr<void const>, bool)', 0],
   ['renderer::set_texture(renderer::State&, renderer::Context*, unsigned int, SceGxmTexture)', 0],
   ['renderer::set_vertex_stream(renderer::State&, renderer::Context*, unsigned long, unsigned long, Ptr<void const>)', 0],
-  ['gxmSetUniformBuffers(renderer::State&, GxmState&, SceGxmContext*, SceGxmProgram const&, std::__2::span<Ptr<void const>, 18446744073709551615ul>, std::__2::array<unsigned int, 15ul> const&, MemState const&)', 0],
+  ['gxmSetUniformBuffers(renderer::State&, GxmState&, SceGxmContext*, SceGxmProgram const&, std::__2::span<Ptr<void const>, dynamic_extent>, std::__2::array<unsigned int, 15ul> const&, MemState const&)', 0],
 ]);
 // Functions whose invoke_* calls may only reach container growth inside
 // inlined standard-library code (an unordered_map rehash when a key is first
@@ -72,7 +75,7 @@ let current = null, callImportLines = null, recent = [];
 for await (const line of createInterface({ input: objdump.stdout })) {
   const header = /^[0-9a-f]+ func\[(\d+)\](?: <(.*)>)?:$/.exec(line);
   if (header) {
-    current = header[2] ?? symbols.get(Number(header[1])) ?? null;
+    current = normalize(header[2] ?? symbols.get(Number(header[1])) ?? null);
     if (hot.has(current) || growthOnly.has(current)) found.set(current, []);
     if (current === callImport) callImportLines = [];
     recent = [];
