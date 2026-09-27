@@ -315,6 +315,8 @@ static int build_aot_image(EmuEnvState &env, const char *out_path) {
 
 // Implementation shared by the exported entry point below, which reports its
 // result through the host exit hook.
+extern "C" void vita3k_web_set_pad(std::uint32_t buttons, float lx, float ly, float rx, float ry);
+
 static int run_app_impl() {
     const auto &config = launch_config();
     if (config.title_id.empty()) {
@@ -615,8 +617,69 @@ static int run_app_impl() {
         double aot_until = 0;
         if (const char *until = std::getenv("VITA3K_AOT_UNTIL"))
             aot_until = std::strtod(until, nullptr);
+        // VITA3K_BENCH_INPUT="<ms>:<input>[+<input>]:<hold ms>,...": scripted
+        // pad input for runs without a page (the Chromium probe's LIMBO_INPUT
+        // syntax), so a Node run can reach gameplay.
+        struct ScriptedInput { double at_ms, hold_ms; std::uint32_t buttons; std::array<float, 4> axes; };
+        std::vector<ScriptedInput> input_script;
+        if (const char *script = std::getenv("VITA3K_BENCH_INPUT")) {
+            static const std::pair<const char *, std::uint32_t> buttons[] = {{"select", 0x1}, {"start", 0x8},
+                {"up", 0x10}, {"right", 0x20}, {"down", 0x40}, {"left", 0x80}, {"l", 0x100}, {"r", 0x200},
+                {"triangle", 0x1000}, {"circle", 0x2000}, {"cross", 0x4000}, {"square", 0x8000}};
+            static const std::tuple<const char *, int, float> sticks[] = {{"lstick-left", 0, -1.0f},
+                {"lstick-right", 0, 1.0f}, {"lstick-up", 1, -1.0f}, {"lstick-down", 1, 1.0f}};
+            std::string entries = script;
+            for (std::size_t begin = 0; begin < entries.size();) {
+                const std::size_t end = std::min(entries.find(',', begin), entries.size());
+                const std::string entry = entries.substr(begin, end - begin);
+                begin = end + 1;
+                const std::size_t first = entry.find(':'), second = entry.find(':', first + 1);
+                if (first == std::string::npos) {
+                    std::fprintf(stderr, "[vita3k-web] VITA3K_BENCH_INPUT: bad entry '%s'\n", entry.c_str());
+                    return -10;
+                }
+                ScriptedInput input{std::strtod(entry.c_str(), nullptr),
+                    second == std::string::npos ? 200.0 : std::strtod(entry.c_str() + second + 1, nullptr), 0, {}};
+                const std::string names = entry.substr(first + 1, second == std::string::npos ? std::string::npos : second - first - 1);
+                for (std::size_t n = 0; n <= names.size();) {
+                    const std::size_t plus = std::min(names.find('+', n), names.size());
+                    const std::string name = names.substr(n, plus - n);
+                    n = plus + 1;
+                    bool known = false;
+                    for (const auto &[label, mask] : buttons)
+                        if (name == label) { input.buttons |= mask; known = true; }
+                    for (const auto &[label, axis, value] : sticks)
+                        if (name == label) { input.axes[axis] = value; known = true; }
+                    if (!known) {
+                        std::fprintf(stderr, "[vita3k-web] VITA3K_BENCH_INPUT: unknown input '%s'\n", name.c_str());
+                        return -10;
+                    }
+                }
+                input_script.push_back(input);
+            }
+        }
+        std::uint32_t scripted_buttons = 0;
+        std::array<float, 4> scripted_axes{};
         unsigned frames_yielded = 0;
         do {
+            if (!input_script.empty()) {
+                const double now_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - jit_started).count();
+                std::uint32_t buttons = 0;
+                std::array<float, 4> axes{};
+                for (const auto &input : input_script) {
+                    if (now_ms < input.at_ms || now_ms >= input.at_ms + input.hold_ms)
+                        continue;
+                    buttons |= input.buttons;
+                    for (int axis = 0; axis < 4; ++axis)
+                        if (input.axes[axis] != 0)
+                            axes[axis] = input.axes[axis];
+                }
+                if (buttons != scripted_buttons || axes != scripted_axes) {
+                    scripted_buttons = buttons;
+                    scripted_axes = axes;
+                    vita3k_web_set_pad(buttons, axes[0], axes[1], axes[2], axes[3]);
+                }
+            }
             if (bench_seconds > 0 && std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - jit_started).count() >= bench_seconds) {
                 bench_expired = true;

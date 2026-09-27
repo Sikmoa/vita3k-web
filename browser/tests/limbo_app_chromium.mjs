@@ -57,6 +57,9 @@ const measure = process.env.LIMBO_MEASURE === '1';
 // LIMBO_PROFILE=0 keeps the measurement windows but skips the CPU profiler,
 // which itself costs guest throughput.
 const profileWindows = process.env.LIMBO_PROFILE !== '0';
+// LIMBO_PROFILE=alloc samples allocations (HeapProfiler) instead of CPU time;
+// LIMBO_PROFILE_OUT then receives <name>.heapprofile.
+const allocationProfile = process.env.LIMBO_PROFILE === 'alloc';
 // Scripted pad input: LIMBO_INPUT="<ms>:<input>[+<input>]:<hold ms>,..." with
 // times relative to run-app, e.g. "30000:cross:200,32000:lstick-right:5000".
 const ctrlButtons = { select: 0x1, start: 0x8, up: 0x10, right: 0x20, down: 0x40, left: 0x80,
@@ -299,6 +302,18 @@ try {
     });
     await page.exposeFunction('limboMeasure', async ({ kind, name }) => {
       if (!profileWindows) return;
+      if (allocationProfile) {
+        if (kind === 'start') {
+          await workerCall('HeapProfiler.enable');
+          await workerCall('HeapProfiler.startSampling', { samplingInterval: 16384,
+            includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
+        } else {
+          const { profile } = await workerCall('HeapProfiler.stopSampling');
+          if (process.env.LIMBO_PROFILE_OUT)
+            await writeFile(`${process.env.LIMBO_PROFILE_OUT}.${name}.heapprofile`, JSON.stringify(profile));
+        }
+        return;
+      }
       if (kind === 'start') {
         await workerCall('Profiler.enable');
         await workerCall('Profiler.setSamplingInterval', { interval: 500 });
