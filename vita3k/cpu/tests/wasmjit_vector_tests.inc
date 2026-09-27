@@ -653,4 +653,110 @@ void guest_structure_lanes(MemState &mem) {
         }
     }
 }
+// Byte-permutation reference for VREV: reverse `element`-bit lanes inside
+// each `group`-bit group of `bytes` bytes starting at `data`.
+void reverse_reference(uint8_t *data, unsigned bytes, unsigned element, unsigned group) {
+    std::vector<uint8_t> in(data, data + bytes);
+    const unsigned group_bytes = group / 8, element_bytes = element / 8;
+    const unsigned elements = group_bytes / element_bytes;
+    for (unsigned i = 0; i < bytes; ++i) {
+        const unsigned base = i / group_bytes * group_bytes, within = i % group_bytes;
+        const unsigned source = elements - 1 - within / element_bytes;
+        data[i] = in[base + source * element_bytes + within % element_bytes];
+    }
+}
+struct Reversal { Op op; unsigned element, group; };
+constexpr Reversal reversals[] = {
+    {Op::VectorReverseElementsInHalfGroups8, 8, 16},
+    {Op::VectorReverseElementsInWordGroups8, 8, 32},
+    {Op::VectorReverseElementsInWordGroups16, 16, 32},
+    {Op::VectorReverseElementsInLongGroups8, 8, 64},
+    {Op::VectorReverseElementsInLongGroups16, 16, 64},
+    {Op::VectorReverseElementsInLongGroups32, 32, 64},
+};
+
+// VectorNarrow16 (VMOVN.I16), the VREV family and ZeroExtendHalfToLong
+// (VLD1.16 element assembly) against byte-level references.
+void ir_narrow_reverse() {
+    Harness h;
+    h.test(Op::VectorNarrow16, [](auto &b) {
+        write_q(b, append(b, Op::VectorNarrow16, {read_q(b, 1)}));
+    }, [](auto &s) {
+        uint64_t low = 0;
+        for (unsigned i = 0; i < 8; ++i) low |= (lane(s, 16, i, 1) & 0xff) << (8 * i);
+        set_lane(s, 64, 0, low);
+        set_lane(s, 64, 1, 0);
+    });
+    for (const auto &r : reversals) {
+        h.test(r.op, [&](auto &b) {
+            write_q(b, append(b, r.op, {read_q(b, 1)}));
+        }, [&](auto &s) {
+            std::memcpy(s.fpu, s.fpu + 4, 16);
+            reverse_reference(reinterpret_cast<uint8_t *>(s.fpu), 16, r.element, r.group);
+        });
+    }
+    h.test(Op::ZeroExtendHalfToLong, [](auto &b) {
+        append(b, Op::A32SetExtendedRegister64, {Value{A32::ExtReg::D0},
+            append(b, Op::ZeroExtendHalfToLong, {scalar_input(b, 16)})});
+    }, [](auto &s) { set_lane(s, 64, 0, s.regs[1] & 0xffff); });
+    h.test(Op::ZeroExtendHalfToLong, [](auto &b) {
+        append(b, Op::A32SetExtendedRegister64, {Value{A32::ExtReg::D0},
+            append(b, Op::ZeroExtendHalfToLong, {Value{uint16_t(0xbeef)}})});
+    }, [](auto &s) { set_lane(s, 64, 0, 0xbeef); });
+    std::printf("Vector narrow/reverse/zero-extend: %u fixtures; %zu missing routes\n", h.cases, h.missing.size());
+    CHECK(h.missing.empty());
+}
+
+// Real VMOVN.I16, VREV16/32/64 and VLD1.16 encodings (ARM and Thumb),
+// assembled with VitaSDK (cortex-a9, neon), single-block and region.
+void guest_narrow_reverse(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    const auto bytes_of = [](JitState &s) { return reinterpret_cast<uint8_t *>(s.fpu); };
+    for (bool region : {false, true}) {
+        jit.set_region_mode(region);
+        for (bool thumb : {false, true}) {
+            guest_case(mem, jit, parent, thumb, 0xf3f2622e, [&](auto &s) { // vmovn.i16 d22, q15
+                uint64_t low = 0;
+                for (unsigned i = 0; i < 8; ++i) low |= (lane(s, 16, i, 15) & 0xff) << (8 * i);
+                set_lane(s, 64, 0, low, 11);
+            });
+            struct Guest { uint32_t opcode; unsigned element, group, dst, src, bytes; };
+            const Guest guests[] = {
+                {0xf3b000c0, 8, 32, 0, 0, 16}, // vrev32.8 q0, q0
+                {0xf3f00020, 8, 64, 16 * 8, 16 * 8, 8}, // vrev64.8 d16, d16
+                {0xf3b42080, 16, 32, 2 * 8, 0, 8}, // vrev32.16 d2, d0
+                {0xf3b02144, 8, 16, 1 * 16, 2 * 16, 16}, // vrev16.8 q1, q2
+                {0xf3b46048, 16, 64, 3 * 16, 4 * 16, 16}, // vrev64.16 q3, q4
+                {0xf3b85006, 32, 64, 5 * 8, 6 * 8, 8}, // vrev64.32 d5, d6
+            };
+            for (const auto &g : guests) {
+                guest_case(mem, jit, parent, thumb, g.opcode, [&](auto &s) {
+                    std::memmove(bytes_of(s) + g.dst, bytes_of(s) + g.src, g.bytes);
+                    reverse_reference(bytes_of(s) + g.dst, g.bytes, g.element, g.group);
+                });
+            }
+            // vld1.16 {d16}, [r5]: four halfword loads assembled into d16.
+            const uint64_t pattern = 0x8899aabbccddeeffull;
+            CHECK(mem_write(mem, data, &pattern, sizeof(pattern)));
+            if (thumb) put_thumb(mem, jit, {thumb_word(0xf465074f), 0xbf00df00});
+            else put(mem, jit, {0xf465074f, 0xef000000});
+            auto context = jit.save_context();
+            context.cpu_registers[5] = data;
+            std::fill(context.fpu_registers.begin(), context.fpu_registers.end(), 0x5a5a5a5a);
+            context.cpsr = 0x10 | (thumb ? 0x20 : 0);
+            jit.load_context(context);
+            CHECK(jit.run() == 0 && parent.svc_called);
+            const auto result = jit.save_context();
+            uint64_t d16;
+            std::memcpy(&d16, &result.fpu_registers[32], sizeof(d16));
+            CHECK(d16 == pattern);
+            CHECK(result.cpu_registers[5] == data);
+            CHECK(result.fpu_registers[31] == 0x5a5a5a5a && result.fpu_registers[34] == 0x5a5a5a5a);
+        }
+    }
+    std::puts("Vector narrow/reverse/VLD1.16 guest: ARM/Thumb single+region passed");
+}
 } // namespace vector_tests

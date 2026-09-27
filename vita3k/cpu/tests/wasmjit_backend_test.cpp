@@ -778,6 +778,91 @@ void multiply32(MemState &mem) {
     }
 }
 
+// SMLABB and SMLSDX (the Limbo encodings behind A32OrQFlag) set the sticky
+// CPSR.Q on signed accumulate overflow and never clear it; NZCV/GE/mode stay.
+// The oracle is plain int64 arithmetic on the halfword operands.
+void saturation_flag(MemState &mem) {
+    constexpr uint32_t q = 1u << 27;
+    const auto half = [](uint32_t value, bool high) { return int64_t(int16_t(high ? value >> 16 : value)); };
+    struct Operands { uint32_t n, m, a; };
+    const Operands operands[] = {
+        {0x7fff, 0x7fff, 0x7fffffff}, // positive overflow
+        {0x8000, 0x7fff, 0x80000000u}, // negative overflow
+        {0x8000, 0x8000, 0x3fffffff}, // 2^30 + (2^30 - 1): largest without overflow
+        {0x8000, 0x8000, 0x40000000}, // ... one more overflows
+        {0x00020003, 0x00050007, 11},
+        {0xffff8001, 0x7fff0002, 0xfffffffe},
+        {0x12345678, 0x9abcdef0, 0x7ffffff0},
+    };
+    struct Form { const char *name; uint32_t arm, thumb, rd; bool dual; };
+    const Form forms[] = {
+        {"SMLABB r3,r1,r3,r2", 0xe1032381, 0x2303fb11, 3, false},
+        {"SMLSDX r8,r2,r11,r9", 0xe7089b72, 0x981bfb42, 8, true},
+    };
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    unsigned overflows = 0, cases = 0;
+    for (bool regions : {false, true}) for (bool thumb : {false, true}) for (const auto &form : forms)
+        for (const auto &o : operands) for (uint32_t q_before : {0u, q}) {
+            jit.set_region_mode(regions);
+            if (thumb) put_thumb(mem, jit, {form.thumb, 0xbf00df00});
+            else put(mem, jit, {form.arm, 0xef000000});
+            // SMLABB: n=r1, m=r3, a=r2. SMLSDX: n=r2, m=r11, a=r9.
+            jit.set_reg(form.dual ? 2 : 1, o.n);
+            jit.set_reg(form.dual ? 11 : 3, o.m);
+            jit.set_reg(form.dual ? 9 : 2, o.a);
+            jit.set_cpsr(jit.get_cpsr() | 0xa0050000u | q_before);
+            const uint32_t before = jit.get_cpsr();
+            const int64_t product = form.dual
+                ? half(o.n, false) * half(o.m, true) - half(o.n, true) * half(o.m, false)
+                : half(o.n, false) * half(o.m, false);
+            const int64_t sum = product + int64_t(int32_t(o.a));
+            const bool overflow = sum != int64_t(int32_t(sum));
+            CHECK(jit.run() == 0 && parent.svc_called);
+            if (jit.get_reg(form.rd) != uint32_t(sum) || jit.get_cpsr() != (before | (overflow ? q : 0)))
+                std::fprintf(stderr, "%s %s region=%d n=%08x m=%08x a=%08x: rd=%08x cpsr=%08x want %08x/%08x\n",
+                    form.name, thumb ? "Thumb" : "ARM", regions, o.n, o.m, o.a, jit.get_reg(form.rd),
+                    jit.get_cpsr(), uint32_t(sum), before | (overflow ? q : 0));
+            CHECK(jit.get_reg(form.rd) == uint32_t(sum));
+            CHECK(jit.get_cpsr() == (before | (overflow ? q : 0)));
+            overflows += overflow;
+            ++cases;
+        }
+    CHECK(overflows != 0 && overflows != cases);
+    // Both CPSR representations (memory word, promoted locals) directly.
+    CHECK(mem_write(mem, code, &forms[0].arm, 4));
+    const auto ir = vita3k::wasmjit::translate_block(mem, code, 0x10, 1, 0);
+    const Dynarmic::A32::LocationDescriptor at{ir.Location()};
+    for (bool promote : {false, true}) {
+        vita3k::wasmjit::RegionStateOptions options{};
+        options.promote_flags = promote;
+        const auto bytes = vita3k::wasmjit::emit_region({&ir}, {{at.PC(), PSR_DISPATCH_MASK,
+            at.CPSR().Value() & PSR_DISPATCH_MASK, 1}}, options);
+        CHECK(!bytes.empty());
+        const int slot = vita3k_jit_install_region(bytes.data(), bytes.size(), checked_memory_read, checked_memory_write);
+        CHECK(slot >= 0);
+        for (const auto &o : operands) {
+            JitState state{};
+            state.regs[1] = o.n;
+            state.regs[3] = o.m;
+            state.regs[2] = o.a;
+            state.regs[15] = code;
+            state.cpsr = 0x500f0010u;
+            const int64_t sum = half(o.n, false) * half(o.m, false) + int64_t(int32_t(o.a));
+            const bool overflow = sum != int64_t(int32_t(sum));
+            CHECK(vita3k_jit_run(slot, reinterpret_cast<uintptr_t>(&state), 1)
+                == static_cast<uint32_t>(vita3k::wasmjit::ExitReason::Miss));
+            CHECK(state.regs[3] == uint32_t(sum));
+            CHECK(state.cpsr == (0x500f0010u | (overflow ? q : 0)));
+        }
+        vita3k_jit_release_region(slot);
+    }
+    std::printf("Q flag: %u SMLABB/SMLSDX guest cases (%u overflow) and both CPSR representations passed\n",
+        cases, overflows);
+}
+
 void backend(MemState &mem) {
     CPUState parent{};
     parent.mem = &mem;
@@ -1862,6 +1947,8 @@ int main() {
     vector_tests::guest_data_movement(mem);
     vector_tests::guest_structure_lanes(mem);
     vector_tests::guest_structure_multiple(mem);
+    vector_tests::ir_narrow_reverse();
+    vector_tests::guest_narrow_reverse(mem);
     vector_integer_tests::ir_arithmetic();
     vector_integer_tests::guest_arithmetic(mem);
     vector_compare_tests::ir_comparisons();
@@ -1902,6 +1989,7 @@ int main() {
     dispatch_ownership_probes(mem);
     leading_zeros(mem);
     multiply32(mem);
+    saturation_flag(mem);
     unsigned_long_multiply(mem);
     signed_long_multiply(mem);
     floating_compare32(mem);

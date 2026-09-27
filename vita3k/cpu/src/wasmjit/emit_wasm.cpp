@@ -313,8 +313,9 @@ public:
     }
     template <typename Value>
     void write_psr_field(Bytes &c, uint32_t bits, const Value &value) const {
-        // Only modeled T/E/IT updates use this operation. NZCV have their
-        // own representation; full CPSR/Q/GE writers remain unsupported IR.
+        // Modeled T/E/IT updates and the sticky Q flag use this operation.
+        // NZCV have their own representation; full CPSR/GE writers remain
+        // unsupported IR.
         if (options.promote_flags) {
             b_get(c, kOtherPsr); b_imm(c, ~bits); b_op(c, And);
             value(); b_op(c, Or); b_set(c, kOtherPsr);
@@ -1378,6 +1379,28 @@ private:
         get(source); mask(0x00ff0000); imm(8); op(ShrU); op(Or);
         get(source); imm(24); op(ShrU); op(Or);
         set(result);
+    }
+    // VREV16/VREV32/VREV64: reverse `element`-bit lanes within each `group`.
+    // A 64-bit group swaps its two words and reverses inside each of them.
+    bool vector_reverse(const Inst &inst, unsigned element, unsigned group) {
+        const auto source = next_local + 4;
+        for (unsigned word = 0; word < 4; ++word) {
+            value_word(inst.GetArg(0), group == 64 ? word ^ 1 : word); set(source);
+            if (element == 8 && group != 16) {
+                byte_reverse_word_from_local(source, next_local + word);
+                continue;
+            }
+            if (element == 8) { // bytes within each halfword
+                get(source); mask(0x00ff00ffu); imm(8); op(Shl);
+                get(source); imm(8); op(ShrU); mask(0x00ff00ffu); op(Or);
+            } else if (element == 16) { // halfwords within the word
+                get(source); imm(16); op(Shl); get(source); imm(16); op(ShrU); op(Or);
+            } else {
+                get(source); // whole words: the swap above is the reversal
+            }
+            set(next_local + word);
+        }
+        return ok;
     }
     // ARM QADD/QSUB family (UQADD8/UQADD16/UQSUB8/UQSUB16 and signed QADD8/
     // QSUB8/QADD16/QSUB16): per-lane saturating arithmetic, no GE flags.
@@ -2962,6 +2985,23 @@ private:
                 set(next_local + word);
             }
             return ok;
+        case Op::VectorNarrow16:
+            // Low byte of each 16-bit lane into the low doubleword (VMOVN.I16).
+            for (unsigned word = 0; word < 2; ++word) {
+                value_word(inst.GetArg(0), word * 2); mask(0xff);
+                value_word(inst.GetArg(0), word * 2); imm(8); op(ShrU); mask(0xff00); op(Or);
+                value_word(inst.GetArg(0), word * 2 + 1); mask(0xff); imm(16); op(Shl); op(Or);
+                value_word(inst.GetArg(0), word * 2 + 1); imm(8); op(Shl); mask(0xff000000u); op(Or);
+                set(next_local + word);
+            }
+            imm(0); set(next_local + 2); imm(0); set(next_local + 3);
+            return ok;
+        case Op::VectorReverseElementsInHalfGroups8: return vector_reverse(inst, 8, 16);
+        case Op::VectorReverseElementsInWordGroups8: return vector_reverse(inst, 8, 32);
+        case Op::VectorReverseElementsInWordGroups16: return vector_reverse(inst, 16, 32);
+        case Op::VectorReverseElementsInLongGroups8: return vector_reverse(inst, 8, 64);
+        case Op::VectorReverseElementsInLongGroups16: return vector_reverse(inst, 16, 64);
+        case Op::VectorReverseElementsInLongGroups32: return vector_reverse(inst, 32, 64);
         case Op::VectorNarrow32:
             // Low halfword of each 32-bit lane into the low doubleword (pmovdw).
             for (unsigned word = 0; word < 2; ++word) {
@@ -3650,6 +3690,14 @@ private:
         case Op::A32ExclusiveWriteMemory32: exclusive_write(inst, 4); return ok;
         case Op::A32ExclusiveWriteMemory64: exclusive_write(inst, 8); return ok;
         case Op::A32GetCFlag: flag(29); break;
+        case Op::A32OrQFlag:
+            // Sticky saturation flag (SMLA<x><y>, SMLAD, QADD...): set CPSR.Q
+            // when the U1 argument is 1, never clear it.
+            state.write_psr_field(code, 0x08000000u, [&] {
+                state.read_dispatch_psr(code); mask(0x08000000u);
+                arg(0); imm(27); op(Shl); op(Or);
+            });
+            return ok;
         case Op::A32SetCpsrNZ:
         case Op::A32SetCpsrNZC:
         case Op::A32SetCpsrNZCV:
@@ -3742,6 +3790,11 @@ private:
         case Op::ZeroExtendByteToLong:
             // U8 source in a word slot; zero high word (VLD1 byte assembly).
             value_word(inst.GetArg(0)); mask(0xff); set(next_local);
+            imm(0); set(next_local + 1);
+            return ok;
+        case Op::ZeroExtendHalfToLong:
+            // U16 source in a word slot; zero high word (VLD1.16 assembly).
+            value_word(inst.GetArg(0)); mask(0xffff); set(next_local);
             imm(0); set(next_local + 1);
             return ok;
         case Op::LogicalShiftLeft64: {
