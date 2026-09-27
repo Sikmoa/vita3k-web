@@ -67,6 +67,80 @@ void ir_saturation() {
     std::printf("Packed saturation: %u independent IR fixtures passed\n", h.cases);
 }
 
+// UADD8: bytewise sum modulo 256; CPSR.GE[i] = carry out of byte i.
+uint32_t uadd8(uint32_t x, uint32_t y, uint32_t &ge) {
+    uint32_t result = 0;
+    ge = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        const uint32_t sum = ((x >> (8 * i)) & 0xff) + ((y >> (8 * i)) & 0xff);
+        result |= (sum & 0xff) << (8 * i);
+        ge |= (sum >> 8) << i;
+    }
+    return result;
+}
+
+void ir_unsigned_add8() {
+    Harness h;
+    for (bool with_ge : {false, true}) {
+        const auto build = [&](auto &b, Value a, Value d) {
+            const auto sum = append(b, Op::PackedAddU8, {a, d});
+            append(b, Op::A32SetRegister, {Value{A32::Reg::R0}, sum});
+            if (with_ge) append(b, Op::A32SetGEFlags, {append(b, Op::GetGEFromOp, {sum})});
+        };
+        const auto expect = [&](JitState &s, uint32_t x, uint32_t y) {
+            uint32_t ge;
+            s.regs[0] = uadd8(x, y, ge);
+            if (with_ge) s.cpsr = (s.cpsr & ~0x000f0000u) | (ge << 16);
+        };
+        h.test(Op::PackedAddU8, [&](auto &b) {
+            build(b, append(b, Op::A32GetRegister, {Value{A32::Reg::R1}}),
+                append(b, Op::A32GetRegister, {Value{A32::Reg::R2}}));
+        }, [&](auto &s) { expect(s, s.regs[1], s.regs[2]); });
+        // Byte sums of 0x100 (carry, zero byte), 0xff (no carry), 0x1fe and 0.
+        for (const auto &[x, y] : std::array<std::pair<uint32_t, uint32_t>, 3>{{
+                 {0x80ff7f00u, 0x80018000u}, {0xff01fe00u, 0xffff0100u}, {0x00ff00ffu, 0xff00ff01u}}}) {
+            h.test(Op::PackedAddU8, [&](auto &b) { build(b, Value{x}, Value{y}); },
+                [&](auto &s) { expect(s, x, y); });
+        }
+    }
+    CHECK(h.missing.empty());
+    std::printf("UADD8/GE: %u independent IR fixtures passed\n", h.cases);
+}
+
+void guest_unsigned_add8(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    for (bool region : {false, true}) {
+        jit.set_region_mode(region);
+        for (bool thumb : {false, true}) {
+            for (const auto &[x, y] : std::array<std::pair<uint32_t, uint32_t>, 4>{{{0u, 0u},
+                     {0xffffffffu, 0xffffffffu}, {0x80ff7f01u, 0x8001807fu}, {0xa58173dfu, 0x13579bdfu}}}) {
+                // UADD8 r0, r1, r2
+                if (thumb) put_thumb(mem, jit, {thumb_word(0xfa81f042), 0xbf00df00});
+                else put(mem, jit, {0xe6510f92, 0xef000000});
+                auto context = jit.save_context();
+                context.cpu_registers[1] = x;
+                context.cpu_registers[2] = y;
+                context.cpsr = 0x000a0010u | (thumb ? 0x20 : 0); // stale GE bits must be replaced
+                jit.load_context(context);
+                if (jit.run() != 0) {
+                    std::fprintf(stderr, "UADD8 guest failed: %s\n", jit.get_last_error().c_str());
+                    CHECK(false);
+                }
+                uint32_t ge;
+                const uint32_t sum = uadd8(x, y, ge);
+                const auto result = jit.save_context();
+                CHECK(result.cpu_registers[0] == sum);
+                CHECK(result.cpsr == ((context.cpsr & ~0x000f0000u) | (ge << 16)));
+                CHECK(jit.get_pc() == code + (thumb ? 6 : 8));
+            }
+        }
+    }
+    std::printf("UADD8/GE: ARM and Thumb guest execution passed (single+region)\n");
+}
+
 void guest_saturation(MemState &mem) {
     CPUState parent{};
     parent.mem = &mem;

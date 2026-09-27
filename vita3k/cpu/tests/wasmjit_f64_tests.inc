@@ -819,6 +819,110 @@ void guest_float_to_int(MemState &mem) {
         CHECK(after.cpsr == before.cpsr);
     }
 }
+// VCVTB/VCVTT.F32.F16 (FPHalfToSingle): all 65536 half inputs under each
+// relevant location mode (FZ, DN, AHP) against Dynarmic's FPConvert, which
+// the emitted integer lowering never calls. The source register's other
+// half holds junk that must be ignored.
+void half_to_single() {
+    constexpr uint32_t fpscr_ahp = 0x04000000;
+    unsigned count = 0;
+    for (uint32_t location_fpscr : {0u, fpscr_fz, fpscr_dn, fpscr_ahp, fpscr_ahp | fpscr_dn}) {
+        auto block = blank(location_fpscr);
+        const auto half = append(block, Op::LeastSignificantHalf, {read_s(block, 1)});
+        write_s(block, append(block, Op::FPHalfToSingle, {half, Value{uint8_t(0)}}));
+        const A32::LocationDescriptor at{block.Location()};
+        for (bool region : {false, true}) {
+            const auto bytes = region
+                ? vita3k::wasmjit::emit_region({&block}, {{at.PC(), PSR_DISPATCH_MASK,
+                    at.CPSR().Value() & PSR_DISPATCH_MASK, 1}})
+                : vita3k::wasmjit::emit_block(block);
+            CHECK(!bytes.empty());
+            if (bytes.empty()) continue;
+            const int slot = region
+                ? vita3k_jit_install_region(bytes.data(), bytes.size(), checked_memory_read, checked_memory_write)
+                : vita3k_jit_install(bytes.data(), bytes.size(), checked_memory_read, checked_memory_write);
+            CHECK(slot >= 0);
+            for (uint32_t input = 0; input < 0x10000; ++input) {
+                Dynarmic::FP::FPSR fpsr{0};
+                const uint32_t want = Dynarmic::FP::FPConvert<uint32_t, uint16_t>(uint16_t(input),
+                    Dynarmic::FP::FPCR{location_fpscr}, Dynarmic::FP::RoundingMode::ToNearest_TieEven, fpsr);
+                auto state = base_state(location_fpscr | 0x90000000u);
+                set_s_bits(state, input | 0xdead0000u, 1);
+                const auto reason = static_cast<Reason>(region
+                    ? vita3k_jit_run(slot, reinterpret_cast<uintptr_t>(&state), 1)
+                    : vita3k_jit_call(slot, reinterpret_cast<uintptr_t>(&state)));
+                CHECK(reason == (region ? Reason::Miss : Reason::Continue));
+                if (s_bits(state) != want || state.fpscr != (location_fpscr | 0x90000000u | (fpsr.Value() & 0x9f)))
+                    std::fprintf(stderr, "half->single fpscr=%08x input=%04x got=%08x/%08x want=%08x/%02x\n",
+                        location_fpscr, input, s_bits(state), state.fpscr, want, fpsr.Value() & 0x9f);
+                CHECK(s_bits(state) == want);
+                CHECK(state.fpscr == (location_fpscr | 0x90000000u | (fpsr.Value() & 0x9f)));
+                CHECK(s_bits(state, 1) == (input | 0xdead0000u));
+                ++count;
+            }
+            if (region) vita3k_jit_release_region(slot);
+            else vita3k_jit_release(slot);
+        }
+    }
+    // A live trap enable must stop before any architectural write.
+    auto block = blank(0);
+    write_s(block, append(block, Op::FPHalfToSingle,
+        {append(block, Op::LeastSignificantHalf, {read_s(block, 1)}), Value{uint8_t(0)}}));
+    const auto bytes = vita3k::wasmjit::emit_block(block);
+    const int slot = vita3k_jit_install(bytes.data(), bytes.size(), checked_memory_read, checked_memory_write);
+    auto state = base_state(0x00000100u);
+    set_s_bits(state, 0x7c01u, 1); // signaling NaN
+    CHECK(static_cast<Reason>(vita3k_jit_call(slot, reinterpret_cast<uintptr_t>(&state))) == Reason::Unsupported);
+    CHECK(s_bits(state) == 0x5a5a5a5au && state.fpscr == 0x00000100u);
+    vita3k_jit_release(slot);
+    std::printf("half->single: %u oracle cases (FZ/DN/AHP, block+region) passed\n", count);
+}
+
+void guest_half_to_single(MemState &mem) {
+    CPUState parent{};
+    parent.mem = &mem;
+    WasmJitCPU jit(&parent, 0);
+    jit.set_instruction_budget(16);
+    const std::array<uint32_t, 6> inputs{0x3c00c000u, 0x7c00fc00u, 0x7c017e00u, 0x00010400u, 0x83ff8000u, 0x7bff0001u};
+    unsigned count = 0;
+    for (bool region : {false, true}) {
+        jit.set_region_mode(region);
+        for (bool thumb : {false, true}) for (bool top : {false, true}) for (uint32_t fpscr : {0u, fpscr_dn}) {
+            for (const uint32_t input : inputs) {
+                // VCVTB/VCVTT.F32.F16 s0, s1 (identical VFP words in ARM and Thumb)
+                const uint32_t opcode = top ? 0xeeb20ae0u : 0xeeb20a60u;
+                if (thumb) put_thumb(mem, jit, {(opcode << 16) | (opcode >> 16), 0xbf00df00});
+                else put(mem, jit, {opcode, 0xef000000});
+                auto context = jit.save_context();
+                context.fpu_registers[0] = std::bit_cast<float>(0x5a5a5a5au);
+                context.fpu_registers[1] = std::bit_cast<float>(input);
+                context.fpscr = fpscr;
+                context.cpsr = 0x10 | (thumb ? 0x20 : 0);
+                jit.load_context(context);
+                if (jit.run() != 0) {
+                    std::fprintf(stderr, "VCVTB/T guest failed: %s\n", jit.get_last_error().c_str());
+                    CHECK(false);
+                }
+                Dynarmic::FP::FPSR fpsr{0};
+                const uint32_t want = Dynarmic::FP::FPConvert<uint32_t, uint16_t>(uint16_t(top ? input >> 16 : input),
+                    Dynarmic::FP::FPCR{fpscr}, Dynarmic::FP::RoundingMode::ToNearest_TieEven, fpsr);
+                const auto result = jit.save_context();
+                const uint32_t s0 = std::bit_cast<uint32_t>(result.fpu_registers[0]);
+                if (s0 != want || result.fpscr != (fpscr | (fpsr.Value() & 0x9f)))
+                    std::fprintf(stderr, "VCVT%c %s fpscr=%08x input=%08x got=%08x/%08x want=%08x/%02x\n",
+                        top ? 'T' : 'B', thumb ? "Thumb" : "ARM", fpscr, input, s0,
+                        result.fpscr, want, fpsr.Value() & 0x9f);
+                CHECK(s0 == want);
+                CHECK(std::bit_cast<uint32_t>(result.fpu_registers[1]) == input);
+                CHECK(result.fpscr == (fpscr | (fpsr.Value() & 0x9f)));
+                CHECK(jit.get_pc() == code + (thumb ? 6 : 8));
+                ++count;
+            }
+        }
+    }
+    std::printf("half->single: %u VCVTB/VCVTT guest cases passed\n", count);
+}
+
 // Fixed-point VCVT (fbits 0..32; Limbo's VCVT.S32.F32 s15, s15, #16). The
 // emitted lowering is pure integer code; the oracle is the vendored Dynarmic
 // FPToFixed, which that code never calls, under the location FPSCR. Pinned

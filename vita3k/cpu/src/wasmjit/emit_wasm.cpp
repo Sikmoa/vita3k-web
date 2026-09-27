@@ -98,7 +98,7 @@ enum Wasm : uint8_t {
     CallIndirect = 0x11, ReturnCall = 0x12, ReturnCallIndirect = 0x13, Select = 0x1b,
     Get = 0x20, Set = 0x21, Tee = 0x22, GlobalGet = 0x23, Load = 0x28, Load64 = 0x29, Load8U = 0x2d, Load16U = 0x2f,
     Store = 0x36, Store8 = 0x3a, Store16 = 0x3b, Const = 0x41,
-    Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtS = 0x48, LtU = 0x49, GtS = 0x4a, GtU = 0x4b, LeS = 0x4c, LeU = 0x4d, GeU = 0x4f, Eqz64 = 0x50,
+    Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtS = 0x48, LtU = 0x49, GtS = 0x4a, GtU = 0x4b, LeS = 0x4c, LeU = 0x4d, GeS = 0x4e, GeU = 0x4f, Eqz64 = 0x50,
     Clz = 0x67, Add = 0x6a, Sub = 0x6b, Mul = 0x6c, And = 0x71, Or = 0x72, Xor = 0x73,
     Shl = 0x74, ShrS = 0x75, ShrU = 0x76, RotR = 0x78,
     Add64 = 0x7c, Sub64 = 0x7d, Mul64 = 0x7e, Or64 = 0x84, Shl64 = 0x86, ShrU64 = 0x88, ShrS64 = 0x87, Wrap = 0xa7, ExtendU = 0xad,
@@ -313,9 +313,9 @@ public:
     }
     template <typename Value>
     void write_psr_field(Bytes &c, uint32_t bits, const Value &value) const {
-        // Modeled T/E/IT updates and the sticky Q flag use this operation.
-        // NZCV have their own representation; full CPSR/GE writers remain
-        // unsupported IR.
+        // Modeled T/E/IT updates, the sticky Q flag and GE writes use this
+        // operation. NZCV have their own representation; full CPSR writers
+        // remain unsupported IR.
         if (options.promote_flags) {
             b_get(c, kOtherPsr); b_imm(c, ~bits); b_op(c, And);
             value(); b_op(c, Or); b_set(c, kOtherPsr);
@@ -1609,6 +1609,220 @@ private:
         for (unsigned i = words; i < 4; ++i) { imm(0); set(next_local + i); }
         return ok;
     }
+    // Result words [0, words) from `bits`-wide lanes (bits <= 32) that
+    // lane(i) pushes, possibly with garbage above the lane width; the
+    // remaining words are zero. The partial word stays on the Wasm stack, so
+    // lane() may only use this instruction's scratch words (+4..+9).
+    template <typename Lane>
+    void pack_lanes(unsigned bits, unsigned words, const Lane &lane) {
+        for (unsigned word = 0; word < 4; ++word) {
+            if (word >= words) { imm(0); set(next_local + word); continue; }
+            for (unsigned shift = 0; shift < 32; shift += bits) {
+                lane((word * 32 + shift) / bits);
+                if (bits < 32) mask((1u << bits) - 1);
+                if (shift) { imm(shift); op(Shl); op(Or); }
+            }
+            set(next_local + word);
+        }
+    }
+    // Lane `index` of a vector of `bits`-wide lanes (bits <= 32), sign- or
+    // zero-extended to i32.
+    void vector_lane(const Value &source, unsigned bits, unsigned index, bool is_signed) {
+        vector_element_word(source, bits, index);
+        if (is_signed && bits < 32) { imm(32 - bits); op(Shl); imm(32 - bits); op(ShrS); }
+    }
+    // Lane semantics below follow Dynarmic's x64 emitters in
+    // backend/x64/emit_x64_vector.cpp (the IR reference, including the
+    // lower-64-bit operand shapes of the *Lower operations).
+    // VPADD: x = a[63:0] then b[63:0]; result lane i = x[2i] + x[2i+1] in
+    // the low 64 bits, upper 64 bits zero.
+    bool vector_paired_add_lower(const Inst &inst, unsigned bits) {
+        const unsigned per_operand = 64 / bits;
+        const auto x = [&](unsigned i) {
+            vector_element_word(inst.GetArg(i < per_operand ? 0 : 1), bits, i % per_operand);
+        };
+        pack_lanes(bits, 2, [&](unsigned i) { x(2 * i); x(2 * i + 1); op(Add); });
+        return ok;
+    }
+    // VZIP: lane 2i = a[base + i], lane 2i + 1 = b[base + i], where base
+    // selects the low (Lower) or high (Upper) half of each operand.
+    bool vector_interleave(const Inst &inst, unsigned bits, bool upper) {
+        const unsigned base = upper ? 64 / bits : 0;
+        if (bits == 64) {
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(word / 2), 2 * base + word % 2);
+                set(next_local + word);
+            }
+            return ok;
+        }
+        pack_lanes(bits, 4, [&](unsigned j) { vector_element_word(inst.GetArg(j % 2), bits, base + j / 2); });
+        return ok;
+    }
+    // VUZP and VPMIN/VPMAX: the even (or odd) lanes of a, then those of b.
+    // The Lower forms read only a[63:0] and b[63:0] and zero the upper half.
+    bool vector_deinterleave(const Inst &inst, unsigned bits, bool odd, bool lower) {
+        const unsigned per_operand = (lower ? 32 : 64) / bits; // selected lanes per operand
+        pack_lanes(bits, lower ? 2 : 4, [&](unsigned i) {
+            vector_element_word(inst.GetArg(i / per_operand), bits, 2 * (i % per_operand) + (odd ? 1 : 0));
+        });
+        return ok;
+    }
+    // VPADDL: result lane i (twice the width) = a[2i] + a[2i + 1], each
+    // sign- or zero-extended first.
+    bool vector_paired_add_widen(const Inst &inst, unsigned bits, bool is_signed) {
+        if (bits == 32) {
+            const uint8_t extend = is_signed ? 0xac : ExtendU;
+            for (unsigned lane = 0; lane < 2; ++lane) {
+                value_word(inst.GetArg(0), 2 * lane); op(extend);
+                value_word(inst.GetArg(0), 2 * lane + 1); op(extend);
+                op(Add64);
+                store_i64_words(next_local + 2 * lane);
+            }
+            return ok;
+        }
+        pack_lanes(2 * bits, 4, [&](unsigned i) {
+            vector_lane(inst.GetArg(0), bits, 2 * i, is_signed);
+            vector_lane(inst.GetArg(0), bits, 2 * i + 1, is_signed);
+            op(Add);
+        });
+        return ok;
+    }
+    // VMOVL.S: the low 64 bits' lanes sign-extended to twice their width.
+    bool vector_sign_extend(const Inst &inst, unsigned bits) {
+        if (bits == 32) {
+            for (unsigned lane = 0; lane < 2; ++lane) {
+                value_word(inst.GetArg(0), lane); set(next_local + 2 * lane);
+                value_word(inst.GetArg(0), lane); imm(31); op(ShrS); set(next_local + 2 * lane + 1);
+            }
+            return ok;
+        }
+        pack_lanes(2 * bits, 4, [&](unsigned i) { vector_lane(inst.GetArg(0), bits, i, true); });
+        return ok;
+    }
+    // VHADD: floor((a + b) / 2) per lane with the full-width intermediate.
+    bool vector_halving_add(const Inst &inst, unsigned bits, bool is_signed) {
+        if (bits == 32) {
+            const uint8_t extend = is_signed ? 0xac : ExtendU; // i64.extend_i32_s/u
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(0), word); op(extend);
+                value_word(inst.GetArg(1), word); op(extend);
+                op(Add64); constant64(code, 1); op(is_signed ? ShrS64 : ShrU64); op(Wrap);
+                set(next_local + word);
+            }
+            return ok;
+        }
+        pack_lanes(bits, 4, [&](unsigned i) {
+            vector_lane(inst.GetArg(0), bits, i, is_signed);
+            vector_lane(inst.GetArg(1), bits, i, is_signed);
+            op(Add); imm(1); op(is_signed ? ShrS : ShrU);
+        });
+        return ok;
+    }
+    // VSHL.U (register): shift each lane of a by the signed low byte s of the
+    // matching lane of b: s >= 0 shifts left, s < 0 shifts right logically
+    // by -s, and |s| >= bits gives 0 (Dynarmic VShift<unsigned>).
+    bool vector_logical_vshift(const Inst &inst, unsigned bits) {
+        const auto amount = next_local + 4, lane = next_local + 5;
+        const auto signed_amount = [&](unsigned word) {
+            value_word(inst.GetArg(1), word); imm(24); op(Shl); imm(24); op(ShrS); set(amount);
+        };
+        // in range: -bits < s < bits, i.e. s + bits - 1 below 2 * bits - 1
+        const auto in_range = [&] { get(amount); imm(bits - 1); op(Add); imm(2 * bits - 1); op(LtU); };
+        if (bits == 64) {
+            for (unsigned word = 0; word < 4; word += 2) {
+                signed_amount(word);
+                const auto a64 = [&] {
+                    value_word(inst.GetArg(0), word); op(ExtendU);
+                    value_word(inst.GetArg(0), word + 1); op(ExtendU); constant64(code, 32); op(Shl64); op(Or64);
+                };
+                a64(); get(amount); op(ExtendU); op(Shl64);
+                a64(); imm(0); get(amount); op(Sub); op(ExtendU); op(ShrU64);
+                get(amount); imm(0); op(GeS); op(Select);
+                constant64(code, 0);
+                in_range(); op(Select);
+                store_i64_words(next_local + word);
+            }
+            return ok;
+        }
+        pack_lanes(bits, 4, [&](unsigned i) {
+            // The amount byte is the lowest byte of b's lane i.
+            const unsigned position = bits * i;
+            value_word(inst.GetArg(1), position / 32);
+            if (position % 32) { imm(position % 32); op(ShrU); }
+            imm(24); op(Shl); imm(24); op(ShrS); set(amount);
+            vector_element_word(inst.GetArg(0), bits, i); set(lane);
+            get(lane); get(amount); op(Shl);
+            get(lane); imm(0); get(amount); op(Sub); op(ShrU);
+            get(amount); imm(0); op(GeS); op(Select);
+            imm(0);
+            in_range(); op(Select);
+        });
+        return ok;
+    }
+    // VMULL.S/U (and VMLAL/VMLSL's product): the low 64 bits' lanes widened
+    // to twice their width and multiplied (Dynarmic's polyfill for
+    // VectorMultiply{Signed,Unsigned}Widen: extend, then VectorMultiply).
+    bool vector_multiply_widen(const Inst &inst, unsigned bits, bool is_signed) {
+        if (bits == 32) {
+            const uint8_t extend = is_signed ? 0xac : ExtendU;
+            for (unsigned lane = 0; lane < 2; ++lane) {
+                value_word(inst.GetArg(0), lane); op(extend);
+                value_word(inst.GetArg(1), lane); op(extend);
+                op(Mul64);
+                store_i64_words(next_local + 2 * lane);
+            }
+            return ok;
+        }
+        pack_lanes(2 * bits, 4, [&](unsigned i) {
+            vector_lane(inst.GetArg(0), bits, i, is_signed);
+            vector_lane(inst.GetArg(1), bits, i, is_signed);
+            op(Mul);
+        });
+        return ok;
+    }
+    // VMULL.P8: carry-less product of the low 8 byte lanes into 16-bit lanes.
+    // Two lanes per i32 word: each partial product stays below bit 15 of its
+    // half, so the halves never interact.
+    void polynomial_multiply_long8(const Inst &inst) {
+        const auto a = next_local + 4, b = next_local + 5, acc = next_local + 6;
+        const auto spread = [&](const Value &source, unsigned word, uint32_t slot) {
+            const unsigned shift = (word % 2) * 16;
+            value_word(source, word / 2); if (shift) { imm(shift); op(ShrU); } mask(0xff);
+            value_word(source, word / 2); imm(shift + 8); op(ShrU); mask(0xff); imm(16); op(Shl);
+            op(Or); set(slot);
+        };
+        for (unsigned word = 0; word < 4; ++word) {
+            spread(inst.GetArg(0), word, a);
+            spread(inst.GetArg(1), word, b);
+            imm(0); set(acc);
+            for (unsigned k = 0; k < 8; ++k) {
+                get(acc);
+                get(a); if (k) { imm(k); op(Shl); }
+                get(b); if (k) { imm(k); op(ShrU); } mask(0x00010001u); imm(0xffff); op(Mul);
+                op(And); op(Xor); set(acc);
+            }
+            get(acc); set(next_local + word);
+        }
+    }
+
+    // VMUL.P8: the low byte of each carry-less byte product, four lanes per
+    // word; the shift masks drop the bits a left shift moves into the next
+    // byte.
+    void polynomial_multiply8(const Inst &inst) {
+        const auto a = next_local + 4, b = next_local + 5, acc = next_local + 6;
+        for (unsigned word = 0; word < 4; ++word) {
+            value_word(inst.GetArg(0), word); set(a);
+            value_word(inst.GetArg(1), word); set(b);
+            imm(0); set(acc);
+            for (unsigned k = 0; k < 8; ++k) {
+                get(acc);
+                get(a); if (k) { imm(k); op(Shl); } mask(0x01010101u * ((0xffu << k) & 0xffu));
+                get(b); if (k) { imm(k); op(ShrU); } mask(0x01010101u); imm(0xff); op(Mul);
+                op(And); op(Xor); set(acc);
+            }
+            get(acc); set(next_local + word);
+        }
+    }
 
     bool valid_location(const Location &loc) const {
         return (loc.TFlag() || loc.IT().Value() == 0) && (loc.PC() & (loc.TFlag() ? 1 : 3)) == 0
@@ -1757,8 +1971,8 @@ private:
 
     // Flag-word consumer pre-scan: arithmetic/shift producers write carry
     // (+4) and overflow (+5) SSA words unconditionally, but only the
-    // GetCarry/GetOverflow/GetNZCV pseudo-ops read them (GetGE is included
-    // though its non-PackedAddU8 producer is rejected). The scan runs once
+    // GetCarry/GetOverflow/GetNZCV/GetGE pseudo-ops read them (GetGE only
+    // from PackedAddU8). The scan runs once
     // per block and marks a superset of real readers; skipping a marked
     // word never happens, and every reader marks its producer, so eliding
     // unmarked words is exact. Measured 75-79% of dynamic carry/overflow
@@ -3030,15 +3244,56 @@ private:
             }
             return ok;
         }
-        case Op::VectorHalvingAddS32:
-            // (a + b) >> 1 with the 33-bit intermediate sum (VHADD.S32).
-            for (unsigned word = 0; word < 4; ++word) {
-                value_word(inst.GetArg(0), word); op(0xac); // i64.extend_i32_s
-                value_word(inst.GetArg(1), word); op(0xac);
-                op(Add64); constant64(code, 1); op(ShrS64); op(Wrap);
-                set(next_local + word);
-            }
-            return ok;
+        case Op::VectorHalvingAddS8: return vector_halving_add(inst, 8, true);
+        case Op::VectorHalvingAddS16: return vector_halving_add(inst, 16, true);
+        case Op::VectorHalvingAddS32: return vector_halving_add(inst, 32, true);
+        case Op::VectorHalvingAddU8: return vector_halving_add(inst, 8, false);
+        case Op::VectorHalvingAddU16: return vector_halving_add(inst, 16, false);
+        case Op::VectorHalvingAddU32: return vector_halving_add(inst, 32, false);
+        case Op::VectorPairedAddLower8: return vector_paired_add_lower(inst, 8);
+        case Op::VectorPairedAddLower16: return vector_paired_add_lower(inst, 16);
+        case Op::VectorPairedAddLower32: return vector_paired_add_lower(inst, 32);
+        case Op::VectorInterleaveLower8: return vector_interleave(inst, 8, false);
+        case Op::VectorInterleaveLower16: return vector_interleave(inst, 16, false);
+        case Op::VectorInterleaveLower32: return vector_interleave(inst, 32, false);
+        case Op::VectorInterleaveLower64: return vector_interleave(inst, 64, false);
+        case Op::VectorInterleaveUpper8: return vector_interleave(inst, 8, true);
+        case Op::VectorInterleaveUpper16: return vector_interleave(inst, 16, true);
+        case Op::VectorInterleaveUpper32: return vector_interleave(inst, 32, true);
+        case Op::VectorInterleaveUpper64: return vector_interleave(inst, 64, true);
+        case Op::VectorDeinterleaveEven8: return vector_deinterleave(inst, 8, false, false);
+        case Op::VectorDeinterleaveEven16: return vector_deinterleave(inst, 16, false, false);
+        case Op::VectorDeinterleaveEven32: return vector_deinterleave(inst, 32, false, false);
+        case Op::VectorDeinterleaveOdd8: return vector_deinterleave(inst, 8, true, false);
+        case Op::VectorDeinterleaveOdd16: return vector_deinterleave(inst, 16, true, false);
+        case Op::VectorDeinterleaveOdd32: return vector_deinterleave(inst, 32, true, false);
+        case Op::VectorDeinterleaveEvenLower8: return vector_deinterleave(inst, 8, false, true);
+        case Op::VectorDeinterleaveEvenLower16: return vector_deinterleave(inst, 16, false, true);
+        case Op::VectorDeinterleaveEvenLower32: return vector_deinterleave(inst, 32, false, true);
+        case Op::VectorDeinterleaveOddLower8: return vector_deinterleave(inst, 8, true, true);
+        case Op::VectorDeinterleaveOddLower16: return vector_deinterleave(inst, 16, true, true);
+        case Op::VectorDeinterleaveOddLower32: return vector_deinterleave(inst, 32, true, true);
+        case Op::VectorPairedAddSignedWiden8: return vector_paired_add_widen(inst, 8, true);
+        case Op::VectorPairedAddSignedWiden16: return vector_paired_add_widen(inst, 16, true);
+        case Op::VectorPairedAddSignedWiden32: return vector_paired_add_widen(inst, 32, true);
+        case Op::VectorPairedAddUnsignedWiden8: return vector_paired_add_widen(inst, 8, false);
+        case Op::VectorPairedAddUnsignedWiden16: return vector_paired_add_widen(inst, 16, false);
+        case Op::VectorPairedAddUnsignedWiden32: return vector_paired_add_widen(inst, 32, false);
+        case Op::VectorSignExtend8: return vector_sign_extend(inst, 8);
+        case Op::VectorSignExtend16: return vector_sign_extend(inst, 16);
+        case Op::VectorSignExtend32: return vector_sign_extend(inst, 32);
+        case Op::VectorLogicalVShift8: return vector_logical_vshift(inst, 8);
+        case Op::VectorLogicalVShift16: return vector_logical_vshift(inst, 16);
+        case Op::VectorLogicalVShift32: return vector_logical_vshift(inst, 32);
+        case Op::VectorLogicalVShift64: return vector_logical_vshift(inst, 64);
+        case Op::VectorMultiplySignedWiden8: return vector_multiply_widen(inst, 8, true);
+        case Op::VectorMultiplySignedWiden16: return vector_multiply_widen(inst, 16, true);
+        case Op::VectorMultiplySignedWiden32: return vector_multiply_widen(inst, 32, true);
+        case Op::VectorMultiplyUnsignedWiden8: return vector_multiply_widen(inst, 8, false);
+        case Op::VectorMultiplyUnsignedWiden16: return vector_multiply_widen(inst, 16, false);
+        case Op::VectorMultiplyUnsignedWiden32: return vector_multiply_widen(inst, 32, false);
+        case Op::VectorPolynomialMultiply8: polynomial_multiply8(inst); return ok;
+        case Op::VectorPolynomialMultiplyLong8: polynomial_multiply_long8(inst); return ok;
         case Op::VectorArithmeticVShift32: {
             // VSHL.S32 (register): shift by the signed low byte of each lane
             // of b; left >= 32 gives 0, right >= 32 gives the sign fill.
@@ -3550,6 +3805,56 @@ private:
             get(0); load(offsetof(JitState, fpscr)); get(flags); op(Or); store(offsetof(JitState, fpscr));
             return ok;
         }
+        case Op::FPHalfToSingle: {
+            // VCVTB/VCVTT.F32.F16, Dynarmic FPConvert<u32, u16>: every half
+            // value is exactly representable, so the rounding operand is
+            // irrelevant. FZ16 is outside the A32 location's FPSCR mode mask
+            // (always clear): half subnormals convert exactly and never raise
+            // IDC. With AHP, exponent 31 is an ordinary binade (no NaN or
+            // infinity). Only a signaling NaN raises a flag (IOC).
+            if (!inst.GetArg(1).IsImmediate()) return false;
+            load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+            begin_if(); ret(ExitReason::Unsupported); end_if();
+            const auto h = next_local + 4, fraction = next_local + 5;
+            value_word(inst.GetArg(0)); mask(0xffff); set(h);
+            get(h); mask(0x3ff); set(fraction);
+            // Normal (and AHP exponent-31) inputs: rebias 15 -> 127.
+            get(h); mask(0x8000); imm(16); op(Shl);
+            get(h); mask(0x7fff); imm(13); op(Shl); imm(112u << 23); op(Add);
+            op(Or); set(next_local);
+            get(h); mask(0x7c00); op(Eqz);
+            begin_if();
+            get(h); mask(0x8000); imm(16); op(Shl); set(next_local); // signed zero
+            get(fraction);
+            begin_if(); // subnormal: 2^-24 * fraction, normalized
+            get(next_local);
+            imm(134); get(fraction); op(Clz); op(Sub); imm(23); op(Shl); op(Or);
+            get(fraction); get(fraction); op(Clz); imm(8); op(Sub); op(Shl); mask(0x007fffffu); op(Or);
+            set(next_local);
+            end_if();
+            end_if();
+            if (!start.FPSCR().AHP()) {
+                get(h); mask(0x7c00); imm(0x7c00); op(Eq);
+                begin_if();
+                get(h); mask(0x8000); imm(16); op(Shl); imm(0x7f800000u); op(Or); set(next_local);
+                get(fraction);
+                begin_if(); // NaN: IOC when signaling, then default or quieted payload
+                get(fraction); mask(0x200); op(Eqz);
+                begin_if();
+                get(0); load(offsetof(JitState, fpscr)); imm(1); op(Or); store(offsetof(JitState, fpscr));
+                end_if();
+                if (start.FPSCR().DN()) {
+                    imm(0x7fc00000u);
+                } else {
+                    get(h); mask(0x8000); imm(16); op(Shl); imm(0x7fc00000u); op(Or);
+                    get(fraction); mask(0x1ff); imm(13); op(Shl); op(Or);
+                }
+                set(next_local);
+                end_if();
+                end_if();
+            }
+            return ok;
+        }
         case Op::FPDoubleToSingle: {
             // Narrowing conversion. Only round-to-nearest is emitted (wasm's
             // f32.demote_f64); every flag below is derived from the exact
@@ -3739,6 +4044,33 @@ private:
         case Op::PackedSaturatedSubU16: return packed_saturating(inst, 16, false, false);
         case Op::PackedSaturatedAddS16: return packed_saturating(inst, 16, true, true);
         case Op::PackedSaturatedSubS16: return packed_saturating(inst, 16, true, false);
+        case Op::PackedAddU8: {
+            // UADD8: bytewise sums modulo 256. GetGEFromOp reads +4 in
+            // Dynarmic's expanded form (EmitPackedAddU8): 0xff in each byte
+            // whose sum carried out. That carry is the majority of the two
+            // bit-7 inputs and the carry into bit 7.
+            const auto a = next_local + 5, b = next_local + 6;
+            arg(0); set(a); arg(1); set(b);
+            get(a); mask(0x7f7f7f7fu); get(b); mask(0x7f7f7f7fu); op(Add);
+            get(a); get(b); op(Xor); mask(0x80808080u); op(Xor); set(next_local);
+            if (carry_needed.count(&inst) != 0) {
+                get(a); get(b); op(And);
+                get(a); get(b); op(Or); get(next_local); imm(UINT32_MAX); op(Xor); op(And);
+                op(Or); mask(0x80808080u); imm(7); op(ShrU); imm(0xff); op(Mul);
+                set(next_local + 4);
+            }
+            return ok;
+        }
+        case Op::A32SetGEFlags:
+            // CPSR.GE[i] is bit 8i+7 of the expanded byte-mask form
+            // (Dynarmic A32JitState::Cpsr); producers emit 0x00/0xff bytes.
+            state.write_psr_field(code, 0x000f0000u, [&] {
+                arg(0); imm(9); op(Shl); mask(0x00010000u);
+                arg(0); imm(2); op(Shl); mask(0x00020000u); op(Or);
+                arg(0); imm(5); op(ShrU); mask(0x00040000u); op(Or);
+                arg(0); imm(12); op(ShrU); mask(0x00080000u); op(Or);
+            });
+            return ok;
         case Op::ByteReverseWord:
             value_word(inst.GetArg(0)); set(next_local + 4);
             byte_reverse_word_from_local(next_local + 4, next_local);

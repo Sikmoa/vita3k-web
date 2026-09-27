@@ -97,6 +97,7 @@ void equal_context(const CPUContext &a, const CPUContext &b) {
 
 #include "wasmjit_vector_tests.inc"
 #include "wasmjit_vector_integer_tests.inc"
+#include "wasmjit_vector_lane_tests.inc"
 #include "wasmjit_vector_compare_tests.inc"
 #include "wasmjit_vectorfp_compare_tests.inc"
 #include "wasmjit_byte_reverse_tests.inc"
@@ -1952,6 +1953,8 @@ int main() {
     vector_tests::guest_narrow_reverse(mem);
     vector_integer_tests::ir_arithmetic();
     vector_integer_tests::guest_arithmetic(mem);
+    vector_lane_tests::ir_lanes();
+    vector_lane_tests::guest_lanes(mem);
     vector_compare_tests::ir_comparisons();
     vector_compare_tests::guest_comparisons(mem);
     vectorfp_compare_tests::run(mem);
@@ -1959,6 +1962,8 @@ int main() {
     byte_reverse_tests::guest_reversal(mem);
     packed_saturate_tests::ir_saturation();
     packed_saturate_tests::guest_saturation(mem);
+    packed_saturate_tests::ir_unsigned_add8();
+    packed_saturate_tests::guest_unsigned_add8(mem);
     fpvector_abs_tests::ir_abs();
     fpvector_abs_tests::guest_abs(mem);
     exclusive_tests::guest_exclusive(mem);
@@ -1969,6 +1974,8 @@ int main() {
     f64_tests::guest_float_to_fixed(mem);
     f64_tests::negate_and_absolute();
     f64_tests::single_to_double();
+    f64_tests::half_to_single();
+    f64_tests::guest_half_to_single(mem);
     f64_tests::double_to_single();
     f64_tests::compare64();
     f64_tests::mode_guards();

@@ -79,6 +79,8 @@ add_library(vita3k_dynarmic_frontend STATIC
     "${_dynarmic_src}/common/fp/op/FPRSqrtEstimate.cpp"
     "${_dynarmic_src}/common/fp/op/FPRSqrtStepFused.cpp"
     "${_dynarmic_src}/common/fp/op/FPToFixed.cpp"
+    # Oracle for the emitted FPHalfToSingle lowering in the backend tests.
+    "${_dynarmic_src}/common/fp/op/FPConvert.cpp"
     "${_dynarmic_src}/common/u128.cpp"
     "${_dynarmic_src}/common/math_util.cpp"
     "${VITA_ROOT}/cpu/src/wasmjit/frontend.cpp"
