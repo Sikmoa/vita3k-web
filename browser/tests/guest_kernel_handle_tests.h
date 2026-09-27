@@ -89,6 +89,9 @@ void check_handles(EmuEnvState &env, Objects &objects, Create create, Open open,
         }
         const SceUID closed = survivor == created ? opened : created;
         REQUIRE(object->handles == 1 && !destroyed(*object) && !objects.contains(closed));
+        // The name stays registered while the object lives.
+        const SceUID again = open(env, 0, "fixture", "handle object");
+        REQUIRE(again > 0 && objects.at(again) == object && close(env, 0, "fixture", again) == 0);
         REQUIRE(close(env, 0, "fixture", closed) == unknown_id);
         REQUIRE(close(env, 0, "fixture", survivor) == 0);
         REQUIRE(destroyed(*object) && !objects.contains(survivor));
@@ -619,6 +622,30 @@ inline void test_guest_kernel_handles(EmuEnvState &env, vita3k::web::GuestThread
         REQUIRE(export_sceKernelDeleteMutex(env, owner->id, "fixture", ceiling) == 0 && owner->priority == 0xa0);
         REQUIRE(export_sceKernelDeleteMutex(env, owner->id, "fixture", relative) == 0);
         REQUIRE(export_sceKernelDeleteMutex(env, owner->id, "fixture", own) == 0);
+        // A mutex handed to a waiter whose wait has not returned yet, then
+        // deleted: the waiter loses the ceiling once, and its cancelled wait
+        // (shutdown) does not release it again.
+        opt->ceilingPriority = 0x70;
+        const SceUID handed = create(owner->id, SCE_KERNEL_MUTEX_ATTR_CEILING, 1, opt);
+        REQUIRE(handed > 0 && owner->priority == 0x70);
+        const Address code = alloc(env.mem, 0x1000, "ceiling waiter code");
+        guest_sync_delete::build_call(env.mem, code, guest_sync_delete::kLockMutex, { uint32_t(handed), 1, 0, 0, 0 }, data + 0xb00);
+        auto waiter = kernel.create_thread(env.mem, "ceiling waiter", Ptr<const void>(code), SCE_KERNEL_DEFAULT_PRIORITY_USER,
+            SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
+        const int waiter_priority = waiter->priority;
+        REQUIRE(waiter_priority > 0x70 && waiter->start(0, Ptr<void>{}, false) == 0);
+        const auto limit = vita3k::web::GuestThreadRuntime::now_us() + 2000000;
+        while (waiter->status != ThreadStatus::wait) {
+            REQUIRE(runtime.resume(64).failed == 0);
+            REQUIRE(vita3k::web::GuestThreadRuntime::now_us() < limit);
+        }
+        REQUIRE(mutex_unlock(kernel, "fixture", owner->id, handed, 1, SyncWeight::Heavy) == 0);
+        REQUIRE(kernel.mutexes.at(handed)->owner == waiter && waiter->priority == 0x70 && owner->priority == 0xa0);
+        REQUIRE(export_sceKernelDeleteMutex(env, owner->id, "fixture", handed) == 0 && waiter->priority == waiter_priority);
+        REQUIRE(runtime.shutdown());
+        REQUIRE(waiter->priority == waiter_priority);
+        REQUIRE(runtime.attach(env));
+        free(env.mem, code);
         owner->exit_delete(false);
         std::puts("Priority-ceiling mutexes passed");
     }

@@ -112,12 +112,14 @@ enum class NameLookup {
     Class,
 };
 
-// Only objects created OPENABLE register their name. A deleted timer keeps
-// its opened handles but not its name.
+// Only objects created OPENABLE register their name, for as long as the
+// object lives, whichever of its handles remain. A deleted timer keeps its
+// opened handles but not its name.
 template <typename T>
 static void add_named(const std::map<SceUID, std::shared_ptr<T>> &objects, const char *name, std::vector<std::pair<SceUID, const SyncPrimitive *>> &found) {
     for (const auto &[uid, object] : objects) {
-        if (uid == object->uid && (object->attr & SCE_KERNEL_ATTR_OPENABLE) && !object->deleted
+        const bool counted = std::any_of(found.begin(), found.end(), [&](const auto &entry) { return entry.second == object.get(); });
+        if (!counted && (object->attr & SCE_KERNEL_ATTR_OPENABLE) && !object->deleted
             && strncmp(object->name, name, KERNELOBJECT_MAX_NAME_LENGTH + 1) == 0)
             found.emplace_back(uid, object.get());
     }
@@ -995,7 +997,7 @@ void mutex_inline_commit(KernelState &kernel, const ThreadStatePtr &running_thre
 // SceKernelThreadMgr 3.74: the owner of a priority-ceiling mutex runs at its
 // ceiling priority at least. The caller holds the mutex's lock.
 static void set_mutex_owner(Mutex &mutex, ThreadStatePtr owner) {
-    if ((mutex.attr & SCE_KERNEL_MUTEX_ATTR_CEILING) && mutex.owner != owner) {
+    if (mutex.ceiling_priority && mutex.owner != owner) {
         if (mutex.owner)
             mutex.owner->remove_ceiling(mutex.ceiling_priority);
         if (owner)
@@ -1309,9 +1311,11 @@ int mutex_close(KernelState &kernel, const char *export_name, SceUID thread_id, 
         // Closed first: condvar_create cannot associate a new condition now.
         const std::lock_guard<std::mutex> mutex_lock(mutex->mutex);
         mutex->deleted = true;
-        // The owner no longer holds the ceiling.
-        if ((mutex->attr & SCE_KERNEL_MUTEX_ATTR_CEILING) && mutex->owner)
+        // The owner no longer holds the ceiling; an ownership change still
+        // under way (a waiter the mutex was handed to) must not drop it again.
+        if (mutex->ceiling_priority && mutex->owner)
             mutex->owner->remove_ceiling(mutex->ceiling_priority);
+        mutex->ceiling_priority = 0;
     }
     std::vector<CondvarPtr> condvars;
     {

@@ -545,7 +545,10 @@ void ThreadState::add_ceiling(int ceiling) {
 void ThreadState::remove_ceiling(int ceiling) {
     const std::lock_guard<std::mutex> lock(priority_mutex);
     const auto it = ceilings.find(ceiling);
-    assert(it != ceilings.end());
+    if (it == ceilings.end()) {
+        LOG_CRITICAL("Thread {} ({}) releases ceiling {} it does not hold", name, id, ceiling);
+        std::abort();
+    }
     ceilings.erase(it);
     update_priority();
 }

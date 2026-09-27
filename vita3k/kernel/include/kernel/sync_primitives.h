@@ -146,7 +146,8 @@ struct Mutex : SyncPrimitive {
     ThreadStatePtr owner;
     WaitingThreadQueuePtr waiting_threads;
     Ptr<SceKernelLwMutexWork> workarea;
-    // With SCE_KERNEL_MUTEX_ATTR_CEILING: the priority the owner runs at least.
+    // With SCE_KERNEL_MUTEX_ATTR_CEILING: the priority the owner runs at least;
+    // 0 otherwise (lightweight mutexes have no ceiling).
     int ceiling_priority = 0;
     // Overlapping cooperative HLE operations, including parked continuations.
     // Inline access is disabled until every operation has completed.

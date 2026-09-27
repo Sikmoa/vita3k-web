@@ -204,6 +204,15 @@ void KernelState::request_process_exit(int res, std::optional<AppLaunchRequest> 
         process_exit_callback(res, std::move(relaunch));
 }
 
+void KernelState::wake_timer_waiters() {
+    // Under each timer's lock: a waiter checks its status and sleeps under it,
+    // so the notification cannot fall between the two.
+    for (auto &[_, timer] : timers) {
+        const std::lock_guard<std::mutex> timer_lock(timer->mutex);
+        timer->condvar.notify_all();
+    }
+}
+
 void KernelState::process_exit() {
     if (execution_host) {
         execution_host->process_exit();
@@ -211,10 +220,9 @@ void KernelState::process_exit() {
     }
     {
         std::lock_guard<std::mutex> lock(mutex);
-        for (auto &[_, timer] : timers)
-            timer->condvar.notify_all();
         for (auto &[_, thread] : threads)
             thread->exit_delete(false);
+        wake_timer_waiters();
     }
 
     std::unique_lock<std::mutex> lock(mutex);

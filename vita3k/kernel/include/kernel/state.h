@@ -282,6 +282,9 @@ struct KernelState {
 
     // Kill all guest threads and block until they have exited. Must only be called from a host thread.
     void process_exit();
+    // Wakes the threads waiting on timers to see that they were deleted.
+    // Called with the kernel mutex held.
+    void wake_timer_waiters();
     std::function<void(int, std::optional<AppLaunchRequest>)> process_exit_callback;
     // Request process exit. Safe to call from a guest thread. Returns immediately.
     // The registered process_exit_callback is invoked to notify the host layer.

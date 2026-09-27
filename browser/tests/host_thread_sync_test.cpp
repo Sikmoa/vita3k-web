@@ -126,5 +126,23 @@ int main() {
         REQUIRE(bounded([&] { return timer_close(kernel, "fixture", deleter->id, timer, HandleClose::Delete); }) == 0);
     }
     std::puts("Timer expiry with two waiters passed");
+
+    // Process exit deletes a waiting thread and then wakes the timer's
+    // waiters, which see it and give up with WAIT_CANCEL.
+    {
+        const SceUID timer = timer_create(kernel, env->mem, "fixture", "exit timer", deleter->id, 0);
+        const auto exiting = make_thread(*env);
+        Waiter waiter;
+        wait_on(*env, exiting, timer, SCE_KERNEL_EVENT_TIMER, waiter);
+        exiting->exit_delete(false);
+        {
+            const std::lock_guard<std::mutex> lock(kernel.mutex);
+            kernel.wake_timer_waiters();
+        }
+        REQUIRE(waiter.result.wait_for(2s) == std::future_status::ready);
+        REQUIRE(waiter.result.get() == SCE_KERNEL_ERROR_WAIT_CANCEL);
+        REQUIRE(bounded([&] { return timer_close(kernel, "fixture", deleter->id, timer, HandleClose::Delete); }) == 0);
+    }
+    std::puts("Process exit with a timer waiter passed");
     return 0;
 }
