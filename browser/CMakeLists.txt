@@ -128,14 +128,8 @@ add_executable(vita3k_web
     src/guest.cpp
 )
 
-add_dependencies(vita3k_web vita3k_guest_probe_elf)
 target_compile_definitions(vita3k_web PRIVATE VITA3K_WEB=1)
 target_link_libraries(vita3k_web PRIVATE vita3k_web_runtime_hle)
-# The POST_BUILD staging step copies the fixture eboot into dist, so the
-# fixture must be built before the browser module links/stages.
-if(TARGET vita3k_vita_display_fixture)
-    add_dependencies(vita3k_web vita3k_vita_display_fixture)
-endif()
 
 add_executable(vita3k_web_memory_tests
     src/memory.cpp
@@ -192,13 +186,41 @@ set_target_properties(vita3k_web PROPERTIES
     SUFFIX ".js"
 )
 
-# Staging of non-link inputs is driven by output-dependent custom commands,
-# not a POST_BUILD step: a POST_BUILD only runs when the target relinks, so
-# edits to the web assets or the fixture (not link inputs) would never reach
-# dist. The module's own js/wasm outputs are staged by POST_BUILD below,
-# which runs exactly when those files change.
-#
-# Every file in web/ is deployed; check_web_imports.cmake fails the stage when
+# Deployable web root, built by vita3k_web_dist. Every file in it is the
+# output of a rule that depends on its source (web asset, module link,
+# fixture), so a deleted or stale dist is rebuilt by the next build.
+set(VITA3K_WEB_DIST "${CMAKE_BINARY_DIR}/dist")
+set(_dist_outputs "")
+# vita3k_web_dist_copy(<path in dist> <source file>)
+function(vita3k_web_dist_copy destination source)
+    set(_dst "${VITA3K_WEB_DIST}/${destination}")
+    get_filename_component(_dir "${_dst}" DIRECTORY)
+    add_custom_command(
+        OUTPUT "${_dst}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_dir}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${source}" "${_dst}"
+        DEPENDS "${source}"
+        COMMENT "Staging dist/${destination}"
+        VERBATIM
+    )
+    set(_dist_outputs ${_dist_outputs} "${_dst}" PARENT_SCOPE)
+endfunction()
+# vita3k_web_dist_module(<module target>): its .js and the .wasm linked with it.
+function(vita3k_web_dist_module target)
+    set(_dir "${VITA3K_WEB_DIST}")
+    add_custom_command(
+        OUTPUT "${_dir}/${target}.js" "${_dir}/${target}.wasm"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_dir}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE_DIR:${target}>/${target}.js" "$<TARGET_FILE_DIR:${target}>/${target}.wasm" "${_dir}"
+        DEPENDS ${target}
+        COMMENT "Staging ${target} into dist"
+        VERBATIM
+    )
+    set(_dist_outputs ${_dist_outputs} "${_dir}/${target}.js" "${_dir}/${target}.wasm" PARENT_SCOPE)
+endfunction()
+
+# Every file in web/ is deployed; check_web_imports.cmake fails the build when
 # a script loaded by relative URL (from web/ or an EM_JS import) is not there.
 file(GLOB _web_assets LIST_DIRECTORIES false CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/web/*")
 file(GLOB _em_js_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
@@ -218,51 +240,22 @@ add_custom_command(
     COMMENT "Checking that web/ holds every script the browser loads"
     VERBATIM
 )
-set(_staged_assets "${VITA3K_GUEST_PROBE_ELF}|${CMAKE_BINARY_DIR}/dist/guest.elf")
+list(APPEND _dist_outputs "${_web_imports_stamp}")
 foreach(_asset IN LISTS _web_assets)
     get_filename_component(_name "${_asset}" NAME)
-    list(APPEND _staged_assets "${_asset}|${CMAKE_BINARY_DIR}/dist/${_name}")
+    vita3k_web_dist_copy("${_name}" "${_asset}")
 endforeach()
-set(_stage_outputs "${_web_imports_stamp}")
-foreach(_pair IN LISTS _staged_assets)
-    string(REGEX REPLACE "^([^|]+)\\|(.+)$" "\\1;\\2" _paths "${_pair}")
-    list(GET _paths 0 _src)
-    list(GET _paths 1 _dst)
-    add_custom_command(
-        OUTPUT "${_dst}"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dist"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_src}" "${_dst}"
-        DEPENDS "${_src}"
-        COMMENT "Staging ${_dst}"
-    )
-    list(APPEND _stage_outputs "${_dst}")
-endforeach()
-add_custom_target(vita3k_web_dist_stage DEPENDS ${_stage_outputs})
-add_custom_command(TARGET vita3k_web POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dist"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_BINARY_DIR}/vita3k_web.js"
-        "${CMAKE_BINARY_DIR}/dist/vita3k_web.js"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_BINARY_DIR}/vita3k_web.wasm"
-        "${CMAKE_BINARY_DIR}/dist/vita3k_web.wasm"
-)
-
-# The fixture eboot is staged by its own output-dependent rule: a POST_BUILD
-# step on vita3k_web would not re-run when only the fixture changes (the
-# fixture is not a link input), so a rebuilt fixture would never reach dist.
-add_custom_command(
-    OUTPUT "${CMAKE_BINARY_DIR}/dist/display-eboot.bin"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_BINARY_DIR}/tests/vita_display_fixture/eboot.bin"
-        "${CMAKE_BINARY_DIR}/dist/display-eboot.bin"
-    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/tests/vita_display_fixture/eboot.bin"
-    COMMENT "Staging genuine Vita display fixture"
-)
-add_custom_target(vita3k_web_fixture_stage
-    DEPENDS "${CMAKE_BINARY_DIR}/dist/display-eboot.bin"
-)
-add_dependencies(vita3k_web_dist_stage vita3k_web_fixture_stage)
-add_dependencies(vita3k_web vita3k_web_dist_stage)
+vita3k_web_dist_copy(guest.elf "${VITA3K_GUEST_PROBE_ELF}")
+if(TARGET vita3k_vita_display_fixture)
+    vita3k_web_dist_copy(display-eboot.bin "${CMAKE_CURRENT_BINARY_DIR}/tests/vita_display_fixture/eboot.bin")
+endif()
+vita3k_web_dist_module(vita3k_web)
+if(TARGET vita3k_web_jit)
+    vita3k_web_dist_module(vita3k_web_jit)
+endif()
+add_custom_target(vita3k_web_dist ALL DEPENDS ${_dist_outputs})
+if(TARGET vita3k_vita_display_fixture)
+    add_dependencies(vita3k_web_dist vita3k_vita_display_fixture)
+endif()
 
 vita3k_web_finalize_memory64("${CMAKE_CURRENT_SOURCE_DIR}")

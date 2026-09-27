@@ -177,10 +177,12 @@ All three exit 0 on success. Playwright lives under `build/playwright`.
 ## Manual browser testing (the animated display fixture)
 
 ```sh
-cmake --build build/web --target vita3k_web_jit -j 8      # rebuild the JIT module
-cmake --build build/web --target vita3k_web_dist_stage    # restage build/web/dist
+cmake --build build/web --target vita3k_web_dist    # modules + web files -> build/web/dist
 cd build/web/dist && python3 -m http.server 8080
 ```
+
+`vita3k_web_dist` (also part of the default build) produces the complete
+deployable directory; serve it as-is.
 
 Open <http://localhost:8080/display.html?backend=jit> for the JIT and
 `display.html` (no query) for the interpreter. No COOP/COEP headers needed (no
