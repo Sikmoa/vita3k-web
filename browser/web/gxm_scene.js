@@ -27,7 +27,7 @@ let layouts, sceneBuffer, sceneBufferSize = 0, bufferGeneration = 0;
 let canvas, canvasContext, canvasFormat, blitPipeline, blitSampler;
 let presentGeneration = 0;
 const stagingBuffers = []; // per-submission fill sources, destroyed after submit
-const stats = { scenes: 0, draws: 0, pipelines: 0, textureUploads: 0, presents: 0, bindGroups: 0, submitMs: 0 };
+const stats = { scenes: 0, draws: 0, pipelines: 0, textureUploads: 0, presents: 0, bindGroups: 0, submitMs: 0, sceneBytes: 0 };
 let log = message => console.warn(message);
 let statsReportedAt = 0;
 const warned = new Set();
@@ -319,6 +319,7 @@ export function submitScene(words, data) {
 function encodeScene(words, data) {
   ensureSceneBuffer(data.byteLength + 4096);
   device.queue.writeBuffer(sceneBuffer, 0, data);
+  stats.sceneBytes += data.byteLength;
   const floats = new Float32Array(words.buffer, words.byteOffset, words.length);
   let cursor = 0;
   const word = () => words[cursor++];

@@ -425,15 +425,45 @@ struct Writer {
     // Commands that must run before the open pass begins (target region copies).
     void insert_before_pass(std::initializer_list<uint32_t> command) {
         words.insert(words.begin() + pass_begin_word, command);
+        for (auto &[site, base] : stream_sites)
+            if (site >= pass_begin_word)
+                site += static_cast<uint32_t>(command.size());
         pass_begin_word += command.size();
         pass_snapshot_word += command.size();
     }
     uint32_t draws = 0;
+    // Vertex streams: Vita3K sizes a stream from its base to the draw's
+    // largest index, and a frame's draws index one growing buffer, so copying
+    // per draw re-sends the same prefix many times. Draws of this submission
+    // that read the same base share one copy of the largest range, taken when
+    // the submission is sent (the guest is stopped until then) or before the
+    // bridge itself writes guest memory.
+    struct StreamSpan { uint32_t size = 0, offset = 0; };
+    std::unordered_map<Address, StreamSpan> streams;
+    std::vector<std::pair<uint32_t, Address>> stream_sites; // offset word, base
     void reset() {
         words.assign(1, kMagic);
         data.clear();
         pass_open = false;
         draws = 0;
+        streams.clear();
+        stream_sites.clear();
+    }
+    // Emits the scene-data offset of guest bytes [base, base + size) as a
+    // word filled in by copy_streams().
+    void stream(Address base, uint32_t size) {
+        auto &span = streams[base];
+        span.size = std::max(span.size, size);
+        stream_sites.emplace_back(static_cast<uint32_t>(words.size()), base);
+        words.push_back(0);
+    }
+    void copy_streams(MemState &mem) {
+        for (auto &[base, span] : streams)
+            span.offset = bytes(Ptr<const uint8_t>(base).get(mem), span.size, 4);
+        for (const auto &[site, base] : stream_sites)
+            words[site] = streams.find(base)->second.offset;
+        streams.clear();
+        stream_sites.clear();
     }
     // noexcept: allocation failure is fatal anyway, and callers with cleanups
     // would otherwise reach every append through a JS invoke wrapper.
@@ -1072,7 +1102,8 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
 
     // Vertex streams and attributes.
     const size_t stream_count = vp->streams.size();
-    std::array<uint32_t, SCE_GXM_MAX_VERTEX_STREAMS> stream_offset{}, stream_size{};
+    std::array<Address, SCE_GXM_MAX_VERTEX_STREAMS> stream_base{};
+    std::array<uint32_t, SCE_GXM_MAX_VERTEX_STREAMS> stream_size{};
     for (size_t i = 0; i < stream_count; ++i) {
         const auto &stream = ctx.record.vertex_streams[i];
         if (gxm::is_stream_instancing(static_cast<SceGxmIndexSource>(vp->streams[i].indexSource)))
@@ -1080,7 +1111,7 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
         if (!stream.data || !stream.size || stream.size > (16u << 20))
             return skip_draw("vertex stream range");
         require_guest(mem, stream.data.address(), stream.size);
-        stream_offset[i] = out.bytes(stream.data.get(mem), stream.size, 4);
+        stream_base[i] = stream.data.address();
         stream_size[i] = static_cast<uint32_t>(stream.size);
     }
     struct Attribute { uint32_t location, stream, offset, format, components; };
@@ -1182,7 +1213,7 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
     out.word(uint32_t(stream_count));
     for (size_t i = 0; i < stream_count; ++i) {
         out.word(vp->streams[i].stride);
-        out.word(stream_offset[i]);
+        out.stream(stream_base[i], stream_size[i]);
         out.word(stream_size[i]);
     }
     out.word(uint32_t(attributes.size()));
@@ -1208,8 +1239,9 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
 }
 
 // False when gxm_scene.js rejected the stream (its error is logged).
-static bool submit_scene(scene::Writer &out) {
+static bool submit_scene(scene::Writer &out, MemState &mem) {
     end_pass(out);
+    out.copy_streams(mem);
     int result = 0;
     if (out.words.size() > 1) {
         const double started = emscripten_get_now();
@@ -1230,6 +1262,7 @@ static int transfer_fill(MemState &mem, uint32_t color, const SceGxmTransferImag
         || start > UINT32_MAX || end > uint64_t(UINT32_MAX) + 1
         || !is_valid_addr_range(mem, static_cast<Address>(start), end))
         return -1;
+    out.copy_streams(mem); // pending draws read guest memory from before the fill
     auto *base = Ptr<uint8_t>(static_cast<Address>(start)).get(mem);
     for (uint32_t y = 0; y < d.height; ++y) {
         auto *row = reinterpret_cast<uint32_t *>(base + size_t(y) * d.stride);
@@ -1266,7 +1299,7 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
     // statuses) is published only once the scene stream was accepted.
     std::vector<std::function<void()>> completions;
     const auto publish = [&] {
-        if (!submit_scene(out))
+        if (!submit_scene(out, mem))
             unsupported("scene submission failed (see browser log)");
         for (const auto &complete : completions)
             complete();
