@@ -4053,7 +4053,23 @@ private:
             // instructions before it have executed. Ticks follow the memory
             // fault contract (completed store segments only).
             if (!inst.GetArg(0).IsImmediate() || inst.GetArg(0).GetType() != Type::U32) return false;
-            get(0); imm(inst.GetArg(0).GetU32()); store(offsetof(JitState, fault_pc));
+            {
+                // The preceding UpdateUpperLocationDescriptor published the
+                // mode AFTER the raising instruction (IT advanced); the host
+                // resumes at the raising instruction, so publish its own mode.
+                // It is the block's last instruction and IT advances once per
+                // instruction; an NV-raised block does not advance at all.
+                const uint32_t raise_pc = inst.GetArg(0).GetU32();
+                Location raising = finish;
+                if (finish.PC() != raise_pc) {
+                    if (block.CycleCount() == 0) return false;
+                    raising = start;
+                    for (uint64_t i = 1; i < block.CycleCount(); ++i) raising = raising.AdvanceIT();
+                    raising = raising.SetPC(raise_pc);
+                }
+                upper_location(raising);
+                get(0); imm(raise_pc); store(offsetof(JitState, fault_pc));
+            }
             if (!region) store_constant(offsetof(JitState, executed), 0);
             else if (completed_store_ticks) add_ticks(completed_store_ticks);
             ret(ExitReason::Exception);

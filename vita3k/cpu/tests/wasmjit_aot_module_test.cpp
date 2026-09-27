@@ -53,10 +53,13 @@ constexpr uint8_t kProgram[] = {
     0x70, 0x47, 0x00, 0xdf, 0x00, 0x00, 0x01, 0x81,
 };
 constexpr uint32_t kDone = kCode + 0x62;
-// A second AOT range: movs r0,#7; udf #0 (Thumb). The UDF block translates
-// (A32ExceptionRaised) and must fail at run time exactly like the lazy JIT.
+// A second AOT range (Thumb): movs r0,#7; itttt ne; movne r1,#1;
+// movne r2,#2; udfne #0; nopne. The UDF block translates
+// (A32ExceptionRaised) and must fail at run time exactly like the lazy JIT,
+// with the UDF's own ITSTATE (0x1c) published.
 constexpr uint32_t kTrap = 0x81050000;
-constexpr uint8_t kTrapProgram[] = {0x07, 0x20, 0x00, 0xde};
+constexpr uint8_t kTrapProgram[] = {0x07, 0x20, 0x1f, 0xbf, 0x01, 0x21, 0x02, 0x22, 0x00, 0xde, 0x00, 0xbf};
+constexpr uint32_t kTrapUdf = kTrap + 8, kTrapCpsr = 0x30 | (0x1cu << 8);
 // classify(7) + 3 * 49 + sum(i*i + (i > 50)) for i < 100
 constexpr uint32_t kResult = 26 + 147 + 328350 + 49;
 
@@ -329,8 +332,9 @@ void write_epochs_recorded(bool aot) {
 // MOVS before it executed.
 struct TrapOutcome {
     std::string error;
-    uint32_t pc = 0, r0 = 0;
+    uint32_t pc = 0, cpsr = 0, r0 = 0, r1 = 0, r2 = 0;
     size_t regions = 0;
+    bool operator==(const TrapOutcome &) const = default;
 };
 TrapOutcome run_trap() {
     Fixture fixture;
@@ -342,7 +346,12 @@ TrapOutcome run_trap() {
     cpu.set_pc(kTrap | 1);
     cpu.set_cpsr(0x30);
     CHECK(cpu.run() < 0);
-    return {cpu.get_last_error(), cpu.get_pc(), cpu.get_reg(0), cpu.regions_formed()};
+    const TrapOutcome first{cpu.get_last_error(), cpu.get_pc(), cpu.get_cpsr(), cpu.get_reg(0),
+        cpu.get_reg(1), cpu.get_reg(2), cpu.regions_formed()};
+    CHECK(cpu.run() < 0); // a retry raises again at the same state
+    CHECK((TrapOutcome{cpu.get_last_error(), cpu.get_pc(), cpu.get_cpsr(), cpu.get_reg(0),
+        cpu.get_reg(1), cpu.get_reg(2), first.regions}) == first);
+    return first;
 }
 } // namespace
 
@@ -355,11 +364,13 @@ int main() {
     write_epochs_recorded(false);
     const TrapOutcome lazy_trap = run_trap();
     CHECK(lazy_trap.error == "unsupported Dynarmic IR or terminal (no fallback)");
-    CHECK(lazy_trap.pc == kTrap + 2 && lazy_trap.r0 == 7 && lazy_trap.regions != 0);
+    CHECK(lazy_trap.pc == kTrapUdf && lazy_trap.cpsr == kTrapCpsr && lazy_trap.regions != 0);
+    CHECK(lazy_trap.r0 == 7 && lazy_trap.r1 == 1 && lazy_trap.r2 == 2);
     build_and_load();
-    const TrapOutcome aot_trap = run_trap();
-    CHECK(aot_trap.error == lazy_trap.error && aot_trap.pc == lazy_trap.pc && aot_trap.r0 == lazy_trap.r0);
+    TrapOutcome aot_trap = run_trap();
     CHECK(aot_trap.regions == 0); // the AOT function raised, not a lazy region
+    aot_trap.regions = lazy_trap.regions;
+    CHECK(aot_trap == lazy_trap);
     check_same(oracle, run_aot(0));
     for (const uint64_t slice : {1u, 2u, 3u, 7u, 50u, 1000u})
         check_same(oracle, run_aot(slice));

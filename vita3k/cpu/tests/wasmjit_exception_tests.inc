@@ -121,6 +121,42 @@ void guest(MemState &mem) {
         CHECK(jit.get_pc() == code + 8);
         CHECK(jit.instructions_executed() - before == 2);
     }
+    // Inside an IT block the host must see the raising instruction's own
+    // ITSTATE, not the advanced one, so a retry raises again instead of
+    // skipping the UDF under a different condition. CPSR ITSTATE bits:
+    // IT[1:0] at 26:25, IT[7:2] at 15:10.
+    struct ItCase { const char *name; std::vector<uint32_t> words; uint32_t flags, offset, it_bits, r0, r1; };
+    const ItCase it_cases[] = {
+        // ite ne; udfne; nopeq; svc  (Z=0: UDF in the then slot, IT=0x14)
+        {"ITE then", {0xde00bf14, 0xdf00bf00}, 0x00000000, 2, 0x14u << 8, 0, 0},
+        // ite ne; nopne; udfeq; svc  (Z=1: UDF in the else slot, IT=0x08)
+        {"ITE else", {0xbf00bf14, 0xdf00de00}, 0x40000000, 4, 0x08u << 8, 0, 0},
+        // itttt ne; movne r0,#7; movne r1,#1; udfne; nopne; svc (IT=0x1c)
+        {"ITTTT third", {0x2007bf1f, 0xde002101, 0xdf00bf00}, 0x00000000, 6, 0x1cu << 8, 7, 1},
+    };
+    for (bool regions : {false, true}) {
+        jit.set_region_mode(regions);
+        for (const auto &c : it_cases) {
+            CHECK(mem_write(mem, code, c.words.data(), c.words.size() * 4));
+            jit.invalidate_jit_cache(code, page);
+            jit.set_cpsr(0x10 | c.flags);
+            jit.set_pc(code | 1);
+            jit.set_reg(0, 0);
+            jit.set_reg(1, 0);
+            parent.svc_called = false;
+            for (unsigned attempt = 0; attempt < 2; ++attempt) {
+                CHECK(jit.run() < 0);
+                if (jit.get_pc() != code + c.offset || jit.get_cpsr() != (0x30 | c.flags | c.it_bits))
+                    std::fprintf(stderr, "%s region=%d attempt=%u: pc=%08x cpsr=%08x\n", c.name, regions,
+                        attempt, jit.get_pc(), jit.get_cpsr());
+                CHECK(!parent.svc_called);
+                CHECK(jit.get_last_error() == "unsupported Dynarmic IR or terminal (no fallback)");
+                CHECK(jit.get_pc() == code + c.offset);
+                CHECK(jit.get_cpsr() == (0x30 | c.flags | c.it_bits));
+                CHECK(jit.get_reg(0) == c.r0 && jit.get_reg(1) == c.r1);
+            }
+        }
+    }
     std::puts("ExceptionRaised: guest UDF/BKPT fail closed at the raising PC (single+region)");
 }
 } // namespace exception_tests
