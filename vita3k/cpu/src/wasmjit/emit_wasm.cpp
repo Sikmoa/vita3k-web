@@ -95,10 +95,10 @@ namespace Term = Dynarmic::IR::Term;
 enum Wasm : uint8_t {
     Block = 0x02, Loop = 0x03, If = 0x04, Else = 0x05, End = 0x0b,
     Br = 0x0c, BrIf = 0x0d, BrTable = 0x0e, Return = 0x0f, Call = 0x10,
-    CallIndirect = 0x11, Select = 0x1b,
-    Get = 0x20, Set = 0x21, Load = 0x28, Load64 = 0x29, Load8U = 0x2d, Load16U = 0x2f,
+    CallIndirect = 0x11, ReturnCall = 0x12, ReturnCallIndirect = 0x13, Select = 0x1b,
+    Get = 0x20, Set = 0x21, Tee = 0x22, GlobalGet = 0x23, Load = 0x28, Load64 = 0x29, Load8U = 0x2d, Load16U = 0x2f,
     Store = 0x36, Store8 = 0x3a, Store16 = 0x3b, Const = 0x41,
-    Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtS = 0x48, LtU = 0x49, GtS = 0x4a, GtU = 0x4b, LeU = 0x4d, GeU = 0x4f, Eqz64 = 0x50,
+    Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtS = 0x48, LtU = 0x49, GtS = 0x4a, GtU = 0x4b, LeS = 0x4c, LeU = 0x4d, GeU = 0x4f, Eqz64 = 0x50,
     Clz = 0x67, Add = 0x6a, Sub = 0x6b, Mul = 0x6c, And = 0x71, Or = 0x72, Xor = 0x73,
     Shl = 0x74, ShrS = 0x75, ShrU = 0x76, RotR = 0x78,
     Add64 = 0x7c, Sub64 = 0x7d, Mul64 = 0x7e, Or64 = 0x84, Shl64 = 0x86, ShrU64 = 0x88, ShrS64 = 0x87, Wrap = 0xa7, ExtendU = 0xad,
@@ -207,6 +207,17 @@ bool arithmetic(Op op) {
     return op == Op::Add32 || op == Op::Sub32;
 }
 
+// Differential-check canary (VITA3K_AOT_CANARY=1 while building an AOT
+// image): every AOT Add32/Sub32 also toggles CPSR.GE[0], an architectural
+// difference the JIT-vs-AOT comparison (VITA3K_AOT_DIFF) must report.
+bool aot_canary() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("VITA3K_AOT_CANARY");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 bool shift(Op op) {
     return op == Op::LogicalShiftLeft32 || op == Op::LogicalShiftRight32
         || op == Op::ArithmeticShiftRight32 || op == Op::RotateRight32 || op == Op::RotateRightExtended;
@@ -221,6 +232,9 @@ constexpr uint32_t kLightDispatchSentinel = 0xffffffffu;
 // Function index space counts IMPORTED functions first: mem_read=0,
 // mem_write=1, fp64=2, run=3, and the outlined fault function=4.
 constexpr uint32_t kFaultFuncIndex = 4;
+// AOT modules place the PC -> table-slot lookup right after the fault function.
+constexpr uint32_t kAotLookupFuncIndex = 5;
+constexpr uint32_t kAotTransferFuncIndex = 6;
 // member_index() result for a location that is not a region member.
 constexpr uint32_t kNoMember = 0xffffffffu;
 constexpr uint32_t kRegionRegBase = 11;
@@ -247,6 +261,9 @@ public:
     // lifetime. Single-block emission always keeps the guard.
     bool skip_fast_guard() const { return options.assume_fast_bases; }
     bool count_fast_memory() const { return options.count_fast_memory; }
+    bool aot() const { return options.aot; }
+    bool unchecked_memory() const { return memory64 && options.aot && options.unchecked_memory; }
+    bool fast_fp() const { return options.aot && options.fast_fp; }
     void load_region_state(Bytes &c) const {
         reload_flags(c);
         if (options.promote_accounting) {
@@ -355,6 +372,8 @@ public:
         // or full CPSR reads (which would double-account completed work).
         b_get(c, 0); b_load(c, offsetof(JitState, executed)); read_executed(c); b_op(c, Add);
         b_store(c, offsetof(JitState, executed));
+        if (options.aot)
+            return; // AOT functions keep no dispatch-iteration count
         b_get(c, 0); b_load(c, offsetof(JitState, dispatches)); b_get(c, 7); b_op(c, Add);
         b_store(c, offsetof(JitState, dispatches));
     }
@@ -626,6 +645,7 @@ private:
     uint32_t hot_nid = 0, svc_inline_success_local = 0;
     bool pc_written = false;
     bool has_bx = false;
+    bool end_mode_written = false; // the body stored finish's mode bits
     bool check_bit_written = false;
     // Region mode state.
     bool region = false;
@@ -732,6 +752,25 @@ private:
     // address (its low word is the instruction's own PC). Write helpers
     // consume memory_value, so the value must be published BEFORE the call.
     uint64_t pending_fault_location = 0;
+
+    // sceKernelGetTLSAddr intrinsic (see kGetTlsAddrNid). Success writes r0
+    // and clears the exclusive monitor exactly like the serviced SVC does.
+    void inline_tls_addr() {
+        const auto success = next_local, key = next_local + 1;
+        svc_inline_success_local = success;
+        if (region) get(reg_base); else load(offsetof(JitState, regs));
+        set(key);
+        get(key); imm(0x100); op(LeU); set(success);
+        get(success); begin_if();
+        const auto result = [&] {
+            load(offsetof(JitState, tpidruro)); imm(kKernelTlsSize); op(Sub);
+            get(key); imm(2); op(Shl); op(Add);
+        };
+        if (region) { result(); set(reg_base); }
+        else { get(0); result(); store(offsetof(JitState, regs)); }
+        store_constant(offsetof(JitState, exclusive_size), 0);
+        end_if();
+    }
 
     // HLE intrinsics run entirely in generated Wasm. Every failure jumps out
     // of this probe block WITHOUT changing registers, guest memory, or mutex
@@ -1028,6 +1067,31 @@ private:
             end_if(); // fast-path enabled
     }
 
+    // Unchecked guest-window access (RegionStateOptions::unchecked_memory).
+    // Wider accesses are consecutive little-endian words, exactly the
+    // memory_value layout the checked helper produces and consumes.
+    void memory_direct(const Inst &inst, bool write, unsigned bytes) {
+        const uint32_t addr_local = next_local + 9;
+        value_word(inst.GetArg(1));
+        set(addr_local);
+        // The fixed window base rides in the memarg offset (u64 in Memory64).
+        for (unsigned word = 0; word < (bytes + 3) / 4; ++word) {
+            const uint64_t offset = vita3k::memory::guest_window_base + word * 4;
+            get(addr_local); op(ExtendU);
+            if (write) {
+                value_word(inst.GetArg(2), word);
+                if (bytes == 1) { op(Store8); memarg(code, 0, offset); }
+                else if (bytes == 2) { op(Store16); memarg(code, 1, offset); }
+                else { op(Store); memarg(code, 2, offset); }
+            } else {
+                if (bytes == 1) { op(Load8U); memarg(code, 0, offset); }
+                else if (bytes == 2) { op(Load16U); memarg(code, 1, offset); }
+                else { op(Load); memarg(code, 2, offset); }
+                set(next_local + word);
+            }
+        }
+    }
+
     // Cold arm of the single probe gate: re-derive the first-failing
     // reason in probe order and take the identical slow path. The hot gate
     // guarantees at least one predicate fails (same values, no calls in
@@ -1099,7 +1163,9 @@ private:
         if (inst.GetArg(1).GetType() != Type::U32) { reject("memory_call arg1 not U32"); return; }
         if (!inst.GetArg(0).IsImmediate()) { reject("memory_call arg0 not imm"); return; }
         pending_fault_location = inst.GetArg(0).GetImmediateAsU64();
-        if (bytes <= 4)
+        if (state.unchecked_memory())
+            memory_direct(inst, write, bytes);
+        else if (bytes <= 4)
             memory_fast_or_slow(inst, write, bytes);
         else
             memory_slow_call(inst, write, bytes);
@@ -1510,17 +1576,19 @@ private:
         state.write_pc(code, [&] { imm(loc.PC()); });
     }
     // Member-edge publish: when the target's CPSR mode bits equal the
-    // block's end-of-body bits, the mode RMW is idempotent and skipped.
-    // The PC write always stays: edge Budget/Stop/Smc exits publish
-    // next_pc from regs[15], and the next block consumes the pending PC.
-    // Sound by the light-edge invariant (member_index requires full
-    // descriptor equality; other_psr provably holds the current end bits
-    // via run-entry reload, in-body maintenance and chained exact-match
-    // induction), and member targets are validated at their own emission.
+    // block's end-of-body bits AND the live mode already holds them, the
+    // mode RMW is idempotent and skipped. The live mode holds the entry bits
+    // until the body writes the end bits (UpdateUpperLocationDescriptor,
+    // BXWritePC): a block inside an IT block enters with IT != 0 and ends
+    // with the advanced IT, so its entry bits must not be assumed to be the
+    // end bits. The PC write always stays: edge Budget/Stop/Smc exits
+    // publish next_pc from regs[15], and the next block consumes it.
     // Non-member (Miss) paths keep the full location() write.
     void location_member(const Location &loc) {
         constexpr uint32_t mask = Location::CPSR_MODE_MASK;
-        if ((loc.CPSR().Value() & mask) == (finish.CPSR().Value() & mask)) {
+        const bool live_is_finish = end_mode_written
+            || (start.CPSR().Value() & mask) == (finish.CPSR().Value() & mask);
+        if (live_is_finish && (loc.CPSR().Value() & mask) == (finish.CPSR().Value() & mask)) {
             state.write_pc(code, [&] { imm(loc.PC()); });
             return;
         }
@@ -1680,13 +1748,23 @@ private:
         // ~19 Wasm ops (carry extraction, overflow idiom, scratch traffic).
         const bool need_carry = carry_needed.count(&inst) != 0;
         const bool need_overflow = overflow_needed.count(&inst) != 0;
-        sum();
         if (need_carry) {
+            sum();
             set(scratch_local);
             get(scratch_local); op(Wrap); set(next_local);
             get(scratch_local); op(0x42); op(32); op(ShrU64); op(Wrap); set(next_local + 4);
+        } else if (const auto &carry_in = inst.GetArg(2); carry_in.IsImmediate()) {
+            // No carry consumer: plain i32 arithmetic (mod 2^32 is exact).
+            // a + ~b + c == a - b - 1 + c.
+            value(inst.GetArg(0)); value(inst.GetArg(1));
+            op(sub ? Sub : Add);
+            if (sub != carry_in.GetU1()) { imm(1); op(sub ? Sub : Add); }
+            set(next_local);
         } else {
-            op(Wrap); set(next_local);
+            value(inst.GetArg(0)); value(inst.GetArg(1));
+            if (sub) { imm(0xffffffff); op(Xor); }
+            op(Add); value(carry_in); op(Add);
+            set(next_local);
         }
         if (!need_overflow) return;
         // V = (~(a ^ b) & (a ^ result)) >> 31 for add; for subtract
@@ -1947,6 +2025,29 @@ private:
         return false;
     }
     void light_redispatch(uint32_t target_index) {
+        if (state.aot()) {
+            // Only backward edges can close a loop inside one call (members
+            // are sorted by PC), so only they pay the budget check; forward
+            // chains are bounded by the function's total ticks. A backward
+            // body is enclosed by its target's label: branch straight to it.
+            // ABLATE C (measurement only): no backward-edge check; transfer()
+            // still checks, so only loops that never call can run unbounded.
+            if (target_index <= body_index && !(ablate_flags() & kAblateBudget)) {
+                state.read_executed(code); imm(entry_ticks((*metadata)[target_index])); op(Add);
+                get(1); op(GtU);
+                begin_if();
+                set_next_pc_runtime();
+                ret(ExitReason::Budget);
+                end_if();
+            }
+            if (target_index < body_index) {
+                op(Br); uleb(code, (body_index - 1 - target_index) + extra_labels);
+                return;
+            }
+            imm(target_index); set(6);
+            br_redispatch();
+            return;
+        }
         const uint32_t ablate = ablate_flags();
         // Direct-threaded back-edge (E/G): reachable iff target < body_index.
         if (ablate_direct_here() && target_index < body_index) {
@@ -2032,6 +2133,12 @@ private:
         // skipped (loop-top slice bound kept instead); the trailing Budget
         // return is then omitted so a stop/smc exit still works and a
         // budget-only trip falls through to the slice bound.
+        if (state.aot()) {
+            // AOT: no stop/SMC polls (AOT text is read-execute, host stops
+            // arrive between calls) and the block's budget was paid in full.
+            completed_store_ticks = point.completed_ticks;
+            return;
+        }
         const uint32_t ablate = ablate_flags();
         load(offsetof(JitState, stop_flag));
         if (!(ablate & kAblateSmc)) {
@@ -2449,7 +2556,18 @@ private:
         // One consumer pre-scan per block (short-circuits after the first
         // instruction); producers below consult it for dead flag words.
         scan_flag_consumers();
-        if (arithmetic(kind)) { add_sub(inst); return ok; }
+        if (arithmetic(kind)) {
+            add_sub(inst);
+            if (state.aot() && aot_canary()) {
+                // Toggle GE[0]: not sticky, so every sample whose call runs an
+                // odd number of these differs (a sticky bit would already be
+                // set in both runs' starting state).
+                state.write_psr_field(code, 0x00010000u, [&] {
+                    state.read_dispatch_psr(code); imm(0x00010000u); op(Xor); imm(0x00010000u); op(And);
+                });
+            }
+            return ok;
+        }
         if (shift(kind)) { shifted(inst); return ok; }
         const auto arg = [&](size_t n) { value(inst.GetArg(n)); };
         switch (kind) {
@@ -2681,6 +2799,15 @@ private:
         case Op::FPVectorMul32:
         case Op::FPVectorAdd32:
         case Op::FPVectorSub32: {
+            if (state.fast_fp()) {
+                const uint8_t lane_op = kind == Op::FPVectorMul32 ? 0x94 : kind == Op::FPVectorSub32 ? 0x93 : 0x92;
+                for (unsigned word = 0; word < 4; ++word) {
+                    value_word(inst.GetArg(0), word); op(0xbe);
+                    value_word(inst.GetArg(1), word); op(0xbe);
+                    op(lane_op); op(0xbc); set(next_local + word);
+                }
+                return ok;
+            }
             // Four-lane binary32 add/sub/mul (vadd/vsub/vmul.f32). A32's
             // standard FPSCR (fpcr_controlled=false) means RN, FZ=DN=1:
             // denormals flush to signed zero, and NaNs become the default
@@ -2859,6 +2986,20 @@ private:
         case Op::FPSub64:
         case Op::FPMul64:
         case Op::FPDiv64: {
+            if (state.fast_fp() && !start.FPSCR().FTZ() && !(start.FPSCR().Value() & 0x00c00000u)) {
+                const auto wide = [&](const Value &v) {
+                    value_word(v, 0); op(ExtendU);
+                    value_word(v, 1); op(ExtendU); constant64(code, 32); op(Shl64); op(Or64);
+                    op(0xbf); // f64.reinterpret_i64
+                };
+                wide(inst.GetArg(0)); wide(inst.GetArg(1));
+                op(kind == Op::FPAdd64 ? 0xa0 : kind == Op::FPSub64 ? 0xa1 : kind == Op::FPMul64 ? 0xa2 : 0xa3);
+                op(0xbd); // i64.reinterpret_f64
+                set(scratch_local);
+                get(scratch_local); op(Wrap); set(next_local);
+                get(scratch_local); constant64(code, 32); op(ShrU64); op(Wrap); set(next_local + 1);
+                return ok;
+            }
             // Exact integer arithmetic in a native Wasm helper, not a JS or
             // interpreter fallback. The helper observes only memory_value and
             // the explicitly supplied FPSCR; cached registers/flags stay local.
@@ -2891,6 +3032,10 @@ private:
             // Wasm arithmetic rounds to nearest-even. Other guest rounding
             // modes remain unsupported rather than silently giving RN results.
             if (start.FPSCR().Value() & 0x00c00000u) return false;
+            if (state.fast_fp() && !start.FPSCR().FTZ()) {
+                arg(0); op(0xbe); arg(1); op(0xbe); op(narrow_op); op(0xbc); set(next_local);
+                return ok;
+            }
             load(offsetof(JitState, fpscr)); mask(0x00009f00u);
             begin_if(); ret(ExitReason::Unsupported); end_if();
             const auto a = next_local + 1, b = next_local + 2;
@@ -3003,6 +3148,10 @@ private:
             // result is tiny — overflow is impossible for a square root).
             // Exactness via the f64 square: w*w holds exactly for a 24-bit w.
             if (start.FPSCR().Value() & 0x00c00000u) return false;
+            if (state.fast_fp() && !start.FPSCR().FTZ()) {
+                arg(0); op(0xbe); op(0x91); op(0xbc); set(next_local);
+                return ok;
+            }
             load(offsetof(JitState, fpscr)); mask(0x00009f00u);
             begin_if(); ret(ExitReason::Unsupported); end_if();
             const auto sa = next_local + 1, saa = next_local + 2;
@@ -3385,10 +3534,14 @@ private:
         case Op::A32UpdateUpperLocationDescriptor:
             // Dynarmic suppresses this update throughout a block containing
             // BXWritePC: that op supplies EndLocation with a dynamic T bit.
-            if (!has_bx) upper_location(finish);
+            if (!has_bx) {
+                upper_location(finish);
+                end_mode_written = true;
+            }
             return ok;
         case Op::A32BXWritePC:
             upper_location(finish);
+            end_mode_written = true;
             state.write_psr_field(code, 0x20, [&] { arg(0); mask(1); imm(5); op(Shl); });
             state.write_pc(code, [&] {
                 arg(0); imm(0xfffffffe); imm(0xfffffffc); arg(0); mask(1); op(Select); op(And);
@@ -3613,11 +3766,14 @@ private:
         case Op::A32CallSupervisor:
             if (!pc_written) return false;
             if (hot_nid) {
-                if (!is_inline_mutex_nid(hot_nid) || start.TFlag() || start.EFlag()
+                if (!is_hle_intrinsic_nid(hot_nid) || start.TFlag() || start.EFlag()
                     || finish.PC() != start.PC() + 4 || block.CycleCount() != 1
                     || !inst.GetArg(0).IsImmediate() || inst.GetArg(0).GetU32() != 0)
                     return false;
-                inline_mutex();
+                if (hot_nid == kGetTlsAddrNid)
+                    inline_tls_addr();
+                else
+                    inline_mutex();
             }
             get(0); arg(0); store(offsetof(JitState, svc));
             svc = true;
@@ -3642,23 +3798,31 @@ std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block, uint32_t hot_n
 }
 
 bool validate_region_block(const Dynarmic::IR::Block &block,
-    const std::vector<StoreContinuation> &store_continuations) {
+    const std::vector<StoreContinuation> &store_continuations, std::string *rejection,
+    RegionStateOptions options) {
     const std::vector<const Dynarmic::IR::Block *> members{&block};
     const Location at(block.Location());
     const std::vector<RegionBlockMeta> metadata{{at.PC(), Location::CPSR_MODE_MASK,
         at.CPSR().Value() & Location::CPSR_MODE_MASK,
         static_cast<uint32_t>(block.CycleCount() + block.ConditionFailedCycleCount()), store_continuations}};
-    Emitter emitter(block, 0, members, metadata);
-    return !emitter.region_body().empty();
+    Emitter emitter(block, 0, members, metadata, options);
+    const bool valid = !emitter.region_body().empty();
+    if (!valid && rejection)
+        *rejection = emitter.rejection.empty() ? "unspecified" : emitter.rejection;
+    return valid;
 }
 
-std::vector<uint8_t> emit_region(
+namespace {
+// Function body (locals + code) of one region run(state, budget) function.
+// With `aot`, entry-search misses report EntryMiss and the shared epilogue
+// tail-calls the AOT function owning next_pc (see emit_aot_module).
+Bytes region_function_body(
     const std::vector<const Dynarmic::IR::Block *> &blocks,
-    const std::vector<RegionBlockMeta> &meta, RegionStateOptions options) {
+    const std::vector<RegionBlockMeta> &meta, RegionStateOptions options, bool aot) {
+    options.aot = aot;
     const RegionState state(options);
     constexpr size_t kMaxBlocks = 512;
     constexpr uint64_t kMaxTicks = 32768;
-    constexpr size_t kMaxModule = 4 << 20;
     const size_t n = blocks.size();
     if (n == 0 || n != meta.size() || n > kMaxBlocks)
         return {};
@@ -3730,6 +3894,9 @@ std::vector<uint8_t> emit_region(
     // edge whose budget check fails exits BEFORE the next loop-top poll, so
     // the HOST re-checks smc_dirty on every exit (see execute_regions).
     Bytes d;
+    // An AOT function entered at a PC it does not own (or in another mode)
+    // must return to the host instead of re-resolving to itself.
+    const ExitReason entry_miss = aot ? ExitReason::EntryMiss : ExitReason::Miss;
     const auto exit_with = [&](ExitReason reason, uint32_t open_ifs) {
         state.set_next_pc_from_pc(d);
         b_imm(d, static_cast<uint32_t>(reason)); b_set(d, 6);
@@ -3737,6 +3904,7 @@ std::vector<uint8_t> emit_region(
         // reach $exit. All state publication is shared after that label.
         b_op(d, Br); uleb(d, static_cast<uint32_t>(n) + 2 + open_ifs);
     };
+    if (!aot) {
     // Keep dispatch accounting in local 7 and publish it only on return.
     b_get(d, 7); b_imm(d, 1); b_op(d, Add); b_set(d, 7);
     // if (state.stop_flag) { next_pc = regs[15]; return Stop }
@@ -3793,14 +3961,14 @@ std::vector<uint8_t> emit_region(
                 state.read_dispatch_psr(d);
                 b_imm(d, meta[lo].psr_mask); b_op(d, And);
                 b_imm(d, meta[lo].psr_value); b_op(d, Ne);
-                b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Miss, open_ifs + 2); b_op(d, End);
+                b_op(d, If); b_op(d, 0x40); exit_with(entry_miss, open_ifs + 2); b_op(d, End);
                 // FPSCR mode bits are part of the block's translation key.
                 const uint32_t fpscr = Location(blocks[lo]->Location()).FPSCR().Value()
                     & Location::FPSCR_MODE_MASK;
                 b_get(d, 0); b_op(d, Load); uleb(d, 2); uleb(d, offsetof(JitState, fpscr));
                 b_imm(d, Location::FPSCR_MODE_MASK); b_op(d, And);
                 b_imm(d, fpscr); b_op(d, Ne);
-                b_op(d, If); b_op(d, 0x40); exit_with(ExitReason::Miss, open_ifs + 2); b_op(d, End);
+                b_op(d, If); b_op(d, 0x40); exit_with(entry_miss, open_ifs + 2); b_op(d, End);
             }
             }
             {
@@ -3826,6 +3994,7 @@ std::vector<uint8_t> emit_region(
     };
     tree(0, n, 1); // the generic-path if is already open
     b_op(d, End); // close generic-path if
+    } // !aot: AOT entries arrive with local 6 = state.aot_entry
 
     // br_table: vec of n labels then the default. Index i -> $bI (depth n-i
     // at this position); default -> $default (depth 0, innermost).
@@ -3842,7 +4011,11 @@ std::vector<uint8_t> emit_region(
     // Fresh entry selects the generic path: locals are zero-initialized per
     // invocation, so the dispatch-index local must start at the sentinel
     // (a stale 0 would wrongly route the first dispatch to block 0).
-    b_imm(code, kLightDispatchSentinel); b_set(code, 6);
+    if (aot)
+        b_load(code, offsetof(JitState, aot_entry));
+    else
+        b_imm(code, kLightDispatchSentinel);
+    b_set(code, 6);
     b_imm(code, 0); b_set(code, 7);
     if (!memory64) { b_load_host(code, offsetof(JitState, page_table_base)); b_set(code, 8); }
     b_load_host(code, offsetof(JitState, page_perms_base)); b_set(code, 9);
@@ -3860,8 +4033,11 @@ std::vector<uint8_t> emit_region(
     code.insert(code.end(), d.begin(), d.end());
     b_op(code, End); // close $default -> miss body
     {
-        state.set_next_pc(code, [&] { b_get(code, 3); });
-        b_imm(code, static_cast<uint32_t>(ExitReason::Miss)); b_set(code, 6);
+        if (aot)
+            state.set_next_pc_from_pc(code);
+        else
+            state.set_next_pc(code, [&] { b_get(code, 3); });
+        b_imm(code, static_cast<uint32_t>(entry_miss)); b_set(code, 6);
         b_op(code, Br); uleb(code, static_cast<uint32_t>(n) + 1); // $exit ($default is closed)
     }
     for (size_t i = n; i-- > 0;) { // close $b(i) -> body i
@@ -3879,6 +4055,16 @@ std::vector<uint8_t> emit_region(
     }
     state.materialize_all_on_exit(code);
     b_get(code, 0); b_get(code, 6); b_store(code, offsetof(JitState, exit_reason));
+    if (aot) {
+        // Miss with a published next_pc: continue in the AOT function that
+        // owns it (transfer), passing the unspent budget. All state is in memory.
+        b_get(code, 6); b_imm(code, static_cast<uint32_t>(ExitReason::Miss)); b_op(code, Eq);
+        b_op(code, If); b_op(code, 0x40);
+        b_get(code, 0); b_get(code, 1); state.read_executed(code); b_op(code, Sub);
+        b_load(code, offsetof(JitState, next_pc));
+        b_op(code, ReturnCall); uleb(code, kAotTransferFuncIndex);
+        b_op(code, End);
+    }
     b_get(code, 6); // function result
     b_op(code, End); // end function body
 
@@ -3894,12 +4080,16 @@ std::vector<uint8_t> emit_region(
         uleb(body, state.ssa_base() - 6 + max_ssa); body.push_back(0x7f);
     }
     body.insert(body.end(), code.begin(), code.end());
-    // Outlined region fault path (R3j): one cold function per module shared
+    return body;
+}
+
+// Outlined region fault path (R3j): one cold function per module shared
     // by every fault arm. Promoted mode round-trips other_psr through a
     // param/return ((state, pc, bits, other) -> other'); reference emission
     // RMWs memory ((state, pc, bits) -> ()). Ticks stay caller-side (the
     // executed_call local is run()'s frame); reason and epilogue branch
-    // stay at the call site (depth-sensitive).
+// stay at the call site (depth-sensitive).
+Bytes region_fault_body(const RegionState &state) {
     Bytes fault;
     uleb(fault, 0); // no additional locals beyond the params
     if (state.uses_flag_locals()) {
@@ -3914,6 +4104,37 @@ std::vector<uint8_t> emit_region(
         b_get(fault, 0); b_get(fault, 1); b_store(fault, offsetof(JitState, fault_pc));
     }
     b_op(fault, End);
+    return fault;
+}
+
+void append_types(Bytes &types, const RegionState &state) {
+    types.insert(types.end(), {
+        0x60, 2, host_type, 0x7f, 1, 0x7f, // type 0: (host,i32)->i32 for run
+        0x60, 3, host_type, 0x7f, 0x7f, 1, 0x7f}); // type 1: checked helpers
+    if (state.uses_flag_locals()) {
+        types.insert(types.end(), {0x60, 4, host_type, 0x7f, 0x7f, 0x7f, 1, 0x7f}); // type 2: fault (P)
+    } else {
+        types.insert(types.end(), {0x60, 3, host_type, 0x7f, 0x7f, 0}); // type 2: fault (A)
+    }
+}
+
+void append_helper_imports(Bytes &imports) {
+    imports.insert(imports.end(), {
+        3, 'e', 'n', 'v', 8, 'm', 'e', 'm', '_', 'r', 'e', 'a', 'd', 0, 1,
+        3, 'e', 'n', 'v', 9, 'm', 'e', 'm', '_', 'w', 'r', 'i', 't', 'e', 0, 1,
+        3, 'e', 'n', 'v', 4, 'f', 'p', '6', '4', 0, 1});
+}
+} // namespace
+
+std::vector<uint8_t> emit_region(
+    const std::vector<const Dynarmic::IR::Block *> &blocks,
+    const std::vector<RegionBlockMeta> &meta, RegionStateOptions options) {
+    constexpr size_t kMaxModule = 4 << 20;
+    const RegionState state(options);
+    const Bytes body = region_function_body(blocks, meta, options, false);
+    if (body.empty())
+        return {};
+    const Bytes fault = region_fault_body(state);
     Bytes functions{2};
     uleb(functions, static_cast<uint32_t>(body.size()));
     functions.insert(functions.end(), body.begin(), body.end());
@@ -3921,20 +4142,11 @@ std::vector<uint8_t> emit_region(
     functions.insert(functions.end(), fault.begin(), fault.end());
 
     Bytes module{0, 'a', 's', 'm', 1, 0, 0, 0};
-    Bytes types{3,
-        0x60, 2, host_type, 0x7f, 1, 0x7f, // type 0: (host,i32)->i32 for run
-        0x60, 3, host_type, 0x7f, 0x7f, 1, 0x7f}; // type 1: checked helpers
-    if (state.uses_flag_locals()) {
-        types.insert(types.end(), {0x60, 4, host_type, 0x7f, 0x7f, 0x7f, 1, 0x7f}); // type 2: fault (P)
-    } else {
-        types.insert(types.end(), {0x60, 3, host_type, 0x7f, 0x7f, 0}); // type 2: fault (A)
-    }
+    Bytes types{3};
+    append_types(types, state);
     section(module, 1, types);
     auto imports = memory_imports(4);
-    imports.insert(imports.end(), {
-        3, 'e', 'n', 'v', 8, 'm', 'e', 'm', '_', 'r', 'e', 'a', 'd', 0, 1,
-        3, 'e', 'n', 'v', 9, 'm', 'e', 'm', '_', 'w', 'r', 'i', 't', 'e', 0, 1,
-        3, 'e', 'n', 'v', 4, 'f', 'p', '6', '4', 0, 1});
+    append_helper_imports(imports);
     section(module, 2, imports);
     section(module, 3, {2, 0, 2}); // run (type 0), fault (type 2)
     // Function index space counts IMPORTED functions first: mem_read=0,
@@ -3943,6 +4155,144 @@ std::vector<uint8_t> emit_region(
     section(module, 10, functions);
     if (module.size() > kMaxModule)
         return {};
+    return module;
+}
+
+std::vector<uint8_t> emit_aot_function(
+    const std::vector<const Dynarmic::IR::Block *> &blocks,
+    const std::vector<RegionBlockMeta> &meta, RegionStateOptions options) {
+    return region_function_body(blocks, meta, options, true);
+}
+
+uint64_t aot_lut_offset_words(const std::vector<AotRange> &ranges, size_t index) {
+    uint64_t words = 0;
+    for (size_t i = 0; i < index && i < ranges.size(); ++i)
+        words += ranges[i].size / 2;
+    return words;
+}
+
+std::vector<uint8_t> assemble_aot_module(
+    const std::vector<std::vector<uint8_t>> &function_bodies,
+    const std::vector<AotRange> &ranges, const std::vector<uint8_t> &metadata,
+    RegionStateOptions options) {
+    const RegionState state(options);
+    const uint32_t count = static_cast<uint32_t>(function_bodies.size());
+    if (!count || ranges.empty())
+        return {};
+    constexpr uint32_t kFirstRegion = kAotTransferFuncIndex + 1;
+    static_assert(kFaultFuncIndex == 4 && kAotLookupFuncIndex == 5 && kAotTransferFuncIndex == 6);
+    if (count > kAotMaxFunctions)
+        return {};
+
+    // entry(state, budget): continue at regs[15].
+    Bytes entry;
+    uleb(entry, 0);
+    b_get(entry, 0); b_get(entry, 1);
+    b_load(entry, offsetof(JitState, regs) + 15 * sizeof(uint32_t));
+    b_op(entry, ReturnCall); uleb(entry, kAotTransferFuncIndex);
+    b_op(entry, End);
+
+    // transfer(state, remaining, pc): all guest state is in memory. Tail-call
+    // the function owning pc at its member block, or return to the host.
+    Bytes transfer;
+    uleb(transfer, 1); uleb(transfer, 1); transfer.push_back(0x7f); // local 3: lookup entry
+    const auto leave = [&](ExitReason reason) {
+        b_get(transfer, 0); b_get(transfer, 2); b_store(transfer, offsetof(JitState, next_pc));
+        b_get(transfer, 0); b_imm(transfer, static_cast<uint32_t>(reason));
+        b_store(transfer, offsetof(JitState, exit_reason));
+        b_imm(transfer, static_cast<uint32_t>(reason));
+        b_op(transfer, Return);
+    };
+    b_get(transfer, 0); b_get(transfer, 2);
+    b_store(transfer, offsetof(JitState, regs) + 15 * sizeof(uint32_t));
+    // Budget spent (signed: the last function may overrun by its forward path).
+    b_get(transfer, 1); b_imm(transfer, 0); b_op(transfer, LeS);
+    b_op(transfer, If); b_op(transfer, 0x40); leave(ExitReason::Budget); b_op(transfer, End);
+    b_get(transfer, 2); b_op(transfer, Call); uleb(transfer, kAotLookupFuncIndex);
+    b_op(transfer, Tee); uleb(transfer, 3); b_op(transfer, Eqz);
+    b_op(transfer, If); b_op(transfer, 0x40); leave(ExitReason::Miss); b_op(transfer, End);
+    // Entries are recorded for IT=0, E=0 and the default FPSCR mode only.
+    b_load(transfer, offsetof(JitState, cpsr)); b_imm(transfer, Location::CPSR_MODE_MASK); b_op(transfer, And);
+    b_get(transfer, 3); b_imm(transfer, 30); b_op(transfer, ShrU); b_imm(transfer, 5); b_op(transfer, Shl);
+    b_op(transfer, Ne);
+    b_load(transfer, offsetof(JitState, fpscr)); b_imm(transfer, Location::FPSCR_MODE_MASK); b_op(transfer, And);
+    b_op(transfer, Or);
+    b_op(transfer, If); b_op(transfer, 0x40); leave(ExitReason::EntryMiss); b_op(transfer, End);
+    b_get(transfer, 0);
+    b_get(transfer, 3); b_imm(transfer, 20); b_op(transfer, ShrU); b_imm(transfer, kAotMaxBlocks - 1); b_op(transfer, And);
+    b_store(transfer, offsetof(JitState, aot_entry));
+    b_get(transfer, 0); b_get(transfer, 1);
+    b_get(transfer, 3); b_imm(transfer, kAotMaxFunctions); b_op(transfer, And); b_imm(transfer, 1); b_op(transfer, Sub);
+    b_op(transfer, ReturnCallIndirect); uleb(transfer, 0); uleb(transfer, 0);
+    b_op(transfer, End);
+
+    // lookup(pc) -> slot + 1, or 0 when no AOT function owns pc.
+    Bytes lookup;
+    uleb(lookup, 1); uleb(lookup, 1); lookup.push_back(0x7f); // local 1: offset
+    for (size_t k = 0; k < ranges.size(); ++k) {
+        if (!ranges[k].size || (ranges[k].size & 1) || (ranges[k].base & 1))
+            return {};
+        b_get(lookup, 0); b_imm(lookup, ranges[k].base); b_op(lookup, Sub);
+        b_op(lookup, Tee); uleb(lookup, 1);
+        b_imm(lookup, ranges[k].size); b_op(lookup, LtU);
+        b_op(lookup, If); b_op(lookup, 0x40);
+        b_op(lookup, GlobalGet); uleb(lookup, 0);
+        b_get(lookup, 1); b_imm(lookup, 1); b_op(lookup, ShrU); b_imm(lookup, 2); b_op(lookup, Shl);
+        address_add_i32(lookup);
+        b_op(lookup, Load); memarg(lookup, 2, aot_lut_offset_words(ranges, k) * 4);
+        b_op(lookup, Return);
+        b_op(lookup, End);
+    }
+    b_imm(lookup, 0);
+    b_op(lookup, End);
+
+    Bytes fault = region_fault_body(state);
+    Bytes functions;
+    uleb(functions, 4 + count);
+    for (const Bytes *body : {&entry, &fault, &lookup, &transfer}) {
+        uleb(functions, static_cast<uint32_t>(body->size()));
+        functions.insert(functions.end(), body->begin(), body->end());
+    }
+    for (const auto &body : function_bodies) {
+        if (body.empty())
+            return {};
+        uleb(functions, static_cast<uint32_t>(body.size()));
+        functions.insert(functions.end(), body.begin(), body.end());
+    }
+
+    Bytes module{0, 'a', 's', 'm', 1, 0, 0, 0};
+    Bytes types{4};
+    append_types(types, state);
+    types.insert(types.end(), {0x60, 1, 0x7f, 1, 0x7f}); // type 3: lookup
+    section(module, 1, types);
+    auto imports = memory_imports(5);
+    append_helper_imports(imports);
+    imports.insert(imports.end(), {3, 'e', 'n', 'v', 7, 'a', 'o', 't', '_', 'l', 'u', 't',
+        3, host_type, 0});
+    section(module, 2, imports);
+    Bytes declared;
+    uleb(declared, 4 + count);
+    declared.insert(declared.end(), {0, 2, 3, 1});
+    for (uint32_t i = 0; i < count; ++i)
+        declared.push_back(0);
+    section(module, 3, declared);
+    Bytes table{1, 0x70, 1};
+    uleb(table, count); uleb(table, count);
+    section(module, 4, table);
+    section(module, 7, {1, 5, 'e', 'n', 't', 'r', 'y', 0, 3});
+    Bytes elements{1, 0};
+    b_imm(elements, 0); b_op(elements, End);
+    uleb(elements, count);
+    for (uint32_t i = 0; i < count; ++i)
+        uleb(elements, kFirstRegion + i);
+    section(module, 9, elements);
+    section(module, 10, functions);
+    Bytes custom;
+    const char name[] = "vita3k.aot";
+    uleb(custom, sizeof(name) - 1);
+    custom.insert(custom.end(), name, name + sizeof(name) - 1);
+    custom.insert(custom.end(), metadata.begin(), metadata.end());
+    section(module, 0, custom);
     return module;
 }
 

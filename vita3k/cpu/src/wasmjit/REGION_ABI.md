@@ -9,6 +9,9 @@ old layout sizes and validation disclaimers are not the current status.
 `offsetof` accesses. Both ABIs pass the full backend and cooperative-runtime
 suites (Node for wasm32, Chromium for Memory64).
 
+Whole-program ahead-of-time modules reuse this region shape with the
+differences listed in [AOT.md](AOT.md).
+
 See [INLINE_MUTEX.md](INLINE_MUTEX.md) for the generated lock/unlock fast paths,
 12-byte import-stub dependencies, host/kernel dirty-list commit boundary, and
 measured retail comparison. The optimization does not change the region

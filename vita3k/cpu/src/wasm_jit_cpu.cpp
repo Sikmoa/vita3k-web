@@ -3,6 +3,7 @@
 #include <cpu/common.h>
 #include <cpu/impl/wasm_jit_cpu.h>
 
+#include <cpu/inline_mutex.h>
 #include <mem/functions.h>
 #include <cpu/state.h>
 #include "wasmjit/frontend.h"
@@ -10,12 +11,18 @@
 #include "wasmjit/fp64.h"
 #include <dynarmic/frontend/A32/a32_location_descriptor.h>
 #include <dynarmic/ir/basic_block.h>
+#include <dynarmic/ir/opcodes.h>
 #include <emscripten.h>
 #include <emscripten/emscripten.h>
 #include <emscripten/heap.h>
 
 #include <algorithm>
 #include <array>
+#include <deque>
+#include <memory>
+#include <fmt/format.h>
+#include <set>
+#include <unordered_map>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -133,14 +140,16 @@ bool revalidate_all_enabled() noexcept {
 // Only ARM little-endian stubs can match. Include return/NID in cache
 // validation below so patching only the literal cannot retain an intrinsic.
 uint32_t hot_stub_nid(const MemState &mem, uint32_t pc, uint32_t cpsr) noexcept {
-    if (!inline_mutex_enabled() || (cpsr & (0x20u | 0x200u)) || (pc & 3u))
+    if ((cpsr & (0x20u | 0x200u)) || (pc & 3u))
         return 0;
     uint32_t words[3] = {};
     if (!mem_fetch(mem, pc, words, sizeof(words)))
         return 0;
     if (words[0] != 0xEF000000u || words[1] != 0xE1A0F00Eu)
         return 0;
-    return vita3k::wasmjit::is_inline_mutex_nid(words[2]) ? words[2] : 0;
+    if (words[2] == vita3k::wasmjit::kGetTlsAddrNid)
+        return words[2];
+    return inline_mutex_enabled() && vita3k::wasmjit::is_inline_mutex_nid(words[2]) ? words[2] : 0;
 }
 
 uint32_t counter_delta(uint32_t before, uint32_t after) noexcept {
@@ -205,6 +214,14 @@ std::array<uint32_t, 1 << 20> g_code_pages{};
 // loaded code - and module loading completes before any region exists.
 std::array<uint32_t, 1 << 20> g_code_page_versions{};
 std::atomic<uint32_t> g_code_write_epoch{1};
+
+// AOT seeding: full location keys (Dynarmic UniqueHash) of every block the
+// lazy JIT translated, recorded only when VITA3K_AOT_SEEDS_OUT is set.
+bool aot_seed_recording() noexcept {
+    static const bool enabled = std::getenv("VITA3K_AOT_SEEDS_OUT") != nullptr;
+    return enabled;
+}
+std::unordered_set<uint64_t> g_aot_seed_keys;
 
 // Record that pages [first_page, last_page] may have changed through a tracked
 // path. Only pages that actually carry compiled code bump a generation, so
@@ -679,6 +696,458 @@ uint32_t fp64_helper(JitState *state, uint32_t operation, uint32_t fpscr) noexce
     state->memory_value[1] = uint32_t(result.bits >> 32);
     return result.flags;
 }
+
+uint32_t aot_hash(const uint8_t *data, size_t size) noexcept {
+    uint32_t hash = 0x811c9dc5;
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= 0x01000193;
+    }
+    return hash;
+}
+
+// Process-wide loaded AOT module. The lookup table is host memory the module
+// reads through its env.aot_lut global; the host uses it to choose AOT entry.
+using AotEntry = uint32_t (*)(JitState *, uint32_t);
+struct AotRuntime {
+    bool loaded = false;
+    AotEntry entry = nullptr;
+    bool disabled = false;
+    std::vector<vita3k::wasmjit::AotRange> ranges;
+    std::vector<uint64_t> offsets; // lookup-table word offset per range
+    std::vector<uint32_t> lut;
+    std::vector<std::pair<uint32_t, uint32_t>> spans; // per slot [begin, end)
+    uint64_t invalidated_functions = 0;
+    uint32_t slot(uint32_t pc) const noexcept {
+        for (size_t k = 0; k < ranges.size(); ++k) {
+            const uint32_t offset = pc - ranges[k].base;
+            if (offset < ranges[k].size)
+                return lut[offsets[k] + offset / 2];
+        }
+        return 0;
+    }
+    bool covers_page(uint32_t page) const noexcept {
+        for (const auto &range : ranges)
+            if (page >= (range.base >> 12) && page <= ((range.base + range.size - 1) >> 12))
+                return true;
+        return false;
+    }
+} g_aot;
+
+// VITA3K_AOT_DIFF=N (diagnostic): every Nth AOT call is also executed by the
+// lazy JIT from the same state and memory, and the results are compared.
+struct AotDiffStats {
+    uint64_t calls = 0, samples = 0, compared = 0, count_mismatch = 0, mismatches = 0;
+    uint64_t fpscr_flags_only = 0, nan_payload_only = 0, snapshot_bytes = 0;
+    std::map<std::string, uint64_t> classes;
+    std::map<int, uint64_t> per_thread; // compared samples by guest thread id
+};
+AotDiffStats g_aot_diff;
+uint64_t aot_diff_every() {
+    static const uint64_t every = [] {
+        const char *value = std::getenv("VITA3K_AOT_DIFF");
+        return value ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+bool is_nan32(uint32_t bits) { return (bits & 0x7fffffffu) > 0x7f800000u; }
+// VITA3K_AOT_DIFF_AFTER=<seconds>: start sampling that long after startup.
+double aot_diff_after_ms() {
+    static const double after = [] {
+        const char *value = std::getenv("VITA3K_AOT_DIFF_AFTER");
+        return (value ? std::strtod(value, nullptr) * 1000.0 : 0.0) + emscripten_get_now();
+    }();
+    return after;
+}
+// VITA3K_AOT_DIFF_THREAD=<guest thread id>: sample only that thread's calls.
+int aot_diff_thread() {
+    static const int thread = [] {
+        const char *value = std::getenv("VITA3K_AOT_DIFF_THREAD");
+        return value ? std::atoi(value) : 0;
+    }();
+    return thread;
+}
+
+// --- AOT: whole-program ahead-of-time regions (AOT.md) --------------------
+// The builder forms one region-shaped function per guest function from a
+// static root set, using the same translation and emission rules as the lazy
+// path, and assembles all of them into ONE module. At run time the module's
+// lookup table maps every member entry PC to its owning function.
+// Control-flow summary of one translated block. The IR itself is NOT kept:
+// every Dynarmic IR::Block eagerly allocates a 4096-instruction pool, so a
+// whole-program cache of blocks exhausts the host heap. Emission re-translates
+// members with the recorded parameters, which reproduces the same block.
+struct AotTranslated {
+    RegionBlock block;
+    uint32_t limit = 0;          // translate_block instruction budget used
+    bool continue_stores = false; // translated with store continuations
+    bool calls = false;          // contains PushRSB
+    std::vector<Dynarmic::A32::LocationDescriptor> targets; // terminal links
+    std::vector<Dynarmic::A32::LocationDescriptor> returns; // PushRSB targets
+    std::optional<Dynarmic::A32::LocationDescriptor> fallthrough; // hot stub return
+    std::optional<Dynarmic::A32::LocationDescriptor> condition_failed;
+    uint64_t location = 0;
+    uint32_t end_pc = 0; // first byte after the block's guest code
+};
+
+class AotBuilder {
+public:
+    AotBuilder(MemState &mem, const WasmJitCPU::AotBuildSpec &spec, vita3k::wasmjit::RegionStateOptions options)
+        : mem(mem), spec(spec), options(options), validate_options(options) {
+        validate_options.aot = true; // accept exactly what emit_aot_function emits
+    }
+
+    bool build(std::vector<uint8_t> &out, std::string &report) {
+        using Dynarmic::A32::LocationDescriptor;
+        for (const auto &range : spec.code)
+            ranges.push_back({range.base, range.size});
+        std::sort(ranges.begin(), ranges.end(), [](const auto &a, const auto &b) { return a.base < b.base; });
+        for (size_t i = 1; i < ranges.size(); ++i)
+            if (ranges[i].base < ranges[i - 1].base + ranges[i - 1].size)
+                return fail(report, "overlapping AOT code ranges");
+        for (const uint64_t value : spec.function_roots)
+            add_root(LocationDescriptor{Dynarmic::IR::LocationDescriptor{value}});
+        drain();
+        // Seeds (locations the lazy JIT actually executed) must be owned by
+        // some function in their own mode; uncovered ones become roots.
+        for (const uint64_t value : spec.extra_entries) {
+            const LocationDescriptor location{Dynarmic::IR::LocationDescriptor{value}};
+            if (!owned(location))
+                add_root(location);
+        }
+        drain();
+        return assemble(out, report);
+    }
+
+private:
+    struct Function {
+        uint64_t root = 0;
+        std::vector<const AotTranslated *> members; // sorted by PC
+        std::vector<uint8_t> body;
+    };
+    MemState &mem;
+    const WasmJitCPU::AotBuildSpec &spec;
+    vita3k::wasmjit::RegionStateOptions options, validate_options;
+    std::vector<vita3k::wasmjit::AotRange> ranges;
+    std::deque<Dynarmic::A32::LocationDescriptor> pending_roots;
+    std::unordered_set<uint64_t> roots;
+    std::unordered_map<uint64_t, std::unique_ptr<AotTranslated>> translated;
+    std::unordered_set<uint64_t> untranslatable;
+    std::unordered_map<uint64_t, std::string> root_failures;
+    std::string last_rejection;
+    std::map<std::string, size_t> rejections; // untranslatable blocks by first rejection
+    std::vector<Function> functions;
+    // Member locations of successfully emitted functions (mode-exact).
+    std::unordered_set<uint64_t> covered;
+    size_t split_roots = 0, emit_rejects = 0, member_count = 0;
+    const bool trace = std::getenv("VITA3K_AOT_TRACE") != nullptr;
+    // Diagnostic: VITA3K_AOT_LIMIT=N stops forming after N functions so a
+    // profiled build finishes quickly; the module is then incomplete.
+    size_t limit = [] {
+        const char *value = std::getenv("VITA3K_AOT_LIMIT");
+        return value ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : SIZE_MAX;
+    }();
+
+    static bool fail(std::string &report, const char *why) {
+        report = why;
+        return false;
+    }
+    bool in_code(uint32_t pc) const {
+        for (const auto &range : ranges)
+            if (pc - range.base < range.size)
+                return true;
+        return false;
+    }
+    bool owned(const Dynarmic::A32::LocationDescriptor &location) const {
+        return covered.contains(location.UniqueHash());
+    }
+    void add_root(const Dynarmic::A32::LocationDescriptor &location) {
+        if (!in_code(location.PC()))
+            return;
+        if (roots.insert(location.UniqueHash()).second)
+            pending_roots.push_back(location);
+    }
+
+    // One translation attempt; the same parameters reproduce the same block.
+    std::optional<Dynarmic::IR::Block> translate_ir(const Dynarmic::A32::LocationDescriptor &location,
+        uint32_t limit, bool continue_stores, RegionBlock &block) {
+        using Dynarmic::A32::LocationDescriptor;
+        const uint32_t pc = location.PC();
+        block = RegionBlock{};
+        try {
+            // AOT bodies continue across stores without polls, so a block
+            // ends only at control flow or the instruction limit.
+            auto ir = vita3k::wasmjit::translate_block(mem, pc, location.CPSR().Value(), limit,
+                location.FPSCR().Value(), continue_stores ? &block.store_continuations : nullptr,
+                REGION_BLOCK_INSTR_LIMIT);
+            const uint64_t end = LocationDescriptor(ir.EndLocation()).PC();
+            if (end <= pc || end - pc > REGION_MAX_CODE_BYTES)
+                return std::nullopt;
+            const uint64_t ticks = ir.CycleCount() + ir.ConditionFailedCycleCount();
+            if (!ticks || ticks > REGION_MAX_TICKS)
+                return std::nullopt;
+            if (!vita3k::wasmjit::validate_region_block(ir, block.store_continuations, &last_rejection, validate_options))
+                return std::nullopt;
+            block.pc = pc;
+            block.hot_nid = hot_stub_nid(mem, pc, location.CPSR().Value());
+            block.psr_mask = PSR_DISPATCH_MASK;
+            block.psr_value = location.CPSR().Value() & PSR_DISPATCH_MASK;
+            block.ticks = static_cast<uint32_t>(ticks);
+            return ir;
+        } catch (const std::exception &) {
+            return std::nullopt;
+        }
+    }
+
+    // Same candidate ladder as form_region: a full store-continued block,
+    // then the store-ending block, then a single instruction.
+    const AotTranslated *translate(const Dynarmic::A32::LocationDescriptor &location) {
+        const uint64_t key = location.UniqueHash();
+        if (const auto found = translated.find(key); found != translated.end())
+            return found->second.get();
+        if (untranslatable.contains(key) || !in_code(location.PC()))
+            return nullptr;
+        auto result = std::make_unique<AotTranslated>();
+        std::optional<Dynarmic::IR::Block> ir;
+        last_rejection.clear();
+        for (const auto [limit, continue_stores] : {std::pair{REGION_BLOCK_INSTR_LIMIT, true},
+                 std::pair{REGION_BLOCK_INSTR_LIMIT, false}, std::pair{1u, false}}) {
+            ir = translate_ir(location, limit, continue_stores, result->block);
+            if (ir) {
+                result->limit = limit;
+                result->continue_stores = continue_stores;
+                break;
+            }
+        }
+        if (!ir) {
+            // The single-instruction attempt names the first unsupported op.
+            ++rejections[last_rejection.empty() ? "fetch/translate" : last_rejection];
+            untranslatable.insert(key);
+            return nullptr;
+        }
+        result->location = key;
+        result->end_pc = Dynarmic::A32::LocationDescriptor(ir->EndLocation()).PC();
+        collect_targets(ir->GetTerminal(), result->targets);
+        for (const Dynarmic::IR::Inst &inst : *ir) {
+            if (inst.GetOpcode() != Dynarmic::IR::Opcode::PushRSB)
+                continue;
+            result->calls = true;
+            result->returns.emplace_back(Dynarmic::IR::LocationDescriptor{inst.GetArg(0).GetU64()});
+        }
+        if (result->block.hot_nid)
+            result->fallthrough.emplace(ir->EndLocation());
+        if (ir->GetCondition() != Dynarmic::IR::Cond::AL && ir->HasConditionFailedLocation())
+            result->condition_failed.emplace(ir->ConditionFailedLocation());
+        auto *pointer = result.get();
+        translated.emplace(key, std::move(result));
+        return pointer;
+    }
+
+    void drain() {
+        using Dynarmic::A32::LocationDescriptor;
+        while (!pending_roots.empty() && functions.size() < limit) {
+            const LocationDescriptor root = pending_roots.front();
+            pending_roots.pop_front();
+            if (owned(root))
+                continue;
+            if (trace)
+                std::fprintf(stderr, "[aot] root %08x%s\n", root.PC(), root.TFlag() ? "T" : "A");
+            form(root);
+        }
+    }
+
+    void form(const Dynarmic::A32::LocationDescriptor &root) {
+        using Dynarmic::A32::LocationDescriptor;
+        Function function;
+        function.root = root.UniqueHash();
+        std::vector<LocationDescriptor> stack{root};
+        std::unordered_set<uint32_t> member_pcs;
+        std::vector<LocationDescriptor> overflow;
+        uint64_t ticks = 0;
+        while (!stack.empty()) {
+            const LocationDescriptor location = stack.back();
+            stack.pop_back();
+            if (member_pcs.contains(location.PC()))
+                continue;
+            const AotTranslated *block = translate(location);
+            if (!block) {
+                if (location.UniqueHash() == function.root) {
+                    root_failures.emplace(function.root, "untranslatable root");
+                    return;
+                }
+                continue; // runtime Miss -> host/lazy JIT for this edge
+            }
+            if (function.members.size() >= REGION_MAX_BLOCKS
+                || ticks + block->block.ticks > REGION_MAX_TICKS) {
+                overflow.push_back(location);
+                continue;
+            }
+            member_pcs.insert(location.PC());
+            function.members.push_back(block);
+            ticks += block->block.ticks;
+            for (const auto &target : block->targets) {
+                // A call edge (the block pushed a return address) or a jump to
+                // a known function entry leaves this function.
+                // Code another function already owns is reached through the
+                // lookup table instead of being duplicated here.
+                if (block->calls || (roots.contains(target.UniqueHash()) && target.UniqueHash() != function.root))
+                    add_root(target);
+                else if (covered.contains(target.UniqueHash()))
+                    continue;
+                else
+                    stack.push_back(target);
+            }
+            for (const auto &ret : block->returns)
+                stack.push_back(ret);
+            if (block->fallthrough)
+                stack.push_back(*block->fallthrough);
+            if (block->condition_failed)
+                stack.push_back(*block->condition_failed);
+        }
+        for (const auto &location : overflow) {
+            if (!member_pcs.contains(location.PC())) {
+                ++split_roots;
+                add_root(location);
+            }
+        }
+        std::sort(function.members.begin(), function.members.end(),
+            [](const AotTranslated *a, const AotTranslated *b) { return a->block.pc < b->block.pc; });
+        // Re-translate the members for emission only; the IR dies here.
+        std::vector<Dynarmic::IR::Block> ir_blocks;
+        ir_blocks.reserve(function.members.size());
+        std::vector<vita3k::wasmjit::RegionBlockMeta> meta;
+        for (const auto *member : function.members) {
+            const LocationDescriptor location{Dynarmic::IR::LocationDescriptor{member->location}};
+            RegionBlock block;
+            auto ir = translate_ir(location, member->limit, member->continue_stores, block);
+            if (!ir || block.ticks != member->block.ticks) {
+                root_failures.emplace(function.root, "nondeterministic retranslation");
+                return;
+            }
+            ir_blocks.push_back(std::move(*ir));
+            meta.push_back({block.pc, block.psr_mask, block.psr_value, block.ticks,
+                std::move(block.store_continuations), block.hot_nid});
+        }
+        std::vector<const Dynarmic::IR::Block *> blocks;
+        blocks.reserve(ir_blocks.size());
+        for (const auto &ir : ir_blocks)
+            blocks.push_back(&ir);
+        function.body = vita3k::wasmjit::emit_aot_function(blocks, meta, options);
+        if (function.body.empty()) {
+            ++emit_rejects;
+            root_failures.emplace(function.root, "emission rejected");
+            return;
+        }
+        for (const auto *member : function.members)
+            covered.insert(member->location);
+        member_count += function.members.size();
+        functions.push_back(std::move(function));
+        if (functions.size() % 2000 == 0)
+            std::fprintf(stderr, "[aot] %zu functions, %zu members, %zu roots queued\n",
+                functions.size(), member_count, pending_roots.size());
+    }
+
+    static void put(std::vector<uint8_t> &out, uint32_t word) {
+        for (int i = 0; i < 4; ++i)
+            out.push_back(static_cast<uint8_t>(word >> (8 * i)));
+    }
+
+    bool assemble(std::vector<uint8_t> &out, std::string &report) {
+        if (functions.empty())
+            return fail(report, "no AOT function could be formed");
+        // Lookup table: a function's root first, then any member. Only
+        // members in the default execution state (IT=0, E=0, FPSCR mode 0)
+        // are addressable; the transfer helper checks exactly that.
+        // One entry per PC. Several functions (or modes) can contain the same
+        // PC; prefer what was observed executing (seeds), then roots, then
+        // members, and Thumb on a tie (a data word decoded as ARM must not
+        // shadow real Thumb code).
+        std::map<uint32_t, std::pair<uint32_t, uint32_t>> ranked_owner; // pc -> (rank, entry)
+        const std::unordered_set<uint64_t> observed(spec.extra_entries.begin(), spec.extra_entries.end());
+        const auto enterable = [](const AotTranslated *member) {
+            const Dynarmic::A32::LocationDescriptor location{Dynarmic::IR::LocationDescriptor{member->location}};
+            return location.IT().Value() == 0 && !location.EFlag()
+                && (location.FPSCR().Value() & Dynarmic::A32::LocationDescriptor::FPSCR_MODE_MASK) == 0;
+        };
+        if (functions.size() > vita3k::wasmjit::kAotMaxFunctions)
+            return fail(report, "too many AOT functions for the lookup table encoding");
+        for (uint32_t slot = 0; slot < functions.size(); ++slot) {
+            const auto &members = functions[slot].members;
+            for (uint32_t index = 0; index < members.size(); ++index) {
+                const auto *member = members[index];
+                if (!enterable(member))
+                    continue;
+                const bool thumb = Dynarmic::A32::LocationDescriptor{
+                    Dynarmic::IR::LocationDescriptor{member->location}}.TFlag();
+                const uint32_t rank = (observed.contains(member->location) ? 8 : 0)
+                    + (member->location == functions[slot].root ? 4 : 0) + (thumb ? 1 : 0);
+                const uint32_t entry = vita3k::wasmjit::aot_lut_entry(slot, index, thumb);
+                auto [it, inserted] = ranked_owner.emplace(member->block.pc, std::pair{rank, entry});
+                if (!inserted && rank > it->second.first)
+                    it->second = {rank, entry};
+            }
+        }
+        std::map<uint32_t, uint32_t> owner;
+        for (const auto &[pc, ranked] : ranked_owner)
+            owner.emplace(pc, ranked.second);
+        std::vector<uint8_t> metadata;
+        put(metadata, WasmJitCPU::aot_magic);
+        put(metadata, WasmJitCPU::aot_version);
+        put(metadata, static_cast<uint32_t>(ranges.size()));
+        for (const auto &range : ranges) {
+            std::vector<uint8_t> bytes(range.size);
+            if (!mem_read(mem, range.base, bytes.data(), bytes.size()))
+                return fail(report, "AOT code range is not readable");
+            put(metadata, range.base);
+            put(metadata, range.size);
+            put(metadata, aot_hash(bytes.data(), bytes.size()));
+        }
+        put(metadata, static_cast<uint32_t>(owner.size()));
+        for (const auto &[pc, entry] : owner) {
+            put(metadata, pc);
+            put(metadata, entry);
+        }
+        // Guest code span of every function (slot order), for invalidation.
+        put(metadata, static_cast<uint32_t>(functions.size()));
+        for (const auto &function : functions) {
+            uint32_t begin = UINT32_MAX, end = 0;
+            for (const auto *member : function.members) {
+                begin = std::min(begin, member->block.pc);
+                end = std::max(end, member->end_pc);
+            }
+            put(metadata, begin);
+            put(metadata, end);
+        }
+        std::vector<std::vector<uint8_t>> bodies;
+        bodies.reserve(functions.size());
+        for (auto &function : functions)
+            bodies.push_back(std::move(function.body));
+        out = vita3k::wasmjit::assemble_aot_module(bodies, ranges, metadata, options);
+        if (out.empty())
+            return fail(report, "AOT module assembly rejected");
+        std::map<std::string, size_t> failures;
+        for (const auto &[root, why] : root_failures)
+            ++failures[why];
+        char line[512];
+        std::snprintf(line, sizeof(line),
+            "functions=%zu members=%zu translated=%zu untranslatable=%zu entries=%zu split_roots=%zu "
+            "emit_rejects=%zu roots=%zu bytes=%zu",
+            functions.size(), member_count, translated.size(), untranslatable.size(), owner.size(),
+            split_roots, emit_rejects, roots.size(), out.size());
+        report = line;
+        for (const auto &[why, count] : failures)
+            report += std::string(" ") + why + "=" + std::to_string(count);
+        std::vector<std::pair<size_t, std::string>> ranked;
+        for (const auto &[why, count] : rejections)
+            ranked.emplace_back(count, why);
+        std::sort(ranked.rbegin(), ranked.rend());
+        if (!ranked.empty())
+            report += "\n[vita3k-web] AOT untranslatable blocks by reason:";
+        for (const auto &[count, why] : ranked)
+            report += "\n  " + std::to_string(count) + " " + why;
+        return true;
+    }
+};
 } // namespace
 
 // Compilation and host entry into generated functions cross JS. Inside a
@@ -812,6 +1281,51 @@ EM_JS(void, vita3k_jit_release_region, (int slot), {
     if (table && slot < table.length) table.set(slot, null);
 });
 
+// AOT module transport. The Worker supplies a precompiled WebAssembly.Module
+// as Module.vita3kAotModule; Node benchmarks may name a file in VITA3K_AOT.
+EM_JS(uint32_t, vita3k_aot_metadata_size, (), {
+    let module = Module['vita3kAotModule'];
+    if (!module) {
+        const path = Module['VITA3K_AOT'] ??
+            (typeof process !== 'undefined' ? process.env?.VITA3K_AOT : undefined);
+        if (!path)
+            return 0;
+        module = new WebAssembly.Module(require('fs').readFileSync(path));
+        Module['vita3kAotModule'] = module;
+    }
+    const sections = WebAssembly.Module.customSections(module, 'vita3k.aot');
+    if (sections.length !== 1) {
+        err('[vita3k-web] AOT module has no vita3k.aot metadata section');
+        return 0;
+    }
+    Module['vita3kAotMetadata'] = new Uint8Array(sections[0]);
+    return Module['vita3kAotMetadata'].length;
+});
+EM_JS(void, vita3k_aot_metadata_copy, (uint8_t *dest), {
+    const metadata = Module['vita3kAotMetadata'];
+    Module['vita3kHostBytes'](dest, metadata.length).set(metadata);
+});
+// Returns the native function-table slot of the module's entry, so the host
+// calls it directly (wasm call_indirect, no JS) as an AotEntry pointer.
+EM_JS(int, vita3k_aot_instantiate, (const uint32_t *lut, MemoryFunction read_memory,
+    MemoryFunction write_memory, MemoryFunction arithmetic), {
+    try {
+        const instance = new WebAssembly.Instance(Module['vita3kAotModule'], {env: {
+            memory: wasmMemory,
+            mem_read: Module['vita3kNativeFunction'](read_memory),
+            mem_write: Module['vita3kNativeFunction'](write_memory),
+            fp64: Module['vita3kNativeFunction'](arithmetic),
+            aot_lut: Module['vita3kHostPointer'](lut)
+        }});
+        const slot = Number(wasmTable.grow(Module['vita3kMemory64'] ? 1n : 1));
+        setWasmTableEntry(slot, instance.exports.entry);
+        return slot;
+    } catch (error) {
+        err('[vita3k-web] AOT instantiation failed: ' + error);
+        return -1;
+    }
+});
+
 struct WasmJitCPU::Impl {
     using State = vita3k::wasmjit::JitState;
     using Key = std::pair<uint64_t, uint32_t>;
@@ -869,6 +1383,11 @@ struct WasmJitCPU::Impl {
     // Miss returns to the host (host_miss; ~all resolve to compiled regions
     // at the loop top, true compiles are region_misses).
     uint64_t tx_wasm = 0, host_miss = 0;
+    // AOT entries (host -> AOT module) and entry misses (PC/mode not owned).
+    uint64_t aot_calls = 0, aot_entry_misses = 0;
+    uint32_t aot_skip_pc = 0xffffffffu;
+    bool aot_enabled = true;    // per thread (VITA3K_AOT_EXCLUDE_THREADS)
+    bool diff_reference = false; // running the lazy half of a VITA3K_AOT_DIFF sample
     bool dispatch_installed = false;
     // Region mode is the production path (M14c); single-block execution
     // remains for step() and the single-block module suite.
@@ -1012,6 +1531,8 @@ struct WasmJitCPU::Impl {
         block_ptrs.reserve(region->blocks.size());
         meta.reserve(region->blocks.size());
         for (size_t i = 0; i < region->blocks.size(); ++i) {
+            if (aot_seed_recording())
+                g_aot_seed_keys.insert(ir_blocks[i].Location().Value());
             block_ptrs.push_back(&ir_blocks[i]);
             meta.push_back({region->blocks[i].pc, region->blocks[i].psr_mask,
                 region->blocks[i].psr_value, region->blocks[i].ticks,
@@ -1050,6 +1571,173 @@ struct WasmJitCPU::Impl {
             stats->wasm_bytes = bytes.size();
         }
         return found;
+    }
+
+    // AOT code is immutable. A store into a page it covers means the guest
+    // rewrote translated code: stop using the whole module (fail closed to
+    // the lazy JIT, which revalidates bytes) and say so loudly.
+    void note_aot_smc() {
+        if (!g_aot.loaded || g_aot.disabled)
+            return;
+        const uint32_t page = state.smc_page;
+        if (page != std::numeric_limits<uint32_t>::max() && !g_aot.covers_page(page))
+            return;
+        g_aot.disabled = true;
+        std::fprintf(stderr, "[vita3k-web] AOT disabled: guest store into AOT code page %08x (pc %08x)\n",
+            page << 12, state.regs[15]);
+    }
+    // One VITA3K_AOT_DIFF sample: run the AOT call, then the lazy JIT from the
+    // same JitState and memory for the same instruction count, compare, and
+    // leave the AOT outcome in place so the run continues unchanged. Every
+    // allocated page is snapshotted: unchecked AOT stores ignore permissions.
+    uint32_t aot_differential(uint32_t granted) {
+        auto &mem = *parent->mem;
+        auto &stats = g_aot_diff;
+        ++stats.samples;
+        constexpr uint32_t page_bytes = 4096, pages_total = 1u << 20, chunk = 256;
+        std::vector<uint32_t> pages;
+        for (uint32_t first = 1; first < pages_total; first += chunk) {
+            const uint32_t end = std::min(first + chunk, pages_total);
+            if (mem.allocator.free_slot_count(first, end) == int(end - first))
+                continue;
+            for (uint32_t page = first; page < end; ++page)
+                if (mem.allocator.free_slot_count(page, page + 1) == 0)
+                    pages.push_back(page);
+        }
+        const auto host = [&](uint32_t page) { return mem_guest_to_host(mem, page * page_bytes); };
+        std::vector<uint8_t> snapshot(size_t(pages.size()) * page_bytes);
+        for (size_t i = 0; i < pages.size(); ++i)
+            std::memcpy(&snapshot[i * page_bytes], host(pages[i]), page_bytes);
+        stats.snapshot_bytes = snapshot.size();
+        const auto changed = [&] {
+            std::map<uint32_t, std::vector<uint8_t>> result;
+            for (size_t i = 0; i < pages.size(); ++i)
+                if (std::memcmp(&snapshot[i * page_bytes], host(pages[i]), page_bytes) != 0)
+                    result.emplace(pages[i], std::vector<uint8_t>(host(pages[i]), host(pages[i]) + page_bytes));
+            return result;
+        };
+        const auto restore = [&](const std::map<uint32_t, std::vector<uint8_t>> &written) {
+            for (const auto &[page, bytes] : written) {
+                const size_t i = std::lower_bound(pages.begin(), pages.end(), page) - pages.begin();
+                std::memcpy(host(page), &snapshot[i * page_bytes], page_bytes);
+            }
+        };
+        // The inline-mutex table is host state the generated code updates
+        // together with the guest workarea: isolate it like guest memory.
+        using MutexTable = vita3k::wasmjit::InlineMutexTable;
+        auto *mutex_table = reinterpret_cast<MutexTable *>(state.mutex_table);
+        std::optional<MutexTable> mutexes_before, mutexes_after_aot;
+        if (mutex_table)
+            mutexes_before = *mutex_table;
+        const vita3k::wasmjit::JitState initial = state;
+        const uint32_t svc0 = parent->svc;
+        const bool svc_called0 = parent->svc_called;
+        const uint64_t executed0 = executed;
+        const uint32_t aot_reason = g_aot.entry(&state, granted);
+        const vita3k::wasmjit::JitState after_aot = state;
+        const uint32_t aot_ticks = counter_delta(initial.executed, after_aot.executed);
+        const auto aot_pages = changed();
+        restore(aot_pages);
+        if (mutex_table) {
+            mutexes_after_aot = *mutex_table;
+            *mutex_table = *mutexes_before;
+        }
+
+        state = initial;
+        diff_reference = true;
+        const bool slice = scheduler_slice;
+        scheduler_slice = true;
+        execute_regions(aot_ticks);
+        scheduler_slice = slice;
+        diff_reference = false;
+        const vita3k::wasmjit::JitState after_lazy = state;
+        const uint32_t lazy_ticks = counter_delta(initial.executed, after_lazy.executed);
+        const auto lazy_pages = changed();
+
+        // Compare. fast_fp AOT images drop cumulative FPSCR flags and may
+        // differ in NaN payloads (AOT.md); those differences are counted apart.
+        const bool fast_fp = !std::getenv("VITA3K_AOT_EXACT_FP");
+        std::vector<std::string> classes;
+        if (aot_ticks != lazy_ticks) {
+            ++stats.count_mismatch;
+        } else {
+            ++stats.compared;
+            ++stats.per_thread[parent->thread_id];
+            for (unsigned r = 0; r < 16; ++r)
+                if (after_aot.regs[r] != after_lazy.regs[r])
+                    classes.push_back(fmt::format("r{} aot={:08x} jit={:08x}", r, after_aot.regs[r], after_lazy.regs[r]));
+            if (after_aot.cpsr != after_lazy.cpsr)
+                classes.push_back(fmt::format("cpsr aot={:08x} jit={:08x}", after_aot.cpsr, after_lazy.cpsr));
+            const uint32_t fpscr_mask = fast_fp ? ~0x9fu : ~0u;
+            if ((after_aot.fpscr & fpscr_mask) != (after_lazy.fpscr & fpscr_mask))
+                classes.push_back(fmt::format("fpscr aot={:08x} jit={:08x}", after_aot.fpscr, after_lazy.fpscr));
+            else if (after_aot.fpscr != after_lazy.fpscr)
+                ++stats.fpscr_flags_only;
+            bool nan_only = false;
+            for (unsigned w = 0; w < 64; ++w) {
+                if (after_aot.fpu[w] == after_lazy.fpu[w])
+                    continue;
+                if (fast_fp && is_nan32(after_aot.fpu[w]) && is_nan32(after_lazy.fpu[w])) {
+                    nan_only = true;
+                    continue;
+                }
+                classes.push_back(fmt::format("fpu[{}] aot={:08x} jit={:08x}", w, after_aot.fpu[w], after_lazy.fpu[w]));
+            }
+            if (nan_only) ++stats.nan_payload_only;
+            if (mutex_table && std::memcmp(mutex_table, &*mutexes_after_aot, sizeof(MutexTable)) != 0)
+                classes.push_back("inline-mutex table");
+            if (after_aot.exclusive_size != after_lazy.exclusive_size
+                || (after_aot.exclusive_size && (after_aot.exclusive_address != after_lazy.exclusive_address
+                    || after_aot.exclusive_value != after_lazy.exclusive_value)))
+                classes.push_back("exclusive monitor");
+            std::set<uint32_t> touched;
+            for (const auto &[page, bytes] : aot_pages) touched.insert(page);
+            for (const auto &[page, bytes] : lazy_pages) touched.insert(page);
+            for (const uint32_t page : touched) {
+                const auto a = aot_pages.find(page), l = lazy_pages.find(page);
+                const size_t i = std::lower_bound(pages.begin(), pages.end(), page) - pages.begin();
+                const uint8_t *aot_bytes = a != aot_pages.end() ? a->second.data() : &snapshot[i * page_bytes];
+                const uint8_t *lazy_bytes = l != lazy_pages.end() ? l->second.data() : &snapshot[i * page_bytes];
+                for (uint32_t b = 0; b < page_bytes; ++b) {
+                    if (aot_bytes[b] != lazy_bytes[b]) {
+                        classes.push_back(fmt::format("mem {:08x} aot={:02x} jit={:02x}", page * page_bytes + b, aot_bytes[b], lazy_bytes[b]));
+                        break;
+                    }
+                }
+            }
+        }
+        if (!classes.empty()) {
+            ++stats.mismatches;
+            for (const auto &c : classes) ++stats.classes[c.substr(0, c.find(' '))];
+            if (stats.mismatches <= 20) {
+                std::fprintf(stderr, "[aot-diff] MISMATCH thread=%d pc=%08x cpsr=%08x ticks=%u reason=%u:", parent->thread_id,
+                    initial.regs[15], initial.cpsr, aot_ticks, aot_reason);
+                for (const auto &c : classes) std::fprintf(stderr, " | %s", c.c_str());
+                std::fprintf(stderr, "\n");
+            }
+        }
+        if (stats.samples % 25 == 0)
+            std::fprintf(stderr, "[aot-diff] samples=%llu compared=%llu count_mismatch=%llu mismatches=%llu fpscr_flags_only=%llu nan_payload_only=%llu snapshot_mb=%.0f\n",
+                (unsigned long long)stats.samples, (unsigned long long)stats.compared, (unsigned long long)stats.count_mismatch,
+                (unsigned long long)stats.mismatches, (unsigned long long)stats.fpscr_flags_only,
+                (unsigned long long)stats.nan_payload_only, stats.snapshot_bytes / 1048576.0);
+        if (stats.samples % 25 == 0) {
+            std::fprintf(stderr, "[aot-diff] compared per thread:");
+            for (const auto &[tid, count] : stats.per_thread) std::fprintf(stderr, " %d:%llu", tid, (unsigned long long)count);
+            std::fprintf(stderr, "\n");
+        }
+
+        // Keep the AOT outcome: undo the lazy writes, reapply the AOT ones.
+        restore(lazy_pages);
+        for (const auto &[page, bytes] : aot_pages)
+            std::memcpy(host(page), bytes.data(), page_bytes);
+        state = after_aot;
+        if (mutex_table)
+            *mutex_table = *mutexes_after_aot;
+        parent->svc = svc0;
+        parent->svc_called = svc_called0;
+        executed = executed0;
+        return aot_reason;
     }
 
     int execute_regions(uint64_t remaining_budget) {
@@ -1177,10 +1865,22 @@ struct WasmJitCPU::Impl {
                 dispatch_installed = true;
             }
             const uint32_t pc = state.regs[15];
+            // AOT first: the module owns this PC unless its entry already
+            // reported a PC/mode mismatch here (then the lazy path runs once).
+            const bool via_aot = g_aot.loaded && !g_aot.disabled && aot_enabled && !diff_reference
+                && pc != aot_skip_pc && g_aot.slot(pc) != 0;
+            aot_skip_pc = 0xffffffffu;
+            if (g_aot.loaded && !via_aot && std::getenv("VITA3K_AOT_TRACE_MISSES")) {
+                static std::unordered_map<uint32_t, uint64_t> uncovered;
+                const uint64_t hits = ++uncovered[pc];
+                if (hits == 1 || hits == 1000 || hits == 100000)
+                    std::fprintf(stderr, "[aot] uncovered pc=%08x cpsr=%08x hits=%llu lut=%08x\n", pc, state.cpsr,
+                        static_cast<unsigned long long>(hits), g_aot.slot(pc));
+            }
             const auto loc = Dynarmic::A32::LocationDescriptor{pc,
                 Dynarmic::A32::PSR{state.cpsr}, Dynarmic::A32::FPSCR{state.fpscr}};
             const uint64_t key = loc.UniqueHash();
-            auto found = region_cache.find(key);
+            auto found = via_aot ? region_cache.end() : region_cache.find(key);
             if (found != region_cache.end()) {
                 ++select_checks;
                 if (!region_unchanged(*found->second.region, *parent->mem)) {
@@ -1195,15 +1895,16 @@ struct WasmJitCPU::Impl {
                 found = region_cache.end();
                 }
             }
-            if (found == region_cache.end()) {
+            if (!via_aot && found == region_cache.end()) {
                 RegionBuildStats build{};
                 found = ensure_region(pc, key, &build);
                 if (found == region_cache.end())
                     return -1; // ensure_region already reported via fail()/reject().
             }
             ++hits;
-            found->second.last_used = ++region_clock;
-            if (log_code)
+            if (!via_aot)
+                found->second.last_used = ++region_clock;
+            if (log_code && !via_aot)
                 std::fprintf(stderr, "JIT region PC=%08x blocks=%zu\n",
                     pc, found->second.region->blocks.size());
             // Refresh per-run state fields (bases are stable but cheap).
@@ -1237,37 +1938,50 @@ struct WasmJitCPU::Impl {
             // regs[15] is the transfer target after every Miss/Budget/Smc
             // return (all exits publish it), so the loop-top resolve below
             // serves both fresh entries and post-dispatcher Miss targets.
-            if (found->second.table_index < 0
-                || found->second.table_index >= static_cast<int>(vita3k::wasmjit::kDispatchTableLimit))
+            if (!via_aot && (found->second.table_index < 0
+                || found->second.table_index >= static_cast<int>(vita3k::wasmjit::kDispatchTableLimit)))
                 return fail("region slot outside dispatch table");
-            if (!dispatch_map_insert(core, key, static_cast<uint32_t>(found->second.table_index)))
+            if (!via_aot && !dispatch_map_insert(core, key, static_cast<uint32_t>(found->second.table_index)))
                 return fail("region map full");
             const uintptr_t map_base = dispatch_map_base(core);
             if (map_base == 0)
                 return fail("dispatch map allocation failed");
             const uintptr_t state_offset = reinterpret_cast<uintptr_t>(&state);
-            const uint32_t granted = static_cast<uint32_t>(std::min<uint64_t>(remaining_budget, UINT32_MAX));
+            // AOT transfers compare the unspent budget as a signed i32 (a
+            // function may overrun by its forward path), so keep it positive.
+            const uint32_t granted = static_cast<uint32_t>(std::min<uint64_t>(remaining_budget,
+                via_aot ? (1u << 30) : UINT32_MAX));
             const uint32_t executed_before = state.executed;
             const uint32_t dispatches_before = state.dispatches;
             const uint32_t tx_before = state.tx_wasm;
             const double t2 = emscripten_get_now();
-            const uint32_t reason = vita3k_jit_run_dispatch(state_offset, granted,
-                map_base, dispatch_epoch_addr());
+            const bool diff_sample = via_aot && aot_diff_every()
+                && (!aot_diff_thread() || aot_diff_thread() == parent->thread_id)
+                && emscripten_get_now() >= aot_diff_after_ms()
+                && ++g_aot_diff.calls % aot_diff_every() == 0;
+            const uint32_t reason = diff_sample ? aot_differential(granted)
+                : via_aot ? g_aot.entry(&state, granted)
+                : vita3k_jit_run_dispatch(state_offset, granted, map_base, dispatch_epoch_addr());
+            aot_calls += via_aot;
             run_js_ms += emscripten_get_now() - t2;
             ++js_calls;
             account_counters();
             dispatches += counter_delta(dispatches_before, state.dispatches);
             tx_wasm += counter_delta(tx_before, state.tx_wasm);
             const uint32_t delta = counter_delta(executed_before, state.executed);
-            if (delta > granted)
+            // AOT checks the budget only at transfers and backward edges, so a
+            // call may overrun by at most one function's forward path.
+            if (delta > granted && !via_aot)
                 return fail("generated region overran its budget");
             executed += delta;
-            remaining_budget -= delta;
+            remaining_budget -= std::min<uint64_t>(delta, remaining_budget);
             // Light-path chained edges can leave the loop (Budget/Stop/Miss/
             // Svc/Fault) without a loop-top smc poll after a code-page store
             // (REGION_ABI.md v1.2): the edge's budget check may exit first.
             // Normalize any pending smc_dirty on EVERY non-Smc exit so
             // "SMC wins over the dispatch budget check" holds everywhere.
+            if (state.smc_dirty)
+                note_aot_smc();
             if (reason != static_cast<uint32_t>(ExitReason::Smc) && state.smc_dirty) {
                 ++smc_exits;
                 if (state.smc_page == std::numeric_limits<uint32_t>::max())
@@ -1350,6 +2064,16 @@ struct WasmJitCPU::Impl {
                 continue;
             case ExitReason::Stop:
                 return 1;
+            case ExitReason::EntryMiss:
+                // An AOT function does not own next_pc in the current mode.
+                // regs[15] still equals next_pc; resolve it lazily once.
+                ++aot_entry_misses;
+                if (std::getenv("VITA3K_AOT_TRACE_MISSES") && aot_entry_misses <= 40)
+                    std::fprintf(stderr, "[aot] entry miss pc=%08x cpsr=%08x fpscr=%08x lut=%08x\n",
+                        state.next_pc, state.cpsr, state.fpscr, g_aot.slot(state.next_pc));
+                aot_skip_pc = state.next_pc;
+                state.regs[15] = state.next_pc;
+                continue;
             default:
                 return fail("generated region returned unsupported exit");
             }
@@ -1496,6 +2220,154 @@ struct WasmJitCPU::Impl {
 
 WasmJitCPU::WasmJitCPU(CPUState *parent, std::size_t core) : impl(std::make_unique<Impl>(parent, core)) {}
 WasmJitCPU::~WasmJitCPU() = default;
+uint64_t WasmJitCPU::aot_location(uint32_t address) {
+    const bool thumb = address & 1;
+    return Dynarmic::A32::LocationDescriptor{address & ~1u, Dynarmic::A32::PSR{thumb ? 0x20u : 0u},
+        Dynarmic::A32::FPSCR{0}}.UniqueHash();
+}
+
+bool WasmJitCPU::build_aot(MemState &mem, const AotBuildSpec &spec, std::vector<uint8_t> &out, std::string &report) {
+    auto options = vita3k::wasmjit::region_state_options();
+    // Same predicate as each CPU's lazy regions: the fast-path metadata arrays
+    // live for the whole MemState lifetime.
+    options.assume_fast_bases = mem.page_permissions != nullptr
+        && (mem.direct_host_memory || (mem.sparse_host_memory && mem.page_table != nullptr));
+    // Plain guest-window accesses: AOT text is read-execute, so its own
+    // stores cannot rewrite translated code. VITA3K_AOT_CHECKED_MEMORY=1
+    // keeps the fault-reporting probes (diagnosis of guest faults).
+    options.unchecked_memory = mem.direct_host_memory && !std::getenv("VITA3K_AOT_CHECKED_MEMORY");
+    // Native Wasm FP arithmetic without cumulative FPSCR flags
+    // (RegionStateOptions::fast_fp); VITA3K_AOT_EXACT_FP=1 keeps exact flags.
+    options.fast_fp = !std::getenv("VITA3K_AOT_EXACT_FP");
+    AotBuilder builder(mem, spec, options);
+    return builder.build(out, report);
+}
+
+int WasmJitCPU::load_aot(MemState &mem, std::string &report) {
+    if (g_aot.loaded) {
+        report = "already loaded";
+        return 1;
+    }
+    const uint32_t size = vita3k_aot_metadata_size();
+    if (!size) {
+        report = "no AOT module supplied";
+        return 0;
+    }
+    std::vector<uint8_t> metadata(size);
+    vita3k_aot_metadata_copy(metadata.data());
+    size_t cursor = 0;
+    const auto word = [&](uint32_t &value) {
+        if (cursor + 4 > metadata.size())
+            return false;
+        value = metadata[cursor] | (metadata[cursor + 1] << 8) | (metadata[cursor + 2] << 16)
+            | (uint32_t(metadata[cursor + 3]) << 24);
+        cursor += 4;
+        return true;
+    };
+    uint32_t magic = 0, version = 0, range_count = 0;
+    if (!word(magic) || !word(version) || !word(range_count) || magic != aot_magic || version != aot_version) {
+        report = "AOT metadata has the wrong magic/version";
+        return -1;
+    }
+    AotRuntime runtime;
+    uint64_t lut_words = 0;
+    for (uint32_t i = 0; i < range_count; ++i) {
+        uint32_t base = 0, bytes = 0, hash = 0;
+        if (!word(base) || !word(bytes) || !word(hash)) {
+            report = "truncated AOT range table";
+            return -1;
+        }
+        std::vector<uint8_t> code(bytes);
+        if (!mem_read(mem, base, code.data(), code.size()) || aot_hash(code.data(), code.size()) != hash) {
+            char line[160];
+            std::snprintf(line, sizeof(line), "guest code [%08x,+%x) differs from the AOT build; AOT not used",
+                base, bytes);
+            report = line;
+            return -1;
+        }
+        runtime.ranges.push_back({base, bytes});
+        runtime.offsets.push_back(lut_words);
+        lut_words += bytes / 2;
+    }
+    runtime.lut.assign(lut_words, 0);
+    uint32_t pairs = 0;
+    if (!word(pairs)) {
+        report = "truncated AOT entry table";
+        return -1;
+    }
+    for (uint32_t i = 0; i < pairs; ++i) {
+        uint32_t pc = 0, slot = 0;
+        if (!word(pc) || !word(slot)) {
+            report = "truncated AOT entry table";
+            return -1;
+        }
+        bool placed = false;
+        for (size_t k = 0; k < runtime.ranges.size(); ++k) {
+            const uint32_t offset = pc - runtime.ranges[k].base;
+            if (offset < runtime.ranges[k].size && !(offset & 1)) {
+                runtime.lut[runtime.offsets[k] + offset / 2] = slot;
+                placed = true;
+                break;
+            }
+        }
+        if (!placed || !slot) {
+            report = "AOT entry outside its code ranges";
+            return -1;
+        }
+    }
+    uint32_t function_count = 0;
+    if (!word(function_count) || function_count > vita3k::wasmjit::kAotMaxFunctions) {
+        report = "truncated AOT function table";
+        return -1;
+    }
+    runtime.spans.resize(function_count);
+    for (auto &[begin, end] : runtime.spans) {
+        if (!word(begin) || !word(end) || end < begin) {
+            report = "truncated AOT function table";
+            return -1;
+        }
+    }
+    g_aot = std::move(runtime);
+    const int entry_slot = vita3k_aot_instantiate(g_aot.lut.data(), checked_memory_read, checked_memory_write, fp64_helper);
+    if (entry_slot < 0) {
+        g_aot = AotRuntime{};
+        report = "AOT module instantiation failed";
+        return -1;
+    }
+    g_aot.entry = reinterpret_cast<AotEntry>(static_cast<uintptr_t>(entry_slot));
+    // Stores into translated code must take the checked path so smc_dirty
+    // reports them (the loaded module never revalidates its bytes).
+    for (const auto &range : g_aot.ranges)
+        for (uint32_t page = range.base >> 12; page <= (range.base + range.size - 1) >> 12; ++page)
+            ++g_code_pages[page];
+    g_aot.loaded = true;
+    char line[160];
+    std::snprintf(line, sizeof(line), "AOT loaded: %u ranges, %u entries, %llu table words",
+        range_count, pairs, static_cast<unsigned long long>(lut_words));
+    report = line;
+    return 1;
+}
+
+bool WasmJitCPU::dump_aot_seeds(const char *path) {
+    // Accumulate: seeds recorded by earlier runs (possibly with an AOT module
+    // loaded, when only uncovered code reaches the lazy JIT) are kept.
+    std::unordered_set<uint64_t> all(g_aot_seed_keys.begin(), g_aot_seed_keys.end());
+    if (FILE *previous = std::fopen(path, "r")) {
+        unsigned long long value = 0;
+        while (std::fscanf(previous, "%llx", &value) == 1)
+            all.insert(value);
+        std::fclose(previous);
+    }
+    std::vector<uint64_t> keys(all.begin(), all.end());
+    std::sort(keys.begin(), keys.end());
+    FILE *out = std::fopen(path, "w");
+    if (!out)
+        return false;
+    for (const uint64_t key : keys)
+        std::fprintf(out, "%016llx\n", static_cast<unsigned long long>(key));
+    return std::fclose(out) == 0;
+}
+
 int WasmJitCPU::run() {
     impl->stopped = false;
     impl->parent->svc_called = false;
@@ -1605,6 +2477,39 @@ void WasmJitCPU::invalidate_jit_cache(Address start, size_t length) {
     // otherwise make an old key dispatch unrelated code after host invalidation.
     if (erased_region)
         dispatch_bump_epoch();
+    // AOT functions overlapping the changed code become unreachable: every
+    // transfer into a function goes through the lookup table, so clearing
+    // the function's entries retires it (the lazy JIT then retranslates).
+    if (g_aot.loaded) {
+        for (uint32_t slot = 0; slot < g_aot.spans.size(); ++slot) {
+            const auto [begin, span_end] = g_aot.spans[slot];
+            if (begin >= end || span_end <= start)
+                continue;
+            bool cleared = false;
+            for (uint32_t pc = begin; pc < span_end; pc += 2) {
+                for (size_t k = 0; k < g_aot.ranges.size(); ++k) {
+                    const uint32_t offset = pc - g_aot.ranges[k].base;
+                    if (offset >= g_aot.ranges[k].size)
+                        continue;
+                    uint32_t &entry = g_aot.lut[g_aot.offsets[k] + offset / 2];
+                    if (entry && (entry & vita3k::wasmjit::kAotMaxFunctions) == slot + 1) {
+                        entry = 0;
+                        cleared = true;
+                    }
+                    break;
+                }
+            }
+            if (cleared)
+                ++g_aot.invalidated_functions;
+        }
+    }
+}
+void WasmJitCPU::release_code_caches() {
+    for (const auto &[key, block] : impl->cache)
+        vita3k_jit_release(block.table_index);
+    impl->invalidated += impl->cache.size();
+    impl->cache.clear();
+    impl->clear_regions();
 }
 bool WasmJitCPU::is_thumb_mode() { return impl->state.cpsr & 0x20; }
 bool WasmJitCPU::hit_breakpoint() { return impl->breakpoint; }
@@ -1630,6 +2535,8 @@ const std::string &WasmJitCPU::get_last_error() const { return impl->error; }
 uint32_t WasmJitCPU::get_fault_address() const { return impl->state.fault_address; }
 bool WasmJitCPU::get_fault_write() const { return impl->state.fault_write != 0; }
 uint64_t WasmJitCPU::instructions_executed() const { return impl->executed; }
+void WasmJitCPU::set_aot_enabled(bool enabled) { impl->aot_enabled = enabled; }
+void WasmJitCPU::disable_aot() { g_aot.disabled = true; }
 uint64_t WasmJitCPU::compiled_blocks() const { return impl->compiled; }
 uint64_t WasmJitCPU::regions_formed() const { return impl->regions; }
 // AOT-1: install the entry closure before first execution. Mirrors the
@@ -1689,7 +2596,7 @@ WasmJitCPU::PrecompileResult WasmJitCPU::precompile_region() {
 uint64_t WasmJitCPU::cache_hits() const { return impl->hits; }
 uint64_t WasmJitCPU::invalidated_blocks() const { return impl->invalidated; }
 std::string WasmJitCPU::get_profile() const {
-    char buffer[1216];
+    char buffer[1344];
     std::snprintf(buffer, sizeof(buffer),
         "emit_ms=%.1f install_ms=%.1f run_js_ms=%.1f js_calls=%llu misses=%llu "
         "svc_exits=%llu blocks=%llu mem_reads=%llu mem_writes=%llu "
@@ -1700,7 +2607,8 @@ std::string WasmJitCPU::get_profile() const {
         "mutex_take=%llu mutex_release=%llu mutex_fallback=%llu "
         "host_entries=%llu post_hle_entries=%llu version_syncs=%llu version_bumps=%llu "
         "entry_scanned=%llu entry_evicted=%llu select_checks=%llu select_stale=%llu "
-        "capacity_evictions=%llu revalidate_ms=%.1f revalidate_all=%d cache_limit=%zu",
+        "capacity_evictions=%llu revalidate_ms=%.1f revalidate_all=%d cache_limit=%zu "
+        "aot=%d aot_calls=%llu aot_entry_misses=%llu aot_invalidated=%llu",
         impl->emit_ms, impl->install_ms, impl->run_js_ms,
         (unsigned long long)impl->js_calls, (unsigned long long)impl->misses,
         (unsigned long long)impl->svc_exits, (unsigned long long)impl->compiled,
@@ -1721,7 +2629,10 @@ std::string WasmJitCPU::get_profile() const {
         (unsigned long long)impl->entry_scanned, (unsigned long long)impl->entry_evicted,
         (unsigned long long)impl->select_checks, (unsigned long long)impl->select_stale,
         (unsigned long long)impl->capacity_evictions, impl->revalidate_ms,
-        revalidate_all_enabled() ? 1 : 0, region_cache_limit());
+        revalidate_all_enabled() ? 1 : 0, region_cache_limit(),
+        g_aot.loaded ? (g_aot.disabled ? -1 : 1) : 0,
+        (unsigned long long)impl->aot_calls, (unsigned long long)impl->aot_entry_misses,
+        (unsigned long long)g_aot.invalidated_functions);
     return buffer;
 }
 

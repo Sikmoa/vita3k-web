@@ -207,6 +207,16 @@ self.onmessage = async ({ data }) => {
       // helper (which returns BigInt for Memory64 and a Number otherwise).
       const hostPointer = (value) => typeof module['vita3kHostPointer'] === 'function'
         ? module['vita3kHostPointer'](value) : value;
+      // Optional ahead-of-time module for this title (AOT.md). Compiled here,
+      // off the guest's critical path; the runtime verifies it against the
+      // loaded code and falls back to the lazy JIT when it does not match.
+      if (data.aotUrl) {
+        const started = performance.now();
+        const response = await fetch(data.aotUrl);
+        if (!response.ok) throw new Error(`AOT module ${data.aotUrl}: HTTP ${response.status}`);
+        module['vita3kAotModule'] = await WebAssembly.compileStreaming(response);
+        post({ type: 'log', message: `[vita3k-web] AOT module compiled in ${Math.round(performance.now() - started)} ms` });
+      }
       module._vita3k_web_set_trace?.(data.trace ? 1 : 0);
       module._vita3k_web_set_fast_vblank?.(data.fastVblank ? 1 : 0);
       module.ccall('vita3k_web_set_app_paths', null, ['string', 'string', 'string'],

@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -35,6 +36,9 @@ enum class ExitReason : uint32_t {
     Budget = 5, // next_pc set; per-call tick budget exhausted
     Smc = 6,    // store into a cached code page observed (smc_dirty)
     Stop = 7,   // host requested stop via stop_flag
+    // AOT only: an AOT function was entered at a PC/mode it does not own.
+    // next_pc is published; the host must resolve it without AOT.
+    EntryMiss = 9,
 };
 
 // Shared with generated Wasm, not Dynarmic's native backend JitState.
@@ -93,6 +97,9 @@ struct JitState {
     uint32_t mutex_fast_take;    // +444 inline successes this call
     uint32_t mutex_fast_release; // +448
     uint32_t mutex_fast_fallback;// +452 declined probes this call
+    // AOT only: member block index at which the next AOT function starts
+    // (written by the transfer helper right before the tail call).
+    uint32_t aot_entry;          // +456
 };
 static_assert(std::is_standard_layout_v<JitState>);
 static_assert(sizeof(JitState::regs) == 16 * sizeof(uint32_t));
@@ -123,7 +130,8 @@ static_assert(offsetof(JitState, mutex_table) == 440);
 static_assert(offsetof(JitState, mutex_fast_take) == 444);
 static_assert(offsetof(JitState, mutex_fast_release) == 448);
 static_assert(offsetof(JitState, mutex_fast_fallback) == 452);
-static_assert(sizeof(JitState) == 456);
+static_assert(offsetof(JitState, aot_entry) == 456);
+static_assert(sizeof(JitState) == 460);
 #else
 static_assert(sizeof(HostAddress) == sizeof(void *));
 static_assert(offsetof(JitState, memory_cookie) % alignof(HostAddress) == 0);
@@ -199,6 +207,15 @@ constexpr bool is_inline_mutex_nid(uint32_t nid) {
     return nid == kInlineMutexLockNid || nid == kInlineMutexUnlockNid
         || nid == kInlineMutexUnlock2Nid;
 }
+// sceKernelGetTLSAddr(key): the calling thread's TLS slot address, i.e.
+// TPIDRURO - kKernelTlsSize + 4 * key for 0 <= key <= 0x100 (kernel.cpp
+// get_thread_tls_addr; TPIDRURO is the user TLS pointer, written only by the
+// kernel). Other keys take the HLE call, which reports the bad slot.
+constexpr uint32_t kGetTlsAddrNid = 0xB295EB61;
+constexpr uint32_t kKernelTlsSize = 0x800; // thread.cpp KERNEL_TLS_SIZE
+constexpr bool is_hle_intrinsic_nid(uint32_t nid) {
+    return is_inline_mutex_nid(nid) || nid == kGetTlsAddrNid;
+}
 
 // M14c region emission (REGION_ABI.md). One WebAssembly.Module per REGION:
 // many guest basic blocks with an in-module dispatch loop, so hot loops never
@@ -267,6 +284,20 @@ struct RegionStateOptions {
     // tens of billions of extra memory operations. Set the switch to recover
     // the exact per-access counts.
     bool count_fast_memory = false;
+    // Ahead-of-time function shape (emit_aot_function only): entry by block
+    // index, no stop/SMC polls, budget checked at transfers and backward
+    // edges only, backward member edges branch directly to their body.
+    bool aot = false;
+    // AOT + Memory64 only: plain guest-window accesses without permission,
+    // mapping or code-page probes. Guest faults are then not reported (the
+    // window is always addressable) and stores never raise smc_dirty, which
+    // is sound for read-execute AOT text but not for writable code.
+    bool unchecked_memory = false;
+    // AOT only: FP add/sub/mul/div/sqrt (scalar and vector) lower to native
+    // Wasm f32/f64 arithmetic. Results match in round-to-nearest without FZ
+    // except NaN payloads and NEON denormal flushing; cumulative FPSCR
+    // exception flags are not updated and trap enables are not checked.
+    bool fast_fp = false;
 };
 // Read once per process/module. Native: getenv; Emscripten: Module properties
 // (same names) override process.env. PROMOTE_FLAGS defaults ON (production);
@@ -289,8 +320,43 @@ std::vector<uint8_t> emit_block(const Dynarmic::IR::Block &block, uint32_t hot_n
 // Checks whether a block can be lowered into a region body without assembling
 // a complete module. Region formation uses this to avoid repeatedly building
 // and discarding one-block Wasm modules for every candidate successor.
+// `options` must be the emission policy the block will be emitted with (AOT
+// accepts operations the reference policy rejects, e.g. fast FP sqrt).
 bool validate_region_block(const Dynarmic::IR::Block &block,
-    const std::vector<StoreContinuation> &store_continuations = {});
+    const std::vector<StoreContinuation> &store_continuations = {}, std::string *rejection = nullptr,
+    RegionStateOptions options = {});
+
+// Ahead-of-time module (AOT.md). Each function is a region run(state,
+// budget) body emitted like emit_region, except that a Miss exit tail-calls
+// (return_call_indirect) the AOT function owning next_pc when the lookup
+// table has one, and entry-search misses return EntryMiss to the host.
+// Empty result = at least one member is unsupported (same rules as
+// emit_region); the builder then splits or drops that function.
+std::vector<uint8_t> emit_aot_function(
+    const std::vector<const Dynarmic::IR::Block *> &blocks,
+    const std::vector<RegionBlockMeta> &meta, RegionStateOptions options);
+// Code range covered by the AOT lookup table, one u32 word per halfword:
+// 0 = no AOT entry, else aot_lut_entry(slot, block index, thumb).
+struct AotRange {
+    uint32_t base = 0;
+    uint32_t size = 0; // bytes, even
+};
+constexpr uint32_t kAotMaxFunctions = (1u << 20) - 1;
+constexpr uint32_t kAotMaxBlocks = 1u << 10;
+constexpr uint32_t aot_lut_entry(uint32_t slot, uint32_t block_index, bool thumb) {
+    return (slot + 1) | (block_index << 20) | (uint32_t(thumb) << 30);
+}
+// Words preceding range `index` in the lookup table (ranges in order).
+uint64_t aot_lut_offset_words(const std::vector<AotRange> &ranges, size_t index);
+// One module: imports env.memory, env.mem_read, env.mem_write, env.fp64
+// and the immutable global env.aot_lut (host pointer to the lookup table);
+// exports entry(state, budget) -> ExitReason, which starts at regs[15].
+// Table slot i holds function_bodies[i]. `metadata` becomes the custom
+// section "vita3k.aot" (opaque to the emitter). Empty = limits exceeded.
+std::vector<uint8_t> assemble_aot_module(
+    const std::vector<std::vector<uint8_t>> &function_bodies,
+    const std::vector<AotRange> &ranges, const std::vector<uint8_t> &metadata,
+    RegionStateOptions options);
 
 // M16 Wasm-side multi-region dispatcher (REGION_ABI.md).
 // The dispatcher pumps already-compiled region run() functions through a

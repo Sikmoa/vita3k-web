@@ -122,6 +122,21 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
             records.erase(it);
             return false;
         }
+        // Diagnostic: VITA3K_AOT_EXCLUDE_THREADS=name[,name...] runs those
+        // guest threads on the lazy JIT only.
+        bool aot = true;
+        if (const char *excluded = std::getenv("VITA3K_AOT_EXCLUDE_THREADS")) {
+            std::string_view list = excluded;
+            while (!list.empty()) {
+                const auto comma = list.find(',');
+                if (list.substr(0, comma) == thread->name)
+                    aot = false;
+                list = comma == list.npos ? std::string_view{} : list.substr(comma + 1);
+            }
+        }
+        static_cast<WasmJitCPU &>(*thread->cpu->cpu).set_aot_enabled(aot);
+        std::printf("[guest-runtime] thread %d %s priority=%d affinity=%#x%s\n", thread->id,
+            thread->name.c_str(), thread->priority, static_cast<unsigned>(thread->affinity_mask), aot ? "" : " aot=off");
         return true;
     }
 
@@ -169,7 +184,7 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
         // Drop the borrowed table before shutdown can release its host memory.
         static_cast<WasmJitCPU &>(*r.thread->cpu->cpu).set_inline_mutex_table(nullptr);
         clear_exclusive(*r.thread->cpu);
-        invalidate_jit_cache(*r.thread->cpu, 0, UINT32_MAX);
+        static_cast<WasmJitCPU &>(*r.thread->cpu->cpu).release_code_caches();
         if (self.last_dispatched == &r)
             self.last_dispatched = nullptr;
         // No exception is active at the scheduler's terminal swap.

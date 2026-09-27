@@ -5,8 +5,10 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace vita3k::wasmjit { struct InlineMutexTable; }
+struct MemState;
 
 class WasmJitCPU final : public CPUInterface {
 public:
@@ -31,7 +33,12 @@ public:
     bool get_log_code() override; bool get_log_mem() override;
     void clear_exclusive() override;
     std::size_t processor_id() const override;
+    // Guest code in [start, start+length) changed: drops lazy regions and
+    // disables every AOT function whose code overlaps the range.
     void invalidate_jit_cache(Address, size_t) override;
+    // Releases this CPU's lazy code caches without implying a code change
+    // (the loaded AOT module is unaffected). Used when a guest thread exits.
+    void release_code_caches();
 
     void set_instruction_budget(uint64_t value);
     // Explicit scheduler boundary, distinct from halt (1), SVC (0), and
@@ -45,6 +52,12 @@ public:
     // The caller must commit dirty entries before any HLE/scheduler observer.
     static bool inline_mutex_fast_paths_enabled();
     void set_inline_mutex_table(vita3k::wasmjit::InlineMutexTable *table);
+    // Diagnostic: false keeps this CPU on the lazy JIT even where the loaded
+    // AOT module has code (VITA3K_AOT_EXCLUDE_THREADS).
+    void set_aot_enabled(bool enabled);
+    // Diagnostic: stop entering the loaded AOT module in every thread
+    // (VITA3K_AOT_UNTIL); execution continues on the lazy JIT.
+    static void disable_aot();
     const std::string &get_last_error() const;
     // Valid after a generated memory-fault exit. CPU state is restored to the
     // faulting instruction's entry; earlier stores in that instruction may
@@ -92,6 +105,31 @@ public:
     };
     PumpCounters pump_counters() const;
     uint64_t cache_hits() const;
+    // Writes the location keys of every block translated so far (one hex
+    // Dynarmic LocationDescriptor value per line) when VITA3K_AOT_SEEDS_OUT
+    // enabled recording. Input for the AOT builder's root set.
+    static bool dump_aot_seeds(const char *path);
+    // Ahead-of-time whole-program module (vita3k/cpu/src/wasmjit/AOT.md).
+    // Locations are Dynarmic A32 LocationDescriptor values (UniqueHash).
+    struct AotBuildSpec {
+        struct Range {
+            uint32_t base = 0, size = 0; // executable guest bytes
+        };
+        std::vector<Range> code;
+        std::vector<uint64_t> function_roots; // known function entries
+        std::vector<uint64_t> extra_entries;  // must be covered (e.g. JIT seeds)
+    };
+    static constexpr uint32_t aot_magic = 0x544f4156; // "VAOT"
+    // Root location for a code address (bit 0 = Thumb) in the default
+    // execution state: IT/E clear and the default FPSCR mode.
+    static uint64_t aot_location(uint32_t address);
+    static constexpr uint32_t aot_version = 2;
+    // Translates and emits the module from the currently loaded guest code.
+    static bool build_aot(MemState &mem, const AotBuildSpec &spec, std::vector<uint8_t> &out, std::string &report);
+    // Loads the module the host supplied (Module.vita3kAotModule or the Node
+    // VITA3K_AOT file) after verifying it against loaded guest code.
+    // Returns 1 loaded, 0 none supplied, -1 rejected (lazy JIT only).
+    static int load_aot(MemState &mem, std::string &report);
     uint64_t invalidated_blocks() const;
 private:
     struct Impl;

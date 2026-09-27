@@ -45,6 +45,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -161,6 +162,136 @@ void vita3k_web_set_license_key(const std::uint8_t *key16) {
     config.has_klic = true;
     std::puts("[vita3k-web] license klic staged");
 }
+
+#ifdef VITA3K_USE_WASM_JIT
+// Offline AOT build (VITA3K_AOT_BUILD=<out.wasm>): after the same module
+// loads the app performs, collect executable ranges and function roots and
+// write one ahead-of-time module (vita3k/cpu/src/wasmjit/AOT.md).
+static int build_aot_image(EmuEnvState &env, const char *out_path) {
+    WasmJitCPU::AotBuildSpec spec;
+    const auto executable = [&](Address address) {
+        return env.mem.page_permissions
+            && (static_cast<uint8_t>(env.mem.page_permissions[address >> 12]) & static_cast<uint8_t>(MemPerm::Execute));
+    };
+    std::vector<uint64_t> seed_values;
+    if (const char *seed_path = std::getenv("VITA3K_AOT_SEEDS")) {
+        FILE *in = std::fopen(seed_path, "r");
+        if (!in) {
+            std::fprintf(stderr, "[vita3k-web] AOT seeds %s cannot be opened\n", seed_path);
+            return -12;
+        }
+        unsigned long long value = 0;
+        while (std::fscanf(in, "%llx", &value) == 1)
+            seed_values.push_back(value);
+        std::fclose(in);
+    }
+    // Code = each module's text segment (segment 0). Page permissions cannot
+    // tell text from data here (data pages are mapped executable too), and a
+    // module with no unwind table, entry point or executed seed (e.g. the
+    // bootimage container) contributes no code.
+    for (const auto &[uid, module] : env.kernel.loaded_modules) {
+        const auto &info = module->info;
+        const auto &segment = info.segments[0];
+        const Address base = segment.vaddr.address();
+        if (!segment.memsz || !executable(base))
+            continue;
+        const uint32_t size = static_cast<uint32_t>(segment.memsz & ~1u);
+        const bool has_seed = std::any_of(seed_values.begin(), seed_values.end(),
+            [&](uint64_t value) { return static_cast<uint32_t>(value) - base < size; });
+        const bool has_exidx = info.exidx_top.address() < info.exidx_btm.address();
+        if (!has_seed && !has_exidx && !info.start_entry) {
+            std::printf("[vita3k-web] AOT skips %s [%08x,+%x): no unwind table, entry or seed\n",
+                info.module_name, base, size);
+            continue;
+        }
+        spec.code.push_back({base, size});
+        std::printf("[vita3k-web] AOT code %s [%08x,+%x)\n", info.module_name, base, size);
+    }
+    const auto in_code = [&](Address address) {
+        for (const auto &range : spec.code)
+            if (address - range.base < range.size)
+                return true;
+        return false;
+    };
+    std::size_t exidx_roots = 0, pointer_roots = 0, export_roots = 0, entry_roots = 0;
+    const auto add = [&](Address address, std::size_t &counter) {
+        const Address pc = address & ~1u;
+        if (!in_code(pc) || ((address & 1) == 0 && (pc & 3)))
+            return;
+        spec.function_roots.push_back(WasmJitCPU::aot_location(address));
+        ++counter;
+    };
+    for (const auto &[uid, module] : env.kernel.loaded_modules) {
+        const auto &info = module->info;
+        if (info.start_entry)
+            add(info.start_entry.address(), entry_roots);
+        if (info.stop_entry)
+            add(info.stop_entry.address(), entry_roots);
+        // .ARM.exidx: 8-byte entries whose first word is a prel31 offset to a
+        // function start (bit 0 = Thumb). The module info stores the table
+        // bounds relative to the text segment.
+        const Address text = info.segments[0].vaddr.address();
+        const Address top = info.exidx_top.address(), bottom = info.exidx_btm.address();
+        if (top < bottom && bottom - top < (64u << 20)) {
+            for (Address entry = text + top; entry + 8 <= text + bottom; entry += 8) {
+                uint32_t word = 0;
+                if (!mem_read(env.mem, entry, &word, sizeof(word)) || (word & 0x80000000u))
+                    continue;
+                const int32_t offset = static_cast<int32_t>(word << 1) >> 1;
+                add(entry + static_cast<uint32_t>(offset), exidx_roots);
+            }
+        }
+        // Thumb code pointers anywhere in the module image (vtables, callback
+        // tables, literal pools). ARM pointers are indistinguishable from data
+        // here; they come from exidx, exports and seeds.
+        for (const auto &segment : info.segments) {
+            const Address base = segment.vaddr.address();
+            for (Address at = base; at + 4 <= base + segment.memsz; at += 4) {
+                uint32_t word = 0;
+                if (!mem_read(env.mem, at, &word, sizeof(word)))
+                    break;
+                if ((word & 1) && in_code(word & ~1u))
+                    add(word, pointer_roots);
+            }
+        }
+    }
+    for (const auto &[nid, address] : env.kernel.export_nids)
+        add(address, export_roots);
+    spec.extra_entries = seed_values;
+    const std::size_t seeds = seed_values.size();
+    // Import stubs [svc #0; mov pc, lr; nid] whose NID this build cannot
+    // service: every one is a future missing-NID stop once the guest calls it.
+    std::map<std::uint32_t, unsigned> unserviced;
+    for (const auto &range : spec.code) {
+        std::vector<std::uint32_t> words(range.size / 4);
+        if (!mem_read(env.mem, range.base, words.data(), words.size() * 4))
+            continue;
+        for (std::size_t i = 0; i + 2 < words.size(); ++i)
+            if (words[i] == 0xEF000000u && words[i + 1] == 0xE1A0F00Eu && !has_hle_implementation(words[i + 2]))
+                ++unserviced[words[i + 2]];
+    }
+    std::printf("[vita3k-web] AOT scan: %zu imported NIDs without an HLE implementation in this build\n", unserviced.size());
+    for (const auto &[nid, stubs] : unserviced)
+        std::printf("[vita3k-web]   unserviced NID=%08x %s\n", nid, import_name(nid));
+    std::printf("[vita3k-web] AOT roots: entries=%zu exidx=%zu pointers=%zu exports=%zu seeds=%zu\n",
+        entry_roots, exidx_roots, pointer_roots, export_roots, seeds);
+    std::vector<std::uint8_t> image;
+    std::string report;
+    const auto started = std::chrono::steady_clock::now();
+    const bool built = WasmJitCPU::build_aot(env.mem, spec, image, report);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    std::printf("[vita3k-web] AOT build %s in %.1fs: %s\n", built ? "ok" : "FAILED", seconds, report.c_str());
+    if (!built)
+        return -12;
+    FILE *out = std::fopen(out_path, "wb");
+    if (!out || std::fwrite(image.data(), 1, image.size(), out) != image.size() || std::fclose(out) != 0) {
+        std::fprintf(stderr, "[vita3k-web] AOT image %s cannot be written\n", out_path);
+        return -12;
+    }
+    std::printf("[vita3k-web] AOT image -> %s (%zu bytes)\n", out_path, image.size());
+    return 0;
+}
+#endif
 
 // Implementation shared by the exported entry point below, which reports its
 // result through the host exit hook.
@@ -359,6 +490,16 @@ static int run_app_impl() {
         }
         const auto &module = env->kernel.loaded_modules.at(eboot_uid)->info;
         std::printf("[vita3k-web] Vita module: %.28s entry=%08x\n", module.module_name, module.start_entry.address());
+#ifdef VITA3K_USE_WASM_JIT
+        if (const char *aot_out = std::getenv("VITA3K_AOT_BUILD"))
+            return build_aot_image(*env, aot_out);
+        {
+            std::string aot_report;
+            const int aot = WasmJitCPU::load_aot(env->mem, aot_report);
+            std::printf("[vita3k-web] AOT %s: %s\n", aot > 0 ? "on" : aot == 0 ? "off" : "REJECTED",
+                aot_report.c_str());
+        }
+#endif
         if (!module.start_entry) return -5;
         SceInt32 priority = SCE_KERNEL_DEFAULT_PRIORITY_USER;
         SceInt32 stack_size = SCE_KERNEL_STACK_SIZE_USER_MAIN;
@@ -390,7 +531,17 @@ static int run_app_impl() {
             if (parsed > 0) pc_sample_every = static_cast<std::size_t>(parsed);
         }
         std::size_t pc_sample_next = pc_sample_every;
+        // Diagnostic: VITA3K_AOT_UNTIL=<seconds> leaves the AOT module after
+        // that much wall time (boot on AOT, the rest on the lazy JIT).
+        double aot_until = 0;
+        if (const char *until = std::getenv("VITA3K_AOT_UNTIL"))
+            aot_until = std::strtod(until, nullptr);
         do {
+            if (aot_until > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - jit_started).count() >= aot_until) {
+                WasmJitCPU::disable_aot();
+                std::printf("[vita3k-web] AOT disabled after %.0fs (VITA3K_AOT_UNTIL)\n", aot_until);
+                aot_until = 0;
+            }
             progress = runtime.resume(256);
             dispatched += progress.dispatches;
             if (pc_sample_every && dispatched >= pc_sample_next) {
@@ -411,6 +562,9 @@ static int run_app_impl() {
 #endif
 #ifdef VITA3K_USE_WASM_JIT
         jit_report("final", true);
+        if (const char *seeds = std::getenv("VITA3K_AOT_SEEDS_OUT"))
+            std::printf("[vita3k-web] AOT seeds -> %s: %s\n", seeds,
+                WasmJitCPU::dump_aot_seeds(seeds) ? "ok" : "FAILED");
 #endif
         std::printf("[vita3k-web] Vita result: process_exit=%d code=%d imports=%u missing_nids=%zu PC=%08x\n",
             exited, exit_code, imports, env->missing_nids.size(), read_pc(*thread->cpu));
