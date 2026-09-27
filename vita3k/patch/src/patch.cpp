@@ -19,6 +19,9 @@
 #include "patch/instructions.h"
 #include "patch/util.h"
 
+#include <mem/functions.h>
+#include <mem/ptr.h>
+#include <mem/state.h>
 #include <util/fs.h>
 #include <util/log.h>
 #include <util/string_utils.h>
@@ -72,6 +75,27 @@ Patches get_patches(fs::path &path, const std::string &titleid, const std::strin
     LOG_INFO("Found {} patches for titleid {}", patches.size(), titleid);
 
     return patches;
+}
+
+std::vector<PatchedRange> apply_patches(MemState &mem, const Patches &patches, const std::vector<PatchSegment> &segments) {
+    std::vector<PatchedRange> written;
+    for (const auto &patch : patches) {
+        if (patch.seg >= segments.size() || !segments[patch.seg].vaddr) {
+            LOG_ERROR("Patch for missing segment {} at offset 0x{:X}", patch.seg, patch.offset);
+            continue;
+        }
+        const auto &seg = segments[patch.seg];
+        if (uint64_t(patch.offset) + patch.values.size() > seg.memsz) {
+            LOG_ERROR("Patch out of bounds for segment {} at offset 0x{:X}", patch.seg, patch.offset);
+            continue;
+        }
+        LOG_INFO("Patching segment {} at offset 0x{:X} with {} values", patch.seg, patch.offset, patch.values.size());
+        const uint32_t address = seg.vaddr + patch.offset;
+        memcpy(Ptr<uint8_t>(address).get(mem), patch.values.data(), patch.values.size());
+        mem_mark_written(mem, address, patch.values.size());
+        written.push_back({ address, static_cast<uint32_t>(patch.values.size()) });
+    }
+    return written;
 }
 
 Patch parse_patch(const std::string &patch) {

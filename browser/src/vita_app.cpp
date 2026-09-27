@@ -19,6 +19,7 @@
 // Backend-agnostic: thread creation, run_loop(true) and HLE dispatch are the
 // production paths shared with run_vita(), so this works under both
 // InterpreterCPU and WasmJitCPU.
+#include <patch/patch.h>
 #include <cpu/functions.h>
 #include <cpu/impl/interpreter_cpu.h>
 #ifdef VITA3K_USE_WASM_JIT
@@ -582,6 +583,23 @@ static int run_app_impl() {
                 aot_report.c_str());
         }
 #endif
+        // Title patches, desktop Vita3K's patch directory format, staged at
+        // <vita fs>/patch. Applied after the AOT image was checked against the
+        // unpatched code; the AOT functions covering patched bytes retire.
+        if (fs::path patch_dir = env->vita_fs_path / "patch"; fs::is_directory(patch_dir)) {
+            const Patches patches = get_patches(patch_dir, env->io.title_id, "app0:eboot.bin");
+            std::vector<PatchSegment> segments;
+            for (const auto &segment : module.segments)
+                segments.push_back({ segment.vaddr.address(), static_cast<uint32_t>(segment.memsz) });
+            const auto written = apply_patches(env->mem, patches, segments);
+            for (const auto &range : written) {
+#ifdef VITA3K_USE_WASM_JIT
+                WasmJitCPU::retire_aot(range.address, range.size);
+#endif
+                env->kernel.invalidate_jit_cache(range.address, range.size);
+            }
+            std::printf("[vita3k-web] patches for %s: %zu applied\n", env->io.title_id.c_str(), written.size());
+        }
         if (!module.start_entry) return -5;
         SceInt32 priority = SCE_KERNEL_DEFAULT_PRIORITY_USER;
         SceInt32 stack_size = SCE_KERNEL_STACK_SIZE_USER_MAIN;

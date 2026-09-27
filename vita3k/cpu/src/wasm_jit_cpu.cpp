@@ -2511,9 +2511,15 @@ void WasmJitCPU::invalidate_jit_cache(Address start, size_t length) {
     // otherwise make an old key dispatch unrelated code after host invalidation.
     if (erased_region)
         dispatch_bump_epoch();
-    // AOT functions overlapping the changed code become unreachable: every
-    // transfer into a function goes through the lookup table, so clearing
-    // the function's entries retires it (the lazy JIT then retranslates).
+    retire_aot(start, length);
+}
+// AOT functions overlapping the changed code become unreachable: every
+// transfer into a function goes through the lookup table, so clearing the
+// function's entries retires it (the lazy JIT then retranslates). Process-wide,
+// so it also applies before any CPU exists (title patches at launch).
+void WasmJitCPU::retire_aot(Address start, size_t length) {
+    if (!length) return;
+    const uint64_t end = uint64_t(start) + std::min<uint64_t>(length, 0x100000000ULL - start);
     if (g_aot.loaded) {
         for (uint32_t slot = 0; slot < g_aot.spans.size(); ++slot) {
             const auto [begin, span_end] = g_aot.spans[slot];

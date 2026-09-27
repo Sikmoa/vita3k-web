@@ -404,23 +404,6 @@ uint32_t install_contents(EmuEnvState &emuenv, const fs::path &path) {
     return installed;
 }
 
-static void do_patches(MemState &mem, const Patches &patches, const SceKernelModuleInfo &sceKernelModuleInfo) {
-    for (const auto &patch : patches) {
-        if (patch.seg < MODULE_INFO_NUM_SEGMENTS) {
-            auto &seg = sceKernelModuleInfo.segments[patch.seg];
-            auto seg_ptr = seg.vaddr.cast<uint8_t>();
-            if (seg_ptr) {
-                LOG_INFO("Patching segment {} at offset 0x{:X} with {} values", patch.seg, patch.offset, patch.values.size());
-                if (patch.offset + patch.values.size() <= seg.memsz) {
-                    memcpy(seg_ptr.get(mem) + patch.offset, patch.values.data(), patch.values.size());
-                } else {
-                    LOG_ERROR("Patch out of bounds for segment {} at offset 0x{:X}", patch.seg, patch.offset);
-                }
-            }
-        }
-    }
-}
-
 static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const AppLaunchRequest &launch_request) {
     const auto call_import = [&emuenv](CPUState &cpu, uint32_t nid, SceUID thread_id) {
         ::call_import(emuenv, cpu, nid, thread_id);
@@ -493,8 +476,12 @@ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const
         const auto module = emuenv.kernel.loaded_modules[main_module_id];
         LOG_INFO("Main executable {} ({}) loaded", module->info.module_name, emuenv.self_path);
         const Patches patches = get_patches(emuenv.patch_path, emuenv.io.title_id, "app0:" + emuenv.self_path);
-        if (!patches.empty())
-            do_patches(emuenv.mem, patches, module->info);
+        if (!patches.empty()) {
+            std::vector<PatchSegment> segments;
+            for (const auto &segment : module->info.segments)
+                segments.push_back({ segment.vaddr.address(), static_cast<uint32_t>(segment.memsz) });
+            apply_patches(emuenv.mem, patches, segments);
+        }
     } else
         return FileNotFound;
     // Set self name from self path, can contain folder, get file name only

@@ -48,3 +48,30 @@ export async function readRuntimeFile(path) {
     : file.endsWith('.html') ? 'text/html' : 'text/javascript';
   return { content: await readFile(file), type };
 }
+
+// Staged Vita content for the Worker's stage-files: every file under `stage`
+// plus the title patches shipped with the port (browser/patches), staged as
+// <vita fs>/patch/ like desktop Vita3K's patch directory. A patch of the same
+// name in the stage's own patch/ wins. Each entry keeps its source file for
+// readStageFile; the manifest sent to the page omits it.
+const patchRoot = fileURLToPath(new URL('../patches', import.meta.url));
+export async function stageFiles(stage) {
+  const files = new Map();
+  const walk = async (directory, prefix) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const full = resolve(directory, entry.name);
+      const path = prefix + entry.name;
+      if (entry.isDirectory()) await walk(full, path + '/');
+      else if (entry.isFile() && !files.has(path)) files.set(path, { path, size: statSync(full).size, source: full });
+    }
+  };
+  await walk(stage, '');
+  if (existsSync(patchRoot)) await walk(patchRoot, 'patch/');
+  return [...files.values()];
+}
+export const stageManifest = (files) => files.map(({ path, size }) => ({ path, size }));
+export async function readStageFile(files, path) {
+  const entry = files.find((file) => file.path === path);
+  if (!entry) throw Object.assign(new Error(`not staged: ${path}`), { code: 'ENOENT' });
+  return readFile(entry.source);
+}

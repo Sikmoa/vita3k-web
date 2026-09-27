@@ -10,4 +10,4 @@ add_library(
 )
 
 target_include_directories(patch PUBLIC include)
-target_link_libraries(patch PRIVATE util)
+target_link_libraries(patch PRIVATE mem util)

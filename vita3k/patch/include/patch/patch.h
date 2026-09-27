@@ -34,5 +34,22 @@ struct PatchHeader {
 
 using Patches = std::vector<Patch>;
 
+struct MemState;
+
+// A loaded module segment (SceKernelSegmentInfo vaddr and memsz).
+struct PatchSegment {
+    uint32_t vaddr;
+    uint32_t memsz;
+};
+
+// Guest bytes one patch replaced.
+struct PatchedRange {
+    uint32_t address;
+    uint32_t size;
+};
+
 Patches get_patches(fs::path &path, const std::string &titleid, const std::string &bin);
 Patch parse_patch(const std::string &patch);
+// Writes each patch into its segment; a patch outside its segment is logged
+// and skipped. Returns the ranges written, which a JIT must invalidate.
+std::vector<PatchedRange> apply_patches(MemState &mem, const Patches &patches, const std::vector<PatchSegment> &segments);

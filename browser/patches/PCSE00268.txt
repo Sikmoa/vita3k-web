@@ -1,0 +1,11 @@
+# LIMBO (PCSE00268): 60 FPS at the game's normal speed.
+#
+# Physics: the step scheduler (0x810FC33A) runs a fixed two 1/60 s steps per
+# frame unless time is scaled; at 60 FPS that doubles the game's speed. The
+# count becomes 0 so it always takes the game's own path that accumulates the
+# measured frame time (mov.w r1, #2 -> mov.w r1, #0 at 0x810FC402).
+0:0xFC402 4FF00001
+# Display: the display queue callback (0x8116ADE6) passes the renderer's swap
+# interval [r4 + 0x23C] = 2 to sceDisplayWaitSetFrameBufMulti; it becomes one
+# vblank (ldr.w r1, [r4, #0x23C] -> movs r1, #vblank; nop).
+0:0x16ADE6 t1_mov(1,vblank) 00BF

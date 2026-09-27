@@ -140,6 +140,8 @@ public:
     // VITA3K_AOT file) after verifying it against loaded guest code.
     // Returns 1 loaded, 0 none supplied, -1 rejected (lazy JIT only).
     static int load_aot(MemState &mem, std::string &report);
+    // Retires the loaded AOT functions covering [start, start + length).
+    static void retire_aot(Address start, size_t length);
     uint64_t invalidated_blocks() const;
 private:
     struct Impl;

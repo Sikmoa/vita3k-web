@@ -29,12 +29,13 @@ add_library(vita3k_web_runtime_core STATIC
     "${VITA_ROOT}/kernel/src/debugger.cpp" "${VITA_ROOT}/kernel/src/callback.cpp"
     "${VITA_ROOT}/kernel/src/load_self.cpp" "${VITA_ROOT}/kernel/src/relocation.cpp"
     "${VITA_ROOT}/rtc/src/rtc.cpp" "${VITA_ROOT}/nids/src/nids.cpp"
-    "${VITA_ROOT}/util/src/arm.cpp" "${VITA_ROOT}/util/src/fs_utils.cpp"
+    "${VITA_ROOT}/util/src/arm.cpp" "${VITA_ROOT}/util/src/fs_utils.cpp" "${VITA_ROOT}/util/src/string_utils.cpp"
+    "${VITA_ROOT}/patch/src/patch.cpp" "${VITA_ROOT}/patch/src/instructions.cpp" "${VITA_ROOT}/patch/src/util.cpp"
     "${EXT_ROOT}/miniz/miniz.c"
 )
 target_include_directories(vita3k_web_runtime_core PUBLIC
     "${VITA_ROOT}/mem/include" "${VITA_ROOT}/cpu/include" "${VITA_ROOT}/kernel/include"
-    "${VITA_ROOT}/rtc/include" "${VITA_ROOT}/nids/include" "${VITA_ROOT}/util/include"
+    "${VITA_ROOT}/rtc/include" "${VITA_ROOT}/nids/include" "${VITA_ROOT}/util/include" "${VITA_ROOT}/patch/include"
     "${VITA_ROOT}/emuenv/include" "${EXT_ROOT}/sdl/include"
     "${EXT_ROOT}/vita-toolchain/src" "${EXT_ROOT}/miniz"
     "${EXT_ROOT}/boost"
@@ -47,6 +48,10 @@ target_link_libraries(vita3k_web_runtime_core PUBLIC fmt::fmt spdlog::spdlog cap
 add_executable(vita3k_web_runtime_tests "${VITA_ROOT}/cpu/tests/interpreter_runtime_tests.cpp")
 target_link_libraries(vita3k_web_runtime_tests PRIVATE vita3k_web_runtime_core)
 target_link_options(vita3k_web_runtime_tests PRIVATE ${VITA3K_WEB_GROWTH_LINK_OPTION} -sSTACK_SIZE=1048576)
+add_executable(vita3k_web_patch_tests "${VITA_ROOT}/patch/tests/patch_tests.cpp")
+target_link_libraries(vita3k_web_patch_tests PRIVATE vita3k_web_runtime_core)
+# Reads the shipped browser/patches directory from the host file system.
+target_link_options(vita3k_web_patch_tests PRIVATE ${VITA3K_WEB_GROWTH_LINK_OPTION} -sNODERAWFS=1)
 add_executable(vita3k_web_loader_tests "${CMAKE_CURRENT_LIST_DIR}/tests/vita_loader_runtime_tests.cpp")
 target_link_libraries(vita3k_web_loader_tests PRIVATE vita3k_web_runtime_core)
 # This executable is a Node-only file-input test; browser entrypoints do not use

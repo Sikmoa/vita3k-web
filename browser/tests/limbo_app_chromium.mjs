@@ -29,6 +29,7 @@
 //   LIMBO_GUEST_CORES=N     emulated guest CPU cores (default 3; 1 = single-core scheduler)
 //   LIMBO_FPS_HACK=1        Vita3K fps-hack: display waits use one vblank
 //   LIMBO_TEXTURE_VERIFY=1  verify cached textures against guest memory
+//   LIMBO_PATCHES=0         skip the title patches of browser/patches (staged as patch/)
 //   LIMBO_SCALE=N           internal resolution multiplier (default 2)
 //   LIMBO_SURFACE_SYNC=1    read rendered surfaces back into guest memory
 //   LIMBO_DIALOG            answer to every guest message dialog (sceMsgDialog):
@@ -37,12 +38,12 @@
 //   LIMBO_AOT               ahead-of-time module to supply to the run (AOT.md)
 //   LIMBO_LOG_OUT           write the retained worker log tail (4000 lines) to this file
 import { createServer } from 'node:http';
-import { readFile, writeFile, readdir } from 'node:fs/promises';
-import { resolve, sep, relative } from 'node:path';
+import { readFile, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { existsSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
 import assert from 'node:assert/strict';
-import { readRuntimeFile } from './runtime_routes.mjs';
+import { readRuntimeFile, readStageFile, stageFiles, stageManifest } from './runtime_routes.mjs';
 
 const stage = resolve(process.env.LIMBO_STAGE || '.limbo_work/stage');
 const title = process.env.LIMBO_TITLE || 'PCSE00268';
@@ -99,21 +100,8 @@ if (frameEvery === 1)
 if (!existsSync(resolve(stage, 'ux0/app', app, 'eboot.bin')))
   throw new Error(`no staged app at ${resolve(stage, 'ux0/app', app, 'eboot.bin')}`);
 
-async function walk(directory) {
-  const entries = await readdir(directory, { withFileTypes: true });
-  const files = [];
-  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-    const full = resolve(directory, entry.name);
-    if (entry.isDirectory()) files.push(...await walk(full));
-    else if (entry.isFile()) files.push({
-      path: relative(stage, full).split(sep).join('/'),
-      size: (await readFile(full)).byteLength,
-    });
-  }
-  return files;
-}
-const staged = await walk(stage);
-const manifestBytes = new TextEncoder().encode(JSON.stringify(staged));
+const staged = (await stageFiles(stage)).filter((file) => process.env.LIMBO_PATCHES !== '0' || !file.path.startsWith('patch/'));
+const manifestBytes = new TextEncoder().encode(JSON.stringify(stageManifest(staged)));
 
 const server = createServer(async (req, res) => {
   try {
@@ -129,9 +117,7 @@ const server = createServer(async (req, res) => {
     if (path === '/manifest.json') { send(manifestBytes, 'application/json'); return; }
     if (path === '/aot.wasm' && aotPath) { send(await readFile(aotPath), 'application/wasm'); return; }
     if (path.startsWith('/stage/')) {
-      const file = resolve(stage, path.slice('/stage/'.length));
-      if (!file.startsWith(stage + sep)) throw new Error('bad stage path');
-      send(await readFile(file), 'application/octet-stream');
+      send(await readStageFile(staged, path.slice('/stage/'.length)), 'application/octet-stream');
       return;
     }
     const { content, type } = await readRuntimeFile(path);

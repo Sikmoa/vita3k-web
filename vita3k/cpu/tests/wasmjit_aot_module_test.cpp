@@ -249,14 +249,16 @@ void vector_min_max_flags() {
 // Guest code that changes after the AOT module loaded must not keep running
 // from the module: invalidate_jit_cache retires the overlapping functions.
 // square's MULS r0,r0 (+0x36) becomes ADDS r0,r0,r0.
-void invalidation_retires_aot() {
-    constexpr uint32_t kSquare = kCode + 0x36;
-    constexpr uint8_t kAdds[] = {0x00, 0x18};
+// Rewrites guest code at `at` and checks that the AOT function covering it
+// retires: the run must match the interpreter on the rewritten program. A
+// launch-time rewrite (title patch) retires through the static entry point
+// before any CPU exists; a runtime one through a CPU's cache invalidation.
+void rewrite_retires_aot(uint32_t at, const std::array<uint8_t, 2> &code, bool before_cpu) {
     Final oracle;
     {
         Fixture fixture;
         CHECK(mem_set_permissions(fixture.mem, kCode, 0x1000, MemPerm::ReadWrite));
-        CHECK(mem_write(fixture.mem, kSquare, kAdds, sizeof(kAdds)));
+        CHECK(mem_write(fixture.mem, at, code.data(), code.size()));
         CHECK(mem_set_permissions(fixture.mem, kCode, 0x1000, MemPerm::ReadExecute));
         CPUState parent{};
         parent.mem = &fixture.mem;
@@ -265,21 +267,32 @@ void invalidation_retires_aot() {
         parent.svc_called = false;
         CHECK(cpu.run() == 0 && parent.svc_called);
         oracle = capture(cpu, fixture.mem, cpu.instructions_executed());
-        CHECK(oracle.table[3] == 6); // doubled, not squared
     }
+    CHECK(oracle.regs[0] != run_interpreter().regs[0]); // the rewrite is observable
+    const uint64_t retired = g_aot.invalidated_functions;
     Fixture fixture;
     CHECK(mem_set_permissions(fixture.mem, kCode, 0x1000, MemPerm::ReadWrite));
-    CHECK(mem_write(fixture.mem, kSquare, kAdds, sizeof(kAdds)));
+    CHECK(mem_write(fixture.mem, at, code.data(), code.size()));
     CHECK(mem_set_permissions(fixture.mem, kCode, 0x1000, MemPerm::ReadExecute));
+    if (before_cpu)
+        WasmJitCPU::retire_aot(at, code.size());
     CPUState parent{};
     parent.mem = &fixture.mem;
     WasmJitCPU cpu(&parent, 0);
     cpu.set_region_mode(true);
-    cpu.invalidate_jit_cache(kSquare, sizeof(kAdds));
+    if (!before_cpu)
+        cpu.invalidate_jit_cache(at, code.size());
+    CHECK(g_aot.invalidated_functions > retired);
     reset(cpu, fixture.mem);
     run_to_svc(cpu, parent, 0);
     check_same(oracle, capture(cpu, fixture.mem, cpu.instructions_executed()));
     CHECK(cpu.regions_formed() > 0); // the retired function ran lazily
+}
+void invalidation_retires_aot() {
+    // square: muls r0,r0 -> adds r0,r0,r0 (doubled, not squared)
+    rewrite_retires_aot(kCode + 0x36, {0x00, 0x18}, false);
+    // tail: adds r0,#3 -> adds r0,#4, as a title patch applied at launch
+    rewrite_retires_aot(kCode + 0x5e, {0x04, 0x30}, true);
 }
 // sceKernelGetTLSAddr intrinsic: an in-range key is answered in Wasm
 // (TPIDRURO - 0x800 + 4*key, no SVC); an out-of-range key takes the SVC.

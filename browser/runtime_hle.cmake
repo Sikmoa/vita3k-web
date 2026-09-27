@@ -508,7 +508,6 @@ add_library(vita3k_web_runtime_hle STATIC
     "${_HLE_ROOT}/io/src/device.cpp"
     "${_HLE_ROOT}/io/src/filesystem.cpp"
     "${_HLE_ROOT}/io/src/state_functions.cpp"
-    "${_HLE_ROOT}/util/src/string_utils.cpp"
     "${_HLE_ROOT}/util/src/net_utils.cpp"
     "${_HLE_ROOT}/np/src/init.cpp"
     # Trophy context lifecycle for sceNpTrophyCreateContext and friends:

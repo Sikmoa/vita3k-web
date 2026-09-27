@@ -11,6 +11,8 @@
 // titles such as Limbo then run faster than real time); ?fpsHack=1 is Vita3K's
 // fps-hack (display waits use one vblank; Limbo's logic is frame-locked, so it
 // also runs up to twice as fast);
+// ?patches=0 skips the title patches of browser/patches (e.g. Limbo's 60 FPS
+// patch) otherwise staged as <vita fs>/patch/;
 // ?scale=N renders at N times the Vita resolution (1-4; default 2 = 1920x1088);
 // ?surfaceSync=1 reads rendered surfaces back into guest memory after each scene;
 // ?inlineMutex=0 disables the inline-mutex optimization for A/B testing; ?auto=1 (start
@@ -50,11 +52,11 @@
 //   LIMBO_AOT           ahead-of-time module for the title (AOT.md), served as
 //                       /aot.wasm and passed to run-app as aotUrl
 import { createServer } from 'node:http';
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { networkInterfaces } from 'node:os';
-import { resolve, sep, relative } from 'node:path';
+import { resolve } from 'node:path';
 import { existsSync, readdirSync } from 'node:fs';
-import { readRuntimeFile, runtimeRoot as root } from './runtime_routes.mjs';
+import { readRuntimeFile, readStageFile, runtimeRoot as root, stageFiles, stageManifest } from './runtime_routes.mjs';
 
 const port = Number(process.env.PORT || 8080);
 const host = process.env.HOST || '127.0.0.1';
@@ -69,20 +71,8 @@ if (!existsSync(root) || !readdirSync(root, { recursive: true }).some((file) => 
   throw new Error(`no built JIT module in ${root} (build vita3k_web_dist first, or set GXM_RUNTIME_DIST)`);
 if (aotPath && !existsSync(aotPath)) throw new Error(`no AOT module at ${aotPath} (LIMBO_AOT)`);
 
-async function walk(directory) {
-  const entries = await readdir(directory, { withFileTypes: true });
-  const files = [];
-  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-    const full = resolve(directory, entry.name);
-    if (entry.isDirectory()) files.push(...await walk(full));
-    else if (entry.isFile()) files.push({
-      path: relative(stage, full).split(sep).join('/'),
-      size: (await readFile(full)).byteLength,
-    });
-  }
-  return files;
-}
-const manifestBytes = new TextEncoder().encode(JSON.stringify(await walk(stage)));
+const staged = await stageFiles(stage);
+const manifestBytes = new TextEncoder().encode(JSON.stringify(stageManifest(staged)));
 
 const page = `<!doctype html>
 <html lang="en">
@@ -378,7 +368,8 @@ async function run() {
         try {
           const files = await (await fetch('/manifest.json')).json();
           worker.postMessage({ type: 'stage-files', root: '/vita',
-            files: files.map((file) => ({ ...file, url: \`/stage/\${file.path}\` })) });
+            files: files.filter((file) => params.get('patches') !== '0' || !file.path.startsWith('patch/'))
+              .map((file) => ({ ...file, url: \`/stage/\${file.path}\` })) });
         } catch (error) { log('manifest failed: ' + error); status.textContent = 'staging failed'; }
         break;
       case 'staged':
@@ -443,11 +434,8 @@ const server = createServer(async (req, res) => {
     if (path === '/manifest.json') return body(manifestBytes, 'application/json');
     if (path === '/favicon.ico') { res.writeHead(404); return res.end(); }
     if (path === '/aot.wasm' && aotPath) return send(await readFile(aotPath), 'application/wasm');
-    if (path.startsWith('/stage/')) {
-      const file = resolve(stage, path.slice('/stage/'.length));
-      if (!file.startsWith(stage + sep)) throw new Error('bad stage path');
-      return send(await readFile(file), 'application/octet-stream');
-    }
+    if (path.startsWith('/stage/'))
+      return send(await readStageFile(staged, path.slice('/stage/'.length)), 'application/octet-stream');
     const { content, type } = await readRuntimeFile(path);
     send(content, type);
   } catch (error) {
