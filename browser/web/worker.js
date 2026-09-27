@@ -198,6 +198,10 @@ self.onmessage = async ({ data }) => {
     }
     break;
   }
+  case 'input':
+    // SCE_CTRL_* button mask and stick axes in [-1, 1] (vita_app.cpp vita3k_web_set_pad).
+    module?._vita3k_web_set_pad?.(data.buttons >>> 0, ...(data.axes ?? [0, 0, 0, 0]));
+    break;
   case 'run-app': {
     // Retail-app launch (vita_app.cpp): the guest sees <vitaFs>/ux0/... and
     // the module owns module loading, license setup and the main thread.

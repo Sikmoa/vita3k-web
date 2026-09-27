@@ -25,6 +25,7 @@
 #include <cpu/impl/wasm_jit_cpu.h>
 #include "guest_thread_runtime.h"
 #endif
+#include <ctrl/state.h>
 #include <display/state.h>
 #include <emuenv/state.h>
 #include <io/functions.h>
@@ -40,6 +41,7 @@
 #include "vita_runtime.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cstdio>
@@ -64,6 +66,13 @@ EM_ASYNC_JS(void, web_yield_to_event_loop, (), {
         channel.port2.postMessage(0);
     });
 });
+
+// Host input (worker.js 'input'): SCE_CTRL_* button mask and stick axes in
+// [-1, 1] (lx, ly, rx, ry), set between event-loop turns and applied to the
+// guest pad by the run loop.
+static std::uint32_t g_host_buttons = 0;
+static std::array<float, 4> g_host_axes{};
+static bool g_host_input_changed = false;
 
 namespace {
 
@@ -556,6 +565,13 @@ static int run_app_impl() {
             aot_until = std::strtod(until, nullptr);
         unsigned frames_yielded = 0;
         do {
+            if (g_host_input_changed) {
+                g_host_input_changed = false;
+                const std::lock_guard<std::mutex> guard(env->ctrl.mutex);
+                auto &pad = env->ctrl.keyboard_state;
+                pad.buttons = pad.buttons_ext = g_host_buttons;
+                std::copy(g_host_axes.begin(), g_host_axes.end(), pad.axes);
+            }
             if (aot_until > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - jit_started).count() >= aot_until) {
                 WasmJitCPU::disable_aot();
                 std::printf("[vita3k-web] AOT disabled after %.0fs (VITA3K_AOT_UNTIL)\n", aot_until);
@@ -606,6 +622,13 @@ static int run_app_impl() {
         std::fprintf(stderr, "[vita3k-web] Vita app runtime error: %s\n", error.what());
         return -9;
     }
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE
+void vita3k_web_set_pad(std::uint32_t buttons, float lx, float ly, float rx, float ry) {
+    g_host_buttons = buttons;
+    g_host_axes = { lx, ly, rx, ry };
+    g_host_input_changed = true;
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE

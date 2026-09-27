@@ -3017,6 +3017,22 @@ EXPORT(int, sceGxmNotificationWait, const SceGxmNotification *notification) {
     std::uint32_t volatile *value = notification->address.get(emuenv.mem);
     const std::uint32_t target_value = notification->value;
 
+    if (emuenv.kernel.execution_host) {
+        // The notifier is another guest fiber on this OS thread, so blocking on
+        // notification_ready would freeze it: park and recheck instead.
+        const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+        if (!thread)
+            return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+        while (*value != target_value) {
+            thread->update_status(ThreadStatus::wait);
+            const auto result = emuenv.kernel.execution_host->wait_sync(*thread, 1000);
+            thread->update_status(ThreadStatus::run);
+            if (result == KernelExecutionHost::WaitResult::cancelled)
+                break;
+        }
+        return 0;
+    }
+
     std::unique_lock<std::mutex> lock(emuenv.renderer->notification_mutex);
     if (*value != target_value) {
         emuenv.renderer->notification_ready.wait(lock, [&]() { return *value == target_value || emuenv.display.abort.load(); });

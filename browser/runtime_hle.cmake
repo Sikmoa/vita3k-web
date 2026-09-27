@@ -242,6 +242,8 @@ set(_hle_exports
     # selecting it is production parity, not a new stub. A missing NID kills
     # the calling thread, which is what ended the run before any present.
     sceGxmPadHeartbeat
+    # Parks the fiber until the (synchronously written) notification matches.
+    sceGxmNotificationWait
     # Display queue (imports=45189 missing_nids=1 RenderThread PC=8126c330):
     # the frame presentation entry point. Production body; under
     # VITA3K_BROWSER_GXM it drains the queue inline (guest display callback on
@@ -264,6 +266,24 @@ set(_hle_exports
     # 0 — the game asks about system/app events and UI overlay, gets "none",
     # and proceeds. Production parity, not a new stub.
     _sceAppMgrGetAppState
+    # Found statically by the AOT build's unserviced-import scan (vita_app.cpp
+    # build_aot_image) before the guest reached them. Production bodies in TUs
+    # this graph already compiles; none of them waits on a host primitive.
+    # GXM descriptor setters and shader-patcher teardown:
+    sceGxmDepthStencilSurfaceSetForceLoadMode sceGxmDepthStencilSurfaceSetForceStoreMode
+    sceGxmShaderPatcherReleaseVertexProgram sceGxmShaderPatcherReleaseFragmentProgram
+    sceGxmShaderPatcherUnregisterProgram sceGxmShaderPatcherDestroy
+    # Thread attributes (no waits):
+    sceKernelChangeThreadPriority sceKernelChangeThreadCpuAffinityMask sceKernelChangeThreadVfpException
+    # Save data and trophies (host-filesystem backed):
+    sceAppUtilSaveDataDataSave sceAppUtilSaveDataDataRemove sceAppUtilSaveDataSlotGetParam
+    sceAppUtilReceiveAppEvent
+    sceNpTrophyUnlockTrophy
+    # Files and directories:
+    sceIoDopen sceIoDread sceIoDclose sceIoMkdir sceIoRmdir sceIoRemove sceIoRename
+    sceIoPread sceIoPwrite sceIoSync sceIoSyncByFd sceIoChstat
+    # Clock:
+    sceRtcGetCurrentClock sceRtcGetCurrentClockLocalTime sceRtcGetTick sceRtcTickAddSeconds
 )
 
 # Take NID values from the one authoritative database, never a second resolver.

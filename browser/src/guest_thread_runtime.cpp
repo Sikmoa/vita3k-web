@@ -48,11 +48,14 @@ bool unsupported_import(uint32_t nid) {
     // ILLEGAL_CONTEXT and leaves it with no vsync at all: retail Limbo's main
     // thread then executes ~1.7k instructions total and burns 400+ thread
     // seconds in semaphore waits trying to pace itself some other way.
-    // sceGxmNotificationWait stays rejected: it blocks on a host
-    // condition_variable that only the notifier (same Worker thread) can
-    // signal, so allowing it would freeze every fiber. It needs a cooperative
-    // implementation first.
     if (n.find("DisplayWait") != n.npos && n.find("CB") == n.npos)
+        return false;
+    // Parks and rechecks the notification (SceGxm execution_host branch).
+    if (n == "sceGxmNotificationWait")
+        return false;
+    // Runs the registered NP service-state callbacks inline (run_callback),
+    // outside callback processing, which the fiber host supports.
+    if (n == "sceNpCheckCallback")
         return false;
     return n.find("Wait") != n.npos || n.find("DelayThread") != n.npos
         || n.find("CheckCallback") != n.npos || n.find("CB") != n.npos

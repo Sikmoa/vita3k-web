@@ -194,6 +194,16 @@ bool find_case_isens_path(IOState &io, VitaIoDevice &device, const fs::path &tra
         final_path = system_path.string().substr(0, system_path.string().find_last_of('/'));
         break;
     }
+    case VitaIoDevice::savedata0: {
+        // Save data is written through SceAppUtil in the case the title chose
+        // and may be read back in another case (Limbo: SAVEGAME.TXT vs savegame.txt).
+        const std::string &root = io.device_paths.savedata0;
+        const auto root_at = system_path.string().find(root);
+        if (root.empty() || root_at == std::string::npos)
+            return false;
+        final_path = system_path.string().substr(0, root_at + root.size());
+        break;
+    }
     default: {
         return false;
     }
@@ -211,12 +221,16 @@ bool find_case_isens_path(IOState &io, VitaIoDevice &device, const fs::path &tra
 
 fs::path find_in_cache(IOState &io, const std::string &system_path) {
     const auto find_path = io.cachemap.find(system_path);
-
-    if (find_path != io.cachemap.end()) {
-        return fs::path{ find_path->second.c_str() };
-    } else {
+    if (find_path == io.cachemap.end())
+        return fs::path{};
+    // Writable devices (savedata0) rename and remove files: a mapping whose
+    // target is gone is dropped so the caller rescans the directory.
+    fs::path cached{ find_path->second.c_str() };
+    if (!fs::exists(cached)) {
+        io.cachemap.erase(find_path);
         return fs::path{};
     }
+    return cached;
 }
 
 std::string translate_path(const char *path, VitaIoDevice &device, const IOState::DevicePaths &device_paths) {
