@@ -18,6 +18,7 @@
 #pragma once
 
 #include "args_layout.h"
+#include "bridge_types.h"
 #include "lay_out_args.h"
 #include "read_arg.h"
 
@@ -39,8 +40,12 @@ public:
         , layoutState() {
     }
 
+    // T is the argument's guest (ARM EABI) type after default promotion.
     template <typename T>
     T next(CPUState &cpu, MemState &mem) {
+        static_assert(sizeof(T) == 4 || sizeof(T) == 8, "variadic arguments occupy one or two 32-bit words");
+        static_assert(!std::is_same_v<T, float>, "variadic floats are promoted to double");
+        static_assert(!is_host_long_v<T>, "name the guest width: long and size_t are 32-bit in the guest");
         if (!currentVaList) {
             const auto state_tuple = add_arg_to_layout<T>(layoutState);
 
@@ -49,6 +54,8 @@ public:
 
             return read<T>(cpu, currentLayout, mem);
         } else {
+            // AAPCS va_arg: 8-byte arguments sit at 8-byte aligned addresses.
+            currentVaList = align(currentVaList, sizeof(T));
             const auto out = *Ptr<T>(currentVaList).get(mem);
             currentVaList += sizeof(T);
             return out;

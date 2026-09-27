@@ -37,7 +37,7 @@ struct BufferInfo {
     SceSize bufferWrittenSize; // size written by method
 };
 
-EXPORT(int, _ZN4IPMI6Client12tryGetResultEjPiPvPmm, unsigned int a1, int *a2, void *a3, unsigned long *a4, unsigned long a5) {
+EXPORT(int, _ZN4IPMI6Client12tryGetResultEjPiPvPmm, unsigned int a1, int *a2, void *a3, uint32_t *a4, uint32_t a5) {
     return UNIMPLEMENTED();
 }
 

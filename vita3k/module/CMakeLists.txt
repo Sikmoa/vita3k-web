@@ -1,6 +1,7 @@
 add_library(
 	module
 	STATIC
+	src/guest_format.cpp
 	src/load_module.cpp
 	src/write_return_value.cpp
 )

@@ -17,6 +17,7 @@
 #include "guest_mspace_tests.h"
 #include "guest_msg_dialog_tests.h"
 #include "guest_fios_overlay_tests.h"
+#include "guest_clib_tests.h"
 #include "inline_mutex_fixture.h"
 
 int main() {
@@ -64,6 +65,7 @@ int main() {
     test_guest_mspace(*env, *parent);
     test_guest_msg_dialog(*env, *parent);
     test_guest_fios_overlay(*env, *parent);
+    test_guest_clib(*env, *parent);
     REQUIRE(parent->start(0, Ptr<void>{}, false) == 0);
     const auto progress = runtime.resume(256);
     REQUIRE(progress.failed == 0);
@@ -652,6 +654,53 @@ int main() {
         REQUIRE(env->kernel.threads.empty() && !env->kernel.execution_host);
     }
     std::puts("Guest thread exceptions: diagnostics, failure accounting and clean teardown passed");
+    {
+        // VitaSDK SCE_DBG_ASSERT: sceDbgAssertionHandler(file, line, 0, component,
+        // msg), then SCE_DBG_BREAK_ACTION (bkpt). The handler returns and requests
+        // no process exit; the break fails the thread, so the run is not reported
+        // as a clean exit.
+        unsigned handler_calls = 0;
+        bool exit_requested = false;
+        env->kernel.call_import = [&](CPUState &cpu, uint32_t nid, SceUID tid) {
+            REQUIRE(nid == 0x1AF3678B);
+            ++handler_calls;
+            call_import(*env, cpu, nid, tid);
+            REQUIRE(env->missing_nids.empty());
+        };
+        env->kernel.process_exit_callback = [&](int, std::optional<AppLaunchRequest>) { exit_requested = true; };
+        REQUIRE(runtime.attach(*env));
+        const Address stub = code + 0x100, result = data + 0x204, text = data + 0x300;
+        const uint32_t stub_words[] = { 0xef000000, 0xe1a0f00e, 0x1AF3678B };
+        std::memcpy(Ptr<void>(stub).get(env->mem), stub_words, sizeof(stub_words));
+        std::strcpy(Ptr<char>(text).get(env->mem), "Assertion (x) failed.\n");
+        *Ptr<uint32_t>(result).get(env->mem) = 0xcccccccc;
+        guest_thread_fixture::Arm p(code);
+        p.emit(0xe92d4010); // push {r4,lr}
+        p.emit(0xe24dd008); // sub sp,sp,#8
+        p.constant(4, result);
+        p.constant(0, text);
+        p.emit(0xe58d0000); // str r0,[sp]: msg, the fifth argument
+        p.constant(0, text); p.constant(1, 7); p.constant(2, 0); p.constant(3, text);
+        p.call(stub);
+        p.store(0, 0);
+        p.emit(0xe1200070); // bkpt #0
+        p.emit(0xe28dd008); // add sp,sp,#8
+        p.emit(0xe8bd8010); // pop {r4,pc}
+        p.finish(env->mem);
+        auto asserting = env->kernel.create_thread(env->mem, "assertion fixture", Ptr<const void>(code),
+            SCE_KERNEL_DEFAULT_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT,
+            SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
+        REQUIRE(asserting && asserting->start(0, Ptr<void>{}, false) == 0);
+        const auto progress = runtime.resume(64);
+        REQUIRE(handler_calls == 1 && !exit_requested);
+        REQUIRE(*Ptr<uint32_t>(result).get(env->mem) == 0);
+        REQUIRE(progress.failed == 1 && progress.idle && progress.runnable == 0);
+        REQUIRE(asserting->returned_value == 0xDEADDEAD);
+        REQUIRE(runtime.shutdown());
+        REQUIRE(env->kernel.threads.empty() && !env->kernel.execution_host);
+        env->kernel.process_exit_callback = {};
+        std::puts("Guest assertion: handler returns, the guest break fails the thread, no clean exit");
+    }
     // Do not retain the last scenario's observer references after their scope.
     env->kernel.call_import = {};
 }

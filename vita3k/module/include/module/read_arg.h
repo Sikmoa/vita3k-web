@@ -21,6 +21,9 @@
 
 #include <cpu/functions.h>
 
+#include <bit>
+#include <type_traits>
+
 // Reads an arg from CPU registers or stack
 template <typename T>
 T read(CPUState &cpu, const ArgLayout &arg, const MemState &mem) {
@@ -32,7 +35,11 @@ T read(CPUState &cpu, const ArgLayout &arg, const MemState &mem) {
             static_assert(sizeof(T) == 8);
             const uint64_t lo = read_reg(cpu, arg.offset);
             const uint64_t hi = read_reg(cpu, arg.offset + 1);
-            return static_cast<T>(lo | (hi << 32));
+            // A double arrives as its bit pattern in a register pair, not as an integer value.
+            if constexpr (std::is_integral_v<T>)
+                return static_cast<T>(lo | (hi << 32));
+            else
+                return std::bit_cast<T>(lo | (hi << 32));
         }
     case ArgLocation::stack:
         return *Ptr<T>(static_cast<Address>(read_sp(cpu) + arg.offset)).get(mem);

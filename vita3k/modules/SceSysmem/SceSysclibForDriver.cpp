@@ -21,7 +21,7 @@
 #include <util/log.h>
 #include <util/tracy.h>
 
-#include <v3kprintf.h>
+#include <module/guest_format.h>
 
 TRACY_MODULE_NAME(SceSysclibForDriver);
 
@@ -168,12 +168,15 @@ EXPORT(int, rshift) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, ksnprintf, char *s, size_t n, const char *format, module::vargs args) {
+EXPORT(int, ksnprintf, char *s, SceSize n, const char *format, module::vargs args) {
     // TODO: add args to tracy func
     TRACY_FUNC(ksnprintf, s, n, format);
 
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
-    return utils::snprintf(s, n, format, *(thread->cpu), emuenv.mem, args);
+    if (!thread) {
+        return SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID;
+    }
+    return module::snprintf_guest(s, n, format, *(thread->cpu), emuenv.mem, args);
 }
 
 EXPORT(int, kstrchr) {

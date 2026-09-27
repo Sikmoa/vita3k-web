@@ -24,7 +24,7 @@
 #include <util/tracy.h>
 
 #include <dlmalloc.h>
-#include <v3kprintf.h>
+#include <module/guest_format.h>
 
 TRACY_MODULE_NAME(SceLibc);
 
@@ -964,23 +964,21 @@ EXPORT(int, perror) {
 EXPORT(int, printf, const char *format, module::vargs args) {
     TRACY_FUNC(printf, format);
     // TODO: add args to tracy func
-    std::vector<char> buffer(1024);
-
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
 
     if (!thread) {
         return SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID;
     }
 
-    const int result = utils::snprintf(buffer.data(), buffer.size(), format, *(thread->cpu), emuenv.mem, args);
+    const auto text = module::format_guest(format, *(thread->cpu), emuenv.mem, args);
 
-    if (!result) {
-        return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
+    if (!text) {
+        return -1;
     }
 
-    LOG_INFO("{}", buffer.data());
+    LOG_INFO("{}", *text);
 
-    return SCE_KERNEL_OK;
+    return static_cast<int>(text->size());
 }
 
 EXPORT(int, printf_s) {
@@ -1118,17 +1116,20 @@ EXPORT(int, setjmp) {
 }
 #pragma pop_macro("setjmp")
 
-EXPORT(int, setvbuf, FILE *stream, char *buffer, int mode, size_t size) {
+EXPORT(int, setvbuf, FILE *stream, char *buffer, int mode, SceSize size) {
     TRACY_FUNC(setvbuf, stream, buffer, mode, size);
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, snprintf, char *s, size_t n, const char *format, module::vargs args) {
+EXPORT(int, snprintf, char *s, SceSize n, const char *format, module::vargs args) {
     // TODO: add args to tracy func
     TRACY_FUNC(snprintf, s, n, format);
 
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
-    return utils::snprintf(s, n, format, *(thread->cpu), emuenv.mem, args);
+    if (!thread) {
+        return SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID;
+    }
+    return module::snprintf_guest(s, n, format, *(thread->cpu), emuenv.mem, args);
 }
 
 EXPORT(int, snprintf_s) {
@@ -1500,7 +1501,7 @@ EXPORT(int, vscanf_s) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, vsnprintf, char *s, size_t n, const char *format, Address args) {
+EXPORT(int, vsnprintf, char *s, SceSize n, const char *format, Address args) {
     TRACY_FUNC(vsnprintf, s, n, format, args);
 
     module::vargs vargs(args);

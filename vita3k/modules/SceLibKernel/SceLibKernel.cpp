@@ -17,8 +17,8 @@
 
 #include "SceLibKernel.h"
 #include <mem/functions.h>
+#include <module/guest_format.h>
 #include <modules/module_parent.h>
-#include <v3kprintf.h>
 
 #include <../SceIofilemgr/SceIofilemgr.h>
 #include <../SceKernelModulemgr/SceModulemgr.h>
@@ -299,21 +299,19 @@ EXPORT(int, sceClibMspaceReallocalign) {
 
 EXPORT(int, sceClibPrintf, const char *fmt, module::vargs args) {
     TRACY_FUNC(sceClibPrintf, fmt);
-    std::vector<char> buffer(KiB(1));
-
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
 
     if (!thread) {
         return SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID;
     }
 
-    const int result = utils::snprintf(buffer.data(), buffer.size(), fmt, *(thread->cpu), emuenv.mem, args);
+    const auto text = module::format_guest(fmt, *(thread->cpu), emuenv.mem, args);
 
-    if (!result) {
+    if (!text) {
         return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
     }
 
-    LOG_INFO("{}", buffer.data());
+    LOG_INFO("{}", *text);
 
     return SCE_KERNEL_OK;
 }
@@ -326,9 +324,9 @@ EXPORT(int, sceClibSnprintf, char *dst, SceSize dst_max_size, const char *fmt, m
         return SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID;
     }
 
-    int result = utils::snprintf(dst, dst_max_size, fmt, *(thread->cpu), emuenv.mem, args);
+    const int result = module::snprintf_guest(dst, dst_max_size, fmt, *(thread->cpu), emuenv.mem, args);
 
-    if (!result) {
+    if (result < 0) {
         return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
     }
 
@@ -361,10 +359,18 @@ EXPORT(int, sceClibStrcpyChk) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(Ptr<char>, sceClibStrlcat, char *dst, const char *src, SceSize len) {
+// BSD strlcat: len is the whole size of dst; returns the length of the string it tried to create.
+EXPORT(SceSize, sceClibStrlcat, char *dst, const char *src, SceSize len) {
     TRACY_FUNC(sceClibStrlcat, dst, src, len);
-    char *res = strncat(dst, src, len);
-    return Ptr<char>(res, emuenv.mem);
+    const size_t dst_len = strnlen(dst, len);
+    const size_t src_len = strlen(src);
+    if (dst_len == len) {
+        return static_cast<SceSize>(len + src_len);
+    }
+    const size_t copied = std::min<size_t>(src_len, len - dst_len - 1);
+    memcpy(dst + dst_len, src, copied);
+    dst[dst_len + copied] = '\0';
+    return static_cast<SceSize>(dst_len + src_len);
 }
 
 EXPORT(int, sceClibStrlcatChk) {
@@ -372,10 +378,16 @@ EXPORT(int, sceClibStrlcatChk) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(Ptr<char>, sceClibStrlcpy, char *dst, const char *src, SceSize len) {
+// BSD strlcpy: returns strlen(src); dst is NUL-terminated whenever len > 0.
+EXPORT(SceSize, sceClibStrlcpy, char *dst, const char *src, SceSize len) {
     TRACY_FUNC(sceClibStrlcpy, dst, src, len);
-    char *res = strncpy(dst, src, len);
-    return Ptr<char>(res, emuenv.mem);
+    const size_t src_len = strlen(src);
+    if (len) {
+        const size_t copied = std::min<size_t>(src_len, len - 1);
+        memcpy(dst, src, copied);
+        dst[copied] = '\0';
+    }
+    return static_cast<SceSize>(src_len);
 }
 
 EXPORT(int, sceClibStrlcpyChk) {
@@ -436,9 +448,15 @@ EXPORT(Ptr<char>, sceClibStrstr, const char *s1, const char *s2) {
     return Ptr<char>(res, emuenv.mem);
 }
 
-EXPORT(int64_t, sceClibStrtoll, const char *str, char **endptr, int base) {
+EXPORT(int64_t, sceClibStrtoll, Ptr<const char> str, Ptr<char> *endptr, int base) {
     TRACY_FUNC(sceClibStrtoll, str, endptr, base);
-    return strtoll(str, endptr, base);
+    const char *const host_str = str.get(emuenv.mem);
+    char *host_end = nullptr;
+    const int64_t result = strtoll(host_str, &host_end, base);
+    if (endptr) {
+        *endptr = Ptr<char>(str.address() + static_cast<Address>(host_end - host_str));
+    }
+    return result;
 }
 
 EXPORT(int, sceClibTolower, char ch) {
@@ -456,22 +474,19 @@ EXPORT(int, sceClibVdprintf) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceClibVprintf, const char *fmt, module::vargs args) {
-    TRACY_FUNC(sceClibVprintf, fmt);
+// The guest passes its va_list (a pointer into its argument area) in r1, not variadic arguments.
+EXPORT(int, sceClibVprintf, const char *fmt, Address list) {
+    TRACY_FUNC(sceClibVprintf, fmt, list);
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
     if (!thread) {
         return SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID;
     }
-    constexpr int dst_max_size = 1024;
-    char dst[dst_max_size];
-    int result = utils::snprintf(dst, dst_max_size, fmt, *(thread->cpu), emuenv.mem, args);
-    if (!result) {
+    module::vargs args(list);
+    const auto text = module::format_guest(fmt, *(thread->cpu), emuenv.mem, args);
+    if (!text) {
         return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
     }
-    if (result == dst_max_size) {
-        LOG_WARN("Predefined buffer too small. Result truncated");
-    }
-    LOG_INFO("{}", dst);
+    LOG_INFO("{}", *text);
     return SCE_KERNEL_OK;
 }
 
@@ -484,13 +499,13 @@ EXPORT(int, sceClibVsnprintf, char *dst, SceSize dst_max_size, const char *fmt, 
         return SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID;
     }
 
-    int result = utils::snprintf(dst, dst_max_size, fmt, *(thread->cpu), emuenv.mem, args);
+    const int result = module::snprintf_guest(dst, dst_max_size, fmt, *(thread->cpu), emuenv.mem, args);
 
-    if (!result) {
+    if (result < 0) {
         return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
     }
 
-    return SCE_KERNEL_OK;
+    return result;
 }
 
 EXPORT(int, sceClibVsnprintfChk) {

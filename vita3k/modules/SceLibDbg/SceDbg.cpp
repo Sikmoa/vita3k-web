@@ -15,38 +15,34 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+#include <module/guest_format.h>
 #include <module/module.h>
 
 #include <kernel/state.h>
 #include <util/lock_and_find.h>
-#include <v3kprintf.h>
 
 #include <util/tracy.h>
 TRACY_MODULE_NAME(SceDbg);
 
-EXPORT(int, sceDbgAssertionHandler, const char *filename, int line, bool do_stop, const char *component, module::vargs messages) {
-    TRACY_FUNC(sceDbgAssertionHandler, filename, line, do_stop, component);
+// The third argument is not a stop request: the handler only reports and returns it. The
+// guest's assertion macro stops by itself (VitaSDK psp2/libdbg.h: SCE_DBG_ASSERT calls this
+// with 0 and then executes SCE_DBG_BREAK_ACTION, a bkpt), so the break instruction, not this
+// handler, ends the thread.
+EXPORT(int, sceDbgAssertionHandler, const char *filename, int line, int unk, const char *component, module::vargs messages) {
+    TRACY_FUNC(sceDbgAssertionHandler, filename, line, unk, component);
     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
 
     if (!thread) {
         return SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID;
     }
 
-    std::vector<char> buffer(KiB(1));
-
     const char *main_message = messages.next<Ptr<const char>>(*(thread->cpu), emuenv.mem).get(emuenv.mem);
-    const int result = utils::snprintf(buffer.data(), buffer.size(), main_message, *(thread->cpu), emuenv.mem, messages);
+    const auto text = module::format_guest(main_message, *(thread->cpu), emuenv.mem, messages);
 
-    LOG_INFO("file {}, line {}, {}", filename, line, buffer.data());
+    LOG_ERROR("Guest assertion failed: component {}, file {}, line {}: {}", component ? component : "", filename ? filename : "", line,
+        text ? *text : "(message could not be formatted)");
 
-    if (do_stop)
-        emuenv.kernel.request_process_exit(0);
-
-    if (!result) {
-        return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
-    }
-
-    return 0;
+    return unk;
 }
 
 EXPORT(int, sceDbgLoggingHandler, const char *pFile, int line, int severity, const char *pComponent, module::vargs messages) {
@@ -67,18 +63,13 @@ EXPORT(int, sceDbgLoggingHandler, const char *pFile, int line, int severity, con
         output += fmt::format(", FILE:{}, LINE:{}", pFile, line);
     }
 
-    std::vector<char> buffer(KiB(1));
-
     const char *main_message = messages.next<Ptr<const char>>(*(thread->cpu), emuenv.mem).get(emuenv.mem);
-    const int result = utils::snprintf(buffer.data(), buffer.size(), main_message, *(thread->cpu), emuenv.mem, messages);
+    const auto text = module::format_guest(main_message, *(thread->cpu), emuenv.mem, messages);
 
-    if (result) {
-        output += fmt::format(" {}", buffer.data());
-    }
-
+    output += fmt::format(" {}", text ? *text : "(message could not be formatted)");
     LOG_INFO(output);
 
-    return 0;
+    return text ? 0 : SCE_KERNEL_ERROR_INVALID_ARGUMENT;
 }
 
 EXPORT(int, sceDbgSetBreakOnErrorState) {

@@ -308,13 +308,15 @@ set(_hle_exports
     sceClibMemcmp sceClibMemmove sceClibMemcpy_safe sceClibLookCtypeTable
     sceClibStrchr sceClibStrrchr sceClibStrncmp sceClibStrncasecmp sceClibStrnlen
     sceClibStrncpy sceClibStrncat sceClibTolower sceClibToupper
-    # Keep sceClibStrlcpy/Strlcat (strncpy/strncat bodies: wrong return value,
-    # no terminator guarantee), sceClibVsnprintf (returns 0, not the length)
-    # and sceClibStrtoll (stores a host char* through the guest endptr)
-    # unselected: their upstream bodies are wrong, not merely incomplete.
-    # Every utils::snprintf user (sceClibPrintf/Snprintf/Vprintf/Vsnprintf,
-    # sceDbg handlers) also stays unselected: external/printf reads %ld/%lu/%z
-    # arguments with the host's 8-byte long/size_t on wasm64, not the guest's 4.
+    # BSD strlcpy/strlcat returns; strtoll stores the guest end address.
+    sceClibStrlcpy sceClibStrlcat sceClibStrtoll
+    # Guest printf family: module::format_guest reads each argument with its
+    # guest ARM EABI width (32-bit long, size_t and pointers; 8-byte aligned
+    # long long and double), from registers, stack or a guest va_list.
+    sceClibPrintf sceClibVprintf sceClibSnprintf sceClibVsnprintf
+    # Log the formatted message; the assertion handler returns its third
+    # argument and leaves stopping to the guest's own break instruction.
+    sceDbgAssertionHandler sceDbgLoggingHandler
     # LwCond signal/delete: signal unlinks parked waiters and sets them
     # running (notify only); delete with waiters returns ILLEGAL_CONTEXT
     # under the fiber host. No host condition variable is reached.
@@ -363,6 +365,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceGxm/SceGxm.cpp"
     "${_HLE_ROOT}/modules/SceLibKernel/SceLibKernel.cpp"
+    "${_HLE_ROOT}/modules/SceLibDbg/SceDbg.cpp"
     "${_HLE_ROOT}/modules/SceKernelThreadMgr/SceThreadmgr.cpp"
     "${_HLE_ROOT}/modules/SceKernelThreadMgr/SceThreadmgrCoredumpTime.cpp"
     "${_HLE_ROOT}/modules/SceKernelThreadMgr/SceThreadmgrForDriver.cpp"
@@ -494,6 +497,7 @@ add_library(vita3k_web_runtime_hle STATIC
     "${_HLE_EXT}/vita-toolchain/src/utils/sha256.c"
     "${_HLE_ROOT}/modules/module_parent.cpp"
     "${_HLE_ROOT}/module/src/write_return_value.cpp"
+    "${_HLE_ROOT}/module/src/guest_format.cpp"
     "${_HLE_ROOT}/module/src/load_module.cpp"
     ${_hle_adapters}
     "${_HLE_ROOT}/kernel/src/sync_primitives.cpp"
@@ -523,7 +527,7 @@ file(GLOB _hle_includes "${_HLE_ROOT}/*/include")
 target_include_directories(vita3k_web_runtime_hle PUBLIC ${_hle_includes}
     "${_HLE_EXT}/yaml-cpp/include")
 target_include_directories(vita3k_web_runtime_hle PRIVATE
-    "${_hle_generated}" "${_lang_generated}" "${_HLE_BROWSER_ROOT}/src" "${_HLE_EXT}/dlmalloc" "${_HLE_EXT}/printf"
+    "${_hle_generated}" "${_lang_generated}" "${_HLE_BROWSER_ROOT}/src" "${_HLE_EXT}/dlmalloc"
     "${_HLE_EXT}/stb" "${_HLE_EXT}/xxHash" "${_HLE_EXT}/vita-toolchain/src"
     "${_HLE_EXT}/pugixml/src")
 target_compile_definitions(vita3k_web_runtime_hle PRIVATE
