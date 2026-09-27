@@ -330,6 +330,10 @@ void ThreadState::run_loop(bool cooperative) {
             if (res != 0) {
                 if (res < 0) {
                     LOG_ERROR("Thread {} ({}) experienced a cpu error.", name, cpu->thread_id);
+                    std::string regs;
+                    for (int r = 0; r < 13; ++r)
+                        regs += fmt::format("r{}={:08x} ", r, read_reg(*cpu, r));
+                    LOG_ERROR("{}sp={:08x} lr={:08x} pc={:08x}", regs, read_sp(*cpu), read_lr(*cpu), read_pc(*cpu));
                     returned_value = 0xDEADDEAD;
                 } else {
                     // Halt-sentinel (res = 1): guest function returned cleanly.

@@ -100,6 +100,8 @@ try {
         VITA3K_WASMJIT_REGION_CACHE: workerParams.get('regionCache') || undefined,
         // GPU-presented frames read back to the page every N frames (0 = never).
         VITA3K_FRAME_READBACK: workerParams.get('readback') ?? undefined,
+        // Per-NID HLE wall time in the progress report (vita_app.cpp).
+        VITA3K_HLE_PROFILE: workerParams.get('hleProfile') === '1' ? '1' : undefined,
         // Emulated guest CPU cores (vita_app.cpp); unset keeps the default.
         VITA3K_GUEST_CORES: workerParams.get('cores') ?? undefined,
       });

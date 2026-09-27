@@ -65,6 +65,8 @@ public:
     uint32_t get_fault_address() const;
     bool get_fault_write() const;
     uint64_t instructions_executed() const;
+    // Wall milliseconds spent inside generated guest code (run_js_ms in get_profile).
+    double run_ms() const;
     uint64_t compiled_blocks() const;
     // Region-mode metric: successfully installed code regions (a region
     // batches many basic blocks into one WebAssembly.Module).

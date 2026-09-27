@@ -2535,6 +2535,7 @@ const std::string &WasmJitCPU::get_last_error() const { return impl->error; }
 uint32_t WasmJitCPU::get_fault_address() const { return impl->state.fault_address; }
 bool WasmJitCPU::get_fault_write() const { return impl->state.fault_write != 0; }
 uint64_t WasmJitCPU::instructions_executed() const { return impl->executed; }
+double WasmJitCPU::run_ms() const { return impl->run_js_ms; }
 void WasmJitCPU::set_aot_enabled(bool enabled) { impl->aot_enabled = enabled; }
 void WasmJitCPU::disable_aot() { g_aot.disabled = true; }
 uint64_t WasmJitCPU::compiled_blocks() const { return impl->compiled; }

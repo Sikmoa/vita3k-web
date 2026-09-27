@@ -354,6 +354,17 @@ static int run_app_impl() {
     double hle_ms = 0.0;
     unsigned frames_presented = 0;
     std::unordered_map<std::uint32_t, std::pair<unsigned, double>> hle_nids;
+    // Last import (NID, PC) per thread under VITA3K_HLE_PROFILE: where a parked thread waits.
+    std::unordered_map<SceUID, std::pair<std::uint32_t, Address>> last_import;
+    // The last imports of every thread, printed when a guest thread fails.
+    struct ImportRecord { unsigned sequence; SceUID tid; std::uint32_t nid; Address pc, lr; };
+    std::array<ImportRecord, 128> recent_imports{};
+    // Wall time the root loop spends asleep (every fiber parked) and in event-loop turns.
+    double idle_ms = 0, yield_ms = 0;
+    // Per-NID call counts and inclusive wall time (VITA3K_HLE_PROFILE=1): two
+    // clock reads and a map update per import, so off by default.
+    const bool hle_profile = std::getenv("VITA3K_HLE_PROFILE") != nullptr;
+    auto last_report = std::chrono::steady_clock::now();
     const char *trace_option = std::getenv("VITA3K_TRACE_HLE");
     const bool trace_hle = trace_option && std::strcmp(trace_option, "1") == 0;
 #ifdef VITA3K_USE_WASM_JIT
@@ -373,10 +384,15 @@ static int run_app_impl() {
         }
         const double seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - jit_started).count();
-        std::printf("[vita3k-web] jit[%s] elapsed=%.1fs insns=%llu rate_mips=%.2f imports=%u threads=%zu hle_ms=%.1f\n",
+        double guest_ms = 0;
+        for (const auto &[id, active] : env->kernel.threads)
+            if (active && active->cpu && active->cpu->cpu)
+                guest_ms += static_cast<WasmJitCPU &>(*active->cpu->cpu).run_ms();
+        std::printf("[vita3k-web] jit[%s] elapsed=%.1fs insns=%llu rate_mips=%.2f imports=%u threads=%zu hle_ms=%.1f frames=%u guest_ms=%.0f idle_ms=%.0f yield_ms=%.0f\n",
             tag, seconds, static_cast<unsigned long long>(total),
             seconds > 0.0 ? static_cast<double>(total) / seconds / 1e6 : 0.0,
-            imports, env->kernel.threads.size(), hle_ms);
+            imports, env->kernel.threads.size(), hle_ms, frames_presented, guest_ms, idle_ms, yield_ms);
+        browser::gxm_timing_report();
         if (!verbose) return;
         // Which import owns the wall clock, and is it many cheap calls (spin) or
         // few expensive ones (blocking/decompression)? Sorted by total ms.
@@ -408,6 +424,13 @@ static int run_app_impl() {
             if (jit.instructions_executed() == hottest)
                 std::printf("[vita3k-web] jit profile %d: %s\n", id, jit.get_profile().c_str());
         }
+        for (const auto &[id, active] : env->kernel.threads) {
+            const auto last = last_import.find(id);
+            if (!active || last == last_import.end()) continue;
+            std::printf("[vita3k-web] thread=%d %s status=%d last_import=%s PC=%08x\n", id,
+                active->name.c_str(), static_cast<int>(active->status),
+                import_name(last->second.first), last->second.second);
+        }
     };
 #endif
     struct Cleanup {
@@ -433,29 +456,47 @@ static int run_app_impl() {
     try {
         if (!env->kernel.init(env->mem, [&](CPUState &cpu, uint32_t nid, SceUID tid) {
                 const unsigned import_sequence = ++imports;
+                recent_imports[import_sequence % recent_imports.size()] = { import_sequence, tid, nid, read_pc(cpu), read_lr(cpu) };
                 if (trace_hle) {
-                    std::fprintf(stderr, "[vita3k-web] HLE enter #%u tid=%d NID=%08x PC=%08x name=%s\n",
-                        import_sequence, tid, nid, read_pc(cpu), import_name(nid));
+                    std::fprintf(stderr, "[vita3k-web] HLE enter #%u tid=%d NID=%08x PC=%08x name=%s args=%08x,%08x,%08x,%08x LR=%08x\n",
+                        import_sequence, tid, nid, read_pc(cpu), import_name(nid),
+                        read_reg(cpu, 0), read_reg(cpu, 1), read_reg(cpu, 2), read_reg(cpu, 3), read_lr(cpu));
                     std::fflush(stderr);
                 }
-                if (imports < 400 || imports % 500 == 0) {
+                // Boot imports are traced one by one; afterwards progress is
+                // reported on a wall-clock period, not per import (retail
+                // titles make 100k+ imports per second).
+                bool report = imports < 400;
+                if (!report && (imports & 1023) == 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - last_report >= std::chrono::seconds(5)) {
+                        last_report = now;
+                        report = true;
+                    }
+                }
+                if (report) {
                     std::printf("[vita3k-web] Vita import #%u: %s NID=%08x PC=%08x\n",
                         imports, import_name(nid), nid, read_pc(cpu));
 #ifdef VITA3K_USE_WASM_JIT
                     jit_report("progress", true);
 #endif
                 }
-                const auto hle_started = std::chrono::steady_clock::now();
-                ::call_import(*env, cpu, nid, tid);
-                const double hle_cost = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - hle_started).count();
-                hle_ms += hle_cost;
-                auto &hle_slot = hle_nids[nid];
-                ++hle_slot.first;
-                hle_slot.second += hle_cost;
+                if (hle_profile) {
+                    last_import[tid] = { nid, read_pc(cpu) };
+                    const auto hle_started = std::chrono::steady_clock::now();
+                    ::call_import(*env, cpu, nid, tid);
+                    const double hle_cost = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - hle_started).count();
+                    hle_ms += hle_cost;
+                    auto &hle_slot = hle_nids[nid];
+                    ++hle_slot.first;
+                    hle_slot.second += hle_cost;
+                } else {
+                    ::call_import(*env, cpu, nid, tid);
+                }
                 if (trace_hle) {
-                    std::fprintf(stderr, "[vita3k-web] HLE return #%u tid=%d NID=%08x PC=%08x\n",
-                        import_sequence, tid, nid, read_pc(cpu));
+                    std::fprintf(stderr, "[vita3k-web] HLE return #%u tid=%d NID=%08x PC=%08x r0=%08x\n",
+                        import_sequence, tid, nid, read_pc(cpu), read_reg(cpu, 0));
                     std::fflush(stderr);
                 }
                 if (nid == 0x7A410B64 /* sceDisplaySetFrameBuf */
@@ -559,6 +600,12 @@ static int run_app_impl() {
             if (parsed > 0) pc_sample_every = static_cast<std::size_t>(parsed);
         }
         std::size_t pc_sample_next = pc_sample_every;
+        // Benchmark bound: stop the pump after this many wall seconds and fall
+        // through to the final report instead of being killed mid-run.
+        double bench_seconds = 0;
+        if (const char *limit = std::getenv("VITA3K_BENCH_SECONDS"))
+            bench_seconds = std::strtod(limit, nullptr);
+        bool bench_expired = false;
         // Diagnostic: VITA3K_AOT_UNTIL=<seconds> leaves the AOT module after
         // that much wall time (boot on AOT, the rest on the lazy JIT).
         double aot_until = 0;
@@ -566,6 +613,11 @@ static int run_app_impl() {
             aot_until = std::strtod(until, nullptr);
         unsigned frames_yielded = 0;
         do {
+            if (bench_seconds > 0 && std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - jit_started).count() >= bench_seconds) {
+                bench_expired = true;
+                break;
+            }
             if (g_host_input_changed) {
                 g_host_input_changed = false;
                 const std::lock_guard<std::mutex> guard(env->ctrl.mutex);
@@ -582,7 +634,9 @@ static int run_app_impl() {
             dispatched += progress.dispatches;
             if (frames_presented != frames_yielded) {
                 frames_yielded = frames_presented;
+                const double started = emscripten_get_now();
                 web_yield_to_event_loop();
+                yield_ms += emscripten_get_now() - started;
             }
             if (pc_sample_every && dispatched >= pc_sample_next) {
                 pc_sample_next = dispatched + pc_sample_every;
@@ -597,20 +651,32 @@ static int run_app_impl() {
             // idle until then (e.g. sceKernelDelayThread), not finished.
             if (progress.idle && progress.next_deadline_us && !exited && !progress.failed) {
                 const auto now = vita3k::web::GuestThreadRuntime::now_us();
-                if (*progress.next_deadline_us > now)
+                if (*progress.next_deadline_us > now) {
+                    const double started = emscripten_get_now();
                     emscripten_sleep(static_cast<unsigned>((*progress.next_deadline_us - now + 999) / 1000));
+                    idle_ms += emscripten_get_now() - started;
+                }
                 progress.idle = false;
             }
         } while (!exited && env->missing_nids.empty() && !progress.failed
             && !progress.idle);
         std::printf("[vita3k-web] Guest scheduler: dispatches=%zu runnable=%zu waiting=%zu dormant=%zu failed=%zu idle=%d\n",
             dispatched, progress.runnable, progress.waiting, progress.dormant, progress.failed, progress.idle);
+        if (progress.failed) {
+            std::vector<ImportRecord> ordered(recent_imports.begin(), recent_imports.end());
+            std::sort(ordered.begin(), ordered.end(), [](const auto &a, const auto &b) { return a.sequence < b.sequence; });
+            for (const auto &r : ordered)
+                if (r.sequence)
+                    std::printf("[vita3k-web] recent import #%u tid=%d %s PC=%08x LR=%08x\n", r.sequence, r.tid, import_name(r.nid), r.pc, r.lr);
+        }
 #else
         thread->run_loop(true);
 #endif
 #ifdef VITA3K_USE_WASM_JIT
         jit_report("final", true);
         browser::gxm_survey_report();
+        if (bench_expired)
+            std::printf("[vita3k-web] benchmark deadline reached after %.1fs\n", bench_seconds);
         if (const char *seeds = std::getenv("VITA3K_AOT_SEEDS_OUT"))
             std::printf("[vita3k-web] AOT seeds -> %s: %s\n", seeds,
                 WasmJitCPU::dump_aot_seeds(seeds) ? "ok" : "FAILED");

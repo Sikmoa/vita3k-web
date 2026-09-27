@@ -39,7 +39,8 @@ find_program(VITA3K_NODE_EXECUTABLE node)
 # entry helper - propagate exactly as they do for vita3k_web_jit).
 set(VITA3K_DISPLAY_BENCH_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vita_runtime.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/vita_display_bridge.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vita_display_bridge.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vita_self_decrypt.cpp")
 set(VITA3K_DISPLAY_BENCH_LINK_OPTIONS
     --no-entry
     -sMODULARIZE=1
