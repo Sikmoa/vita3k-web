@@ -175,8 +175,9 @@ PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index
 ```
 
 All exit 0 on success. Playwright lives under `build/playwright`.
-`dist_chromium.mjs` checks a deployment: the Worker must load the module of the
-dist's memory model without falling back (`DIST_MEMORY_MODEL` for a wasm32 dist).
+`dist_chromium.mjs` checks a deployment: the Worker, asked for the dist's memory
+model (`DIST_MEMORY=w32` for a wasm32 build's dist), must load its module, and
+GXM must initialise from `dist/shaders/`.
 
 ## Manual browser testing (the animated display fixture)
 
@@ -206,9 +207,9 @@ and boots the app with the same Worker messages the headless probe uses. The
 runtime files come from `browser/tests/runtime_routes.mjs`, shared with the
 probes: `browser/web` from source, everything else from the built dist
 `GXM_RUNTIME_DIST` (default `build/web64/dist`), including the shader
-toolchain in `dist/shaders/` (GXP compiler, Naga, WASI shim; building it runs
-`npm ci` on `browser/shaders/package-lock.json`, so it needs npm and the
-registry or an npm cache).
+toolchain in `dist/shaders/` (GXP compiler, Naga, WASI shim; configuring the
+build runs `npm ci` on `browser/shaders/package-lock.json`, so it needs npm and
+the registry or an npm cache).
 `LIMBO_AOT=<file>` supplies an AOT module (below). The option list is the
 header of `limbo_serve.mjs`; the ones that change what is measured:
 

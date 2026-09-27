@@ -235,8 +235,9 @@ endfunction()
 # dist/shaders/ holds what web_gxm_init (gxm_webgpu_bridge.cpp) loads: the
 # GXP compiler, built from browser/shaders as its own wasm32 project, and Naga
 # plus the WASI shim, installed by `npm ci` from the pinned
-# browser/shaders/package-lock.json. That install is the one input the build
-# fetches: it needs npm and the npm registry (or an npm cache holding them).
+# browser/shaders/package-lock.json. That install is the one input the
+# configure step fetches: it needs npm and the npm registry (or an npm cache
+# holding the packages).
 include(ExternalProject)
 set(_gxp_compiler_dir "${CMAKE_CURRENT_BINARY_DIR}/gxp_compiler")
 ExternalProject_Add(vita3k_gxp_compiler
@@ -252,34 +253,41 @@ if(NOT VITA3K_NPM)
     message(FATAL_ERROR "npm not found: it installs Naga and the WASI shim for dist/shaders "
         "(browser/shaders/package-lock.json)")
 endif()
+# Installed at configure time, like a FetchContent dependency, so every file
+# the shim ships is known here and gets its own staging rule; a changed
+# lockfile reconfigures and reinstalls.
 set(_shader_deps "${CMAKE_CURRENT_BINARY_DIR}/shader_deps")
 set(_naga "${_shader_deps}/node_modules/naga-wasi-cli")
 set(_wasi_shim "${_shader_deps}/node_modules/@bjorn3/browser_wasi_shim")
-set(_shader_dep_files
-    "${_naga}/wasi/naga.wasm" "${_naga}/LICENSE-MIT" "${_naga}/LICENSE-APACHE"
-    "${_wasi_shim}/dist/index.js" "${_wasi_shim}/LICENSE-MIT" "${_wasi_shim}/LICENSE-APACHE")
-add_custom_command(
-    OUTPUT ${_shader_dep_files}
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${_shader_deps}"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/package.json"
-        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/package-lock.json" "${_shader_deps}"
-    COMMAND ${CMAKE_COMMAND} -E chdir "${_shader_deps}"
-        "${VITA3K_NPM}" ci --ignore-scripts --no-audit --no-fund
-    # npm keeps the packages' 1985 timestamps; mark the outputs as fresh.
-    COMMAND ${CMAKE_COMMAND} -E touch ${_shader_dep_files}
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/package.json" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/package-lock.json"
-    COMMENT "Installing Naga and the WASI shim (npm ci)"
-    VERBATIM
-)
-add_custom_command(
-    OUTPUT "${VITA3K_WEB_DIST}/shaders/wasi/index.js"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory "${_wasi_shim}/dist" "${VITA3K_WEB_DIST}/shaders/wasi"
-    DEPENDS "${_wasi_shim}/dist/index.js"
-    COMMENT "Staging dist/shaders/wasi"
-    VERBATIM
-)
-list(APPEND _dist_outputs "${VITA3K_WEB_DIST}/shaders/wasi/index.js")
+set(_shader_lock "${CMAKE_CURRENT_SOURCE_DIR}/shaders/package-lock.json")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/package.json" "${_shader_lock}")
+file(SHA256 "${_shader_lock}" _shader_lock_hash)
+set(_shader_installed "")
+if(EXISTS "${_shader_deps}/installed.sha256" AND EXISTS "${_naga}/wasi/naga.wasm" AND EXISTS "${_wasi_shim}/dist/index.js")
+    file(READ "${_shader_deps}/installed.sha256" _shader_installed)
+endif()
+if(NOT _shader_installed STREQUAL _shader_lock_hash)
+    file(REMOVE_RECURSE "${_shader_deps}")
+    file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/shaders/package.json" "${_shader_lock}" DESTINATION "${_shader_deps}")
+    message(STATUS "Installing Naga and the WASI shim (npm ci in ${_shader_deps})")
+    execute_process(COMMAND "${VITA3K_NPM}" ci --ignore-scripts --no-audit --no-fund
+        WORKING_DIRECTORY "${_shader_deps}" RESULT_VARIABLE _npm_result)
+    if(NOT _npm_result EQUAL 0)
+        message(FATAL_ERROR "npm ci failed (${_npm_result}); it needs the npm registry or an npm cache "
+            "holding the packages pinned in ${_shader_lock}")
+    endif()
+    # npm keeps the packages' 1985 timestamps: date them now so staged copies
+    # of an older install count as out of date.
+    file(GLOB_RECURSE _installed_files "${_shader_deps}/node_modules/*")
+    file(TOUCH_NOCREATE ${_installed_files})
+    file(WRITE "${_shader_deps}/installed.sha256" "${_shader_lock_hash}")
+endif()
+file(GLOB _wasi_shim_modules "${_wasi_shim}/dist/*.js")
+foreach(_module IN LISTS _wasi_shim_modules)
+    get_filename_component(_name "${_module}" NAME)
+    vita3k_web_dist_copy("shaders/wasi/${_name}" "${_module}")
+endforeach()
 vita3k_web_dist_copy(shaders/gxp_compiler.mjs "${_gxp_compiler_dir}/gxp_compiler.mjs")
 vita3k_web_dist_copy(shaders/gxp_compiler.wasm "${_gxp_compiler_dir}/gxp_compiler.wasm")
 vita3k_web_dist_copy(shaders/naga.wasm "${_naga}/wasi/naga.wasm")

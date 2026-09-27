@@ -36,7 +36,7 @@ caller passes 32 explicit `SceGxmTextureFormat` hints (16 vertex, 16 fragment).
 
 The browser build produces all of it in `dist/shaders/` (target
 `vita3k_web_dist`: the compiler as a separate wasm32 project, Naga and the
-shim by `npm ci`). The native oracle is the same project without Emscripten:
+shim by `npm ci` when the build is configured). The native oracle is the same project without Emscripten:
 
 ```sh
 cmake -S browser/shaders -B build/gxp-native -G Ninja && cmake --build build/gxp-native

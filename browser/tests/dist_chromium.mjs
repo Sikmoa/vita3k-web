@@ -1,15 +1,15 @@
 // Deployment check: serves a built dist directory as plain static files (no
 // route rewriting, as a web server would) and loads the runtime from it in
-// Chromium. The Worker must load the JIT module for the dist's memory model
-// without falling back, and gxm_scene.js must initialise from the dist's
-// shaders/ and translate repository GXP programs, as sceGxmInitialize does.
+// Chromium. The Worker, asked for the dist's memory model, must load the JIT
+// module from where it looks for that model, and gxm_scene.js must initialise
+// from the dist's shaders/ and translate repository GXP programs, as
+// sceGxmInitialize does.
 //
 //   PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index.mjs \
 //     node browser/tests/dist_chromium.mjs [build/web64/dist]
 //
 // Environment:
-//   DIST_MEMORY_MODEL   expected 'ready' memoryModel (default wasm64-direct;
-//                       wasm32-sparse for a wasm32 build's dist)
+//   DIST_MEMORY         w64 (default: a Memory64 build's dist) or w32
 //   PLAYWRIGHT_CHROMIUM_EXECUTABLE, LIMBO_GPU=1, LIMBO_HEADED=1  as in limbo_app_chromium.mjs
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -18,7 +18,9 @@ import assert from 'node:assert/strict';
 
 const root = resolve(process.argv[2] || 'build/web64/dist');
 const gxpRoot = resolve('tools/native-tool/src/shaders');
-const expectedModel = process.env.DIST_MEMORY_MODEL || 'wasm64-direct';
+const memory = process.env.DIST_MEMORY || 'w64';
+const expectedModel = { w64: 'wasm64-direct', w32: 'wasm32-sparse' }[memory];
+assert(expectedModel, `DIST_MEMORY=${memory}: expected w64 or w32`);
 const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm' };
 const requests = [];
 const server = createServer(async (req, res) => {
@@ -60,9 +62,10 @@ try {
   const pageErrors = [];
   page.on('pageerror', (error) => pageErrors.push(String(error)));
   await page.goto(`http://127.0.0.1:${server.address().port}/__dist_probe.html`);
-  const ready = await page.evaluate(() => new Promise((done, fail) => {
-    // Default memory selection (auto), as a deployed page uses it.
-    const worker = new Worker('./worker.js?backend=jit', { type: 'module' });
+  const ready = await page.evaluate((memory) => new Promise((done, fail) => {
+    // A forced model loads only from that model's directory: a misplaced
+    // module fails here instead of being found by the other model's attempt.
+    const worker = new Worker(`./worker.js?backend=jit&memory=${memory}`, { type: 'module' });
     const logs = [];
     const timer = setTimeout(() => fail(new Error(`no ready: ${logs.join(' | ')}`)), 60000);
     worker.onmessage = ({ data }) => {
@@ -71,7 +74,7 @@ try {
       if (data.type === 'ready') { clearTimeout(timer); worker.terminate(); done({ ...data.diagnostics, logs }); }
     };
     worker.onerror = (event) => { clearTimeout(timer); fail(new Error(event.message)); };
-  }));
+  }), memory);
   // The URLs web_gxm_init (browser/src/gxm_webgpu_bridge.cpp) builds relative
   // to the Worker, which sits next to this page.
   const gxm = await page.evaluate(async () => {
@@ -93,7 +96,6 @@ try {
   console.log(JSON.stringify({ root, ready, gxm, requests }, null, 2));
   assert.deepEqual(pageErrors, []);
   assert.equal(ready.memoryModel, expectedModel, 'module memory model');
-  assert.equal(ready.memoryFallback, false, 'the dist must hold the module where the Worker looks first');
   assert.equal(gxm.programs, 2, 'GXM initialised and translated both programs');
   console.log(`DIST OK: ${ready.module} ${ready.memoryModel}, GXM initialised from ${root}`);
 } finally {
