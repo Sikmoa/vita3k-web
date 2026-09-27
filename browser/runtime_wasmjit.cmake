@@ -25,7 +25,10 @@ add_library(vita3k_guest_thread_runtime STATIC
 target_include_directories(vita3k_guest_thread_runtime PUBLIC "${CMAKE_CURRENT_LIST_DIR}/src")
 target_link_libraries(vita3k_guest_thread_runtime PUBLIC vita3k_web_runtime_hle vita3k_wasm_jit)
 target_compile_options(vita3k_guest_thread_runtime PUBLIC -fexceptions)
-target_link_options(vita3k_guest_thread_runtime INTERFACE -fexceptions -sASYNCIFY=1)
+target_link_options(vita3k_guest_thread_runtime INTERFACE -fexceptions -sASYNCIFY=1
+    -lexports.js "SHELL:--post-js ${CMAKE_CURRENT_LIST_DIR}/src/asyncify_post.js")
+set_property(TARGET vita3k_guest_thread_runtime PROPERTY INTERFACE_LINK_DEPENDS
+    "${CMAKE_CURRENT_LIST_DIR}/src/asyncify_post.js")
 
 # Separate fixture-launch targets: opting into tests does not switch the
 # already-working interpreter application. The Worker selects this module only
