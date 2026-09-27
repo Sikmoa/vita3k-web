@@ -66,6 +66,10 @@ bool classify_unsupported_import(uint32_t nid) {
     // outside callback processing, which the fiber host supports.
     if (n == "sceNpCheckCallback")
         return false;
+    // Offline network stack: parks until readiness, timeout or abort
+    // (SceNet execution_host branch); the CB variant stays rejected.
+    if (n == "sceNetEpollWait")
+        return false;
     return n.find("Wait") != n.npos || n.find("DelayThread") != n.npos
         || n.find("CheckCallback") != n.npos || n.find("CB") != n.npos
         || n.find("ReceiveMsgPipe") != n.npos || n.find("SendMsgPipe") != n.npos;

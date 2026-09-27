@@ -26,7 +26,11 @@
 #include <condition_variable>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
+#include <vector>
+
+struct ThreadState;
 
 typedef std::map<int, SocketPtr> NetSockets;
 typedef std::map<int, EpollPtr> NetEpolls;
@@ -42,6 +46,10 @@ struct NetState {
     int current_addr_index = 0;
     uint32_t broadcastAddr = 0xFFFFFFFF;
     uint32_t netAddr = 0xFFFFFFFF;
+    // Offline stack (net/offline_socket.h) only.
+    std::map<int, std::optional<int>> resolvers; // id -> result of its finished lookup
+    std::vector<std::shared_ptr<ThreadState>> parked_threads;
+    uint16_t next_ephemeral_port = 49152;
 
     void abort_all();
     void deinit();

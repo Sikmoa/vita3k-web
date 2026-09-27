@@ -112,8 +112,8 @@ set(_hle_exports
     sceKernelWaitSema sceKernelCancelSema
     # Mutex cancel and LwCond info: production kernel objects, no waits.
     sceKernelCancelMutex sceKernelGetLwCondInfo sceKernelGetLwCondInfoById
-    # Network init/term: production bodies are net-state writes only
-    # (SceNet.cpp:471/698); net_utils gets a loopback Emscripten branch.
+    # Network init/term: production bodies are net-state writes only;
+    # net_utils gets a loopback Emscripten branch.
     sceNetInit sceNetTerm
     # Offline control initialization only; upstream stub parity, no connection.
     sceNetCtlInit sceNetCtlTerm
@@ -339,6 +339,19 @@ set(_hle_exports
     # regmgr over the staged firmware template os0/kd/registry.db0, loaded at
     # launch as desktop does (vita_app.cpp).
     sceRegMgrSystemParamGetInt
+    # Offline network: a Vita with no connection (net/offline_socket.h). No
+    # host socket exists; sockets bind, datagrams to 127/8 are delivered,
+    # other destinations have no route, the resolver has no DNS server and
+    # SceNetCtl reports disconnected. Receives and epoll waits park the guest
+    # thread (SO_RCVTIMEO, abort and delivery end them).
+    sceNetSocket sceNetSocketClose sceNetSocketAbort sceNetBind sceNetConnect
+    sceNetShutdown sceNetSetsockopt sceNetGetsockopt sceNetGetsockname sceNetGetpeername
+    sceNetSend sceNetSendto sceNetRecv sceNetRecvfrom
+    sceNetEpollCreate sceNetEpollControl sceNetEpollWait sceNetEpollDestroy sceNetEpollAbort
+    sceNetResolverCreate sceNetResolverStartNtoa sceNetResolverGetError
+    sceNetResolverAbort sceNetResolverDestroy
+    sceNetInetPton sceNetInternalInetPton
+    sceNetCtlInetGetState sceNetCtlInetGetInfo
 )
 
 # Take NID values from the one authoritative database, never a second resolver.
@@ -396,6 +409,7 @@ set(_hle_module_sources
     "${_HLE_ROOT}/rtc/src/rtc.cpp"
     "${_HLE_ROOT}/modules/SceNet/SceNet.cpp"
     "${_HLE_ROOT}/modules/SceNetCtl/SceNetCtl.cpp"
+    "${_HLE_ROOT}/modules/SceNetInternal/SceNetInternal.cpp"
     "${_HLE_ROOT}/modules/SceNpManager/SceNpManager.cpp"
     "${_HLE_ROOT}/modules/SceNpCommerce2/SceNpCommerce2.cpp"
     "${_HLE_ROOT}/modules/SceNpBasic/SceNpBasic.cpp"
@@ -517,6 +531,8 @@ add_library(vita3k_web_runtime_hle STATIC
     "${_HLE_ROOT}/io/src/state_functions.cpp"
     "${_HLE_ROOT}/util/src/net_utils.cpp"
     "${_HLE_ROOT}/regmgr/src/regmgr.cpp"
+    "${_HLE_ROOT}/net/src/offline_socket.cpp"
+    "${_HLE_ROOT}/net/src/epoll.cpp"
     "${_HLE_ROOT}/np/src/init.cpp"
     # Trophy context lifecycle for sceNpTrophyCreateContext and friends:
     # upstream production bodies over the staged TRP files (pugixml parses

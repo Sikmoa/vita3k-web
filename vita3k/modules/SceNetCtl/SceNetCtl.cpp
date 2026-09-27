@@ -568,6 +568,12 @@ EXPORT(int, sceNetCtlInetGetInfo, int code, SceNetCtlInfo *info) {
         return RET_ERROR(SCE_NET_CTL_ERROR_INVALID_ADDR);
     }
 
+#ifdef __EMSCRIPTEN__
+    // Offline: no infrastructure connection, so nothing about it can be read.
+    if (code < SCE_NETCTL_INFO_GET_CNF_NAME || code > SCE_NETCTL_INFO_GET_HTTP_PROXY_PORT)
+        return RET_ERROR(SCE_NET_CTL_ERROR_INVALID_CODE);
+    return RET_ERROR(SCE_NET_CTL_ERROR_NOT_CONNECTED);
+#endif
     const auto addr = net_utils::get_selected_assigned_addr(emuenv.cfg.adhoc_addr);
 
     switch (code) {
@@ -674,8 +680,13 @@ EXPORT(int, sceNetCtlInetGetState, int *state) {
         return RET_ERROR(SCE_NET_CTL_ERROR_INVALID_ADDR);
     }
 
+#ifdef __EMSCRIPTEN__
+    *state = SCE_NET_CTL_STATE_DISCONNECTED; // offline
+    return 0;
+#else
     *state = SCE_NET_CTL_STATE_IPOBTAINED;
     return STUBBED("state = SCE_NETCTL_STATE_CONNECTED");
+#endif
 }
 
 EXPORT(int, sceNetCtlInetRegisterCallback, Ptr<void> func, Ptr<void> arg, int *cid) {

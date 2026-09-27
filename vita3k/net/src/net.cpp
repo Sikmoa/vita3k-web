@@ -32,6 +32,9 @@ void NetState::deinit() {
     }
     socks.clear();
     epolls.clear();
+    resolvers.clear();
+    parked_threads.clear();
+    next_ephemeral_port = 49152;
 
 #ifdef _WIN32
     if (inited)

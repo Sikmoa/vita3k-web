@@ -46,6 +46,7 @@ int Epoll::mod(int id, SceNetEpollEvent *ev) {
     return 0;
 }
 
+#ifndef __EMSCRIPTEN__ // the browser's offline stack waits in SceNet.cpp (epoll_wait_offline)
 static void add_event_fd_set(fd_set *set, int *maxFd, abs_socket sock) {
     FD_SET(sock, set);
     if (sock > *maxFd)
@@ -118,3 +119,4 @@ int Epoll::wait(SceNetEpollEvent *events, int maxevents, int timeout_microsecond
 
     return eventCount;
 }
+#endif

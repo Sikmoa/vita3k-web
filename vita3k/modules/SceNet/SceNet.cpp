@@ -28,6 +28,10 @@
 #include <cstdio>
 #include <thread>
 
+#ifdef __EMSCRIPTEN__
+#include <net/offline_socket.h>
+#endif
+
 #ifdef __APPLE__
 #include "macos_net_helper.h"
 #include <net/if.h>
@@ -136,6 +140,94 @@ static int ret_net_errno(EmuEnvState &emuenv, int thread_id, int ret) {
         return (_r < 0 ? RET_ERROR(_r) : _r);             \
     } while (0)
 
+#ifdef __EMSCRIPTEN__
+// The browser has no host sockets: every socket is an OfflineSocket
+// (net/offline_socket.h), and the calls that wait park the guest thread.
+static std::shared_ptr<OfflineSocket> find_offline_socket(EmuEnvState &emuenv, int sid) {
+    return std::static_pointer_cast<OfflineSocket>(lock_and_find(sid, emuenv.net.socks, emuenv.kernel.mutex));
+}
+
+static uint32_t elapsed_us(std::chrono::steady_clock::time_point start) {
+    return static_cast<uint32_t>(std::min<int64_t>(UINT32_MAX,
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()));
+}
+
+// Blocking receive: waits for a datagram, the SO_RCVTIMEO timeout (EAGAIN, as
+// BSD reports it) or sceNetSocketAbort (EINTR).
+static int recv_offline(EmuEnvState &emuenv, SceUID thread_id, int sid, void *buf, unsigned int len, int flags, SceNetSockaddr *from, unsigned int *fromlen) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto first = find_offline_socket(emuenv, sid);
+    if (!first)
+        return SCE_NET_ERROR_EBADF;
+    const unsigned int generation = first->abort_generation;
+    for (;;) {
+        const auto sock = find_offline_socket(emuenv, sid);
+        if (!sock)
+            return SCE_NET_ERROR_EBADF; // closed while waiting
+        if (sock->abort_generation != generation)
+            return SCE_NET_ERROR_EINTR;
+        const int result = sock->recv_packet(buf, len, flags, from, fromlen);
+        if (result != static_cast<int>(SCE_NET_ERROR_EAGAIN) || sock->nonblocking(flags))
+            return result;
+        std::optional<uint32_t> remaining;
+        if (const auto timeout = sock->receive_timeout()) {
+            const uint32_t elapsed = elapsed_us(start);
+            if (elapsed >= *timeout)
+                return SCE_NET_ERROR_EAGAIN;
+            remaining = *timeout - elapsed;
+        }
+        if (offline_net_park(emuenv.kernel, emuenv.net, thread_id, remaining) == KernelExecutionHost::WaitResult::cancelled)
+            return SCE_NET_ERROR_EINTR;
+    }
+}
+
+// Epoll readiness of a socket, or of a resolver whose lookup has finished.
+static unsigned int offline_ready_events(EmuEnvState &emuenv, int id, const EpollSocket &entry) {
+    if (const auto resolver = emuenv.net.resolvers.find(id); resolver != emuenv.net.resolvers.end())
+        return resolver->second ? SCE_NET_EPOLLIN : 0;
+    const auto sock = entry.sock.lock();
+    return sock ? static_cast<const OfflineSocket &>(*sock).poll_events() : 0;
+}
+
+static int epoll_wait_offline(EmuEnvState &emuenv, SceUID thread_id, int eid, SceNetEpollEvent *events, int maxevents, int timeout_us) {
+    if (!events || maxevents <= 0)
+        return SCE_NET_ERROR_EINVAL;
+    const auto start = std::chrono::steady_clock::now();
+    const auto first = lock_and_find(eid, emuenv.net.epolls, emuenv.kernel.mutex);
+    if (!first)
+        return SCE_NET_ERROR_EBADF;
+    const unsigned int generation = first->abort_generation;
+    for (;;) {
+        const auto epoll = lock_and_find(eid, emuenv.net.epolls, emuenv.kernel.mutex);
+        if (!epoll)
+            return SCE_NET_ERROR_EBADF; // destroyed while waiting
+        if (epoll->abort_preserved || epoll->abort_generation != generation)
+            return SCE_NET_ERROR_EINTR;
+        int count = 0;
+        for (const auto &[id, entry] : epoll->eventEntries) {
+            const unsigned int ready = offline_ready_events(emuenv, id, entry) & (entry.events | SCE_NET_EPOLLERR);
+            if (!ready || count == maxevents)
+                continue;
+            events[count] = {};
+            events[count].events = ready;
+            events[count].data = entry.data;
+            ++count;
+        }
+        if (count || timeout_us == 0)
+            return count;
+        std::optional<uint32_t> remaining; // a negative timeout waits without limit
+        if (timeout_us > 0) {
+            const uint32_t elapsed = elapsed_us(start);
+            if (elapsed >= static_cast<uint32_t>(timeout_us))
+                return 0;
+            remaining = static_cast<uint32_t>(timeout_us) - elapsed;
+        }
+        if (offline_net_park(emuenv.kernel, emuenv.net, thread_id, remaining) == KernelExecutionHost::WaitResult::cancelled)
+            return SCE_NET_ERROR_EINTR;
+    }
+}
+#endif
+
 EXPORT(int, sceNetAccept, int sid, SceNetSockaddr *addr, unsigned int *addrlen) {
     TRACY_FUNC(sceNetAccept, sid, addr, addrlen);
     auto sock = lock_and_find(sid, emuenv.net.socks, emuenv.kernel.mutex);
@@ -201,10 +293,26 @@ EXPORT(int, sceNetEmulationSet) {
     return UNIMPLEMENTED();
 }
 
+#ifdef __EMSCRIPTEN__
+EXPORT(int, sceNetEpollAbort, int eid, int flags) {
+    TRACY_FUNC(sceNetEpollAbort, eid, flags);
+    constexpr int preservation = 1; // SCE_NET_EPOLL_ABORT_FLAG_PRESERVATION
+    if (flags & ~preservation)
+        RET_NET_ERRNO(SCE_NET_ERROR_EINVAL);
+    const auto epoll = lock_and_find(eid, emuenv.net.epolls, emuenv.kernel.mutex);
+    if (!epoll)
+        RET_NET_ERRNO(SCE_NET_ERROR_EBADF);
+    ++epoll->abort_generation;
+    epoll->abort_preserved = epoll->abort_preserved || (flags & preservation);
+    offline_net_wake(emuenv.net);
+    return 0;
+}
+#else
 EXPORT(int, sceNetEpollAbort) {
     TRACY_FUNC(sceNetEpollAbort);
     return UNIMPLEMENTED();
 }
+#endif
 
 EXPORT(int, sceNetEpollControl, int eid, SceNetEpollControlFlag op, int id, SceNetEpollEvent *ev) {
     TRACY_FUNC(sceNetEpollControl, eid, op, id, ev);
@@ -212,10 +320,17 @@ EXPORT(int, sceNetEpollControl, int eid, SceNetEpollControlFlag op, int id, SceN
     if (!epoll)
         RET_NET_ERRNO(SCE_NET_ERROR_EBADF);
 
+#ifdef __EMSCRIPTEN__
+    if ((op == SCE_NET_EPOLL_CTL_ADD || op == SCE_NET_EPOLL_CTL_MOD) && !ev)
+        RET_NET_ERRNO(SCE_NET_ERROR_EINVAL);
+    if (op == SCE_NET_EPOLL_CTL_ADD && emuenv.net.resolvers.contains(id))
+        RET_NET_ERRNO(epoll->add(id, {}, ev));
+#else
     if (id == emuenv.net.resolver_id) {
         STUBBED("Async DNS resolve is not supported");
         return 0;
     }
+#endif
 
     switch (op) {
     case SCE_NET_EPOLL_CTL_ADD: {
@@ -243,15 +358,22 @@ EXPORT(int, sceNetEpollCreate, const char *name, int flags) {
 EXPORT(int, sceNetEpollDestroy, int eid) {
     TRACY_FUNC(sceNetEpollDestroy, eid);
     const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+#ifdef __EMSCRIPTEN__
+    offline_net_wake(emuenv.net); // waiters see the epoll gone
+#endif
 
     RET_NET_ERRNO(emuenv.net.epolls.erase(eid) ? 0 : SCE_NET_ERROR_EBADF);
 }
 
 EXPORT(int, sceNetEpollWait, int eid, SceNetEpollEvent *events, int maxevents, int timeout) {
     TRACY_FUNC(sceNetEpollWait, eid, events, maxevents, timeout);
+#ifdef __EMSCRIPTEN__
+    RET_NET_ERRNO(epoll_wait_offline(emuenv, thread_id, eid, events, maxevents, timeout));
+#else
     auto epoll = lock_and_find(eid, emuenv.net.epolls, emuenv.kernel.mutex);
 
     RET_NET_ERRNO(epoll ? epoll->wait(events, maxevents, timeout) : SCE_NET_ERROR_EBADF);
+#endif
 }
 
 EXPORT(int, sceNetEpollWaitCB) {
@@ -465,7 +587,11 @@ EXPORT(int, sceNetInetPton, int af, const char *src, void *dst) {
     int res = inet_pton(af, src, dst);
 #endif
 
+#ifdef __EMSCRIPTEN__
+    RET_NET_ERRNO(res == 0 ? SCE_NET_ERROR_EINVAL : res); // af is checked above: res is 1
+#else
     RET_NET_ERRNO(res == 0 ? SCE_NET_ERROR_EINVAL : PosixSocket::translate_return_value(res));
+#endif
 }
 
 EXPORT(int, sceNetInit, SceNetInitParam *param) {
@@ -515,16 +641,24 @@ EXPORT(SceUInt16, sceNetNtohs, SceUInt16 n) {
 
 EXPORT(int, sceNetRecv, int sid, void *buf, unsigned int len, int flags) {
     TRACY_FUNC(sceNetRecv, sid, buf, len, flags);
+#ifdef __EMSCRIPTEN__
+    RET_NET_ERRNO(recv_offline(emuenv, thread_id, sid, buf, len, flags, nullptr, nullptr));
+#else
     auto sock = lock_and_find(sid, emuenv.net.socks, emuenv.kernel.mutex);
 
     RET_NET_ERRNO(sock ? sock->recv_packet(buf, len, flags, nullptr, 0) : SCE_NET_ERROR_EBADF);
+#endif
 }
 
 EXPORT(int, sceNetRecvfrom, int sid, void *buf, unsigned int len, int flags, SceNetSockaddr *from, unsigned int *fromlen) {
     TRACY_FUNC(sceNetRecvfrom, sid, buf, len, flags, from, fromlen);
+#ifdef __EMSCRIPTEN__
+    RET_NET_ERRNO(recv_offline(emuenv, thread_id, sid, buf, len, flags, from, fromlen));
+#else
     auto sock = lock_and_find(sid, emuenv.net.socks, emuenv.kernel.mutex);
 
     RET_NET_ERRNO(sock ? sock->recv_packet(buf, len, flags, from, fromlen) : SCE_NET_ERROR_EBADF);
+#endif
 }
 
 EXPORT(int, sceNetRecvmsg) {
@@ -532,6 +666,42 @@ EXPORT(int, sceNetRecvmsg) {
     return UNIMPLEMENTED();
 }
 
+#ifdef __EMSCRIPTEN__
+// Offline resolver: no DNS server is configured, so every lookup finishes at
+// once with RESOLVER_ENODNS. Ids share the socket descriptor space (epoll
+// takes both); a finished lookup reports EPOLLIN.
+EXPORT(int, sceNetResolverAbort, int rid, int flags) {
+    TRACY_FUNC(sceNetResolverAbort, rid, flags);
+    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+    RET_NET_ERRNO(emuenv.net.resolvers.contains(rid) ? 0 : SCE_NET_ERROR_EBADF); // nothing is in progress
+}
+
+EXPORT(int, sceNetResolverCreate, const char *name, void *param, int flags) {
+    TRACY_FUNC(sceNetResolverCreate, name, param, flags);
+    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+    const int id = ++emuenv.net.next_id;
+    emuenv.net.resolvers.emplace(id, std::nullopt);
+    return id;
+}
+
+EXPORT(int, sceNetResolverDestroy, int rid) {
+    TRACY_FUNC(sceNetResolverDestroy, rid);
+    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+    RET_NET_ERRNO(emuenv.net.resolvers.erase(rid) ? 0 : SCE_NET_ERROR_EBADF);
+}
+
+EXPORT(int, sceNetResolverGetError, int rid, int *result) {
+    TRACY_FUNC(sceNetResolverGetError, rid, result);
+    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+    const auto resolver = emuenv.net.resolvers.find(rid);
+    if (resolver == emuenv.net.resolvers.end())
+        RET_NET_ERRNO(SCE_NET_ERROR_EBADF);
+    if (!result)
+        RET_NET_ERRNO(SCE_NET_ERROR_EINVAL);
+    *result = resolver->second.value_or(0);
+    return 0;
+}
+#else
 EXPORT(int, sceNetResolverAbort) {
     TRACY_FUNC(sceNetResolverAbort);
     return UNIMPLEMENTED();
@@ -552,6 +722,7 @@ EXPORT(int, sceNetResolverGetError) {
     TRACY_FUNC(sceNetResolverGetError);
     return UNIMPLEMENTED();
 }
+#endif
 
 EXPORT(int, sceNetResolverStartAton, int rid, const SceNetInAddr *addr, char *hostname, int len, int timeout, int retry, int flags) {
     TRACY_FUNC(sceNetResolverStartAton, rid, addr, hostname, len, timeout, retry, flags);
@@ -562,6 +733,19 @@ EXPORT(int, sceNetResolverStartAton, int rid, const SceNetInAddr *addr, char *ho
 
 EXPORT(int, sceNetResolverStartNtoa, int rid, const char *hostname, SceNetInAddr *addr, int timeout, int retry, int flags) {
     TRACY_FUNC(sceNetResolverStartNtoa, rid, hostname, addr, timeout, retry, flags);
+#ifdef __EMSCRIPTEN__
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+        const auto resolver = emuenv.net.resolvers.find(rid);
+        if (resolver == emuenv.net.resolvers.end())
+            RET_NET_ERRNO(SCE_NET_ERROR_EBADF);
+        if (!hostname || !addr)
+            RET_NET_ERRNO(SCE_NET_ERROR_EINVAL);
+        resolver->second = static_cast<int>(SCE_NET_ERROR_RESOLVER_ENODNS);
+    }
+    offline_net_wake(emuenv.net);
+    RET_NET_ERRNO(SCE_NET_ERROR_RESOLVER_ENODNS);
+#else
     struct hostent *resolved = gethostbyname(hostname);
     if (resolved == nullptr) {
         memset(addr, 0, sizeof(*addr));
@@ -569,6 +753,7 @@ EXPORT(int, sceNetResolverStartNtoa, int rid, const char *hostname, SceNetInAddr
     }
     memcpy(addr, resolved->h_addr, sizeof(uint32_t));
     return 0;
+#endif
 }
 
 EXPORT(int, sceNetSend, int sid, const void *msg, unsigned int len, int flags) {
@@ -608,13 +793,18 @@ EXPORT(int, sceNetSendto, int sid, const void *msg, unsigned int len, int flags,
     auto sock = lock_and_find(sid, emuenv.net.socks, emuenv.kernel.mutex);
     if (!sock)
         RET_NET_ERRNO(SCE_NET_ERROR_EBADF);
-
+#ifdef __EMSCRIPTEN__
+    // No broadcast rewrite: offline, lo0 is the only interface and has no
+    // broadcast address, so 255.255.255.255 has no route.
+    RET_NET_ERRNO(sock->send_packet(msg, len, flags, to, tolen));
+#else
     SceNetSockaddrIn to_in;
     std::memcpy(&to_in, to, sizeof(SceNetSockaddrIn));
     if (!sock->sockopt_so_onesbcast && (to_in.sin_addr.s_addr == INADDR_BROADCAST))
         to_in.sin_addr.s_addr = emuenv.net.broadcastAddr;
 
     RET_NET_ERRNO(sock->send_packet(msg, len, flags, (SceNetSockaddr *)&to_in, tolen));
+#endif
 }
 
 EXPORT(int, sceNetSetDnsInfo) {
@@ -660,6 +850,19 @@ EXPORT(int, sceNetShutdown, int sid, int how) {
 
 EXPORT(int, sceNetSocket, const char *name, int domain, SceNetSocketType type, SceNetProtocol protocol) {
     TRACY_FUNC(sceNetSocket, name, domain, type, protocol);
+#ifdef __EMSCRIPTEN__
+    if (domain != SCE_NET_AF_INET)
+        RET_NET_ERRNO(SCE_NET_ERROR_EAFNOSUPPORT);
+    const bool stream = type == SCE_NET_SOCK_STREAM || type == SCE_NET_SOCK_STREAM_P2P;
+    // SOCK_RAW is not modelled by the offline stack.
+    if ((!stream && type != SCE_NET_SOCK_DGRAM && type != SCE_NET_SOCK_DGRAM_P2P)
+        || (protocol != SCE_NET_IPPROTO_IP && protocol != (stream ? SCE_NET_IPPROTO_TCP : SCE_NET_IPPROTO_UDP)))
+        RET_NET_ERRNO(SCE_NET_ERROR_EPROTONOSUPPORT);
+    const std::lock_guard<std::mutex> lock(emuenv.kernel.mutex);
+    const int id = ++emuenv.net.next_id;
+    emuenv.net.socks.emplace(id, std::make_shared<OfflineSocket>(emuenv.net, type));
+    return id;
+#else
     bool isP2P = (type == SCE_NET_SOCK_DGRAM_P2P || type == SCE_NET_SOCK_STREAM_P2P);
 
     SocketPtr sock = isP2P ? std::make_shared<P2PSocket>(domain, type, protocol) : std::make_shared<PosixSocket>(domain, type, protocol);
@@ -667,6 +870,7 @@ EXPORT(int, sceNetSocket, const char *name, int domain, SceNetSocketType type, S
     auto id = ++emuenv.net.next_id;
     emuenv.net.socks.emplace(id, sock);
     return id;
+#endif
 }
 
 EXPORT(int, sceNetSocketAbort, int sid, int flags) {
