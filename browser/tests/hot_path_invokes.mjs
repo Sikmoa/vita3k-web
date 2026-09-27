@@ -53,7 +53,8 @@ for await (const line of createInterface({ input: objdump.stdout })) {
   if (!call) continue;
   const callee = /^call (\d+)$/.exec(call);
   if (callee && symbols.has(Number(callee[1]))) call += ` <${symbols.get(Number(callee[1]))}>`;
-  if (hot.has(current) && /<invoke_/.test(call)) found.get(current).push(call);
+  // wasm32 disassembly labels imports with their module (<env.invoke_vii>).
+  if (hot.has(current) && /<(?:env\.)?invoke_/.test(call)) found.get(current).push(call);
   if (current === callImport) callImportLines.push(call);
 }
 const exitCode = await new Promise((done) => objdump.on('close', done));

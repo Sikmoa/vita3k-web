@@ -17,7 +17,10 @@ if (!existsSync(join(runtimeRoot, 'shaders/gxp_compiler.mjs')))
   const buildOutput = resolve(runtimeRoot, '../browser');
   for (const dir of [runtimeRoot, join(runtimeRoot, 'wasm64')]) {
     if (!existsSync(dir)) continue;
-    for (const name of readdirSync(dir).filter((file) => file.endsWith('.wasm'))) {
+    // Each module is a generated .js/.wasm pair; either can be the stale one
+    // (a --post-js change can leave the .wasm identical).
+    const modules = readdirSync(dir).filter((file) => file.endsWith('.wasm'));
+    for (const name of modules.flatMap((file) => [file, file.replace(/\.wasm$/, '.js')])) {
       const built = join(buildOutput, basename(name));
       // copy_if_different keeps an identical copy's older mtime: compare bytes.
       if (existsSync(built) && statSync(built).mtimeMs > statSync(join(dir, name)).mtimeMs
