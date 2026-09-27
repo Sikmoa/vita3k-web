@@ -263,7 +263,8 @@ int OfflineSocket::deliver(const void *msg, unsigned int len, const SceNetSockad
     datagram.data.assign(bytes, bytes + len);
     const auto same_peer = [&](const OfflineSocket &receiver) {
         return receiver.peer.sin_addr.s_addr == datagram.from.sin_addr.s_addr
-            && receiver.peer.sin_port == datagram.from.sin_port;
+            && receiver.peer.sin_port == datagram.from.sin_port
+            && (!p2p() || receiver.peer.sin_vport == datagram.from.sin_vport);
     };
     for (const auto &[id, socket] : net.socks) {
         auto &receiver = offline(socket);

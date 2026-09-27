@@ -200,8 +200,19 @@ int main(void) {
     CHECK(49, sceNetBind(p2p_a, (SceNetSockaddr *)&p2p_addr, sizeof(p2p_addr)) == 0);
     p2p_addr.sin_vport = sceNetHtons(3660);
     CHECK(50, sceNetBind(p2p_b, (SceNetSockaddr *)&p2p_addr, sizeof(p2p_addr)) == 0);
+    // A connected P2P socket takes datagrams from its peer's virtual port only,
+    // although every sender shares the UDP port.
+    const int p2p_c = sceNetSocket("p2p c", SCE_NET_AF_INET, SCE_NET_SOCK_DGRAM_P2P, 0);
+    p2p_addr.sin_vport = sceNetHtons(3661);
+    CHECK(64, p2p_c >= 0 && sceNetBind(p2p_c, (SceNetSockaddr *)&p2p_addr, sizeof(p2p_addr)) == 0);
+    SceNetSockaddrIn peer_a = address(LOOPBACK, 3658, 3659), to_c = address(LOOPBACK, 3658, 3661);
+    CHECK(65, sceNetConnect(p2p_c, (SceNetSockaddr *)&peer_a, sizeof(peer_a)) == 0);
+    CHECK(66, sceNetSendto(p2p_b, "b", 1, 0, (SceNetSockaddr *)&to_c, sizeof(to_c)) == 1
+        && sceNetRecv(p2p_c, buffer, sizeof(buffer), SCE_NET_MSG_DONTWAIT) == (int)SCE_NET_ERROR_EAGAIN);
+    CHECK(67, sceNetSendto(p2p_a, "a", 1, 0, (SceNetSockaddr *)&to_c, sizeof(to_c)) == 1
+        && sceNetRecv(p2p_c, buffer, sizeof(buffer), SCE_NET_MSG_DONTWAIT) == 1 && buffer[0] == 'a');
 
-    const int sockets[] = { receiver, sender_socket, stream, p2p_a, p2p_b };
+    const int sockets[] = { receiver, sender_socket, stream, p2p_a, p2p_b, p2p_c };
     for (unsigned i = 0; i < sizeof(sockets) / sizeof(sockets[0]); ++i)
         CHECK(51, sceNetSocketClose(sockets[i]) == 0);
     CHECK(52, sceNetSocketClose(receiver) == (int)SCE_NET_ERROR_EBADF);
