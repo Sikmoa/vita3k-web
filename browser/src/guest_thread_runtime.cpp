@@ -50,6 +50,11 @@ bool classify_unsupported_import(uint32_t nid) {
     // seconds in semaphore waits trying to pace itself some other way.
     if (n.find("DisplayWait") != n.npos && n.find("CB") == n.npos)
         return false;
+    // Releases the LwMutex, parks on the condition queue and re-acquires
+    // through the cooperative mutex wait (sync_primitives execution_host
+    // branch); the CB variant still runs host callbacks.
+    if (n == "sceKernelWaitLwCond")
+        return false;
     // Parks until the target's dormant transition unlinks the waiter
     // (SceThreadmgr execution_host branch); the CB variant stays rejected.
     if (n == "sceKernelWaitThreadEnd")

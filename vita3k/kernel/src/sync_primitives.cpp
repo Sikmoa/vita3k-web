@@ -132,7 +132,7 @@ inline static int handle_timeout(KernelState &kernel, const ThreadStatePtr &thre
 // cancellation flag (if any) lives on the parked fiber until we unlink it.
 inline static int handle_cooperative_wait(KernelState &kernel, const ThreadStatePtr &thread,
     std::unique_lock<std::mutex> &thread_lock, std::unique_lock<std::mutex> &primitive_lock,
-    WaitingThreadQueuePtr &queue, SceUInt *timeout) {
+    WaitingThreadQueuePtr &queue, SceUInt *timeout, KernelExecutionHost::WaitResult *wait_result = nullptr) {
     const auto start = std::chrono::steady_clock::now();
     const auto duration = timeout ? std::optional<uint32_t>(*timeout) : std::nullopt;
     primitive_lock.unlock();
@@ -150,6 +150,8 @@ inline static int handle_cooperative_wait(KernelState &kernel, const ThreadState
         thread_lock.unlock();
         throw;
     }
+    if (wait_result)
+        *wait_result = result;
     primitive_lock.lock();
     // Unlock/signal/cancel may already have erased the original iterator.
     const auto pending = queue->find(thread);
@@ -1534,11 +1536,17 @@ int condvar_wait(KernelState &kernel, MemState &mem, const char *export_name, Sc
 
     std::unique_lock<std::mutex> condition_variable_lock(condvar->mutex);
 
-    if (kernel.execution_host)
-        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
-
     if (auto error = mutex_unlock_impl(kernel, export_name, thread_id, 1, condvar->associated_mutex))
         return error;
+    if (kernel.execution_host && weight == SyncWeight::Light) {
+        // The inline fast paths compare this mirror with the kernel object;
+        // publish the release as the public unlock does.
+        auto &mutex = *condvar->associated_mutex;
+        const std::lock_guard<std::mutex> mutex_lock(mutex.mutex);
+        auto *work = mutex.workarea.get(mem);
+        work->lockCount = mutex.lock_count;
+        work->owner = mutex.owner ? static_cast<uint32_t>(mutex.owner->id) : static_cast<uint32_t>(-1);
+    }
 
     std::unique_lock<std::mutex> thread_lock(thread->mutex);
     thread->update_status(ThreadStatus::wait, ThreadStatus::run);
@@ -1550,7 +1558,17 @@ int condvar_wait(KernelState &kernel, MemState &mem, const char *export_name, Sc
     const auto data_it = condvar->waiting_threads->push(data);
     thread_lock.unlock();
 
-    if (auto error = handle_timeout(kernel, thread, thread_lock, condition_variable_lock, condvar->waiting_threads, data_it, export_name, timeout))
+    if (kernel.execution_host) {
+        // Signal unlinks the waiter and sets it running; a waiter still
+        // queued timed out or was cancelled. Like the desktop path, neither
+        // re-acquires the mutex. A thread deleted after its signal must not
+        // take the mutex with it either.
+        auto result = KernelExecutionHost::WaitResult::ready;
+        if (auto error = handle_cooperative_wait(kernel, thread, thread_lock, condition_variable_lock, condvar->waiting_threads, timeout, &result))
+            return error;
+        if (result == KernelExecutionHost::WaitResult::cancelled)
+            return SCE_KERNEL_ERROR_WAIT_CANCEL;
+    } else if (auto error = handle_timeout(kernel, thread, thread_lock, condition_variable_lock, condvar->waiting_threads, data_it, export_name, timeout))
         return error;
 
     condition_variable_lock.unlock();
@@ -1596,8 +1614,16 @@ int condvar_signal(KernelState &kernel, const char *export_name, SceUID thread_i
             if (!waiting_thread_lock)
                 continue;
 
+            // Deletion wakes a parked waiter before its HLE continuation
+            // unlinks itself; it must not consume the signal.
+            if (kernel.execution_host && waiting_thread->status != ThreadStatus::wait) {
+                waiting_threads->pop();
+                continue;
+            }
             waiting_thread->update_status(ThreadStatus::run, ThreadStatus::wait);
             waiting_threads->pop();
+            if (target_type == Condvar::SignalTarget::Type::Any)
+                break;
         }
     }
 
@@ -1618,6 +1644,9 @@ int condvar_delete(KernelState &kernel, const char *export_name, SceUID thread_i
             condvar->waiting_threads->size());
     }
 
+    // Production deletion does not implement waking live condition waiters.
+    if (kernel.execution_host && !condvar->waiting_threads->empty())
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
     if (condvar->waiting_threads->empty()) {
         const std::lock_guard<std::mutex> kernel_lock(kernel.mutex);
         condvars->erase(condid);

@@ -218,4 +218,86 @@ inline void build_thread_end_pair(MemState &mem, Address code, Address data, boo
     t.emit(0xe8bd8010);
     t.finish(mem);
 }
+// Lightweight condition variable fixture. Host creates the LwMutex at
+// data+0x300 and the LwCond at data+0x340 (associated with that mutex).
+// Stubs live at code+0xf00. Offsets are into data.
+namespace lwcond {
+constexpr Address kMutex = 0x300, kCond = 0x340, kTimeout = 0x60, kSignaler = 0x80;
+constexpr Address waiter_area(unsigned slot) { return 0x100 + 0x20 * slot; }
+// Waiter area: +0 lock result, +4 wait result, +8 workarea owner after the
+// wait, +0xc unlock result, +0x10 done. Signaler area: +0 gate, +4 lock
+// result, +8 signal result, +0xc phase (1 = signalled, mutex held), +0x10
+// unlock gate, +0x14 unlock result.
+constexpr uint32_t kLock = 0x46e7be7b, kUnlock = 0x91fa6614, kWait = 0xe1878282,
+    kSignal = 0x3ac63b9a, kSignalAll = 0xe5241a0c, kDelay = 0x4b675d05;
+
+inline Address stub(Address code, unsigned index) { return code + 0xf00 + 16 * index; }
+
+inline void branch(Arm &a, uint32_t cond, Address target) {
+    a.emit((cond << 28) | 0x0a000000u | ((static_cast<uint32_t>(static_cast<int32_t>(target - (a.pc() + 8))) >> 2) & 0xffffffu));
+}
+
+// Poll a word at [r4+offset] until nonzero, parking in DelayThread(1000).
+inline void gate(Arm &a, Address code, unsigned offset) {
+    const Address loop = a.pc();
+    a.load(0, offset); a.emit(0xe3500000);
+    a.emit(0x1a000003); // bne past the delay (+3 instructions)
+    a.constant(0, 1000);
+    a.call(stub(code, 5));
+    branch(a, 0xe, loop);
+}
+
+inline void build(MemState &mem, Address code, Address data) {
+    const uint32_t nids[] = {kLock, kUnlock, kWait, kSignal, kSignalAll, kDelay};
+    for (unsigned i = 0; i < 6; ++i) {
+        const uint32_t words[] = {0xef000000, 0xe1a0f00e, nids[i]};
+        std::memcpy(Ptr<void>(stub(code, i)).get(mem), words, sizeof(words));
+    }
+    // Waiters 0..3 at code + 0x100 * slot: lock, wait(timeout pointer at
+    // data+kTimeout+4*slot, zero = none), read the workarea owner, unlock.
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        Arm w(code + 0x100 * slot);
+        w.emit(0xe92d4010); // push {r4,lr}
+        w.constant(4, data + waiter_area(slot));
+        w.constant(0, data + kMutex); w.constant(1, 1); w.constant(2, 0);
+        w.call(stub(code, 0));
+        w.store(0, 0);
+        w.constant(0, data + kCond); w.constant(1, data + kTimeout + 4 * slot);
+        w.emit(0xe5911000); // ldr r1,[r1]: the timeout pointer itself
+        w.call(stub(code, 2));
+        w.store(0, 4);
+        w.constant(0, data + kMutex); w.emit(0xe5900000); // ldr r0,[r0]
+        w.store(0, 8);
+        w.constant(0, data + kMutex); w.constant(1, 1);
+        w.call(stub(code, 1));
+        w.store(0, 0xc);
+        w.constant(0, 1); w.store(0, 0x10);
+        w.constant(0, 42);
+        w.emit(0xe8bd8010); // pop {r4,pc}
+        w.finish(mem);
+    }
+    // Signalers: 0x400 = SignalLwCond, 0x600 = SignalLwCondAll. Take the
+    // mutex, signal, publish the phase, hold the mutex until the unlock gate.
+    for (const bool all : {false, true}) {
+        Arm s(code + (all ? 0x600 : 0x400));
+        s.emit(0xe92d4010);
+        s.constant(4, data + kSignaler);
+        gate(s, code, 0);
+        s.constant(0, data + kMutex); s.constant(1, 1); s.constant(2, 0);
+        s.call(stub(code, 0));
+        s.store(0, 4);
+        s.constant(0, data + kCond);
+        s.call(stub(code, all ? 4 : 3));
+        s.store(0, 8);
+        s.constant(0, 1); s.store(0, 0xc);
+        gate(s, code, 0x10);
+        s.constant(0, data + kMutex); s.constant(1, 1);
+        s.call(stub(code, 1));
+        s.store(0, 0x14);
+        s.constant(0, 43);
+        s.emit(0xe8bd8010);
+        s.finish(mem);
+    }
+}
+} // namespace lwcond
 } // namespace guest_thread_fixture

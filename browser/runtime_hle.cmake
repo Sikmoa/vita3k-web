@@ -187,7 +187,11 @@ set(_hle_exports
     # Thread join: _sceKernelWaitThreadEnd parks cooperatively until the
     # target goes dormant (SceThreadmgr execution_host branch).
     sceKernelWaitThreadEnd
-    # Keep DelayThreadCB, WaitThreadEndCB, WaitEventFlagCB and WaitLwCond/CB
+    # LwCond wait: releases the LwMutex, parks on the condition queue and
+    # re-acquires through the cooperative mutex wait (sync_primitives
+    # execution_host branch); timeout and cancel return without re-acquiring.
+    sceKernelWaitLwCond
+    # Keep DelayThreadCB, WaitThreadEndCB, WaitEventFlagCB and WaitLwCondCB
     # unselected: their production paths wait on host condition variables
     # (or sleep) and cannot yield guest threads.
     # GetSystemTime and GetThreadRunStatus are UNIMPLEMENTED upstream. There
@@ -311,9 +315,9 @@ set(_hle_exports
     # Every utils::snprintf user (sceClibPrintf/Snprintf/Vprintf/Vsnprintf,
     # sceDbg handlers) also stays unselected: external/printf reads %ld/%lu/%z
     # arguments with the host's 8-byte long/size_t on wasm64, not the guest's 4.
-    # LwCond signal/delete: condvar_wait returns ILLEGAL_CONTEXT under the
-    # fiber host, so no waiter is ever queued and these only update or erase
-    # the kernel object (no host condition variable is reached).
+    # LwCond signal/delete: signal unlinks parked waiters and sets them
+    # running (notify only); delete with waiters returns ILLEGAL_CONTEXT
+    # under the fiber host. No host condition variable is reached.
     sceKernelSignalLwCond sceKernelSignalLwCondAll sceKernelDeleteLwCond
     # libc time conversions and memblock lookups: host libc time math and
     # SysmemState reads; SceDateTime fill from a time_t is pure.
