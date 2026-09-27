@@ -36,12 +36,16 @@
 #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <random>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #if defined(__aarch64__) && defined(__APPLE__)
 #define stat64 stat
@@ -915,60 +919,223 @@ int remove_dir(IOState &io, const char *dir_in, const fs::path &vita_fs_path, co
     return 0;
 }
 
-static std::string standardize_path(std::string_view path) {
-    // replace app0:... by app0:/...
-    bool start_with_app0 = path.starts_with("app0:");
-    if (start_with_app0 && path.size() >= 6 && path[5] != '/')
-        return "app0:/" + std::string(path.substr(5));
-    else
-        return std::string(path);
-}
-
-SceUID create_overlay(IOState &io, SceFiosProcessOverlay *fios_overlay) {
-    std::lock_guard<std::mutex> lock(io.overlay_mutex);
-
-    FiosOverlay overlay{
-        .id = io.next_overlay_id++,
-        .type = fios_overlay->type,
-        .order = fios_overlay->order,
-        .process_id = fios_overlay->process_id,
-        .dst = standardize_path(fios_overlay->dst),
-        .src = standardize_path(fios_overlay->src)
-    };
-
-    // find location where to put it
-    size_t overlay_index = 0;
-    // lower order first and in case of equality, last one inserted first
-    while (overlay_index < io.overlays.size() && io.overlays[overlay_index].order < overlay.order)
-        overlay_index++;
-    auto res = overlay.id;
-    io.overlays.insert(io.overlays.begin() + overlay_index, std::move(overlay));
-
-    return res;
-}
-
-std::string resolve_path(IOState &io, const char *input, const SceUInt32 min_order, const SceUInt32 max_order) {
-    std::lock_guard<std::mutex> lock(io.overlay_mutex);
-
-    std::string curr_path = input;
-
-    size_t overlay_idx = 0;
-    while (overlay_idx < io.overlays.size() && io.overlays[overlay_idx].order < min_order)
-        overlay_idx++;
-
-    while (overlay_idx < io.overlays.size()) {
-        const FiosOverlay &overlay = io.overlays[overlay_idx];
-        overlay_idx++;
-
-        if (overlay.order > max_order)
-            break;
-
-        if (!curr_path.starts_with(overlay.dst))
-            continue;
-
-        // replace dst with src
-        curr_path = overlay.src + curr_path.substr(overlay.dst.size());
+std::optional<std::string> normalize_fios_path(std::string_view path, size_t capacity) {
+    if (path.empty())
+        return std::nullopt;
+    const auto is_separator = [](char c) { return c == '/' || c == '\\'; };
+    std::string out;
+    std::string_view rest = path;
+    bool absolute = is_separator(path.front());
+    const size_t colon = path.find(':');
+    if (colon != std::string_view::npos && colon >= 1 && colon <= 16
+        && std::all_of(path.begin(), path.begin() + colon, [](char c) { return std::isalnum(static_cast<unsigned char>(c)); })) {
+        out = path.substr(0, colon + 1);
+        rest = path.substr(colon + 1);
+        absolute = true;
+        if (colon == 5 && path.starts_with("host")) {
+            // A host PC path: an optional UNC prefix (two backslashes) and drive letter, then
+            // a path that is relative unless it follows the drive with a separator.
+            if (rest.starts_with("\\\\"))
+                out += "\\\\";
+            while (!rest.empty() && is_separator(rest.front()))
+                rest.remove_prefix(1);
+            absolute = false;
+            if (rest.size() >= 2 && std::isalpha(static_cast<unsigned char>(rest[0])) && rest[1] == ':') {
+                out += static_cast<char>(std::toupper(static_cast<unsigned char>(rest[0])));
+                out += ':';
+                rest.remove_prefix(2);
+                absolute = !rest.empty() && is_separator(rest.front());
+            }
+        }
     }
+    std::vector<std::string_view> parts;
+    while (!rest.empty()) {
+        const auto end = std::find_if(rest.begin(), rest.end(), is_separator);
+        const std::string_view part(rest.begin(), end);
+        rest.remove_prefix(end == rest.end() ? rest.size() : part.size() + 1);
+        if (part.empty() || part == ".")
+            continue;
+        if (part == "..") {
+            if (!parts.empty() && parts.back() != "..")
+                parts.pop_back();
+            else if (!absolute)
+                parts.push_back(part);
+            continue;
+        }
+        parts.push_back(part);
+    }
+    if (absolute)
+        out += '/';
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i)
+            out += '/';
+        out += parts[i];
+    }
+    if (!absolute && parts.empty())
+        out += '.';
+    if (out.size() >= capacity)
+        return std::nullopt;
+    return out;
+}
 
-    return curr_path;
+namespace {
+constexpr int SCE_FIOS_ERROR_BAD_PATH = 0x80820005, SCE_FIOS_ERROR_BAD_PTR = 0x80820006, SCE_FIOS_ERROR_ACCESS = 0x80820013,
+              SCE_FIOS_ERROR_PATH_TOO_LONG = 0x80820018, SCE_FIOS_ERROR_TOO_MANY_OVERLAYS = 0x80820019,
+              SCE_FIOS_ERROR_BAD_OVERLAY = 0x8082001A; // names from the FIOS2 SDK numbering
+constexpr uint8_t privileged_order = 0x80;
+
+// SceFios2Kernel's validator: type <= 3, both paths terminated within
+// SCE_FIOS_OVERLAY_POINT_MAX and short enough once normalized.
+int validate_overlay(const SceFiosProcessOverlay &overlay, std::string &dst, std::string &src) {
+    if (overlay.type > SCE_FIOS_OVERLAY_TYPE_WRITABLE)
+        return SCE_FIOS_ERROR_BAD_OVERLAY;
+    if (strnlen(overlay.dst, SCE_FIOS_OVERLAY_POINT_MAX) == SCE_FIOS_OVERLAY_POINT_MAX
+        || strnlen(overlay.src, SCE_FIOS_OVERLAY_POINT_MAX) == SCE_FIOS_OVERLAY_POINT_MAX)
+        return SCE_FIOS_ERROR_PATH_TOO_LONG;
+    const auto normalized_dst = normalize_fios_path(overlay.dst, SCE_FIOS_OVERLAY_POINT_MAX);
+    const auto normalized_src = normalize_fios_path(overlay.src, SCE_FIOS_OVERLAY_POINT_MAX);
+    if (!normalized_dst || !normalized_src)
+        return SCE_FIOS_ERROR_BAD_PATH;
+    dst = *normalized_dst;
+    src = *normalized_src;
+    return 0;
+}
+
+// A caller that is not privileged may name only its own process.
+int check_access(SceUID caller, SceUID pid) {
+    return pid == -1 || pid != caller ? SCE_FIOS_ERROR_ACCESS : 0;
+}
+
+// Its lookups skip privileged overlays and other processes' ones.
+std::vector<FiosOverlay>::iterator find_overlay(IOState &io, SceUID pid, SceUID id) {
+    return std::find_if(io.overlays.begin(), io.overlays.end(), [&](const FiosOverlay &overlay) {
+        return overlay.id == id && overlay.order < privileged_order && overlay.process_id == pid;
+    });
+}
+
+// Before the first overlay whose order is not lower.
+void insert_overlay(IOState &io, FiosOverlay overlay) {
+    const auto at = std::find_if(io.overlays.begin(), io.overlays.end(), [&](const FiosOverlay &other) { return other.order >= overlay.order; });
+    io.overlays.insert(at, std::move(overlay));
+}
+
+// Apps may not overlay a whole device: "ux0:", "ux0:/" or "ux0:.".
+bool is_device_root(const char *dst) {
+    size_t i = 0;
+    while (i < SCE_FIOS_OVERLAY_POINT_MAX && std::isalnum(static_cast<unsigned char>(dst[i])))
+        ++i;
+    if (i == 0 || i + 2 >= SCE_FIOS_OVERLAY_POINT_MAX || dst[i] != ':')
+        return false;
+    const char *rest = dst + i + 1;
+    return rest[0] == '\0' || (rest[1] == '\0' && (rest[0] == '.' || rest[0] == '/'));
+}
+} // namespace
+
+int create_overlay(IOState &io, SceUID caller, SceUID pid, const SceFiosProcessOverlay *fios_overlay, SceUID *id) {
+    if (!fios_overlay || !id)
+        return SCE_FIOS_ERROR_BAD_PTR;
+    // The syscall copies the id out whatever the result.
+    *id = 0;
+    if (is_device_root(fios_overlay->dst))
+        return SCE_FIOS_ERROR_BAD_PATH;
+    if (const int error = check_access(caller, pid))
+        return error;
+    std::lock_guard<std::mutex> lock(io.overlay_mutex);
+    std::string dst, src;
+    if (const int error = validate_overlay(*fios_overlay, dst, src))
+        return error;
+    // A process table holds 128 entries, at most 64 of them app overlays.
+    const auto process_overlays = std::count_if(io.overlays.begin(), io.overlays.end(), [&](const FiosOverlay &overlay) { return overlay.process_id == pid; });
+    const auto app_overlays = std::count_if(io.overlays.begin(), io.overlays.end(), [&](const FiosOverlay &overlay) {
+        return overlay.process_id == pid && overlay.order < privileged_order;
+    });
+    if ((fios_overlay->order < privileged_order && app_overlays >= SCE_FIOS_OVERLAY_MAX_OVERLAYS) || process_overlays >= 2 * SCE_FIOS_OVERLAY_MAX_OVERLAYS)
+        return SCE_FIOS_ERROR_TOO_MANY_OVERLAYS;
+    *id = io.next_overlay_id++;
+    if (io.next_overlay_id == 0)
+        io.next_overlay_id = 1;
+    insert_overlay(io, { .id = *id, .type = fios_overlay->type, .order = fios_overlay->order, .process_id = pid, .dst = dst, .src = src });
+    return 0;
+}
+
+int get_overlay(IOState &io, SceUID caller, SceUID pid, SceUID id, SceFiosProcessOverlay *out) {
+    if (!out)
+        return SCE_FIOS_ERROR_BAD_PTR;
+    // The kernel copies its whole buffer back: zeros unless an entry was found.
+    memset(out, 0, sizeof(*out));
+    std::lock_guard<std::mutex> lock(io.overlay_mutex);
+    if (const int error = check_access(caller, pid))
+        return error;
+    const auto overlay = find_overlay(io, pid, id);
+    if (overlay == io.overlays.end())
+        return SCE_FIOS_ERROR_BAD_OVERLAY;
+    out->type = overlay->type;
+    out->order = overlay->order;
+    out->dst_len = static_cast<int16_t>(overlay->dst.size());
+    out->src_len = static_cast<int16_t>(overlay->src.size());
+    out->process_id = overlay->process_id;
+    out->id = overlay->id;
+    strncpy(out->dst, overlay->dst.c_str(), sizeof(out->dst) - 1);
+    strncpy(out->src, overlay->src.c_str(), sizeof(out->src) - 1);
+    return 0;
+}
+
+int modify_overlay(IOState &io, SceUID caller, SceUID pid, SceUID id, const SceFiosProcessOverlay *fios_overlay) {
+    if (!fios_overlay)
+        return SCE_FIOS_ERROR_BAD_PTR;
+    std::lock_guard<std::mutex> lock(io.overlay_mutex);
+    if (const int error = check_access(caller, pid))
+        return error;
+    std::string dst, src;
+    if (const int error = validate_overlay(*fios_overlay, dst, src))
+        return error;
+    const auto overlay = find_overlay(io, pid, id);
+    if (overlay == io.overlays.end())
+        return SCE_FIOS_ERROR_BAD_OVERLAY;
+    FiosOverlay replacement{ .id = id, .type = fios_overlay->type, .order = fios_overlay->order, .process_id = pid, .dst = dst, .src = src };
+    if (replacement.order == overlay->order) {
+        *overlay = std::move(replacement);
+    } else {
+        io.overlays.erase(overlay);
+        insert_overlay(io, std::move(replacement));
+    }
+    return 0;
+}
+
+int remove_overlay(IOState &io, SceUID caller, SceUID pid, SceUID id) {
+    std::lock_guard<std::mutex> lock(io.overlay_mutex);
+    if (const int error = check_access(caller, pid))
+        return error;
+    const auto overlay = find_overlay(io, pid, id);
+    if (overlay == io.overlays.end())
+        return SCE_FIOS_ERROR_BAD_OVERLAY;
+    io.overlays.erase(overlay);
+    return 0;
+}
+
+int resolve_path(IOState &io, SceUID pid, const char *input, std::string &output, const SceUInt32 min_order, const SceUInt32 max_order) {
+    constexpr size_t capacity = 1024;
+    if (strnlen(input, capacity) == capacity)
+        return SCE_FIOS_ERROR_PATH_TOO_LONG;
+    auto path = normalize_fios_path(input, capacity);
+    if (!path)
+        return SCE_FIOS_ERROR_BAD_PATH;
+    const auto is_separator = [](char c) { return c == '/' || c == '\\'; };
+    std::lock_guard<std::mutex> lock(io.overlay_mutex);
+    for (const FiosOverlay &overlay : io.overlays) {
+        if ((overlay.process_id != -1 && overlay.process_id != pid) || overlay.order < min_order || overlay.order > max_order)
+            continue;
+        // The overlay covers dst itself and paths below it.
+        const std::string &dst = overlay.dst;
+        if (!path->starts_with(dst))
+            continue;
+        if (!dst.empty() && !is_separator(dst.back()) && path->size() > dst.size() && !is_separator((*path)[dst.size()]))
+            continue;
+        auto replaced = normalize_fios_path(overlay.src + "/" + path->substr(dst.size()), capacity);
+        if (!replaced)
+            return SCE_FIOS_ERROR_BAD_PATH;
+        path = std::move(replaced);
+    }
+    output = std::move(*path);
+    return 0;
 }

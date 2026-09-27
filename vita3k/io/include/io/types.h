@@ -135,13 +135,15 @@ enum SceFiosOverlayLimits {
 struct SceFiosProcessOverlay {
     SceFiosOverlayType type;
     uint8_t order;
-    int16_t src_size;
-    int16_t dst_size;
+    int16_t dst_len; // computed by the kernel
+    int16_t src_len; // computed by the kernel
+    int16_t reserved;
     SceUID process_id;
-    uint32_t reserved;
+    SceUID id;
     char dst[SCE_FIOS_OVERLAY_POINT_MAX];
     char src[SCE_FIOS_OVERLAY_POINT_MAX];
 };
+static_assert(sizeof(SceFiosProcessOverlay) == 0x258);
 
 static_assert(offsetof(SceFiosProcessOverlay, src) == 308);
 

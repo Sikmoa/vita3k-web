@@ -70,6 +70,7 @@ struct ThreadState {
 
     int priority;
     int init_priority;
+    bool fios_overlays_disabled = false; // sceFiosOverlayThreadSetDisabled02
     SceInt32 affinity_mask;
     SceInt32 init_affinity_mask;
     // Firmware marks every thread created for user mode with bit 31.

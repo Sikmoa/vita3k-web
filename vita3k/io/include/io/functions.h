@@ -78,5 +78,12 @@ int close_dir(IOState &io, SceUID fd, const char *export_name);
 int remove_dir(IOState &io, const char *dir, const fs::path &vita_fs_path, const char *export_name);
 
 // SceFios functions
-SceUID create_overlay(IOState &io, SceFiosProcessOverlay *fios_overlay);
-std::string resolve_path(IOState &io, const char *input, const SceUInt32 min_order = 0, const SceUInt32 max_order = 0x7F);
+// SceFios2Kernel overlays of firmware 3.74, for a caller that is not a system
+// program: it may only see and change its own process's app overlays
+// (order < 0x80). Results are 0 or a SCE_FIOS error.
+int create_overlay(IOState &io, SceUID caller, SceUID pid, const SceFiosProcessOverlay *fios_overlay, SceUID *id);
+int get_overlay(IOState &io, SceUID caller, SceUID pid, SceUID id, SceFiosProcessOverlay *out);
+int modify_overlay(IOState &io, SceUID caller, SceUID pid, SceUID id, const SceFiosProcessOverlay *overlay);
+int remove_overlay(IOState &io, SceUID caller, SceUID pid, SceUID id);
+// Paths are normalized the way the kernel does; errors are SCE_FIOS errors.
+int resolve_path(IOState &io, SceUID pid, const char *input, std::string &output, SceUInt32 min_order, SceUInt32 max_order);

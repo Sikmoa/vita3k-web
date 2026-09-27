@@ -335,9 +335,12 @@ set(_hle_exports
     sceKernelLibcGmtime_r sceKernelLibcLocaltime_r sceKernelLibcMktime
     sceKernelFindMemBlockByAddr sceKernelOpenMemBlock
     sceRtcSetTime64_t
-    # libfios2 overlays: production IOState overlay table (create/resolve),
-    # the scheduler query is a pure path test.
+    # libfios2 overlays: the IOState overlay table with SceFios2Kernel's
+    # access rules and per-thread disable flag; the scheduler query is a pure
+    # path test.
     sceFiosOverlayAddForProcess02 sceFiosOverlayResolveWithRangeSync02
+    sceFiosOverlayGetInfoForProcess02 sceFiosOverlayModifyForProcess02 sceFiosOverlayRemoveForProcess02
+    sceFiosOverlayThreadIsDisabled02 sceFiosOverlayThreadSetDisabled02
     sceFiosOverlayGetRecommendedScheduler02
     # Byte-order, TLS errno slot and address formatting: pure, no socket.
     sceNetHtonl sceNetHtons sceNetNtohl sceNetNtohs sceNetErrnoLoc sceNetInetNtop
