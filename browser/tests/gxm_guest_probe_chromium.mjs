@@ -3,9 +3,8 @@
 // verifies the current blocker and must never be presented as renderer success.
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { resolve, sep } from 'node:path';
 import assert from 'node:assert/strict';
-const root = resolve(process.env.GXM_RUNTIME_DIST || 'build/web64/browser');
+import { readRuntimeFile } from './runtime_routes.mjs';
 const fixture = await readFile(process.env.GXM_PROBE_BIN || '.limbo_work/gxm/guest_probe.bin');
 const server = createServer(async (req, res) => {
   try {
@@ -13,35 +12,7 @@ const server = createServer(async (req, res) => {
     let content, type;
     if (path === '/') { content = '<!doctype html><title>GXM guest probe</title>'; type = 'text/html'; }
     else if (path === '/probe.bin') { content = fixture; type = 'application/octet-stream'; }
-    else {
-      // Force the existing Memory64-only distribution through worker.js's w64
-      // path, without falling back to an interpreter or a wasm32 module.
-      if (['/worker.js', '/storage.js', '/gxm_scene.js', '/gxp_shader_adapter.js'].includes(path)) {
-        content = await readFile(resolve('browser/web', path.slice(1)));
-        res.writeHead(200, { 'Content-Type': 'text/javascript' }); res.end(content); return;
-      }
-      // Locally built compiler and pinned WASI dependencies; no compilation server.
-      const shaderRoutes = {
-        '/shaders/gxp_compiler.mjs': '.limbo_work/gxm/shader-wasm/gxp_compiler.mjs',
-        '/shaders/gxp_compiler.wasm': '.limbo_work/gxm/shader-wasm/gxp_compiler.wasm',
-        '/shaders/naga.wasm': '.limbo_work/gxm/node_modules/naga-wasi-cli/wasi/naga.wasm',
-      };
-      let shaderFile = shaderRoutes[path];
-      if (path.startsWith('/shaders/wasi/')) {
-        const base = resolve('.limbo_work/gxm/node_modules/@bjorn3/browser_wasi_shim/dist');
-        const candidate = resolve(base, path.slice('/shaders/wasi/'.length));
-        if (!candidate.startsWith(base + sep)) throw new Error('bad shader path');
-        shaderFile = candidate;
-      }
-      if (shaderFile) {
-        content = await readFile(shaderFile);
-        res.writeHead(200, { 'Content-Type': path.endsWith('.wasm') ? 'application/wasm' : 'text/javascript' });
-        res.end(content); return;
-      }
-      const file = resolve(root, `.${path.replace(/^\/wasm64\//, '/')}`);
-      if (!file.startsWith(root + sep)) throw new Error('bad path');
-      content = await readFile(file); type = path.endsWith('.wasm') ? 'application/wasm' : 'text/javascript';
-    }
+    else ({ content, type } = await readRuntimeFile(path));
     res.writeHead(200, { 'Content-Type': type }); res.end(content);
   } catch { res.writeHead(404); res.end(); }
 });
