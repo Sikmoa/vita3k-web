@@ -26,6 +26,8 @@
 #include <dlmalloc.h>
 #include <module/guest_format.h>
 
+#include <climits>
+
 TRACY_MODULE_NAME(SceLibc);
 
 EXPORT(int, _Assert) {
@@ -970,15 +972,15 @@ EXPORT(int, printf, const char *format, module::vargs args) {
         return SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID;
     }
 
-    const auto text = module::format_guest(format, *(thread->cpu), emuenv.mem, args);
+    const auto text = module::format_guest(format, *(thread->cpu), emuenv.mem, args, module::GUEST_PRINTF_LOG_LIMIT);
 
-    if (!text) {
+    if (!text || text->length > INT_MAX) {
         return -1;
     }
 
-    LOG_INFO("{}", *text);
+    LOG_INFO("{}{}", text->text, text->length > text->text.size() ? " [truncated]" : "");
 
-    return static_cast<int>(text->size());
+    return static_cast<int>(text->length);
 }
 
 EXPORT(int, printf_s) {

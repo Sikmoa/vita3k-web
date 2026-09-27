@@ -5,6 +5,7 @@
 #pragma once
 #include <module/guest_format.h>
 #include <util/align.h>
+#include <emscripten/heap.h>
 #include <bit>
 #include <cstring>
 #include <string>
@@ -114,6 +115,11 @@ inline void test_guest_clib(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(kSnprintf, { out, 0, put("%s!"), hello }) == 6);
     REQUIRE(text(out) == "abc");
     REQUIRE(call(kSnprintf, { 0, 0, put("%d"), 12345 }) == 5);
+    // A huge field width is counted, not materialised in host memory.
+    const size_t heap_before = emscripten_get_heap_size();
+    REQUIRE(call(kSnprintf, { out, 4, put("%*s|%n"), 2000000000, hello, cell }) == 2000000001);
+    REQUIRE(text(out) == "   " && word(cell) == 2000000001);
+    REQUIRE(emscripten_get_heap_size() == heap_before);
     // Conversions it cannot perform faithfully fail instead of misreading arguments.
     REQUIRE(call(kSnprintf, { out, 256, put("%ls"), hello }) == invalid_argument);
     REQUIRE(call(kSnprintf, { out, 256, put("%b"), 1 }) == invalid_argument);
@@ -143,8 +149,8 @@ inline void test_guest_clib(EmuEnvState &env, ThreadState &thread) {
     write_reg(cpu, 2, lo(bits(2.5)));
     write_reg(cpu, 3, hi(bits(2.5)));
     module::vargs from_r1(LayoutArgsState{ 1, 0, 0 });
-    const auto formatted = module::format_guest("%d %.1f", cpu, env.mem, from_r1);
-    REQUIRE(formatted && *formatted == "7 2.5");
+    const auto formatted = module::format_guest("%d %.1f", cpu, env.mem, from_r1, 64);
+    REQUIRE(formatted && formatted->text == "7 2.5" && formatted->length == 5);
 
     // BSD strlcpy: returns strlen(src); terminates whenever size > 0.
     std::memset(Ptr<void>(out).get(env.mem), 'z', 16);
@@ -192,6 +198,10 @@ inline void test_guest_clib(EmuEnvState &env, ThreadState &thread) {
     word(cell) = 0xcccccccc;
     REQUIRE(call(kLog, { file, 13, 2, component, put("%d %lld%n"), 4, lo(5ll), hi(5ll), cell }) == 0);
     REQUIRE(word(cell) == 3);
+    // Output beyond 511 characters is truncated and reported as a negative result.
+    REQUIRE(call(kLog, { file, 14, 2, component, put("%511d"), 1 }) == 0);
+    REQUIRE(static_cast<int32_t>(call(kLog, { file, 15, 2, component, put("%512d"), 1 })) < 0);
+    REQUIRE(call(kAssert, { file, 16, 1, component, put("%600d"), 1 }) == 1);
     env.kernel.process_exit_callback = saved_exit;
 
     free(env.mem, page);

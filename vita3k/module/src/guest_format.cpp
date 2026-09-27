@@ -40,19 +40,35 @@ enum class Length {
     L,
 };
 
-// Formats one already-read value with the host's snprintf. `spec` names only host types
-// whose width matches the value passed (int, unsigned, long long, double, const char *).
-template <typename T>
-bool append_host(std::string &out, const std::string &spec, T value) {
-    const int size = std::snprintf(nullptr, 0, spec.c_str(), value);
-    if (size < 0)
-        return false;
-    const std::size_t start = out.size();
-    out.resize(start + static_cast<std::size_t>(size) + 1);
-    std::snprintf(out.data() + start, static_cast<std::size_t>(size) + 1, spec.c_str(), value);
-    out.resize(start + static_cast<std::size_t>(size));
-    return true;
-}
+struct Output {
+    GuestFormatted formatted{};
+    std::size_t max_stored;
+
+    void put(char c) {
+        if (formatted.text.size() < max_stored)
+            formatted.text += c;
+        ++formatted.length;
+    }
+
+    // Formats one already-read value with the host's snprintf, storing only what fits.
+    // `spec` names only host types whose width matches the value passed (int, unsigned,
+    // long long, double, const char *).
+    template <typename T>
+    bool append_host(const std::string &spec, T value) {
+        const int size = std::snprintf(nullptr, 0, spec.c_str(), value);
+        if (size < 0)
+            return false;
+        const std::size_t stored = std::min<std::size_t>(static_cast<std::size_t>(size), max_stored - formatted.text.size());
+        if (stored) {
+            const std::size_t start = formatted.text.size();
+            formatted.text.resize(start + stored + 1);
+            std::snprintf(formatted.text.data() + start, stored + 1, spec.c_str(), value);
+            formatted.text.resize(start + stored);
+        }
+        formatted.length += static_cast<std::size_t>(size);
+        return true;
+    }
+};
 
 // Width or precision digits; nullopt when they overflow int, which C leaves undefined.
 std::optional<int> parse_decimal(const char *&p) {
@@ -76,20 +92,20 @@ bool store_count(MemState &mem, Address address, std::size_t count) {
 
 } // namespace
 
-std::optional<std::string> format_guest(const char *format, CPUState &cpu, MemState &mem, vargs &args) {
+std::optional<GuestFormatted> format_guest(const char *format, CPUState &cpu, MemState &mem, vargs &args, std::size_t max_stored) {
     if (!format) {
         LOG_ERROR("Guest format string is null");
         return std::nullopt;
     }
-    std::string out;
+    Output out{ .max_stored = max_stored };
     const char *p = format;
     while (*p) {
         if (*p != '%') {
-            out += *p++;
+            out.put(*p++);
             continue;
         }
         const char *const spec_begin = p++;
-        const auto fail = [&](const char *reason) -> std::optional<std::string> {
+        const auto fail = [&](const char *reason) -> std::optional<GuestFormatted> {
             const std::string_view spec(spec_begin, static_cast<std::size_t>(p - spec_begin));
             LOG_ERROR("Guest format \"{}\": {} in conversion \"{}\"", format, reason, spec);
             return std::nullopt;
@@ -171,9 +187,9 @@ std::optional<std::string> format_guest(const char *format, CPUState &cpu, MemSt
             if (length == Length::L)
                 return fail("invalid length modifier");
             if (integer_64)
-                ok = append_host<long long>(out, host_spec + "ll" + conversion, args.next<int64_t>(cpu, mem));
+                ok = out.append_host<long long>(host_spec + "ll" + conversion, args.next<int64_t>(cpu, mem));
             else
-                ok = append_host<int>(out, host_spec + narrow + conversion, args.next<int32_t>(cpu, mem));
+                ok = out.append_host<int>(host_spec + narrow + conversion, args.next<int32_t>(cpu, mem));
             break;
         case 'u':
         case 'o':
@@ -182,14 +198,14 @@ std::optional<std::string> format_guest(const char *format, CPUState &cpu, MemSt
             if (length == Length::L)
                 return fail("invalid length modifier");
             if (integer_64)
-                ok = append_host<unsigned long long>(out, host_spec + "ll" + conversion, args.next<uint64_t>(cpu, mem));
+                ok = out.append_host<unsigned long long>(host_spec + "ll" + conversion, args.next<uint64_t>(cpu, mem));
             else
-                ok = append_host<unsigned>(out, host_spec + narrow + conversion, args.next<uint32_t>(cpu, mem));
+                ok = out.append_host<unsigned>(host_spec + narrow + conversion, args.next<uint32_t>(cpu, mem));
             break;
         case 'c':
             if (length != Length::none)
                 return fail("unsupported wide character");
-            ok = append_host<int>(out, host_spec + 'c', args.next<int32_t>(cpu, mem));
+            ok = out.append_host<int>(host_spec + 'c', args.next<int32_t>(cpu, mem));
             break;
         case 's': {
             if (length != Length::none)
@@ -198,7 +214,7 @@ std::optional<std::string> format_guest(const char *format, CPUState &cpu, MemSt
             const char *const host = string.get(mem);
             if (string.address() && !host)
                 return fail("string argument is not guest memory");
-            ok = append_host<const char *>(out, host_spec + 's', host ? host : "(null)");
+            ok = out.append_host<const char *>(host_spec + 's', host ? host : "(null)");
             break;
         }
         case 'p': {
@@ -207,19 +223,19 @@ std::optional<std::string> format_guest(const char *format, CPUState &cpu, MemSt
             // A guest pointer is 32-bit: eight uppercase hex digits unless a precision says otherwise.
             if (!precision)
                 host_spec += ".8";
-            ok = append_host<unsigned>(out, host_spec + 'X', args.next<Ptr<const void>>(cpu, mem).address());
+            ok = out.append_host<unsigned>(host_spec + 'X', args.next<Ptr<const void>>(cpu, mem).address());
             break;
         }
         case 'n': {
             const Address target = args.next<Ptr<void>>(cpu, mem).address();
             bool stored = false;
             switch (length) {
-            case Length::hh: stored = store_count<int8_t>(mem, target, out.size()); break;
-            case Length::h: stored = store_count<int16_t>(mem, target, out.size()); break;
+            case Length::hh: stored = store_count<int8_t>(mem, target, out.formatted.length); break;
+            case Length::h: stored = store_count<int16_t>(mem, target, out.formatted.length); break;
             case Length::ll:
-            case Length::j: stored = store_count<int64_t>(mem, target, out.size()); break;
+            case Length::j: stored = store_count<int64_t>(mem, target, out.formatted.length); break;
             case Length::L: return fail("invalid length modifier");
-            default: stored = store_count<int32_t>(mem, target, out.size()); break;
+            default: stored = store_count<int32_t>(mem, target, out.formatted.length); break;
             }
             if (!stored)
                 return fail("count target is not guest memory");
@@ -236,10 +252,10 @@ std::optional<std::string> format_guest(const char *format, CPUState &cpu, MemSt
             // Variadic floats are promoted to double; the guest's long double is double.
             if (length != Length::none && length != Length::l && length != Length::L)
                 return fail("invalid length modifier");
-            ok = append_host<double>(out, host_spec + conversion, args.next<double>(cpu, mem));
+            ok = out.append_host<double>(host_spec + conversion, args.next<double>(cpu, mem));
             break;
         case '%':
-            out += '%';
+            out.put('%');
             break;
         default:
             return fail("unsupported conversion");
@@ -247,7 +263,7 @@ std::optional<std::string> format_guest(const char *format, CPUState &cpu, MemSt
         if (!ok)
             return fail("host formatting failed");
     }
-    return out;
+    return std::move(out.formatted);
 }
 
 int snprintf_guest(char *buffer, std::uint32_t count, const char *format, CPUState &cpu, MemState &mem, vargs &args) {
@@ -255,15 +271,14 @@ int snprintf_guest(char *buffer, std::uint32_t count, const char *format, CPUSta
         LOG_ERROR("Guest snprintf into a null buffer of size {}", count);
         return -1;
     }
-    const auto text = format_guest(format, cpu, mem, args);
-    if (!text || text->size() > INT_MAX)
+    const auto formatted = format_guest(format, cpu, mem, args, count ? count - 1 : 0);
+    if (!formatted || formatted->length > INT_MAX)
         return -1;
     if (count) {
-        const std::size_t stored = std::min<std::size_t>(text->size(), count - 1);
-        std::memcpy(buffer, text->data(), stored);
-        buffer[stored] = '\0';
+        std::memcpy(buffer, formatted->text.data(), formatted->text.size());
+        buffer[formatted->text.size()] = '\0';
     }
-    return static_cast<int>(text->size());
+    return static_cast<int>(formatted->length);
 }
 
 } // namespace module

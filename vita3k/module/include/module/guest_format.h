@@ -19,21 +19,32 @@
 
 #include <module/vargs.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
 
 namespace module {
 
+struct GuestFormatted {
+    std::string text; // the first max_stored characters of the output
+    std::size_t length; // the length of the whole output
+};
+
 // Formats a guest printf format string. Every argument is read from `args` with the
 // guest's ARM EABI type (long, size_t, ptrdiff_t and pointers are 32-bit; long long,
-// intmax_t and double are 64-bit), never with the host's C type. Returns nullopt, after
-// logging, for a conversion it cannot perform faithfully (e.g. wide characters).
-std::optional<std::string> format_guest(const char *format, CPUState &cpu, MemState &mem, vargs &args);
+// intmax_t and double are 64-bit), never with the host's C type. Only max_stored
+// characters are kept, so a huge guest field width costs no host memory. Returns
+// nullopt, after logging, for a conversion it cannot perform faithfully (e.g. wide
+// characters).
+std::optional<GuestFormatted> format_guest(const char *format, CPUState &cpu, MemState &mem, vargs &args, std::size_t max_stored);
+
+// How much of a guest printf the host log shows; the guest never observes it.
+constexpr std::size_t GUEST_PRINTF_LOG_LIMIT = 4096;
 
 // C snprintf contract over format_guest: stores at most count - 1 characters and a
 // terminating NUL when count > 0, and returns the untruncated length, or -1 when
-// format_guest fails.
+// format_guest fails or the length exceeds INT_MAX.
 int snprintf_guest(char *buffer, std::uint32_t count, const char *format, CPUState &cpu, MemState &mem, vargs &args);
 
 } // namespace module

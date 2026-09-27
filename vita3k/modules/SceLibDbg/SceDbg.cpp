@@ -24,6 +24,11 @@
 #include <util/tracy.h>
 TRACY_MODULE_NAME(SceDbg);
 
+// VitaSDK psp2/libdbg.h: both handlers truncate their output to 511 characters. That
+// limit covers the module's own prefix, whose format is unknown, so it is applied to
+// the formatted message alone.
+constexpr std::size_t DBG_OUTPUT_LIMIT = 511;
+
 // The third argument is not a stop request: the handler only reports and returns it. The
 // guest's assertion macro stops by itself (VitaSDK psp2/libdbg.h: SCE_DBG_ASSERT calls this
 // with 0 and then executes SCE_DBG_BREAK_ACTION, a bkpt), so the break instruction, not this
@@ -37,10 +42,10 @@ EXPORT(int, sceDbgAssertionHandler, const char *filename, int line, int unk, con
     }
 
     const char *main_message = messages.next<Ptr<const char>>(*(thread->cpu), emuenv.mem).get(emuenv.mem);
-    const auto text = module::format_guest(main_message, *(thread->cpu), emuenv.mem, messages);
+    const auto text = module::format_guest(main_message, *(thread->cpu), emuenv.mem, messages, DBG_OUTPUT_LIMIT);
 
     LOG_ERROR("Guest assertion failed: component {}, file {}, line {}: {}", component ? component : "", filename ? filename : "", line,
-        text ? *text : "(message could not be formatted)");
+        text ? text->text : "(message could not be formatted)");
 
     return unk;
 }
@@ -64,12 +69,16 @@ EXPORT(int, sceDbgLoggingHandler, const char *pFile, int line, int severity, con
     }
 
     const char *main_message = messages.next<Ptr<const char>>(*(thread->cpu), emuenv.mem).get(emuenv.mem);
-    const auto text = module::format_guest(main_message, *(thread->cpu), emuenv.mem, messages);
+    const auto text = module::format_guest(main_message, *(thread->cpu), emuenv.mem, messages, DBG_OUTPUT_LIMIT);
 
-    output += fmt::format(" {}", text ? *text : "(message could not be formatted)");
+    output += fmt::format(" {}", text ? text->text : "(message could not be formatted)");
     LOG_INFO(output);
 
-    return text ? 0 : SCE_KERNEL_ERROR_INVALID_ARGUMENT;
+    if (!text) {
+        return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
+    }
+    // Documented only as negative on truncation; the exact value is unknown.
+    return text->length > DBG_OUTPUT_LIMIT ? SCE_KERNEL_ERROR_ERROR : 0;
 }
 
 EXPORT(int, sceDbgSetBreakOnErrorState) {

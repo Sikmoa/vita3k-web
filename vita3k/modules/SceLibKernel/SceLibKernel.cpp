@@ -305,13 +305,13 @@ EXPORT(int, sceClibPrintf, const char *fmt, module::vargs args) {
         return SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID;
     }
 
-    const auto text = module::format_guest(fmt, *(thread->cpu), emuenv.mem, args);
+    const auto text = module::format_guest(fmt, *(thread->cpu), emuenv.mem, args, module::GUEST_PRINTF_LOG_LIMIT);
 
     if (!text) {
         return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
     }
 
-    LOG_INFO("{}", *text);
+    LOG_INFO("{}{}", text->text, text->length > text->text.size() ? " [truncated]" : "");
 
     return SCE_KERNEL_OK;
 }
@@ -482,11 +482,11 @@ EXPORT(int, sceClibVprintf, const char *fmt, Address list) {
         return SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID;
     }
     module::vargs args(list);
-    const auto text = module::format_guest(fmt, *(thread->cpu), emuenv.mem, args);
+    const auto text = module::format_guest(fmt, *(thread->cpu), emuenv.mem, args, module::GUEST_PRINTF_LOG_LIMIT);
     if (!text) {
         return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
     }
-    LOG_INFO("{}", *text);
+    LOG_INFO("{}{}", text->text, text->length > text->text.size() ? " [truncated]" : "");
     return SCE_KERNEL_OK;
 }
 
