@@ -2304,6 +2304,11 @@ std::vector<uint32_t> WasmJitCPU::aot_exidx_functions(MemState &mem, uint32_t ex
 }
 
 bool WasmJitCPU::build_aot(MemState &mem, const AotBuildSpec &spec, std::vector<uint8_t> &out, std::string &report) {
+    if (vita3k::wasmjit::ablation_removes_budget_checks()) {
+        report = "VITA3K_ABLATE with C (or F/G) removes the budget checks that bound AOT loops; "
+                 "an image built under it can hang, so build it without the ablation";
+        return false;
+    }
     auto options = vita3k::wasmjit::region_state_options();
     // Same predicate as each CPU's lazy regions: the fast-path metadata arrays
     // live for the whole MemState lifetime.

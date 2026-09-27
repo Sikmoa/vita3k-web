@@ -491,6 +491,9 @@ uint32_t ablate_flags() {
     }();
     return env_flags | g_ablate_override;
 }
+} // namespace
+bool ablation_removes_budget_checks() { return (ablate_flags() & kAblateBudget) != 0; }
+namespace {
 uint32_t ablate_entry_env() {
     static uint32_t entry = []() -> uint32_t {
 #ifdef __EMSCRIPTEN__
@@ -2528,9 +2531,9 @@ private:
             // are sorted by PC), so only they pay the budget check; forward
             // chains are bounded by the function's total ticks. A backward
             // body is enclosed by its target's label: branch straight to it.
-            // ABLATE C (measurement only): no backward-edge check; transfer()
-            // still checks, so only loops that never call can run unbounded.
-            if (target_index <= body_index && !(ablate_flags() & kAblateBudget)) {
+            // ABLATE C does not apply: without this check a loop that never
+            // calls out cannot stop, so build_aot refuses to run under it.
+            if (target_index <= body_index) {
                 state.read_executed(code); imm(entry_ticks((*metadata)[target_index])); op(Add);
                 get(1); op(GtU);
                 begin_if();

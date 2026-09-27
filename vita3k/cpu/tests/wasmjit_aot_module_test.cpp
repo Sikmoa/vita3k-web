@@ -194,6 +194,14 @@ void build_and_load() {
     spec.function_roots.push_back(WasmJitCPU::aot_location(kTrap | 1));
     std::vector<uint8_t> image;
     std::string report;
+    // The C ablation (alone, or in F/G) drops the backward-edge budget checks
+    // that bound AOT loops (the program's loops never call out): refused.
+    for (const uint32_t flags : {2u, 7u, 30u}) {
+        vita3k::wasmjit::set_ablate_flags(flags);
+        CHECK(!WasmJitCPU::build_aot(fixture.mem, spec, image, report));
+        CHECK(image.empty() && report.find("VITA3K_ABLATE") != std::string::npos);
+    }
+    vita3k::wasmjit::set_ablate_flags(0);
     CHECK(WasmJitCPU::build_aot(fixture.mem, spec, image, report));
     std::printf("AOT module: %s\n", report.c_str());
     aot_test_supply(image.data(), image.size());

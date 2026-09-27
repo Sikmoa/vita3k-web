@@ -441,5 +441,11 @@ std::vector<uint8_t> emit_dispatch();
 // member back-edges) and G = 30 (E+C+D+loop-top-SMC-hoist, never B).
 // bit-identical unless VITA3K_ABLATE env or this test-only setter opts in.
 void set_ablate_flags(uint32_t flags);
+// True when the ablation removes the per-edge budget checks (C, and F/G,
+// which include it). Lazy regions stay bounded by the dispatch loop's slice
+// check; an AOT function's backward edges branch straight to their target, so
+// without the check a loop that never calls out runs forever. The AOT build
+// refuses to run under it.
+bool ablation_removes_budget_checks();
 
 } // namespace vita3k::wasmjit
