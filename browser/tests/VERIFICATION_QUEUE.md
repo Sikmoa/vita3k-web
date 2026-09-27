@@ -99,8 +99,8 @@ VADD.I8 q15,q15,q1 = f24ee8c2; VSUB.I64 d31,d2,d31 = f372f82f;
 VMUL.I16 q15,q15,d3[3] = f3dee8eb.
 Assembler disagreement is a fixture problem to investigate, never a reason
 to bypass a rejected guest instruction. Inventory should add eleven dispatch
-routes while retaining VectorMultiply64 as missing. After successful review,
-replace the committed pre-B1 inventory with the generated scratch document.
+routes while retaining VectorMultiply64 as missing. The inventory is a
+generated report; it is not committed.
 
 ## B2 — NEON integer comparison/min/max/absolute family
 

@@ -53,8 +53,8 @@ ops, so the Wasm lowering produces the result word only.
   Rd, untouched sources and resume PC.
 - Full backend suite green: wasm32 Node
   (`WasmJit backend: 13048797 checks passed`) and Memory64 Chromium
-  (`13048068 checks`). The regenerated `JIT_COVERAGE_INVENTORY.md` records
-  dispatch routes for all eight ops (Packed integer/DSP: 8 of 34).
+  (`13048068 checks`). The inventory report (`jit_coverage_inventory.py`)
+  then listed dispatch routes for all eight ops (Packed integer/DSP: 8 of 34).
 - Remaining packed family (`PackedAddU8` with GE results, halving variants,
   `PackedSelect`, ...) still rejects emission; the next retail crash names
   the next opcode to lower.
