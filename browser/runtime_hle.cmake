@@ -293,6 +293,36 @@ set(_hle_exports
     sceIoPread sceIoPwrite sceIoSync sceIoSyncByFd sceIoChstat
     # Clock:
     sceRtcGetCurrentClock sceRtcGetCurrentClockLocalTime sceRtcGetTick sceRtcTickAddSeconds
+    # Remaining static imports of the eboot and the preloaded LLE modules
+    # (libc, libfios2, libSceFt2, libpvf, libhttp, libssl) whose production
+    # bodies are pure or state-only: no host wait, thread, sleep or device.
+    # SceClib string/memory helpers over guest buffers (memmove marks written
+    # pages like the selected memcpy/memset; memcpy_safe forwards to memcpy):
+    sceClibMemcmp sceClibMemmove sceClibMemcpy_safe sceClibLookCtypeTable
+    sceClibStrchr sceClibStrrchr sceClibStrncmp sceClibStrncasecmp sceClibStrnlen
+    sceClibStrncpy sceClibStrncat sceClibTolower sceClibToupper
+    sceClibPrintf sceClibSnprintf
+    # Keep sceClibStrlcpy/Strlcat (strncpy/strncat bodies: wrong return value,
+    # no terminator guarantee), sceClibVsnprintf (returns 0, not the length)
+    # and sceClibStrtoll (stores a host char* through the guest endptr)
+    # unselected: their upstream bodies are wrong, not merely incomplete.
+    # LwCond signal/delete: condvar_wait returns ILLEGAL_CONTEXT under the
+    # fiber host, so no waiter is ever queued and these only update or erase
+    # the kernel object (no host condition variable is reached).
+    sceKernelSignalLwCond sceKernelSignalLwCondAll sceKernelDeleteLwCond
+    # libc time conversions and memblock lookups: host libc time math and
+    # SysmemState reads; SceDateTime fill from a time_t is pure.
+    sceKernelLibcGmtime_r sceKernelLibcLocaltime_r sceKernelLibcMktime
+    sceKernelFindMemBlockByAddr sceKernelOpenMemBlock
+    sceRtcSetTime64_t
+    # libfios2 overlays: production IOState overlay table (create/resolve),
+    # the scheduler query is a pure path test.
+    sceFiosOverlayAddForProcess02 sceFiosOverlayResolveWithRangeSync02
+    sceFiosOverlayGetRecommendedScheduler02
+    # Byte-order, TLS errno slot and address formatting: pure, no socket.
+    sceNetHtonl sceNetHtons sceNetNtohl sceNetNtohs sceNetErrnoLoc sceNetInetNtop
+    # NP ID comparison: pure struct comparison.
+    sceNpCmpNpId
 )
 
 # Take NID values from the one authoritative database, never a second resolver.
