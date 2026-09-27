@@ -165,6 +165,12 @@ set(_hle_exports
     # trivial production bodies (STATUS_NONE with no active dialog; constant
     # 0 game-program query). SceCommonDialog.cpp is already sourced.
     sceNetCheckDialogGetStatus sceAppMgrIsGameProgram
+    # Message dialog: production SceCommonDialog bodies; button and system
+    # message text comes from the lang catalog (default English). No overlay
+    # renders it here, so only the guest's Close/Abort finishes a dialog.
+    sceMsgDialogInit sceMsgDialogGetStatus sceMsgDialogGetResult
+    sceMsgDialogClose sceMsgDialogAbort sceMsgDialogTerm
+    sceMsgDialogProgressBarInc sceMsgDialogProgressBarSetMsg sceMsgDialogProgressBarSetValue
     # Limbo RTC frontier (imports=39419 missing_nids=2 PC=8126bce0):
     # sceRtcGetCurrentTick reads the host clock via base_tick, and
     # sceRtcGetTickResolution is the VITA_CLOCKS_PER_SEC constant.
@@ -404,8 +410,29 @@ endforeach()
 file(CONFIGURE OUTPUT "${_hle_generated}/startup_bridge_selection.inc" CONTENT "${_hle_bridges}" @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_hle_module_sources})
 
+# String catalog behind lang::get (SceCommonDialog button/system texts), built
+# by the same generator and inputs as vita3k/lang. That CMakeLists is not
+# reused because its util target does not exist in the web graph.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(_lang_root "${_HLE_ROOT}/lang")
+set(_lang_generated "${CMAKE_CURRENT_BINARY_DIR}/runtime-lang-generated")
+set(_lang_generator "${_HLE_ROOT}/../tools/i18n/generate_lang_catalog.py")
+set(_lang_json_dir "${_HLE_ROOT}/../i18n/lang")
+file(GLOB _lang_json CONFIGURE_DEPENDS "${_lang_json_dir}/overlay_*.json")
+add_custom_command(
+    OUTPUT "${_lang_generated}/generated_catalog.h" "${_lang_generated}/generated_catalog.cpp"
+    COMMAND ${Python3_EXECUTABLE} "${_lang_generator}"
+        --input-dir "${_lang_json_dir}"
+        --strings-def "${_lang_root}/include/lang/strings.def"
+        --output-header "${_lang_generated}/generated_catalog.h"
+        --output-source "${_lang_generated}/generated_catalog.cpp"
+    DEPENDS "${_lang_generator}" "${_lang_root}/include/lang/strings.def" ${_lang_json}
+    VERBATIM)
+
 add_library(vita3k_web_runtime_hle STATIC
     "${_HLE_BROWSER_ROOT}/src/gxm_webgpu_bridge.cpp"
+    "${_lang_root}/src/lang.cpp"
+    "${_lang_generated}/generated_catalog.cpp"
     "${_HLE_ROOT}/renderer/src/renderer.cpp"
     "${_HLE_ROOT}/renderer/src/creation.cpp"
     "${_HLE_ROOT}/gxm/src/textures.cpp"
@@ -451,7 +478,7 @@ file(GLOB _hle_includes "${_HLE_ROOT}/*/include")
 target_include_directories(vita3k_web_runtime_hle PUBLIC ${_hle_includes}
     "${_HLE_EXT}/yaml-cpp/include")
 target_include_directories(vita3k_web_runtime_hle PRIVATE
-    "${_hle_generated}" "${_HLE_BROWSER_ROOT}/src" "${_HLE_EXT}/dlmalloc" "${_HLE_EXT}/printf"
+    "${_hle_generated}" "${_lang_generated}" "${_HLE_BROWSER_ROOT}/src" "${_HLE_EXT}/dlmalloc" "${_HLE_EXT}/printf"
     "${_HLE_EXT}/stb" "${_HLE_EXT}/xxHash" "${_HLE_EXT}/vita-toolchain/src"
     "${_HLE_EXT}/pugixml/src")
 target_compile_definitions(vita3k_web_runtime_hle PRIVATE

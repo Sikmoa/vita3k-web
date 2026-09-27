@@ -14,6 +14,7 @@
 
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
 #include "guest_mspace_tests.h"
+#include "guest_msg_dialog_tests.h"
 #include "inline_mutex_fixture.h"
 
 int main() {
@@ -59,6 +60,7 @@ int main() {
         SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
     REQUIRE(parent && parent->status == ThreadStatus::dormant);
     test_guest_mspace(*env, *parent);
+    test_guest_msg_dialog(*env, *parent);
     REQUIRE(parent->start(0, Ptr<void>{}, false) == 0);
     const auto progress = runtime.resume(256);
     REQUIRE(progress.failed == 0);
