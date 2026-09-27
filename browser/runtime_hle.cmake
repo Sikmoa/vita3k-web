@@ -318,9 +318,10 @@ set(_hle_exports
     sceAppUtilAppEventParseNpBasicJoinablePresence sceAppUtilAppEventParseNearGift
     sceAppUtilAppEventParseLiveArea
     # SceNearUtil of firmware 3.74 over an empty near.db (its service answers
-    # locally, without PSN): the own gift is kept; the two Near app launches
-    # stay unselected.
+    # locally, without PSN): the own gift is kept; the Near app launches only
+    # queue their URI with SceAppMgr.
     sceNearInitialize sceNearFinalize sceNearRefresh
+    sceNearFinalizeAndLaunchNearApp sceNearLaunchNearAppForUpdate
     sceNearGetNeighbors sceNearGetDiscoveredGifts sceNearGetDiscoveredGiftInfo
     sceNearGetDiscoveredGiftSender sceNearGetDiscoveredGiftStatus
     sceNearConvertDiscoveredGiftParam sceNearDeleteDiscoveredGift

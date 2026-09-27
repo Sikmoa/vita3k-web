@@ -107,6 +107,24 @@ inline void test_guest_near(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(finalize, { bad_comm_id }) == 0x80104902 && call(finalize, { comm_id }) == 0);
     REQUIRE(call(finalize, { comm_id }) == 0x80104905);
 
+    // The Near app launches only queue their URI. ForUpdate checks nothing;
+    // FinalizeAndLaunch type 1 finalizes, type 2 needs a discovered gift.
+    constexpr uint32_t finalize_and_launch = 0x3F3F6D92, launch_for_update = 0xF3398774;
+    REQUIRE(call(launch_for_update, {}) == 0);
+    REQUIRE(call(finalize_and_launch, { 1, 0, 0 }) == 0x80104905);
+    REQUIRE(call(initialize, { comm_id, param, 1 }) == 0);
+    REQUIRE(call(finalize_and_launch, { 1, 4, 0 }) == 0x80104901);
+    REQUIRE(call(finalize_and_launch, { 2, 0, out_id }) == 0x80104901);
+    REQUIRE(call(finalize_and_launch, { 3, 0, 0 }) == 0x80104901);
+    REQUIRE(call(finalize_and_launch, { 2, 4, 0 }) == 0x80104901);
+    *words(out_id) = 0;
+    REQUIRE(call(finalize_and_launch, { 2, 4, out_id }) == 0x80104912);
+    *words(out_id) = 7;
+    REQUIRE(call(finalize_and_launch, { 2, 4, out_id }) == 0x8010491E);
+    REQUIRE(env.np.near.inited && call(launch_for_update, {}) == 0);
+    REQUIRE(call(finalize_and_launch, { 1, 0, 0 }) == 0 && !env.np.near.inited);
+    REQUIRE(call(finalize, { comm_id }) == 0x80104905);
+
     // The process ends without Finalize or the other libraries' Term: the
     // next process starts clean.
     REQUIRE(call(initialize, { comm_id, param, 1 }) == 0);
@@ -118,5 +136,5 @@ inline void test_guest_near(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(!env.np.auth_inited && !env.np.commerce2_inited && env.np.signaling_ctxs.empty());
     REQUIRE(call(initialize, { comm_id, param, 1 }) == 0 && call(finalize, { comm_id }) == 0);
     free(env.mem, block);
-    std::puts("Guest Near: initialization, empty lists, discovered-gift lookups and the own gift passed");
+    std::puts("Guest Near: initialization, empty lists, discovered-gift lookups, the own gift and the Near app launches passed");
 }

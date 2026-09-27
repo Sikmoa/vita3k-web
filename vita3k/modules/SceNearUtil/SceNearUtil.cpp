@@ -151,9 +151,19 @@ EXPORT(int, sceNearFinalize, const np::CommunicationID *commId) {
     return 0;
 }
 
-EXPORT(int, sceNearFinalizeAndLaunchNearApp) {
-    TRACY_FUNC(sceNearFinalizeAndLaunchNearApp);
-    return UNIMPLEMENTED();
+// The launches build a near: URI and return sceAppMgrLaunchAppByUri2, which
+// only queues the URI for the shell and returns 0; the Near app starting in
+// the foreground afterwards is outside the calling game. Type 1 opens Near,
+// type 2 (a 4-byte gift id) a discovered gift, which the empty near.db lacks.
+EXPORT(int, sceNearFinalizeAndLaunchNearApp, SceUInt32 type, SceSize size, const SceUInt32 *arg) {
+    TRACY_FUNC(sceNearFinalizeAndLaunchNearApp, type, size, arg);
+    NEAR_REQUIRE_INITIALIZED();
+    if (!(type == 1 && size == 0) && !(type == 2 && size == sizeof(SceUInt32)))
+        return RET_ERROR(NEAR_ERROR_INVALID_ARGUMENT);
+    if (type == 2)
+        return RET_ERROR(arg ? missing_discovered_gift(*arg) : NEAR_ERROR_INVALID_ARGUMENT);
+    emuenv.np.near = {}; // as sceNearFinalize
+    return 0;
 }
 
 EXPORT(int, sceNearGetDiscoveredGiftInfo, SceUInt32 giftId, void *info) {
@@ -303,9 +313,10 @@ EXPORT(int, sceNearLaunchNearAppForDownload) {
     return UNIMPLEMENTED();
 }
 
+// No check at all, not even initialization: the "near:010" launch is queued.
 EXPORT(int, sceNearLaunchNearAppForUpdate) {
     TRACY_FUNC(sceNearLaunchNearAppForUpdate);
-    return UNIMPLEMENTED();
+    return 0;
 }
 
 // The gift id is the handle; there is nothing to open.
