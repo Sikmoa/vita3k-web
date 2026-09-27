@@ -116,10 +116,11 @@ wasm32 consumers are unaffected):
 - The `ready` diagnostics report `memoryRequested`, `memoryFallback`, and the
   effective `memoryModel`, so any run is attributable after the fact.
 
-Serving layout: the wasm64 module files (`vita3k_web.js`/`.wasm`,
-`vita3k_web_jit.js`/`.wasm` from the `VITA3K_WEB_MEMORY64=ON` build) are
-served from a `wasm64/` subdirectory next to `worker.js`; `locateFile` is
-based per attempt so each module resolves its own `.wasm`. Browser
+Serving layout: `moduleDirectories` in `worker.js` names each memory model's
+module directory next to the Worker (wasm64 in `wasm64/`, wasm32 beside it),
+and the `vita3k_web_dist` target stages each build's modules into its
+directory; a deployment offering both merges the two builds' `dist/`.
+`locateFile` is based per attempt so each module resolves its own `.wasm`. Browser
 requirement: Chrome 128+ (Memory64 unflagged). Firefox/Safari behavior is
 deployment-tested via the fallback path, not assumed.
 

@@ -2,13 +2,13 @@
 // session and a probe run load the same files from the same URLs:
 //   /<file in browser/web>    the Worker and the modules it loads, from source
 //   /shaders/...              GXP compiler, Naga and the WASI shim (GXM_SHADER_ASSETS)
-//   anything else             the built runtime module (GXM_RUNTIME_DIST)
+//   anything else             the built dist, as deployed (GXM_RUNTIME_DIST)
 import { readFile } from 'node:fs/promises';
 import { readdirSync } from 'node:fs';
 import { resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const runtimeRoot = resolve(process.env.GXM_RUNTIME_DIST || 'build/web64/browser');
+export const runtimeRoot = resolve(process.env.GXM_RUNTIME_DIST || 'build/web64/dist');
 export const shaderRoot = resolve(process.env.GXM_SHADER_ASSETS || '.limbo_work/gxm');
 
 // The Worker and every module it loads must come from one directory: the
@@ -32,9 +32,7 @@ function runtimeFile(path) {
   if (webFiles.has(path.slice(1))) return resolve(webRoot, path.slice(1));
   if (path in shaderFiles) return shaderFiles[path];
   if (path.startsWith('/shaders/wasi/')) return inside(wasiRoot, path.slice('/shaders/wasi/'.length));
-  // ?memory=w64 makes the Worker request ./wasm64/<module>.js; the module
-  // directory already IS the wasm64 flavor, so strip the prefix.
-  return inside(runtimeRoot, `.${path.replace(/^\/wasm64\//, '/')}`);
+  return inside(runtimeRoot, `.${path}`);
 }
 
 // Content and type for a decoded request path; rejects when the file is

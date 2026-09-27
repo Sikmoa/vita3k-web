@@ -14,7 +14,7 @@
 // (see browser/runtime_wasmjit.cmake).
 //
 // Environment overrides:
-//   GXM_RUNTIME_DIST        browser module directory (default build/web64/browser)
+//   GXM_RUNTIME_DIST        built dist (default build/web64/dist)
 //   GXM_SHADER_ASSETS       GXP compiler/Naga/WASI assets (default .limbo_work/gxm)
 //   LIMBO_STAGE             staged content root (default .limbo_work/stage)
 //   LIMBO_TITLE             title id (default PCSE00268)

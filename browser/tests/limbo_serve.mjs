@@ -46,7 +46,7 @@
 //   LIMBO_STAGE         staged content root (default .limbo_work/stage)
 //   LIMBO_TITLE         title id (default PCSE00268)
 //   LIMBO_APP           app directory under ux0/app (default: LIMBO_TITLE)
-//   GXM_RUNTIME_DIST    built module directory (default build/web64/browser)
+//   GXM_RUNTIME_DIST    built dist (default build/web64/dist; target vita3k_web_dist)
 //   GXM_SHADER_ASSETS   GXP compiler/Naga/WASI assets (default .limbo_work/gxm)
 //   LIMBO_AOT           ahead-of-time module for the title (AOT.md), served as
 //                       /aot.wasm and passed to run-app as aotUrl
@@ -54,7 +54,7 @@ import { createServer } from 'node:http';
 import { readFile, readdir } from 'node:fs/promises';
 import { networkInterfaces } from 'node:os';
 import { resolve, sep, relative } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { readRuntimeFile, runtimeRoot as root } from './runtime_routes.mjs';
 
 const port = Number(process.env.PORT || 8080);
@@ -66,8 +66,8 @@ const aotPath = process.env.LIMBO_AOT ? resolve(process.env.LIMBO_AOT) : '';
 
 if (!existsSync(resolve(stage, 'ux0/app', app, 'eboot.bin')))
   throw new Error(`no staged app at ${resolve(stage, 'ux0/app', app, 'eboot.bin')} (set LIMBO_STAGE/LIMBO_APP)`);
-if (!existsSync(resolve(root, 'vita3k_web_jit.wasm')))
-  throw new Error(`no built module at ${root} (build vita3k_web_jit first, or set GXM_RUNTIME_DIST)`);
+if (!existsSync(root) || !readdirSync(root, { recursive: true }).some((file) => file.endsWith('vita3k_web_jit.wasm')))
+  throw new Error(`no built JIT module in ${root} (build vita3k_web_dist first, or set GXM_RUNTIME_DIST)`);
 if (aotPath && !existsSync(aotPath)) throw new Error(`no AOT module at ${aotPath} (LIMBO_AOT)`);
 
 async function walk(directory) {

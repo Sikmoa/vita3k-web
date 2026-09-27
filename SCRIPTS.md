@@ -170,9 +170,13 @@ node browser/tests/jit_smoke.mjs                      # M14 suite in a real Work
 node browser/tests/jit_fixture_smoke.mjs              # exit-42 fixture through the Worker path
 PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index.mjs \
   node browser/tests/worker_smoke.mjs build/web/dist  # full display page, visual output
+PLAYWRIGHT_MODULE_URL=file://$PWD/build/playwright/node_modules/playwright/index.mjs \
+  node browser/tests/dist_chromium.mjs build/web64/dist  # dist served as static files
 ```
 
-All three exit 0 on success. Playwright lives under `build/playwright`.
+All exit 0 on success. Playwright lives under `build/playwright`.
+`dist_chromium.mjs` checks a deployment: the Worker must load the module of the
+dist's memory model without falling back (`DIST_MEMORY_MODEL` for a wasm32 dist).
 
 ## Manual browser testing (the animated display fixture)
 
@@ -192,7 +196,7 @@ SharedArrayBuffer). The Worker's console prints the JIT profile line ending in
 ## Retail app (Limbo) in a browser
 
 ```sh
-cmake --build build/web64 --target vita3k_web_jit
+cmake --build build/web64 --target vita3k_web_dist
 HOST=0.0.0.0 PORT=5173 node browser/tests/limbo_serve.mjs
 ```
 
@@ -200,8 +204,8 @@ Open the printed URL (add `?auto=1` to start on load). The page stages
 `.limbo_work/stage` (`LIMBO_STAGE`, `LIMBO_TITLE`, `LIMBO_APP`) into the Worker
 and boots the app with the same Worker messages the headless probe uses. The
 runtime files come from `browser/tests/runtime_routes.mjs`, shared with the
-probes: `browser/web` from source, the module from `GXM_RUNTIME_DIST` (default
-`build/web64/browser`) and the shader compiler assets from `GXM_SHADER_ASSETS`
+probes: `browser/web` from source, everything else from the built dist
+`GXM_RUNTIME_DIST` (default `build/web64/dist`) and the shader compiler assets from `GXM_SHADER_ASSETS`
 (default `.limbo_work/gxm`: the compiler from `browser/tests/build_gxp_compiler.sh
 wasm`, Naga and the WASI shim from the npm packages `naga-wasi-cli` and
 `@bjorn3/browser_wasi_shim` installed there).

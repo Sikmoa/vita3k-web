@@ -1,6 +1,11 @@
 // M4 worker lifecycle shell. The generated Emscripten module is loaded here.
 import { createWebStorage } from './storage.js';
 
+// Module directory of each memory model, relative to this Worker. The build
+// stages a flavour's modules into its directory by reading this line
+// (browser/CMakeLists.txt), so keep it a one-line literal.
+const moduleDirectories = { w64: 'wasm64/', w32: '' };
+
 const storage = createWebStorage('./');
 const post = (message, transfer) => self.postMessage({ ...message, timestamp: performance.now() }, transfer || []);
 let module = null;
@@ -59,8 +64,7 @@ try {
   // unsupported); ?memory=w32 forces the sparse reference; default (auto)
   // probes for Memory64 support, attempts the preferred module first, and
   // falls back to wasm32 on any load/instantiation error (which also covers
-  // a failed 8 GiB reservation on constrained devices). The wasm64 module
-  // files are served from ./wasm64/ next to this worker; see MEMORY64.md.
+  // a failed 8 GiB reservation on constrained devices). See MEMORY64.md.
   const memoryParam = (workerParams.get('memory') || 'auto').toLowerCase();
   const forceW64 = memoryParam === 'w64' || memoryParam === 'wasm64' || memoryParam === 'memory64';
   const forceW32 = memoryParam === 'w32' || memoryParam === 'wasm32';
@@ -77,7 +81,7 @@ try {
   const attempts = forceW64 ? ['w64'] : forceW32 ? ['w32'] : (probeMemory64() ? ['w64', 'w32'] : ['w32']);
   let memoryFallback = false;
   for (const attempt of attempts) {
-    const base = attempt === 'w64' ? './wasm64/' : './';
+    const base = `./${moduleDirectories[attempt]}`;
     const moduleUrl = new URL(`${base}${moduleName}.js`, self.location.href).href;
     try {
       const { default: createModule } = await import(moduleUrl);

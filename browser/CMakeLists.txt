@@ -206,8 +206,20 @@ function(vita3k_web_dist_copy destination source)
     set(_dist_outputs ${_dist_outputs} "${_dst}" PARENT_SCOPE)
 endfunction()
 # vita3k_web_dist_module(<module target>): its .js and the .wasm linked with it.
+# The directory is the one worker.js loads this build's memory model from.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/web/worker.js" _module_directories
+    REGEX "^const moduleDirectories = ")
+if(NOT _module_directories MATCHES "w64: '([^']*)', w32: '([^']*)'")
+    message(FATAL_ERROR "web/worker.js: no `const moduleDirectories = { w64: '...', w32: '...' }` line")
+endif()
+if(VITA3K_WEB_MEMORY64)
+    set(VITA3K_WEB_MODULE_DIR "${VITA3K_WEB_DIST}/${CMAKE_MATCH_1}")
+else()
+    set(VITA3K_WEB_MODULE_DIR "${VITA3K_WEB_DIST}/${CMAKE_MATCH_2}")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/web/worker.js")
 function(vita3k_web_dist_module target)
-    set(_dir "${VITA3K_WEB_DIST}")
+    set(_dir "${VITA3K_WEB_MODULE_DIR}")
     add_custom_command(
         OUTPUT "${_dir}/${target}.js" "${_dir}/${target}.wasm"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${_dir}"
