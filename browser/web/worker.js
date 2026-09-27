@@ -1,5 +1,11 @@
 // M4 worker lifecycle shell. The generated Emscripten module is loaded here.
 import { createWebStorage } from './storage.js';
+// Persistent content cache (OPFS) lives on the page: the worker asks for
+// bytes ('stage-need' -> 'stage-data') and hands downloads back for
+// storing ('stage-store'). OPFS I/O stays in one place (the page, where it
+// is proven to work) and this worker keeps zero new imports, so it loads
+// from any server generation.
+let stageResponder = null;
 
 // Module directory of each memory model, relative to this Worker. The build
 // stages a flavour's modules into its directory by reading this line
@@ -44,6 +50,19 @@ globalThis.vita3kWebOnIme = (ime) => post({ type: 'vita-ime', ime });
 let pendingCanvas = null;
 globalThis.vita3kGxmReady = (scene) => {
   if (pendingCanvas) { scene.attachCanvas(pendingCanvas); pendingCanvas = null; }
+};
+// GXM WebGPU device loss (browser/web/gxm_scene.js): the renderer can no
+// longer present, but emulation continues, so the page must say so and offer
+// a restart. Wired by default: scene.init falls back to this global hook
+// when the embedder passes no onDeviceLost of its own.
+globalThis.vita3kWebOnGxmDevice = (info) => {
+  post({ type: 'vita-gxm-device', device: info ?? null });
+};
+// GPU back-pressure (browser/web/gxm_scene.js): the renderer is dropping
+// scenes because the GPU queue is saturated — the page can suggest a lower
+// render scale instead of letting the driver wedge the whole display.
+globalThis.vita3kWebOnGxmThrottle = (detail) => {
+  post({ type: 'vita-gxm-throttle', throttle: detail ?? null });
 };
 // PCM tap (see browser/src/hle_audio_null.cpp): one copied buffer per
 // sceAudioOutOutput call. Transfer the copy; the Wasm scratch is reused by
@@ -166,9 +185,33 @@ async function readStagedFile(response, onProgress) {
   return payload;
 }
 
+  // Ask the page (OPFS owner) for staged-file bytes. Sequential: staging
+  // awaits each answer. A 30 s safety timeout falls back to the network.
+  const requestCachedBytes = (path, size) => new Promise((resolve) => {
+    const answer = (data) => {
+      clearTimeout(timer);
+      if (stageResponder !== answer) return;
+      stageResponder = null;
+      if (data && data.path === path && data.bytes instanceof ArrayBuffer && data.bytes.byteLength === size)
+        resolve(new Uint8Array(data.bytes));
+      else resolve(null);
+    };
+    const timer = setTimeout(() => {
+      if (stageResponder === answer) { stageResponder = null; resolve(null); }
+    }, 30000);
+    stageResponder = answer;
+    post({ type: 'stage-need', path, size });
+  });
 self.onmessage = async ({ data }) => {
   if (!data || lifecycle === 'error') return;
   switch (data.type) {
+  case 'stage-data': {
+    // answer() clears stageResponder itself after its identity guard, so it
+    // must still be set here (clearing first would fail the guard and hang).
+    const answer = stageResponder;
+    if (typeof answer === 'function') answer(data);
+    break;
+  }
   case 'status':
     post({ type: 'status', state: lifecycle });
     break;
@@ -242,34 +285,57 @@ self.onmessage = async ({ data }) => {
       const list = Array.isArray(data.files) ? data.files : [];
       const sizeOf = (entry) => (Number.isSafeInteger(entry?.size) && entry.size >= 0 ? entry.size : 0);
       const totalBytes = list.reduce((sum, entry) => sum + sizeOf(entry), 0);
-      let files = 0, bytes = 0, lastReport = 0;
+      // Persistent content cache: the page owns OPFS (upload fills it and
+      // it mirrors each boot's manifest). The worker asks per file
+      // ('stage-need' -> 'stage-data') and hands downloads back for storing
+      // ('stage-store'), so this side needs no storage imports at all.
+      const useContentCache = data.useContentCache === true;
+      let files = 0, bytes = 0, cachedFiles = 0, cachedBytes = 0;
+      let lastReport = 0;
       // { path, index (1-based file being fetched), total, bytes (finished),
-      //   totalBytes, pathBytes, pathSize } — at most every 120 ms, plus the
-      //   forced first/last report of each file.
-      const report = (path, pathSize, pathBytes, force) => {
+      //   totalBytes, pathBytes, pathSize, source: 'cache' | 'network' } —
+      // at most every 120 ms, plus the forced first/last report of each file.
+      const report = (path, pathSize, pathBytes, force, source) => {
         const now = performance.now();
         if (!force && now - lastReport < 120) return;
         lastReport = now;
         post({ type: 'stage-progress', path, index: files + 1, total: list.length,
-          bytes, totalBytes, pathBytes, pathSize });
+          bytes, totalBytes, pathBytes, pathSize, source });
       };
       for (const entry of list) {
         const path = String(entry?.path ?? '');
         if (!path || path.startsWith('/') || path.split('/').includes('..'))
           throw new RangeError(`unsafe staged path: ${path}`);
-        report(path, sizeOf(entry), 0, true);
-        const response = await fetch(entry.url, { credentials: 'same-origin' });
-        if (!response.ok) throw new Error(`staged fetch failed (${response.status}): ${path}`);
-        const payload = await readStagedFile(response, (received) => report(path, sizeOf(entry), received));
-        if (Number.isSafeInteger(entry.size) && entry.size >= 0 && payload.byteLength !== entry.size)
-          throw new Error(`staged size mismatch for ${path}: ${payload.byteLength} != ${entry.size}`);
+        let payload = null;
+        if (useContentCache) payload = await requestCachedBytes(path, sizeOf(entry));
+        if (payload) {
+          cachedFiles += 1; cachedBytes += payload.byteLength;
+          report(path, sizeOf(entry), payload.byteLength, true, 'cache');
+        } else {
+          report(path, sizeOf(entry), 0, true, 'network');
+          // No URL: the file exists only in the page's persistent storage
+          // (an uploaded package), so a miss there is a real failure.
+          if (!entry.url) throw new Error(`not in persistent storage: ${path} (re-upload the package)`);
+          const response = await fetch(entry.url, { credentials: 'same-origin' });
+          if (!response.ok) throw new Error(`staged fetch failed (${response.status}): ${path}`);
+          payload = await readStagedFile(response,
+            (received) => report(path, sizeOf(entry), received, false, 'network'));
+          if (Number.isSafeInteger(entry.size) && entry.size >= 0 && payload.byteLength !== entry.size)
+            throw new Error(`staged size mismatch for ${path}: ${payload.byteLength} != ${entry.size}`);
+          if (useContentCache) {
+            const copy = payload.slice();
+            post({ type: 'stage-store', path, bytes: copy.buffer }, [copy.buffer]);
+          }
+        }
         const target = `${root}/${path}`;
         const directory = target.slice(0, target.lastIndexOf('/'));
         if (directory) fs.mkdirTree(directory);
         fs.writeFile(target, payload);
         files += 1; bytes += payload.byteLength;
       }
-      post({ type: 'staged', root, files, bytes });
+      if (useContentCache)
+        post({ type: 'log', message: `[vita3k-web] staged ${files} files (${cachedFiles} from content cache)` });
+      post({ type: 'staged', root, files, bytes, cachedFiles, cachedBytes });
     } catch (error) {
       post({ type: 'error', message: `stage-files failed: ${error}` });
     }

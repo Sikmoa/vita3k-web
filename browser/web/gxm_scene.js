@@ -32,8 +32,60 @@ const depthSurfaces = new Map(); // `${depth}:${stencil}` guest addresses -> kep
 let layouts, sceneBuffer, sceneBufferSize = 0;
 let canvas, canvasContext, canvasFormat, blitPipeline, blitSampler;
 let presentGeneration = 0;
+// Device generation: 'active' until device.lost resolves. After loss every
+// WebGPU call on this device fails, so the scene layer stops submitting and
+// presenting (counted, not silent) and the page is told to offer a restart.
+// Emulation/audio never touch WebGPU, which is why a lost device looks like
+// a frozen frame with a live game behind it.
+let deviceState = 'active';
+let deviceInfo = {};
+let deviceLostInfo = null;
+let notifyDeviceLost = null;
+let submitSerial = 0, completedSerial = 0, completionPending = false;
+// GPU back-pressure. WebGPU's queue is unbounded: left alone, a slow phone GPU
+// falls further behind every frame (measured in the field: ~300-500 scenes
+// queued and never draining). A permanently backlogged vendor driver stalls
+// the whole display stack on Android — the system UI and its clock freeze,
+// not just this page — so past `maxInFlight` scenes the encoder stops feeding
+// the queue (scenes are dropped, counted and reported) until it drains.
+const maxInFlight = (() => {
+  try {
+    const raw = new URL(self.location.href).searchParams.get('maxInFlight');
+    if (raw === null) return 6;
+    const value = Number(raw);
+    return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 6;
+  } catch {
+    return 6; // 0 disables the valve
+  }
+})();
+let throttleReported = false;
+// Flight recorder: last 256 frame-lifecycle events. Submits continuing
+// while presents/completions stop is the queue/backend wedge signature;
+// a 'lost' entry followed by 'drop' entries is device loss.
+const flight = [];
+function record(ev, detail) {
+  flight.push({ t: Math.round(performance.now()), ev, detail: detail ?? '' });
+  if (flight.length > 256) flight.splice(0, flight.length - 256);
+}
 const stagingBuffers = [], transientTextures = []; // per-submission texel writes, destroyed after submit
-const stats = { scenes: 0, draws: 0, pipelines: 0, textureUploads: 0, presents: 0, bindGroups: 0, submitMs: 0, sceneBytes: 0, surfaceSyncs: 0 };
+const stats = { scenes: 0, draws: 0, pipelines: 0, textureUploads: 0, presents: 0, bindGroups: 0, submitMs: 0, uploadMs: 0, sceneBytes: 0, surfaceSyncs: 0, droppedScenes: 0, presentFailures: 0, stateSkips: 0, throttledScenes: 0 };
+// Redundant state-change filter (reset per pass): every WebGPU call from a
+// worker crosses into the browser/GPU process, so re-emitting unchanged
+// bindings, buffers, viewport, scissor or stencil reference each draw costs
+// real IPC time on a phone CPU. Skipping identical state is a no-op visually.
+const lastGroups = [null, null, null, null];
+const lastDyn = [-1, -1, -1, -1];
+const lastVB = new Int32Array(16), lastVBSize = new Int32Array(16);
+const lastViewport = new Float32Array(4), lastScissor = new Int32Array(4);
+let lastPipeline = null, lastIndexFormat = null, lastIndexOffset = -1, lastIndexBytes = -1, lastStencil = -1;
+function resetPassState() {
+  lastPipeline = null;
+  lastGroups[0] = lastGroups[1] = lastGroups[2] = lastGroups[3] = null;
+  lastDyn[0] = lastDyn[1] = lastDyn[2] = lastDyn[3] = -1;
+  lastVB.fill(-1); lastVBSize.fill(-1);
+  lastViewport.fill(-1); lastScissor.fill(-1);
+  lastIndexFormat = null; lastIndexOffset = -1; lastIndexBytes = -1; lastStencil = -1;
+}
 let log = message => console.warn(message);
 let statsReportedAt = 0;
 const warned = new Set();
@@ -43,7 +95,7 @@ const warnOnce = message => {
   log(`[gxm-scene] ${message}`);
 };
 
-export async function init({ compilerURL, nagaURL, wasiShimURL, logger }) {
+export async function init({ compilerURL, nagaURL, wasiShimURL, logger, onDeviceLost }) {
   if (logger) log = logger;
   if (device) return;
   if (!globalThis.navigator?.gpu)
@@ -53,8 +105,21 @@ export async function init({ compilerURL, nagaURL, wasiShimURL, logger }) {
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error('WebGPU adapter unavailable');
   const info = adapter.info ?? {};
+  deviceInfo = { vendor: info.vendor ?? '', architecture: info.architecture ?? '',
+    device: info.device ?? '', description: info.description ?? '' };
   log(`[gxm-scene] adapter: ${info.vendor} ${info.architecture} ${info.device} ${info.description}`);
   device = await adapter.requestDevice();
+  // The bridge may pass this explicitly; otherwise fall back to the worker's
+  // global hook (same pattern as vita3kGxmReady/vita3kWebOnGpuFrame).
+  notifyDeviceLost = onDeviceLost ?? ((detail) => globalThis.vita3kWebOnGxmDevice?.(detail));
+  device.lost.then((lost) => {
+    deviceState = 'lost';
+    completionPending = false;
+    deviceLostInfo = { reason: lost?.reason ?? 'unknown', message: lost?.message ?? '' };
+    record('lost', `${deviceLostInfo.reason} ${deviceLostInfo.message}`);
+    log(`[gxm-device] lost reason=${deviceLostInfo.reason} message=${deviceLostInfo.message}`);
+    try { notifyDeviceLost?.({ ...deviceLostInfo, adapter: deviceInfo }); } catch {}
+  });
   device.addEventListener('uncapturederror', event =>
     warnOnce(`WebGPU validation: ${event.error?.message ?? event.error}`));
   compiler = await createGXPShaderAdapter({ compilerURL, nagaURL, wasiShimURL });
@@ -87,6 +152,7 @@ export async function init({ compilerURL, nagaURL, wasiShimURL, logger }) {
 // producer's program id; the same GXP bytes always get the same id.
 export async function registerProgram(id, gxp, fragment) {
   if (programs.has(id)) return;
+  if (deviceState !== 'active') throw new Error('WebGPU device lost; restart the run');
   const textureFormats = new Uint32Array(32).fill(0x0c000000); // RGBA8 after producer decode
   const { wgsl } = await compiler.translate(gxp, { textureFormats });
   const module = device.createShaderModule({ code: wgsl });
@@ -100,7 +166,12 @@ export function attachCanvas(offscreen) {
   canvas = offscreen;
   canvasContext = canvas.getContext('webgpu');
   canvasFormat = navigator.gpu.getPreferredCanvasFormat();
-  canvasContext.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
+  try {
+    canvasContext.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
+  } catch (error) {
+    log(`[gxm-device] canvas configure failed: ${error?.message ?? error}`);
+    throw error;
+  }
 }
 
 // GXM color formats the consumer renders to (base format | swizzle). The
@@ -458,17 +529,75 @@ function writeTexels(encoder, target, x, y, width, height, data, dataOffset, mas
   if (target.resolved) resolveTarget(encoder, target);
 }
 
+// One completion probe at a time. It resolves when everything submitted so
+// far has finished, which is how the valve learns the queue drained. Never
+// awaited on the frame path: it only moves a counter.
+function requestCompletion() {
+  if (completionPending || deviceState !== 'active') return;
+  completionPending = true;
+  const submitted = submitSerial;
+  device.queue.onSubmittedWorkDone().then(() => {
+    completedSerial = Math.max(completedSerial, submitted);
+    completionPending = false;
+    record('completed', `through=${submitted}`);
+    if (throttleReported && submitSerial - completedSerial < maxInFlight) {
+      throttleReported = false;
+      log(`[gxm-scene] GPU queue drained (in flight ${submitSerial - completedSerial}); encoding again`);
+    }
+  }, (error) => {
+    completionPending = false;
+    record('completion-error', String(error?.message ?? error));
+  });
+}
+
 // words: Uint32Array view of the command stream; data: Uint8Array payload.
 export function submitScene(words, data) {
+  if (deviceState !== 'active') {
+    // The device is gone: encoding would only throw on dead objects. Count
+    // the drop and keep a heartbeat so the log shows the stall boundary.
+    ++stats.droppedScenes;
+    record('drop', `scene #${stats.scenes + stats.droppedScenes}`);
+    const now = performance.now();
+    if (now - statsReportedAt >= 5000) {
+      statsReportedAt = now;
+      log(`[gxm-device] still lost; droppedScenes=${stats.droppedScenes} reason=${deviceLostInfo?.reason ?? 'unknown'}`);
+    }
+    return;
+  }
+  const inFlight = submitSerial - completedSerial;
+  if (maxInFlight > 0 && inFlight >= maxInFlight) {
+    // Back-pressure: never queue more work than the GPU retires. The guest
+    // keeps running; frames are simply not encoded, and the page is told so
+    // it can suggest a lower render scale.
+    ++stats.throttledScenes;
+    record('throttled', `in-flight ${inFlight}`);
+    requestCompletion();
+    if (!throttleReported) {
+      throttleReported = true;
+      log(`[gxm-scene] GPU back-pressure: ${inFlight} scenes queued (max ${maxInFlight}); ` +
+        `dropping scenes until it drains — lower ?scale= if this persists`);
+      try {
+        globalThis.vita3kWebOnGxmThrottle?.({ inFlight, maxInFlight, throttledScenes: stats.throttledScenes });
+      } catch {}
+    }
+    return;
+  }
   const started = performance.now();
   try {
     encodeScene(words, data);
+    record('submit', `#${submitSerial}`);
   } finally {
     const now = performance.now();
     stats.submitMs += now - started;
     if (now - statsReportedAt >= 5000) {
       statsReportedAt = now;
+      // Observational: submitted-vs-completed lag is the wedge signal, and
+      // `throttledScenes` says whether the valve had to intervene.
+      requestCompletion();
       log(`[gxm-scene] stats ${JSON.stringify({ ...stats, submitMs: Math.round(stats.submitMs),
+        device: deviceState, submitSerial, completedSerial, inFlight: submitSerial - completedSerial,
+        maxInFlight,
+        adapter: `${deviceInfo.vendor} ${deviceInfo.architecture}`.trim(),
         targets: targets.size, textures: textures.size, pipelinesCached: pipelines.size, groupsCached: textureGroups.size })}`);
     }
   }
@@ -476,8 +605,24 @@ export function submitScene(words, data) {
 
 function encodeScene(words, data) {
   ensureSceneBuffer(data.byteLength + 4096);
+  const uploadStart = performance.now();
   device.queue.writeBuffer(sceneBuffer, 0, data);
+  stats.uploadMs += performance.now() - uploadStart;
   stats.sceneBytes += data.byteLength;
+  // State filter, rebound per pass below (pass is recreated by BEGIN_PASS).
+  const setGroup = (index, group) => {
+    if (lastGroups[index] !== group) { pass.setBindGroup(index, group); lastGroups[index] = group; }
+    else ++stats.stateSkips;
+  };
+  const setGroupDyn = (group) => {
+    if (lastGroups[0] !== group || lastDyn[0] !== dynamicOffsets[0] || lastDyn[1] !== dynamicOffsets[1]
+        || lastDyn[2] !== dynamicOffsets[2] || lastDyn[3] !== dynamicOffsets[3]) {
+      pass.setBindGroup(0, group, dynamicOffsets, 0, 4);
+      lastGroups[0] = group;
+      lastDyn[0] = dynamicOffsets[0]; lastDyn[1] = dynamicOffsets[1];
+      lastDyn[2] = dynamicOffsets[2]; lastDyn[3] = dynamicOffsets[3];
+    } else ++stats.stateSkips;
+  };
   const floats = new Float32Array(words.buffer, words.byteOffset, words.length);
   let cursor = 0;
   const word = () => words[cursor++];
@@ -520,6 +665,7 @@ function encodeScene(words, data) {
       });
       target.fresh = false;
       if (depth && depthMode === 2) depth.fresh = false; // mode 2 always stores
+      resetPassState();
       break;
     }
     case 2: { // DRAW
@@ -551,18 +697,39 @@ function encodeScene(words, data) {
         for (let i = 0; i < 8; ++i) unitWords[stage][at + i] = word();
       }
       if (!pass) throw new Error('draw outside a pass');
-      pass.setPipeline(cachedPipeline(target, depth));
+      const pipeline = cachedPipeline(target, depth);
+      if (pipeline !== lastPipeline) { pass.setPipeline(pipeline); lastPipeline = pipeline; }
+      else ++stats.stateSkips;
       dynamicOffsets[0] = vsInfo; dynamicOffsets[1] = fsInfo; dynamicOffsets[2] = vsUniforms; dynamicOffsets[3] = fsUniforms;
-      pass.setBindGroup(0, bufferGroupFor(vsUniformSize, fsUniformSize), dynamicOffsets, 0, 4);
-      pass.setBindGroup(1, emptyGroup());
-      pass.setBindGroup(2, textureGroupFor(1));
-      pass.setBindGroup(3, textureGroupFor(0));
-      for (let i = 0; i < streamCount; ++i) pass.setVertexBuffer(i, sceneBuffer, streamOffsets[i], streamSizes[i]);
-      pass.setIndexBuffer(sceneBuffer, indexSize === 2 ? 'uint16' : 'uint32', indexOffset, indexCount * indexSize);
+      setGroupDyn(bufferGroupFor(vsUniformSize, fsUniformSize));
+      setGroup(1, emptyGroup());
+      setGroup(2, textureGroupFor(1));
+      setGroup(3, textureGroupFor(0));
+      for (let i = 0; i < streamCount; ++i) {
+        if (lastVB[i] !== streamOffsets[i] || lastVBSize[i] !== streamSizes[i]) {
+          pass.setVertexBuffer(i, sceneBuffer, streamOffsets[i], streamSizes[i]);
+          lastVB[i] = streamOffsets[i]; lastVBSize[i] = streamSizes[i];
+        } else ++stats.stateSkips;
+      }
+      const indexFormat = indexSize === 2 ? 'uint16' : 'uint32';
+      const indexBytes = indexCount * indexSize;
+      if (lastIndexFormat !== indexFormat || lastIndexOffset !== indexOffset || lastIndexBytes !== indexBytes) {
+        pass.setIndexBuffer(sceneBuffer, indexFormat, indexOffset, indexBytes);
+        lastIndexFormat = indexFormat; lastIndexOffset = indexOffset; lastIndexBytes = indexBytes;
+      } else ++stats.stateSkips;
       const scale = target.renderScale; // viewport and scissor are render pixels
-      pass.setViewport(vx * scale, vy * scale, Math.max(vw, 0) * scale, Math.max(vh, 0) * scale, 0, 1);
-      pass.setScissorRect(sx * scale, sy * scale, sw * scale, sh * scale);
-      pass.setStencilReference(stencilRef);
+      const vpx = vx * scale, vpy = vy * scale, vpw = Math.max(vw, 0) * scale, vph = Math.max(vh, 0) * scale;
+      if (lastViewport[0] !== vpx || lastViewport[1] !== vpy || lastViewport[2] !== vpw || lastViewport[3] !== vph) {
+        pass.setViewport(vpx, vpy, vpw, vph, 0, 1);
+        lastViewport[0] = vpx; lastViewport[1] = vpy; lastViewport[2] = vpw; lastViewport[3] = vph;
+      } else ++stats.stateSkips;
+      const scx = sx * scale, scy = sy * scale, scw = sw * scale, sch = sh * scale;
+      if (lastScissor[0] !== scx || lastScissor[1] !== scy || lastScissor[2] !== scw || lastScissor[3] !== sch) {
+        pass.setScissorRect(scx, scy, scw, sch);
+        lastScissor[0] = scx; lastScissor[1] = scy; lastScissor[2] = scw; lastScissor[3] = sch;
+      } else ++stats.stateSkips;
+      if (lastStencil !== stencilRef) { pass.setStencilReference(stencilRef); lastStencil = stencilRef; }
+      else ++stats.stateSkips;
       pass.drawIndexed(indexCount);
       ++stats.draws;
       break;
@@ -627,6 +794,7 @@ function encodeScene(words, data) {
   }
   if (pass) pass.end();
   device.queue.submit([encoder.finish()]);
+  ++submitSerial;
   for (const buffer of stagingBuffers.splice(0)) buffer.destroy();
   for (const texture of transientTextures.splice(0)) texture.destroy();
   ++stats.scenes;
@@ -672,7 +840,9 @@ function blit(target, viewTarget, format) {
 // frame; pixels are read back only every `readbackEvery` frames.
 export function presentTarget(address, onFrame, readbackEvery) {
   const target = targets.get(address);
-  if (!target) return false;
+  // False also covers the lost device: the caller falls back to presenting
+  // guest memory. Throwing out of here would cross the EM_JS boundary.
+  if (!target || deviceState !== 'active') return false;
   const generation = ++presentGeneration;
   ++stats.presents;
   // Shown at its render scale: a downscaled surface's double-size render is
@@ -682,8 +852,16 @@ export function presentTarget(address, onFrame, readbackEvery) {
     if (canvas.width !== width || canvas.height !== height) {
       canvas.width = width; canvas.height = height;
     }
-    blit(target, canvasContext.getCurrentTexture().createView(), canvasFormat);
+    try {
+      blit(target, canvasContext.getCurrentTexture().createView(), canvasFormat);
+    } catch (error) {
+      ++stats.presentFailures;
+      record('present-failed', String(error?.message ?? error));
+      warnOnce(`frame presentation failed: ${error?.message ?? error}`);
+      return false;
+    }
   }
+  record('present', `${width}x${height}`);
   if (readbackEvery > 0 && generation % readbackEvery === 1 % readbackEvery) {
     // RGBA8 copy of the displayed target, asynchronously; never blocks the guest.
     const copy = device.createTexture({ size: [width, height], format: 'rgba8unorm',
@@ -779,4 +957,8 @@ export async function readTarget(address, width, height, pixelBytes, write) {
   ++stats.surfaceSyncs;
 }
 
-export function sceneStats() { return { ...stats, targets: targets.size, textures: textures.size, pipelines: pipelines.size }; }
+export function sceneStats() {
+  return { ...stats, device: deviceState, submitSerial, completedSerial,
+    lostReason: deviceLostInfo?.reason ?? null,
+    targets: targets.size, textures: textures.size, pipelines: pipelines.size };
+}

@@ -110,7 +110,7 @@ const server = createServer(async (req, res) => {
   try {
     const path = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
     const send = (content, type) => {
-      res.writeHead(200, { 'Content-Type': type, 'Content-Length': content.length });
+      res.writeHead(200, { 'Content-Type': type, 'Content-Length': content.length, 'Cache-Control': 'no-store' });
       res.end(content);
     };
     if (path === '/') {
