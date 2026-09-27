@@ -80,8 +80,14 @@ if(EMSCRIPTEN)
     )
 endif()
 
-find_program(VITA3K_ARM_CLANG NAMES clang REQUIRED)
-find_program(VITA3K_ARM_LLD NAMES ld.lld-19 ld.lld REQUIRED)
+# ARM guest code is built with the VitaSDK toolchain, as the fixtures are. A
+# plain `clang` is not enough: emsdk's clang (first on PATH in an Emscripten
+# environment) has no ARM backend.
+set(VITASDK "$ENV{VITASDK}" CACHE PATH "VitaSDK root (containing bin/arm-vita-eabi-gcc)")
+set(VITA3K_ARM_GCC "${VITASDK}/bin/arm-vita-eabi-gcc")
+if(NOT EXISTS "${VITA3K_ARM_GCC}")
+    message(FATAL_ERROR "Set VITASDK to a VitaSDK installation; missing ${VITA3K_ARM_GCC}")
+endif()
 
 # The browser runtime is an emulated machine: debug (-g, no optimization) Wasm
 # runs the interpreter ~100x too slow for frame-paced guest loops. Default the
@@ -95,17 +101,16 @@ add_compile_options($<$<CONFIG:Release>:-O2> $<$<CONFIG:RelWithDebInfo>:-O2> $<$
 set(VITA3K_GUEST_PROBE_ELF "${CMAKE_CURRENT_BINARY_DIR}/guest_probe.elf")
 add_custom_command(
     OUTPUT "${VITA3K_GUEST_PROBE_ELF}"
-    COMMAND "${VITA3K_ARM_CLANG}"
-        --target=armv7-none-eabi
+    COMMAND "${VITA3K_ARM_GCC}"
         -mthumb
         -nostdlib
-        "-fuse-ld=${VITA3K_ARM_LLD}"
         "-Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/tests/guest_probe/guest.ld"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/guest_probe/guest.S"
         -o "${VITA3K_GUEST_PROBE_ELF}"
     DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/guest_probe/guest.S"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/guest_probe/guest.ld"
+        "${VITA3K_ARM_GCC}"
     COMMENT "Building ARM guest ELF probe"
     VERBATIM
 )
