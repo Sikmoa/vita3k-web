@@ -333,7 +333,7 @@ void write_epochs_recorded(bool aot) {
 struct TrapOutcome {
     std::string error;
     uint32_t pc = 0, cpsr = 0, r0 = 0, r1 = 0, r2 = 0;
-    size_t regions = 0;
+    uint64_t regions = 0;
     bool operator==(const TrapOutcome &) const = default;
 };
 TrapOutcome run_trap() {
