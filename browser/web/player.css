@@ -40,6 +40,10 @@ h1 { font-size: 32px; margin: 0; font-weight: 550; letter-spacing: -.8px; }
 #launch-fill { display: block; height: 100%; width: 0; border-radius: 99px; background: var(--accent); transition: width .2s ease; }
 .below-player { display: flex; justify-content: space-between; gap: 10px; margin: 15px 0 24px; color: #939eaa; font-size: 12px; }
 .play-hint { margin: 0; }
+.title-picker { font-size: 12px; }
+.title-picker select { font-size: 11px; min-height: 0; padding: 6px 8px; margin-left: 6px; max-width: 46vw; }
+.package-upload { font-size: 12px; }
+.package-upload button { font-size: 11px; min-height: 0; padding: 6px 10px; margin-left: 6px; }
 .play-hint strong { font-weight: 500; color: #cad2db; }
 .rotate-hint { display: none; }
 kbd { font: 11px ui-monospace, monospace; color: #d2dae3; }

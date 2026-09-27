@@ -68,20 +68,52 @@ const title = process.env.LIMBO_TITLE || 'PCSE00268';
 const app = process.env.LIMBO_APP || title;
 const aotPath = process.env.LIMBO_AOT ? resolve(process.env.LIMBO_AOT) : '';
 
-if (!existsSync(resolve(stage, 'ux0/app', app, 'eboot.bin')))
-  throw new Error(`no staged app at ${resolve(stage, 'ux0/app', app, 'eboot.bin')} (set LIMBO_STAGE/LIMBO_APP)`);
+// Every title staged under ux0/app with an eboot.bin is servable: the default
+// one (LIMBO_TITLE/LIMBO_APP) and, without restarting the server, any other
+// via ?title=<id> / ?app=<dir> on /player-config.json — useful for trying a
+// homebrew next to the retail title. Each title keeps its own content cache.
+const appRoot = resolve(stage, 'ux0/app');
+const stagedTitles = existsSync(appRoot)
+  ? readdirSync(appRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && existsSync(resolve(appRoot, entry.name, 'eboot.bin')))
+    .map((entry) => entry.name).sort()
+  : [];
+if (!stagedTitles.includes(app))
+  throw new Error(`no staged app at ${resolve(appRoot, app, 'eboot.bin')} (set LIMBO_STAGE/LIMBO_APP);` +
+    ` staged titles: ${stagedTitles.join(', ') || 'none'}`);
 if (!existsSync(root) || !readdirSync(root, { recursive: true }).some((file) => file.endsWith('vita3k_web_jit.wasm')))
   throw new Error(`no built JIT module in ${root} (build vita3k_web_dist first, or set GXM_RUNTIME_DIST)`);
 if (aotPath && !existsSync(aotPath)) throw new Error(`no AOT module at ${aotPath} (LIMBO_AOT)`);
 
 const staged = await stageFiles(stage);
-const manifestBytes = new TextEncoder().encode(JSON.stringify(stageManifest(staged)));
+// A boot stages only its own title: firmware (os0/vs0), the app directory and
+// that title's patch. Trophy data under ux0/user belongs to the retail title,
+// so a homebrew does not pay for 130 MiB of another game's assets.
+// A boot stages firmware (os0/vs0) and its patch always; the title's own
+// files only when the server has them staged. A title the server does not
+// know (an uploaded package) therefore gets a firmware-only manifest and
+// takes its game files from persistent storage.
+const manifestFor = (wantedApp, wantedTitle, isStaged) => new TextEncoder().encode(JSON.stringify(stageManifest(
+  staged.filter((file) => {
+    if (/^(os0|vs0)\//.test(file.path)) return true;
+    if (file.path.startsWith('patch/')) return file.path === `patch/${wantedTitle}.txt`;
+    if (!isStaged) return false;
+    if (file.path.startsWith(`ux0/app/${wantedApp}/`)) return true;
+    if (file.path.startsWith('ux0/user/')) return wantedApp === app;
+    return false;
+  }))));
+// Title ids are directory names in the guest's filesystem; anything else
+// would be a path traversal attempt.
+const titleIdOk = (value) => /^[A-Za-z0-9_-]{1,24}$/.test(value);
 
 const server = createServer(async (req, res) => {
   try {
-    const path = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
+    const requestUrl = new URL(req.url, 'http://localhost');
+    const path = decodeURIComponent(requestUrl.pathname);
     const send = (content, type) => {
-      res.writeHead(200, { 'Content-Type': type, 'Content-Length': content.length });
+      // Dev server: the tree is edited live (player/worker/scene come from
+      // source), so browsers must never cache these responses.
+      res.writeHead(200, { 'Content-Type': type, 'Content-Length': content.length, 'Cache-Control': 'no-store' });
       res.end(content);
     };
     const body = (content, type) => send(content, type);
@@ -89,9 +121,21 @@ const server = createServer(async (req, res) => {
       const { content, type } = await readRuntimeFile('/player.html');
       return send(content, type);
     }
-    if (path === '/player-config.json')
-      return body(Buffer.from(JSON.stringify({ title, app, aot: Boolean(aotPath) })), 'application/json');
-    if (path === '/manifest.json') return body(manifestBytes, 'application/json');
+    if (path === '/player-config.json') {
+      const wanted = requestUrl.searchParams.get('app') || requestUrl.searchParams.get('title') || app;
+      if (!titleIdOk(wanted)) { res.writeHead(400, { 'Content-Type': 'text/plain' }); return res.end('bad title id'); }
+      const isStaged = stagedTitles.includes(wanted);
+      const wantedTitle = requestUrl.searchParams.get('title') || (wanted === app ? title : wanted);
+      return body(Buffer.from(JSON.stringify({ title: wantedTitle, app: wanted, staged: isStaged,
+        // The AOT image belongs to the title it was built for.
+        aot: isStaged && Boolean(aotPath) && wanted === app, titles: stagedTitles })), 'application/json');
+    }
+    if (path === '/manifest.json') {
+      const wanted = requestUrl.searchParams.get('app') || requestUrl.searchParams.get('title') || app;
+      if (!titleIdOk(wanted)) { res.writeHead(400, { 'Content-Type': 'text/plain' }); return res.end('bad title id'); }
+      const wantedTitle = requestUrl.searchParams.get('title') || (wanted === app ? title : wanted);
+      return body(manifestFor(wanted, wantedTitle, stagedTitles.includes(wanted)), 'application/json');
+    }
     if (path === '/favicon.ico') { res.writeHead(404); return res.end(); }
     if (path === '/aot.wasm' && aotPath) return send(await readFile(aotPath), 'application/wasm');
     if (path.startsWith('/stage/'))
@@ -103,8 +147,8 @@ const server = createServer(async (req, res) => {
   }
 });
 server.listen(port, host, () => {
-  const files = JSON.parse(new TextDecoder().decode(manifestBytes));
-  console.log(`Limbo dev server: (title ${title}, ${files.length} staged files)`);
+  console.log(`Limbo dev server: (title ${title}, ${staged.length} staged files)`);
+  console.log(`  staged titles ${stagedTitles.join(', ')}  (open ?title=<id> for another)`);
   console.log(`  module root ${root}`);
   console.log(`  staged root ${stage}`);
   if (aotPath) console.log(`  AOT module  ${aotPath}`);

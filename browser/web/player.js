@@ -1,12 +1,45 @@
 import { SCE_CTRL, keyMap, createPadState, createTouchControls } from './pad_input.js';
+// Persistent content helpers live in content_cache.js but are imported
+// lazily at each use site (never statically): late dynamic imports resolve
+// completely and a missing file (old server) disables the feature cleanly.
+// Only the pure key helpers are inlined so they need no module at all.
+const sanitizeSegment = (value) =>
+  String(value ?? '').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 64) || '_';
+const storageSupported = () => {
+  try {
+    return typeof navigator !== 'undefined' && typeof navigator.storage?.getDirectory === 'function';
+  } catch {
+    return false;
+  }
+};
+// Module namespace, resolved once and shared: the uploader's successful
+// import is reused by the boot so both paths always see one instance.
+let cacheNSPromise = null;
+function cacheAPI() {
+  if (!cacheNSPromise) cacheNSPromise = import('./content_cache.js').then((m) => m, () => null);
+  return cacheNSPromise;
+}
+// Namespace of the current run's staging session, resolved in the ready
+// handler and shared by the stage-need/store/staged handlers below.
+let cacheNS = null;
 
 const params = new URLSearchParams(location.search);
 const backend = params.get('backend') === 'interp' ? 'interp' : 'jit';
 const memory = ['w64', 'w32'].includes(params.get('memory')) ? params.get('memory') : 'auto';
+// ?title=<id>&app=<dir> boots another title the server has staged (utilities
+// like homebrew next to the retail title); without them the server's default
+// applies. The title also selects its own persistent content cache.
+const titleParam = params.get('title') || '', appParam = params.get('app') || '';
+const configQuery = (() => {
+  const query = new URLSearchParams();
+  if (titleParam) query.set('title', titleParam);
+  if (appParam) query.set('app', appParam);
+  return query.size ? '?' + query : '';
+})();
 let config;
 try {
-  const response = await fetch('./player-config.json');
-  if (!response.ok) throw new Error('Player configuration: HTTP ' + response.status);
+  const response = await fetch('./player-config.json' + configQuery);
+  if (!response.ok) throw new Error(await response.text() || `Player configuration: HTTP ${response.status}`);
   config = await response.json();
 } catch (error) {
   document.querySelector('#status').textContent = 'Unable to load player';
@@ -15,6 +48,16 @@ try {
   throw error;
 }
 const { title: TITLE, app: APP, aot: AOT } = config;
+// Persistent content cache (OPFS) namespace for this title: staging reads
+// through it, and the package upload below fills it.
+const cacheKey = `${sanitizeSegment(TITLE)}/${sanitizeSegment(APP)}`;
+// Page-side content cache state: the page owns all OPFS I/O (the worker
+// only asks and hands back). stageCacheActive gates reads and write-back;
+// stageNeeded is the manifest the worker is currently staging.
+let stageCacheActive = false;
+let stageNeeded = null;
+let stageCacheIndex = null;
+const stageSources = { storage: 0, downloaded: 0 };
 // A transferred canvas can no longer be drawn or read from this page, so GPU
 // frames get their own element and pixel frames the 2D canvas over it.
 const presentToCanvas = params.get('present') !== 'readback';
@@ -44,17 +87,23 @@ function launch(phase, detail, fraction) {
   launchBar.hidden = !measured;
   if (measured) launchFill.style.width = Math.round(Math.min(1, Math.max(0, fraction)) * 100) + '%';
 }
+// Progress of staging. The byte fraction counts every staged file (read from
+// storage or downloaded), so `stageTotals.bytes` is the whole title, not the
+// amount fetched: the read/download counters say which is which.
 function stagingDetail(index, bytes) {
   const parts = [];
   if (stageTotals.files) parts.push(`${Math.min(index, stageTotals.files)}/${stageTotals.files} files`);
   if (stageTotals.bytes) parts.push(`${mib(bytes)}/${mib(stageTotals.bytes)} MiB`,
     `${Math.floor(Math.min(1, bytes / stageTotals.bytes) * 100)}%`);
+  if (stageSources.storage) parts.push(`${stageSources.storage} from storage`);
+  if (stageSources.downloaded) parts.push(`${stageSources.downloaded} downloaded`);
   parts.push(elapsed());
   return parts.join(' · ');
 }
 document.querySelector('#game-title').textContent = TITLE === 'PCSE00268' ? 'Limbo' : TITLE;
 document.title = 'Vita3K Web — ' + document.querySelector('#game-title').textContent;
-document.querySelector('#runtime-info').textContent = TITLE + ' · ' + backend.toUpperCase() + ' · ' + memory + (AOT ? ' · AOT' : '');
+document.querySelector('#runtime-info').textContent = TITLE + ' · ' + backend.toUpperCase() + ' · ' + memory +
+  (AOT ? ' · AOT' : '') + (config.staged === false ? ' · package' : '');
 function notice(message) {
   const element = document.querySelector('#player-notice');
   element.textContent = message; element.hidden = !message;
@@ -82,6 +131,10 @@ if (!webgpuBlocked) navigator.gpu.requestAdapter().then((adapter) => {
   if (problem) { warningBox.textContent = problem; warningBox.style.display = 'block'; }
 }).catch((error) => { warningBox.textContent = 'WebGPU adapter check failed: ' + error.message; warningBox.style.display = 'block'; });
 let worker = null, running = false, frames = 0, gpuFrames = 0, pixelFrames = 0, firstFrameAt = 0, startedAt = 0;
+// Present watchdog: a run whose worker stays alive but stops presenting is
+// the frozen-frame failure (device loss, wedged queue). Armed only after
+// the first presented frame so slow boot/AOT compile never trips it.
+let lastPresentAt = 0, presentedOnce = false, watchdogWarned = false;
 let fps = 0, fpsSince = 0, fpsFrames = 0;
 // Web Audio sink: guest PCM (int16 interleaved; 48 kHz stereo on the MAIN
 // port) arrives as transferred ArrayBuffers from the worker (see
@@ -152,6 +205,12 @@ const log = (text) => {
 // Batch diagnostics instead of rebuilding/scrolling the log on every HLE message.
 setInterval(() => {
   if (worker) showStats();
+  if (running && presentedOnce && !watchdogWarned && performance.now() - lastPresentAt > 15000) {
+    watchdogWarned = true;
+    const idle = Math.round((performance.now() - lastPresentAt) / 1000);
+    log(`watchdog: no presented frames for ${idle}s while the run continues (device loss or wedged queue?)`);
+    notice(`No new frames for ${idle}s — the graphics device may be stuck. Stop and press Play to restart.`);
+  }
   if (logDirty) {
     logBox.textContent = logLines.join('\n'); logDirty = false;
     if (document.querySelector('#diagnostics').open) logBox.scrollTop = logBox.scrollHeight;
@@ -167,6 +226,7 @@ const showStats = () => {
 };
 function countFrame() {
   const now = performance.now();
+  lastPresentAt = now; presentedOnce = true; watchdogWarned = false;
   frames += 1;
   if (!firstFrameAt) { firstFrameAt = now - startedAt; fpsSince = now; fpsFrames = 0; }
   fpsFrames += 1;
@@ -366,6 +426,92 @@ addEventListener('keydown', (event) => {
     shell.classList.remove('expanded'); document.body.classList.remove('player-expanded'); updateFullscreen();
   }
 });
+// Game package upload: a .zip of the staged tree is unpacked into persistent
+// storage (OPFS) once, and later boots stage from there instead of
+// re-downloading. Uploads are serialized against runs via the Stop button:
+// a run is active exactly while Stop is enabled.
+const uploadRow = document.querySelector('#upload-row');
+const uploadButton = document.querySelector('#upload');
+const uploadInput = document.querySelector('#upload-file');
+if (!storageSupported()) {
+  uploadRow.hidden = true;
+} else {
+  uploadButton.onclick = () => {
+    if (running || !stopButton.disabled) { notice('Stop the game before uploading a package.'); return; }
+    uploadInput.click();
+  };
+  uploadInput.onchange = async () => {
+    const file = uploadInput.files?.[0];
+    uploadInput.value = '';
+    if (!file) return;
+    const wasDisabled = runButton.disabled;
+    runButton.disabled = true; uploadButton.disabled = true;
+    const started = performance.now();
+    try {
+      if (!/\.zip$/i.test(file.name)) throw new Error('only .zip packages are supported');
+      const cache = await cacheAPI();
+      if (!cache) throw new Error('content cache module unavailable');
+      // The package names its own title (its ux0/app/<id> directory), so an
+      // upload is all a game needs to become bootable — the server only has
+      // to supply firmware. Files are stored under that title's own cache.
+      const contents = await cache.packageContents(file);
+      const packageKey = `${sanitizeSegment(contents.title)}/${sanitizeSegment(contents.app)}`;
+      const totalBytes = contents.files.reduce((sum, entry) => sum + entry.size, 0);
+      let lastNotice = 0;
+      const result = await cache.unpackPackageToCache(file, packageKey,
+        (done, total, path, doneBytes) => {
+          const now = performance.now();
+          if (now - lastNotice < 200 && done < total) return;
+          lastNotice = now;
+          notice(`Unpacking ${path} — ${done}/${total} files · ${mib(doneBytes)}/${mib(totalBytes)} MiB`);
+        });
+      try { await navigator.storage.persist?.(); } catch {}
+      const secs = Math.round((performance.now() - started) / 1000);
+      log(`package stored: ${result.title} — ${result.files} files · ${mib(result.bytes)} MiB` +
+        ` in ${secs}s (persistent storage, key ${packageKey})`);
+      await refreshTitlePicker();
+      titlePicker.value = result.title;
+      notice(result.title === TITLE
+        ? `Package ready: ${result.files} files · ${mib(result.bytes)} MiB. Press Play.`
+        : `Package ready: ${result.title} — ${result.files} files · ${mib(result.bytes)} MiB. Pick it in Title, then Play.`);
+    } catch (error) {
+      log('package upload failed: ' + (error?.message ?? error));
+      notice('Upload failed: ' + (error?.message ?? error));
+    } finally {
+      runButton.disabled = wasDisabled; uploadButton.disabled = false;
+    }
+  };
+}
+// Title picker: everything bootable — the server's staged titles plus the
+// packages this browser holds in persistent storage (uploaded, no server
+// work). Switching reloads with ?title=<id>, which is also the shareable link.
+const titleRow = document.querySelector('#title-row');
+const titlePicker = document.querySelector('#title-picker');
+async function refreshTitlePicker() {
+  const stagedTitles = Array.isArray(config.titles) ? config.titles : [];
+  const cache = storageSupported() ? await cacheAPI() : null;
+  let uploaded = [];
+  try { uploaded = cache?.listCachedTitles ? await cache.listCachedTitles() : []; } catch { uploaded = []; }
+  const counts = new Map(uploaded.map((entry) => [entry.title, entry.files]));
+  const ids = [...new Set([...stagedTitles, ...counts.keys(), TITLE])].sort();
+  titlePicker.replaceChildren(...ids.map((id) => {
+    const option = document.createElement('option');
+    option.value = id;
+    option.textContent = stagedTitles.includes(id)
+      ? `${id} · server`
+      : `${id} · package${counts.has(id) ? ` (${counts.get(id)})` : ''}`;
+    return option;
+  }));
+  titlePicker.value = TITLE;
+  titleRow.hidden = ids.length < 2;
+}
+titlePicker.onchange = () => {
+  const next = new URLSearchParams(location.search.replace(/^\?/, ''));
+  next.set('title', titlePicker.value);
+  next.delete('app');
+  location.search = next.toString();
+};
+refreshTitlePicker();
 
 function stop(keepsStatus) {
   clearInputs();
@@ -396,6 +542,7 @@ beepButton.onclick = () => {
 async function run() {
   stop(); notice('');
   frames = 0; gpuFrames = 0; pixelFrames = 0; fps = 0; firstFrameAt = 0; logBox.textContent = ''; logLines.length = 0; logDirty = false; startedAt = performance.now();
+  lastPresentAt = 0; presentedOnce = false; watchdogWarned = false;
   welcome.hidden = false;
   welcome.querySelector('h2').textContent = 'Starting your game…';
   welcome.querySelector('p').textContent = 'The first launch can take a little while.';
@@ -410,7 +557,7 @@ async function run() {
   if (webgpuBlocked) log('warning: ' + webgpuBlocked);
   runButton.disabled = true; stopButton.disabled = false;
   ensureAudio();
-  const currentWorker = worker = new Worker(`./worker.js?backend=${backend}&memory=${memory}&inlineMutex=${params.get('inlineMutex') === '0' ? '0' : '1'}${params.get('fpsHack') === '1' ? '&fpsHack=1' : ''}${params.get('scale') ? '&scale=' + params.get('scale') : ''}${params.get('surfaceSync') === '1' ? '&surfaceSync=1' : ''}`, { type: 'module' });
+  const currentWorker = worker = new Worker(`./worker.js?backend=${backend}&memory=${memory}&inlineMutex=${params.get('inlineMutex') === '0' ? '0' : '1'}${params.get('fpsHack') === '1' ? '&fpsHack=1' : ''}${params.get('scale') ? '&scale=' + params.get('scale') : ''}${params.get('surfaceSync') === '1' ? '&surfaceSync=1' : ''}${params.get('maxInFlight') ? '&maxInFlight=' + encodeURIComponent(params.get('maxInFlight')) : ''}`, { type: 'module' });
   worker.onerror = (event) => { if (worker !== currentWorker) return; log('worker error: ' + event.message); status.textContent = 'Worker error'; notice(event.message); stop(true); };
   worker.onmessage = async ({ data }) => {
     if (worker !== currentWorker || !data || typeof data !== 'object') return;
@@ -426,15 +573,49 @@ async function run() {
           }
         }
         try {
-          const response = await fetch('./manifest.json');
+          // Same title query as the config: the server scopes its manifest to
+          // this title (firmware, its patch, and the app directory only when
+          // the server has it staged). The title's own files may instead live
+          // in persistent storage (an uploaded package), so merge those in,
+          // marked storage-only: a miss there is an error, not a doomed fetch.
+          const response = await fetch('./manifest.json' + configQuery);
           if (!response.ok) throw new Error('HTTP ' + response.status);
-          const files = await response.json();
+          const serverFiles = (await response.json())
+            .filter((file) => params.get('patches') !== '0' || !file.path.startsWith('patch/'));
           if (worker !== currentWorker) return;
-          const staged = files.filter((file) => params.get('patches') !== '0' || !file.path.startsWith('patch/'));
+          const cache = await cacheAPI();
+          // Shared with the stage-need/stage-store handlers below.
+          cacheNS = cache;
+          const storedManifest = cache ? await cache.cacheReadManifest(cacheKey) : null;
+          const serverPaths = new Set(serverFiles.map((file) => file.path));
+          const storedOnly = (storedManifest?.files ?? []).filter((file) => !serverPaths.has(file.path));
+          const staged = [...serverFiles, ...storedOnly];
+          // An empty manifest is allowed (a fixture, or a title with nothing
+          // staged yet): say what to do, then let the launch report the rest.
+          if (!staged.length)
+            notice(`No content for ${TITLE}: upload its .zip package (or stage it on the server) first.`);
           stageTotals = { files: staged.length, bytes: staged.reduce((sum, file) => sum + (file.size || 0), 0) };
-          launch('Staging game files…', stagingDetail(0, 0), stageTotals.bytes ? 0 : undefined);
-          worker.postMessage({ type: 'stage-files', root: '/vita',
-            files: staged.map((file) => ({ ...file, url: `/stage/${file.path}` })) });
+          stageNeeded = staged.map((file) => ({ path: file.path, size: file.size }));
+          stageCacheActive = storageSupported() && !!cache;
+          stageCacheIndex = stageCacheActive ? cache.cacheIndexFor(storedManifest?.files, stageNeeded) : null;
+          const useContentCache = (stageCacheIndex?.size ?? 0) > 0;
+          document.body.dataset.cacheVerdict = stageCacheActive
+            ? `${stageCacheIndex.size} of ${stageNeeded.length} files in storage`
+              + (storedOnly.length ? `, ${storedOnly.length} package-only` : '')
+            : 'unsupported';
+          log(`[vita3k-web] ${staged.length} files to stage (${storedOnly.length} from the package, ` +
+            `${stageCacheIndex?.size ?? 0} in storage)`);
+          stageSources.storage = 0;
+          stageSources.downloaded = 0;
+          const toFetch = stageTotals.files - (stageCacheIndex?.size ?? 0);
+          const fetchBytes = staged.filter((file) => !stageCacheIndex?.has(file.path))
+            .reduce((sum, file) => sum + (file.size || 0), 0);
+          launch('Staging game files…', `${toFetch} of ${stageTotals.files} files to download` +
+            (toFetch ? ` (${mib(fetchBytes)} MiB)` : '') + (toFetch ? `; ${stageCacheIndex?.size ?? 0} from storage` : ''),
+            stageTotals.bytes ? 0 : undefined);
+          worker.postMessage({ type: 'stage-files', root: '/vita', useContentCache,
+            files: staged.map((file) => ({ ...file,
+              url: serverPaths.has(file.path) ? `/stage/${file.path}` : null })) });
         } catch (error) { if (worker !== currentWorker) return; log('manifest failed: ' + error); status.textContent = 'Staging failed'; notice(error.message); stop(true); }
         break;
       case 'stage-progress':
@@ -449,13 +630,47 @@ async function run() {
           const bytes = data.bytes || 0;
           const filePct = data.pathSize >= 1048576 && data.pathBytes > 0
             ? Math.min(99, Math.floor(data.pathBytes / data.pathSize * 100)) : null;
-          launch((data.path ? `Downloading ${data.path}` : 'Staging game files…') + (filePct === null ? '' : ` — ${filePct}%`),
+          if (data.source === 'cache') stageSources.storage += 1;
+          else if (data.path) stageSources.downloaded += 1;
+          const phase = data.source === 'cache' && data.path ? `Reading ${data.path} from storage`
+            : (data.path ? `Downloading ${data.path}` : 'Staging game files…');
+          launch(phase + (filePct === null ? '' : ` — ${filePct}%`),
             stagingDetail(data.index || 0, bytes), stageTotals.bytes ? bytes / stageTotals.bytes : undefined);
         }
         break;
+      case 'stage-need': {
+        // OPFS read-through for the worker's staging loop. A miss (or any
+        // error) answers null and the worker downloads instead.
+        let bytes = null;
+        if (stageCacheActive && cacheNS && stageCacheIndex?.get(data.path) === data.size
+            && Number.isSafeInteger(data.size) && data.size >= 0 && typeof data.path === 'string') {
+          try {
+            const hit = await cacheNS.cacheReadFile(cacheKey, data.path);
+            if (hit && hit.byteLength === data.size) bytes = hit;
+          } catch { bytes = null; }
+        }
+        worker.postMessage({ type: 'stage-data', path: data.path, bytes: bytes ? bytes.buffer : null },
+          bytes ? [bytes.buffer] : []);
+        break;
+      }
+      case 'stage-store': {
+        if (stageCacheActive && cacheNS && typeof data.path === 'string' && data.bytes instanceof ArrayBuffer) {
+          try {
+            await cacheNS.cacheWriteFile(cacheKey, data.path, new Uint8Array(data.bytes));
+          } catch {
+            stageCacheActive = false;
+            log('[vita3k-web] content cache write failed; continuing without cache');
+          }
+        }
+        break;
+      }
       case 'staged':
         status.textContent = 'running';
-        launch('Launching the game…', `${data.files} files · ${mib(data.bytes)} MiB staged · ${elapsed()}`, 1);
+        launch('Launching the game…', `${data.files} files` +
+          (data.cachedFiles ? ` (${data.cachedFiles} from storage)` : '') +
+          ` · ${mib(data.bytes)} MiB staged · ${elapsed()}`, 1);
+        if (stageCacheActive && stageNeeded && cacheNS)
+          cacheNS.cacheWriteManifest(cacheKey, stageNeeded).catch(() => {});
         log(`staged ${data.files} files (${(data.bytes / 1048576).toFixed(1)} MiB) — launching`);
         worker.postMessage({ type: 'run-app', vitaFs: data.root, title: TITLE, app: APP, fastVblank,
           ...(AOT ? { aotUrl: '/aot.wasm' } : {}) });
@@ -485,6 +700,26 @@ async function run() {
         break;
       case 'vita-dialog': onDialog(data.dialog); break;
       case 'vita-ime': onIme(data.ime); break;
+      case 'vita-gxm-throttle': {
+        // The renderer refuses to queue more work than the GPU retires, so a
+        // slow phone GPU cannot end up permanently backlogged (which stalls
+        // the system display stack, not just this page).
+        const info = data.throttle ?? {};
+        log(`[gxm-throttle] GPU saturated: ${info.inFlight} scenes queued (max ${info.maxInFlight}); ` +
+          `${info.throttledScenes} frames dropped to keep the device responsive`);
+        notice(`GPU is saturated (${info.inFlight} frames queued) — frames are being dropped. ` +
+          'Reload with ?scale=1 for a lighter render, then Play.');
+        break;
+      }
+      case 'vita-gxm-device': {
+        // The worker's renderer lost its WebGPU device: emulation continues
+        // but no new frames can draw. Say so and offer the restart path.
+        const info = data.device ?? {};
+        log(`[gxm-device] lost reason=${info.reason ?? 'unknown'} message=${info.message ?? ''}`);
+        status.textContent = 'Graphics device lost';
+        notice(`Graphics device lost (${info.reason ?? 'unknown'}) — the game keeps running but cannot draw. Stop and press Play to restart.`);
+        break;
+      }
       case 'vita-exit':
         // Report first, then release the worker: stop() must not overwrite the
         // outcome the viewer is waiting to read.
