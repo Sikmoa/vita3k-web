@@ -407,6 +407,7 @@ set(_hle_exports
     # processmgr and acmgr (retail console: DIPSW and QA flags clear).
     SceThreadmgrForDriver_1AAFA818 SceThreadmgrForDriver_5053B005
     SceProcessmgrForDriver_61B9B6FA SceProcessmgrForDriver_B1C3EFCA
+    SceProcessmgrForDriver_D141C076 SceProcessmgrForDriver_6599E5D9 sceKernelGetPMUSERENR
     ksceSblACMgrIsDevelopmentMode ksceSblACMgrIsGameProgram ksceSblACMgrIsPSMDevAssistant
 )
 

@@ -44,6 +44,33 @@ EXPORT(int, SceProcessmgrForDriver_B1C3EFCA, SceUID pid, SceUInt32 value) {
     return RET_ERROR(dipsw_off);
 }
 
+// Firmware 3.74 processmgr resolves pid 0 (and its own pid) to the calling
+// process; any other is 0x80029001 here, where there is one process.
+static bool is_own_process(SceUID pid) {
+    return pid == 0 || pid == GUEST_PROCESS_ID;
+}
+
+// Processmgr 0x81000a69: the SDK version from the executable's
+// SceProcessParam (sysmodule compares it when loading NP message).
+EXPORT(int, SceProcessmgrForDriver_D141C076, SceUID pid, SceUInt32 *sdk_version) {
+    TRACY_FUNC(SceProcessmgrForDriver_D141C076, pid, sdk_version);
+    if (!is_own_process(pid))
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_PID);
+    const SceProcessParam *param = emuenv.kernel.process_param.get(emuenv.mem);
+    *sdk_version = param ? param->fw_version : 0;
+    return 0;
+}
+
+// Processmgr 0x8100590d: writes the process's PMUSERENR word in SceLibKernel
+// (sysmodule sets it around loading libperf).
+EXPORT(int, SceProcessmgrForDriver_6599E5D9, SceUID pid, SceUInt32 value) {
+    TRACY_FUNC(SceProcessmgrForDriver_6599E5D9, pid, value);
+    if (!is_own_process(pid))
+        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_PID);
+    emuenv.kernel.pmuserenr = value;
+    return 0;
+}
+
 EXPORT(int, ksceKernelGetProcessInfo) {
     return UNIMPLEMENTED();
 }

@@ -1521,9 +1521,9 @@ EXPORT(int, sceKernelGetOpenPsId) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceKernelGetPMUSERENR) {
+EXPORT(SceUInt32, sceKernelGetPMUSERENR) {
     TRACY_FUNC(sceKernelGetPMUSERENR);
-    return UNIMPLEMENTED();
+    return emuenv.kernel.pmuserenr;
 }
 
 EXPORT(int, sceKernelGetProcessTime, SceUInt64 *time) {

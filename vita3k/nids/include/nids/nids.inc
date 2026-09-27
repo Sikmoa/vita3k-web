@@ -6130,6 +6130,8 @@ NID(sceKernelUnregisterProcessTerminationCallback, 0x973A4527)
 // Library "SceProcessmgrForDriver"
 NID(SceProcessmgrForDriver_61B9B6FA, 0x61B9B6FA)
 NID(SceProcessmgrForDriver_B1C3EFCA, 0xB1C3EFCA)
+NID(SceProcessmgrForDriver_6599E5D9, 0x6599E5D9)
+NID(SceProcessmgrForDriver_D141C076, 0xD141C076)
 NID(ksceKernelCreateProcessLocalStorage, 0x3801D7D6)
 NID(ksceKernelGetProcessInfo, 0x0AFF3EAE)
 NID(ksceKernelGetProcessLocalStorageAddr, 0xEE694840)

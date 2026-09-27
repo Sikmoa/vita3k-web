@@ -153,6 +153,10 @@ struct KernelState {
     };
     std::map<Address, MspaceUsage> mspace_usage;
 
+    // SceLibKernel's PMUSERENR word (sceKernelGetPMUSERENR), which
+    // SceProcessmgrForDriver_6599E5D9 writes for the process.
+    SceUInt32 pmuserenr = 0;
+
     Ptr<const void> tls_address = Ptr<const void>(0);
     unsigned int tls_psize = 0;
     unsigned int tls_msize = 0;
