@@ -1,0 +1,223 @@
+// Game content in persistent browser storage (OPFS). A package (.zip the user
+// picks) defines its own title: its `ux0/app/<id>/` directory names the title
+// and every file it ships is stored under that title's namespace, so an
+// upload alone makes a game bootable — no server-side staging. Files the
+// package lacks (firmware above all) come from the server and are cached the
+// same way on first use. Runs on the page and in the worker; every read
+// degrades to a miss and every call reports failure with a message.
+import { listZipEntries, extractZipEntry, normalizeEntryPath } from './zip.js';
+
+export function contentCacheSupported() {
+  try {
+    return typeof navigator !== 'undefined' && typeof navigator.storage?.getDirectory === 'function';
+  } catch {
+    return false;
+  }
+}
+
+const sanitize = (value) =>
+  String(value ?? '').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 64) || '_';
+export function cacheKeyFor(title, app) {
+  return `${sanitize(title)}/${sanitize(app)}`;
+}
+
+const contentParts = (key) => ['vita3k-content', ...key.split('/')];
+const metaParts = (key) => ['vita3k-meta', ...key.split('/')];
+
+async function openDir(create, ...parts) {
+  let dir = await navigator.storage.getDirectory();
+  for (const part of parts) dir = await dir.getDirectoryHandle(part, { create });
+  return dir;
+}
+
+export async function cacheReadManifest(key) {
+  try {
+    const dir = await openDir(false, ...metaParts(key));
+    const handle = await dir.getFileHandle('manifest.json');
+    const json = JSON.parse(await (await handle.getFile()).text());
+    if (!json || !Array.isArray(json.files)) return null;
+    if (!json.files.every((f) => typeof f?.path === 'string' && Number.isSafeInteger(f?.size))) return null;
+    return json;
+  } catch {
+    return null;
+  }
+}
+
+export async function cacheWriteManifest(key, files) {
+  const dir = await openDir(true, ...metaParts(key));
+  const handle = await dir.getFileHandle('manifest.json', { create: true });
+  const writable = await handle.createWritable();
+  try {
+    await writable.write(JSON.stringify({ files }));
+  } finally {
+    await writable.close();
+  }
+}
+
+export async function cacheReadFile(key, relPath) {
+  try {
+    const segments = relPath.split('/');
+    const dir = await openDir(false, ...contentParts(key), ...segments.slice(0, -1));
+    const handle = await dir.getFileHandle(segments[segments.length - 1]);
+    return new Uint8Array(await (await handle.getFile()).arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
+export async function cacheWriteFile(key, relPath, bytes) {
+  const segments = relPath.split('/');
+  const dir = await openDir(true, ...contentParts(key), ...segments.slice(0, -1));
+  const handle = await dir.getFileHandle(segments[segments.length - 1], { create: true });
+  const writable = await handle.createWritable();
+  try {
+    await writable.write(bytes);
+    await writable.close();
+  } catch (error) {
+    try { await writable.close(); } catch {}
+    try { await dir.removeEntry(segments[segments.length - 1]); } catch {}
+    throw error;
+  }
+}
+
+export async function cacheClear(key) {
+  for (const parts of [contentParts(key), metaParts(key)]) {
+    try {
+      const parent = await openDir(false, ...parts.slice(0, -1));
+      await parent.removeEntry(parts[parts.length - 1], { recursive: true });
+    } catch {}
+  }
+}
+
+// Titles this browser has content for: [{ title, app, files, bytes }].
+export async function listCachedTitles() {
+  const out = [];
+  try {
+    const root = await openDir(false, 'vita3k-meta');
+    for await (const [title, handle] of root.entries()) {
+      if (handle.kind !== 'directory') continue;
+      for await (const [app, appHandle] of handle.entries()) {
+        if (appHandle.kind !== 'directory') continue;
+        let files = 0, bytes = 0;
+        try {
+          const manifest = JSON.parse(await (await (await appHandle.getFileHandle('manifest.json')).getFile()).text());
+          files = manifest.files.length;
+          bytes = manifest.files.reduce((sum, file) => sum + file.size, 0);
+        } catch {}
+        if (files) out.push({ title, app, files, bytes });
+      }
+    }
+  } catch {}
+  return out.sort((a, b) => a.title.localeCompare(b.title));
+}
+
+// Which needed paths does a stored manifest cover (path+size)? Returns a
+// Map<path, size>; anything absent is fetched (and then stored).
+export function cacheIndexFor(manifestFiles, needed) {
+  const index = new Map();
+  if (!Array.isArray(manifestFiles) || !Array.isArray(needed)) return index;
+  const have = new Map(manifestFiles.map((f) => [f?.path, f?.size]));
+  for (const file of needed) {
+    if (typeof file?.path === 'string' && have.get(file.path) === file.size)
+      index.set(file.path, file.size);
+  }
+  return index;
+}
+
+// Vita device roots: a path starting with one of these is already absolute
+// in the guest's filesystem and must not be re-rooted under ux0.
+const DEVICE_ROOTS = new Set(['ux0', 'os0', 'vs0', 'ur0', 'vd0', 'tm0', 'sa0', 'pd0', 'app0', 'ux0:']);
+
+// Which title a package holds and what it ships, normalized into the Vita
+// tree. The app directory may sit at `ux0/app/<id>/…` or `app/<id>/…`,
+// optionally under wrapper folders (`MyGame/ux0/app/<id>/…`), which is how
+// most dumps and homebrew zips are archived. Everything under the same device
+// root is kept when it belongs to this title (its app directory, its trophy
+// data) or is firmware the package happens to include.
+// Returns { title, app, files: [{ path, size, entry }] }.
+export async function packageContents(blob) {
+  if (!blob || !Number.isSafeInteger(blob.size) || blob.size === 0)
+    throw new Error('empty package file');
+  const entries = await listZipEntries(blob);
+  const files = [];
+  for (const entry of entries) {
+    if (entry.dir) continue;
+    const path = normalizeEntryPath(entry.name);
+    if (path === null) continue;
+    files.push({ entry, path });
+  }
+  if (!files.length) throw new Error('package contains no usable files');
+  // Candidate device roots: each `app/<id>` occurrence fixes a strip depth
+  // (one level shallower when it is already under ux0/). The depth whose
+  // `app/<id>` pair covers the most files wins; ties keep the first.
+  const candidates = new Map(); // depth -> { ids: Map<id, count>, hits }
+  for (const file of files) {
+    const segments = file.path.split('/');
+    const appAt = segments.indexOf('app');
+    if (appAt < 0 || appAt + 1 >= segments.length) continue;
+    const id = segments[appAt + 1];
+    if (!/^[A-Za-z0-9_-]{3,24}$/.test(id)) continue;
+    const depth = appAt >= 1 && segments[appAt - 1] === 'ux0' ? appAt - 1 : appAt;
+    let candidate = candidates.get(depth);
+    if (!candidate) candidates.set(depth, candidate = { depth, ids: new Map(), hits: 0 });
+    candidate.ids.set(id, (candidate.ids.get(id) ?? 0) + 1);
+    candidate.hits++;
+  }
+  let best = null;
+  for (const candidate of candidates.values()) {
+    const [title, hits] = [...candidate.ids.entries()].sort((a, b) => b[1] - a[1])[0];
+    if (!best || hits > best.hits) best = { ...candidate, title, hits };
+  }
+  if (!best)
+    throw new Error('no game found in the package: expected an app/ or ux0/app/ directory ' +
+      '(a .zip of the title\'s ux0 tree)');
+  const shipped = [];
+  for (const file of files) {
+    const segments = file.path.split('/');
+    if (segments.length <= best.depth) continue;
+    // The strip depth lands on a device root when the archive holds the
+    // whole Vita tree (os0/… next to ux0/…), and on a bare ux0 tree when it
+    // holds only the app partition: the latter needs the ux0/ prefix.
+    const rest = segments.slice(best.depth).join('/');
+    const rooted = DEVICE_ROOTS.has(segments[best.depth]);
+    const path = rooted ? rest : 'ux0/' + rest;
+    const isTitle = path.startsWith(`ux0/app/${best.title}/`) || path.startsWith('ux0/user/');
+    // Anything outside ux0 (firmware the package happens to carry) ships as
+    // is; inside ux0 only this title's own files are kept.
+    if (rooted ? false : !isTitle) continue;
+    shipped.push({ path, size: file.entry.size, entry: file.entry });
+  }
+  if (!shipped.length) throw new Error(`package has no files for ${best.title}`);
+  return { title: best.title, app: best.title, files: shipped };
+}
+
+// Store a package under its own title's key. onProgress(done, total, path,
+// doneBytes, totalBytes). Returns { title, app, files, bytes }.
+export async function unpackPackageToCache(blob, key, onProgress) {
+  const contents = await packageContents(blob);
+  const totalBytes = contents.files.reduce((sum, file) => sum + file.size, 0);
+  await cacheClear(key);
+  const stored = [];
+  let bytes = 0;
+  try {
+    for (const file of contents.files) {
+      const payload = await extractZipEntry(blob, file.entry);
+      if (payload.byteLength !== file.size)
+        throw new Error(`size mismatch in ${file.path}: ${payload.byteLength} != ${file.size}`);
+      await cacheWriteFile(key, file.path, payload);
+      stored.push({ path: file.path, size: file.size });
+      bytes += payload.byteLength;
+      onProgress?.(stored.length, contents.files.length, file.path, bytes, totalBytes);
+    }
+  } catch (error) {
+    // Keep what unpacked cleanly so a re-upload only has to finish the tail.
+    if (stored.length) {
+      try { await cacheWriteManifest(key, stored); } catch {}
+    } else {
+      try { await cacheClear(key); } catch {}
+    }
+    throw error;
+  }
+  await cacheWriteManifest(key, stored);
+  return { title: contents.title, app: contents.app, files: stored.length, bytes };
+}
