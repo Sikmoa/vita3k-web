@@ -56,6 +56,14 @@ target_link_options(vita3k_web_jit PRIVATE
     "-sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_vita3k_web_set_app_paths','_vita3k_web_set_license_key','_vita3k_web_run_app']"
     "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','cwrap']")
 
+# The guest hot path must not call through invoke_* exception wrappers.
+find_program(VITA3K_WASM_OBJDUMP wasm-objdump REQUIRED)
+add_custom_command(TARGET vita3k_web_jit POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E env "WASM_OBJDUMP=${VITA3K_WASM_OBJDUMP}"
+        ${CMAKE_CROSSCOMPILING_EMULATOR} "${CMAKE_CURRENT_LIST_DIR}/tests/hot_path_invokes.mjs"
+        "$<TARGET_FILE_DIR:vita3k_web_jit>/vita3k_web_jit.wasm"
+    VERBATIM)
+
 add_executable(vita3k_jit_fixture_node
     src/vita_runtime.cpp src/vita_display_bridge.cpp tests/vita_bench_main.cpp)
 target_compile_definitions(vita3k_jit_fixture_node PRIVATE VITA3K_USE_WASM_JIT=1)

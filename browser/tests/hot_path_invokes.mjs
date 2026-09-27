@@ -9,7 +9,8 @@
 //
 //   node browser/tests/hot_path_invokes.mjs [build/web64/browser/vita3k_web_jit.wasm]
 //
-// Needs wasm-objdump (wabt) on PATH.
+// Needs wasm-objdump (wabt): $WASM_OBJDUMP or on PATH. Runs after every
+// vita3k_web_jit link (browser/runtime_wasmjit.cmake).
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 
@@ -24,7 +25,7 @@ const hot = new Map([
 // but the HLE body itself must be a direct call_indirect after resolve_import.
 const callImport = 'call_import(EmuEnvState&, CPUState&, unsigned int, int)';
 
-const objdump = spawn('wasm-objdump', ['-d', wasm], { stdio: ['ignore', 'pipe', 'inherit'] });
+const objdump = spawn(process.env.WASM_OBJDUMP || 'wasm-objdump', ['-d', wasm], { stdio: ['ignore', 'pipe', 'inherit'] });
 const found = new Map();
 let current = null, callImportLines = null;
 for await (const line of createInterface({ input: objdump.stdout })) {
