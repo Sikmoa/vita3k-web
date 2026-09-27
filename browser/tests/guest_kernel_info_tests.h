@@ -1,7 +1,9 @@
-// Firmware (SceKernelThreadMgr and SceSysmem 3.74) process, thread and driver
-// queries under the fiber runtime.
+// Firmware (SceKernelThreadMgr, SceSysmem and SceGxm 3.74) process, thread and
+// driver queries under the fiber runtime.
 #pragma once
 #include "guest_sync_delete_tests.h"
+#include <gxm/state.h>
+#include <gxm/types.h>
 
 DECL_EXPORT(SceUID, sceKernelGetProcessId);
 DECL_EXPORT(SceInt32, _sceKernelGetThreadInfo, SceUID threadId, Ptr<SceKernelThreadInfo> pInfo, const SceSize *pSize);
@@ -10,6 +12,12 @@ DECL_EXPORT(SceInt32, sceKernelChangeThreadPriority, SceUID thid, SceInt32 prior
 DECL_EXPORT(SceInt32, ksceKernelSetPermission, SceInt32 permission);
 DECL_EXPORT(int, SceThreadmgrForDriver_20C228E4);
 DECL_EXPORT(int, SceQafMgrForDriver_B9770A13);
+DECL_EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params);
+DECL_EXPORT(int, sceGxmTerminate);
+DECL_EXPORT(int, sceGxmMapVertexUsseMemory, Ptr<void> base, uint32_t size, uint32_t *offset);
+DECL_EXPORT(int, sceGxmMapFragmentUsseMemory, Ptr<void> base, uint32_t size, uint32_t *offset);
+DECL_EXPORT(int, sceGxmUnmapVertexUsseMemory, void *base);
+DECL_EXPORT(int, sceGxmUnmapFragmentUsseMemory, void *base);
 
 namespace guest_kernel_info {
 constexpr uint32_t kGetThreadId = 0x0fb972f9;
@@ -163,6 +171,40 @@ inline void test_guest_kernel_info(EmuEnvState &env, vita3k::web::GuestThreadRun
     caller->is_processing_callbacks = false;
     REQUIRE(export_SceQafMgrForDriver_B9770A13(env, caller->id, "fixture") == 0);
     std::puts("Driver thread permission, callback state and QA flag passed");
+
+    // USSE mapping (libgxm 0x8100df34/0x8100e128, unmap 0x8100e084/0x8100e27c).
+    const bool initialized = env.gxm.initialized;
+    env.gxm.initialized = false;
+    uint32_t offset = 0xcccccccc;
+    const Ptr<void> base(data + 0x800);
+    void *const host_base = base.get(env.mem);
+    REQUIRE(export_sceGxmMapVertexUsseMemory(env, caller->id, "fixture", base, 0x1000, &offset) == SCE_GXM_ERROR_UNINITIALIZED);
+    REQUIRE(export_sceGxmUnmapFragmentUsseMemory(env, caller->id, "fixture", host_base) == SCE_GXM_ERROR_UNINITIALIZED);
+    REQUIRE(export_sceGxmTerminate(env, caller->id, "fixture") == SCE_GXM_ERROR_UNINITIALIZED);
+    env.gxm.initialized = true;
+    REQUIRE(export_sceGxmInitialize(env, caller->id, "fixture", nullptr) == SCE_GXM_ERROR_ALREADY_INITIALIZED);
+    const Address param = data + 0xa00;
+    auto *process = Ptr<SceProcessParam>(param).get(env.mem);
+    std::memset(process, 0, sizeof(*process));
+    process->magic = '2PSP';
+    process->version = 1;
+    process->fw_version = 0x03100000;
+    for (const bool vertex : {true, false}) {
+        const auto map = vertex ? export_sceGxmMapVertexUsseMemory : export_sceGxmMapFragmentUsseMemory;
+        const auto unmap = vertex ? export_sceGxmUnmapVertexUsseMemory : export_sceGxmUnmapFragmentUsseMemory;
+        REQUIRE(map(env, caller->id, "fixture", Ptr<void>(), 0x1000, &offset) == SCE_GXM_ERROR_INVALID_POINTER);
+        REQUIRE(map(env, caller->id, "fixture", base, 0x1000, nullptr) == SCE_GXM_ERROR_INVALID_POINTER);
+        // Only titles built for SDK 3.10 or later are limited to 8 MiB.
+        REQUIRE(map(env, caller->id, "fixture", base, MiB(8) + 1, &offset) == 0);
+        env.kernel.process_param = Ptr<SceProcessParam>(param);
+        REQUIRE(map(env, caller->id, "fixture", base, MiB(8) + 1, &offset) == SCE_GXM_ERROR_INVALID_VALUE);
+        REQUIRE(map(env, caller->id, "fixture", base, MiB(8), &offset) == 0);
+        env.kernel.process_param = Ptr<SceProcessParam>();
+        REQUIRE(unmap(env, caller->id, "fixture", nullptr) == SCE_GXM_ERROR_INVALID_POINTER);
+        REQUIRE(unmap(env, caller->id, "fixture", host_base) == 0);
+    }
+    env.gxm.initialized = initialized;
+    std::puts("USSE map and unmap validation passed");
 
     REQUIRE(semaphore_delete(env.kernel, "fixture", 0, sema) == 0);
     REQUIRE(runtime.shutdown());

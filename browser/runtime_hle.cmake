@@ -209,7 +209,7 @@ set(_hle_exports
     # Limbo graphics-memory mapping (imports=4033 missing_nids=1 PC=8126b2d0):
     # sceGxmMap/UnmapMemory record regions in gxm.memory_mapped_regions and
     # return 0 while enable_memory_mapping stays false (the default); the
-    # USSE map/unmap pair are always-success upstream stubs (desktop parity).
+    # USSE map/unmap pair validate their arguments as libgxm does.
     sceGxmMapMemory sceGxmUnmapMemory
     sceGxmMapFragmentUsseMemory sceGxmUnmapFragmentUsseMemory
     sceGxmMapVertexUsseMemory sceGxmUnmapVertexUsseMemory

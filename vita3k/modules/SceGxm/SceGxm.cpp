@@ -2864,6 +2864,8 @@ EXPORT(int, sceGxmGetRenderTargetMemSize, const SceGxmRenderTargetParams *params
 
 EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
     TRACY_FUNC(sceGxmInitialize, params);
+    if (emuenv.gxm.initialized)
+        return RET_ERROR(SCE_GXM_ERROR_ALREADY_INITIALIZED);
     if (!params) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
     }
@@ -2885,7 +2887,9 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
 
 #ifdef VITA3K_BROWSER_GXM
     // Browser GPU completion is cooperative; never create a native host thread.
-    return browser::gxm_initialize(emuenv);
+    const int result = browser::gxm_initialize(emuenv);
+    emuenv.gxm.initialized = result == SCE_KERNEL_OK;
+    return result;
 #else
     const ThreadStatePtr main_thread = emuenv.kernel.get_thread(thread_id);
     const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", Ptr<void>(0), SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, nullptr);
@@ -2899,6 +2903,7 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
     emuenv.gxm.display_host_thread = std::thread(display_entry_thread, std::ref(emuenv));
     emuenv.gxm.notification_region = Ptr<uint32_t>(alloc(emuenv.mem, MiB(1), "SceGxmNotificationRegion"));
     memset(emuenv.gxm.notification_region.get(emuenv.mem), 0, MiB(1));
+    emuenv.gxm.initialized = true;
     return 0;
 #endif
 }
@@ -2908,15 +2913,33 @@ EXPORT(int, sceGxmIsDebugVersion) {
     return UNIMPLEMENTED();
 }
 
+// libgxm 3.74 checks these before its driver maps the memory into a USSE
+// heap. Titles built for SDK 3.10 or later map at most 8 MiB at a time.
+static int check_usse_mapping(EmuEnvState &emuenv, const char *export_name, Ptr<void> base, uint32_t size, const uint32_t *offset) {
+    if (!emuenv.gxm.initialized)
+        return RET_ERROR(SCE_GXM_ERROR_UNINITIALIZED);
+    if (!base || !offset)
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
+    if (size > MiB(8) && emuenv.kernel.main_module_sdk_version(emuenv.mem) >= 0x03100000)
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+    return 0;
+}
+
+static int check_usse_unmapping(EmuEnvState &emuenv, const char *export_name, const void *base) {
+    if (!emuenv.gxm.initialized)
+        return RET_ERROR(SCE_GXM_ERROR_UNINITIALIZED);
+    if (!base)
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
+    return 0;
+}
+
 EXPORT(int, sceGxmMapFragmentUsseMemory, Ptr<void> base, uint32_t size, uint32_t *offset) {
     TRACY_FUNC(sceGxmMapFragmentUsseMemory, base, size, offset);
-    STUBBED("always return success");
+    if (auto error = check_usse_mapping(emuenv, export_name, base, size, offset))
+        return error;
 
-    if (!base || !offset) {
-        return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
-    }
-
-    // TODO What should this be?
+    // The offset encodes the USSE device address the driver picks; nothing
+    // here reads it back, so the guest address stands in for it.
     *offset = base.address();
 
     return 0;
@@ -2962,13 +2985,10 @@ EXPORT(int, sceGxmMapMemory, Ptr<void> base, uint32_t size, uint32_t attribs) {
 
 EXPORT(int, sceGxmMapVertexUsseMemory, Ptr<void> base, uint32_t size, uint32_t *offset) {
     TRACY_FUNC(sceGxmMapVertexUsseMemory, base, size, offset);
-    STUBBED("always return success");
+    if (auto error = check_usse_mapping(emuenv, export_name, base, size, offset))
+        return error;
 
-    if (!base || !offset) {
-        return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
-    }
-
-    // TODO What should this be?
+    // See sceGxmMapFragmentUsseMemory.
     *offset = base.address();
 
     return 0;
@@ -4926,8 +4946,13 @@ EXPORT(int, sceGxmSyncObjectDestroy, Ptr<SceGxmSyncObject> syncObject) {
 
 EXPORT(int, sceGxmTerminate) {
     TRACY_FUNC(sceGxmTerminate);
+    if (!emuenv.gxm.initialized)
+        return RET_ERROR(SCE_GXM_ERROR_UNINITIALIZED);
 #ifdef VITA3K_BROWSER_GXM
-    return browser::gxm_terminate(emuenv);
+    const int result = browser::gxm_terminate(emuenv);
+    if (result == SCE_KERNEL_OK)
+        emuenv.gxm.initialized = false;
+    return result;
 #else
     // Make sure everything is done in SDL side before killing Vita thread
     emuenv.gxm.display_queue.wait_empty();
@@ -4935,6 +4960,7 @@ EXPORT(int, sceGxmTerminate) {
     gxm::destroy_all_render_targets(emuenv, false);
     emuenv.gxm.display_queue.abort();
     emuenv.kernel.get_thread(emuenv.gxm.display_queue_thread)->exit_delete();
+    emuenv.gxm.initialized = false;
     return 0;
 #endif
 }
@@ -5699,11 +5725,7 @@ EXPORT(int, sceGxmTransferFinish) {
 
 EXPORT(int, sceGxmUnmapFragmentUsseMemory, void *base) {
     TRACY_FUNC(sceGxmUnmapFragmentUsseMemory, base);
-    if (!base) {
-        return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
-    }
-
-    return 0;
+    return check_usse_unmapping(emuenv, export_name, base);
 }
 
 EXPORT(int, sceGxmUnmapMemory, Ptr<void> base) {
@@ -5741,11 +5763,7 @@ EXPORT(int, sceGxmUnmapMemory, Ptr<void> base) {
 
 EXPORT(int, sceGxmUnmapVertexUsseMemory, void *base) {
     TRACY_FUNC(sceGxmUnmapVertexUsseMemory, base);
-    if (!base) {
-        return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
-    }
-
-    return 0;
+    return check_usse_unmapping(emuenv, export_name, base);
 }
 
 EXPORT(int, sceGxmVertexFence, SceGxmContext *immediateContext) {

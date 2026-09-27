@@ -56,6 +56,8 @@ struct MemoryMapInfo {
 
 struct GxmState {
     SceGxmInitializeParams params;
+    // Between a successful sceGxmInitialize and sceGxmTerminate.
+    bool initialized = false;
 
     Queue<DisplayCallback> display_queue;
     SceUID display_queue_thread;
@@ -89,6 +91,7 @@ struct GxmState {
         memory_mapped_regions.clear();
         display_queue.reset();
         params = {};
+        initialized = false;
         display_queue_thread = 0;
         global_timestamp = 1;
         last_display_global = 0;
