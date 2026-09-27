@@ -1755,32 +1755,15 @@ struct WasmJitCPU::Impl {
             ++post_hle_entries;
             last_svc_at_entry = svc_exits;
         }
-        // The whole-cache revalidation below exists because host/HLE/loader Ptr
-        // writes are unchecked and can change any cached region. Guest writes
-        // cannot need it: a store into a code page already forces the checked
-        // path, sets smc_dirty, and the region loop above re-forms from the
-        // bytes on disk. So the ONLY entries that can need a revalidation are
-        // the ones where host code actually ran (an SVC/HLE exit was serviced
-        // since the previous entry). Budget/miss/stop/SMC entries carry no host
-        // write, and rescanning the entire cache for them is pure waste: a
-        // measured 180s retail run spent 42.0s of 176.6s wall clock in exactly
-        // this sweep, ~1021 region byte-compares on each of 69k host entries,
-        // while evictions from the sweep itself were zero. Skipping the
-        // no-host-write entries keeps the guarantee (any real host write still
-        // forces a full sweep before the next entry can chain into a region)
-        // and drops the count to the HLE-driven subset.
-        //
-        // VITA3K_WASMJIT_REVALIDATE_ALL=1 restores the unconditional sweep for
-        // matched A/B runs: a single earlier pair of runs suggested B2 was a
-        // net regression, but the LRU explanation offered for it was wrong
-        // (last_used has exactly one writer, the loop-top selected-region path
-        // at the `found->second.last_used = ++region_clock` line below;
-        // region_unchanged() only reads bytes), so the question is now purely
-        // empirical and needs interleaved samples rather than one pair.
-        if (parent->mem->direct_host_memory && (revalidate_all_enabled() || hle_ran)) {
-            // The hint map/table are process-global. Discard hints from any
-            // other cooperatively scheduled CPU before publishing this CPU's
-            // revalidated region set; table slots themselves remain reusable.
+        if (parent->mem->direct_host_memory) {
+            // Hint ownership, independent of the sweep gate below. The hint
+            // map/table are process-global: discard hints from any other
+            // cooperatively scheduled CPU before this CPU chains through the
+            // map, because another CPU's regions are neither in this CPU's
+            // cache nor covered by its sweep. After a bump every reachable hint
+            // is re-inserted by this CPU's loop top, which validates the region
+            // bytes first; that is also what covers tracked code writes made by
+            // other CPUs, since any such CPU entered (and bumped) in between.
             // Bump ONLY when an eviction happened since this CPU last synced:
             // an unconditional per-entry bump would stale this CPU's own live
             // entries, forcing one host miss per pump re-entry (measured 717
@@ -1796,6 +1779,21 @@ struct WasmJitCPU::Impl {
                 dispatch_bump_epoch();
                 last_dispatch_version = dispatch_global_version;
             }
+        }
+        // The whole-cache revalidation below exists because host/HLE/loader Ptr
+        // writes can change any cached region while this CPU's own hints stay
+        // live (no other CPU entered, so the sync above did not bump). Guest
+        // writes by this CPU take the checked path, set smc_dirty and drop the
+        // affected regions. So the only entries that can need a sweep are the
+        // ones where host code ran for this CPU (an SVC/HLE exit was serviced
+        // since the previous entry). A measured 180s retail run spent 42.0s of
+        // 176.6s wall clock sweeping ~1021 regions on each of 69k host entries,
+        // with zero evictions; gating on HLE drops that to the HLE subset.
+        //
+        // VITA3K_WASMJIT_REVALIDATE_ALL=1 restores the every-entry sweep for
+        // matched A/B runs; whether the gate is a net win is an empirical
+        // question that needs interleaved samples rather than one pair.
+        if (parent->mem->direct_host_memory && (revalidate_all_enabled() || hle_ran)) {
             // Host/HLE/loader Ptr writes are intentionally unchecked and can
             // change any cached region, not only the first region entered.
             // Revalidate ALL potential dispatch targets after each host entry
