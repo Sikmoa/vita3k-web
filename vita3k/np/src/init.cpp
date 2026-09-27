@@ -53,6 +53,7 @@ bool deinit(NpTrophyState &state) {
             close_file(*ctx.io, ctx.trophy_file_stream, "np_deinit");
     }
     state.contexts.clear();
+    state.handles.clear();
     state.clear_trophy_unlock_callbacks();
     state.inited = false;
     return true;

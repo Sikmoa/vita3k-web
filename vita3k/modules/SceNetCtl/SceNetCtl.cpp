@@ -760,12 +760,13 @@ EXPORT(int, sceNetCtlInit) {
     emuenv.netctl.adhocThread = std::thread(adhoc_thread, std::ref(emuenv), thread_id);
 #endif
 
-    return STUBBED("Stub");
+    return 0;
 }
 
 EXPORT(void, sceNetCtlTerm) {
     TRACY_FUNC(sceNetCtlTerm);
-    STUBBED("Stub");
+    if (!emuenv.netctl.inited)
+        return;
     emuenv.netctl.inited = false;
 
     {

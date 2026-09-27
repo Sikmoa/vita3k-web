@@ -20,9 +20,14 @@
 #include <io/state.h>
 #include <kernel/state.h>
 #include <np/common.h>
+#include <np/state.h>
 
 #include <util/tracy.h>
 TRACY_MODULE_NAME(SceNpCommon);
+
+enum SceNpAuthErrorCode {
+    SCE_NP_AUTH_ERROR_ALREADY_INITIALIZED = 0x80550301,
+};
 
 enum SceNpUtilErrorCode {
     SCE_NP_UTIL_Ok = 0x0,
@@ -87,14 +92,20 @@ EXPORT(int, sceNpAuthGetTicketParam) {
     return UNIMPLEMENTED();
 }
 
+// Firmware 3.74 np_common: Init registers with the shell's NP service and
+// fails only when already initialized; Term succeeds either way.
 EXPORT(int, sceNpAuthInit) {
     TRACY_FUNC(sceNpAuthInit);
-    return UNIMPLEMENTED();
+    if (emuenv.np.auth_inited)
+        return RET_ERROR(SCE_NP_AUTH_ERROR_ALREADY_INITIALIZED);
+    emuenv.np.auth_inited = true;
+    return 0;
 }
 
 EXPORT(int, sceNpAuthTerm) {
     TRACY_FUNC(sceNpAuthTerm);
-    return UNIMPLEMENTED();
+    emuenv.np.auth_inited = false;
+    return 0;
 }
 
 EXPORT(int, sceNpCmpNpId, np::SceNpId *npid1, np::SceNpId *npid2) {

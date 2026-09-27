@@ -36,6 +36,19 @@ inline void test_guest_appmgr_rtc(EmuEnvState &env, ThreadState &thread) {
         REQUIRE(bytes[i] == 0);
     REQUIRE(call(receive_event, { 0 }) == 0x80802016);
 
+    // App state: nothing pending; the checks come before the pointer's, and
+    // the 128 bytes are zeroed whatever the result.
+    constexpr uint32_t app_state = 0x5E86319A;
+    std::memset(bytes, 0xcc, 0x80);
+    REQUIRE(call(app_state, { block, 0x80, 0x02000000 }) == 0);
+    for (int i = 0; i < 0x80; ++i)
+        REQUIRE(bytes[i] == 0);
+    std::memset(bytes, 0xcc, 0x80);
+    REQUIRE(call(app_state, { block, 0x7c, 0x02000000 }) == 0x8080201A && bytes[0x7f] == 0);
+    REQUIRE(call(app_state, { block, 0x80, 0x03740012 }) == 0x8080201A);
+    REQUIRE(call(app_state, { 0, 0x80, 0x02000000 }) == 0x80802016);
+    REQUIRE(call(app_state, { 0, 0x40, 0x02000000 }) == 0x8080201A);
+
     // A game has PAID class 0x210 (Limbo: 0x210000101CCA010C).
     const uint64_t saved_paid = env.kernel.process_program_authority_id;
     env.kernel.process_program_authority_id = 0x210000101CCA010CULL;

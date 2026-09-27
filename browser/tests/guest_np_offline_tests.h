@@ -1,6 +1,7 @@
 // NP while signed out, as firmware 3.74 answers it (np_manager, np_basic,
 // np_signaling, np_activity_sdk, np_common and the shell's NP service).
 #pragma once
+#include <net/state.h>
 #include <np/state.h>
 #include <cstring>
 
@@ -62,7 +63,52 @@ inline void test_guest_np_offline(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(sig_term, {}) == 0);
 
     REQUIRE(call(post_status, { np_id, 0, 0 }) == 0x80552302); // sceNpActivityInit never ran
+
+    // NpAuth and NpCommerce2 fail only on a second Init; Term always succeeds.
+    constexpr uint32_t auth_init = 0x441D8B4E, auth_term = 0x6093B689, commerce_init = 0xC73F209A,
+                       commerce_term = 0xB99958AE;
+    REQUIRE(call(auth_init, {}) == 0 && call(auth_init, {}) == 0x80550301);
+    REQUIRE(call(auth_term, {}) == 0 && call(auth_term, {}) == 0 && call(auth_init, {}) == 0);
+    REQUIRE(call(auth_term, {}) == 0);
+    REQUIRE(call(commerce_init, {}) == 0 && call(commerce_init, {}) == 0x80550f02);
+    REQUIRE(call(commerce_term, {}) == 0 && call(commerce_term, {}) == 0 && call(commerce_init, {}) == 0);
+    REQUIRE(call(commerce_term, {}) == 0);
+
+    // Trophy handles: unique ids, at most four live, unknown ones refused.
+    constexpr uint32_t create_handle = 0x4EBC6977, destroy_handle = 0xFF142071, abort_handle = 0xD55C6F4C;
+    auto &trophy = env.np.trophy_state;
+    REQUIRE(call(create_handle, { out }) == 0x80551601); // sceNpTrophyInit not called
+    trophy.inited = true;
+    REQUIRE(call(create_handle, { 0 }) == 0x80551604);
+    uint32_t handles[4];
+    for (auto &handle : handles) {
+        REQUIRE(call(create_handle, { out }) == 0);
+        handle = *word;
+        REQUIRE(static_cast<int32_t>(handle) > 0);
+    }
+    REQUIRE(handles[0] != handles[1] && handles[1] != handles[2] && handles[2] != handles[3]);
+    REQUIRE(call(create_handle, { out }) == 0x80551606 && *word == 0xffffffff);
+    REQUIRE(call(abort_handle, { handles[0] }) == 0 && call(destroy_handle, { handles[0] }) == 0);
+    REQUIRE(call(destroy_handle, { handles[0] }) == 0x80551608 && call(abort_handle, { handles[0] }) == 0x80551608);
+    REQUIRE(call(destroy_handle, { 0xffffffff }) == 0x80551604);
+    REQUIRE(call(create_handle, { out }) == 0);
+    for (const uint32_t handle : { handles[1], handles[2], handles[3], *word })
+        REQUIRE(call(destroy_handle, { handle }) == 0);
+    trophy.inited = false;
+    REQUIRE(call(destroy_handle, { handles[1] }) == 0x80551601);
+
+    // NetCtl: a second Init is refused until Term.
+    constexpr uint32_t netctl_init = 0x495CA1DB, netctl_term = 0xCD188648;
+    const bool netctl_was_inited = env.netctl.inited;
+    if (netctl_was_inited)
+        call(netctl_term, {});
+    REQUIRE(call(netctl_init, {}) == 0 && call(netctl_init, {}) == 0x80412102);
+    call(netctl_term, {});
+    call(netctl_term, {}); // not initialized: nothing to do
+    REQUIRE(call(netctl_init, {}) == 0);
+    if (!netctl_was_inited)
+        call(netctl_term, {});
     call(np_term, {});
     free(env.mem, block);
-    std::puts("Guest NP offline: service state, rating, NpBasic, signaling, platform and activity passed");
+    std::puts("Guest NP offline: service state, rating, NpBasic, signaling, platform, activity, NpAuth, Commerce2, trophy handles and NetCtl passed");
 }

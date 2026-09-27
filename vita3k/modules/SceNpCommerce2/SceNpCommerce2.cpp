@@ -17,6 +17,12 @@
 
 #include <module/module.h>
 
+#include <np/state.h>
+
+enum SceNpCommerce2ErrorCode {
+    SCE_NP_COMMERCE2_ERROR_ALREADY_INITIALIZED = 0x80550f02,
+};
+
 EXPORT(int, sceNpCommerce2AbortReq) {
     return UNIMPLEMENTED();
 }
@@ -153,8 +159,13 @@ EXPORT(int, sceNpCommerce2HidePsStoreIcon) {
     return UNIMPLEMENTED();
 }
 
+// Firmware 3.74 np_commerce2: Init sets up its 8 KiB work heap and fails
+// only when already initialized; Term succeeds either way.
 EXPORT(int, sceNpCommerce2Init) {
-    return UNIMPLEMENTED();
+    if (emuenv.np.commerce2_inited)
+        return RET_ERROR(SCE_NP_COMMERCE2_ERROR_ALREADY_INITIALIZED);
+    emuenv.np.commerce2_inited = true;
+    return 0;
 }
 
 EXPORT(int, sceNpCommerce2InitGetCategoryContentsResult) {
@@ -182,5 +193,6 @@ EXPORT(int, sceNpCommerce2StopEmptyStoreCheck) {
 }
 
 EXPORT(int, sceNpCommerce2Term) {
-    return UNIMPLEMENTED();
+    emuenv.np.commerce2_inited = false;
+    return 0;
 }

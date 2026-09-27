@@ -23,6 +23,7 @@
 #include <mem/util.h> // Address.
 
 #include <map>
+#include <set>
 #include <mutex>
 #include <vector>
 
@@ -47,6 +48,9 @@ using NpTrophyUnlockCallback = std::function<void(NpTrophyUnlockCallbackData &)>
 struct NpTrophyState {
     bool inited = false;
     std::mutex access_mutex;
+    // Live handles (the shell's trophy server hands out their ids).
+    std::set<int32_t> handles;
+    int32_t next_handle = 1;
 
     std::vector<np::trophy::Context> contexts;
     std::mutex callback_mutex;
@@ -80,6 +84,8 @@ struct NpState {
     std::vector<SceUID> state_cb_pending;
     bool basic_inited = false; // SceNpBasic
     bool signaling_inited = false; // SceNpSignaling
+    bool auth_inited = false; // SceNpCommon sceNpAuthInit
+    bool commerce2_inited = false; // SceNpCommerce2
     std::map<int, Address> signaling_ctxs; // context id (1..8) -> handler
 
     NpTrophyState trophy_state;

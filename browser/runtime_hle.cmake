@@ -48,9 +48,13 @@ set(_hle_exports
     ksceKernelGetProcessLocalStorageAddr ksceKernelGetProcessLocalStorageAddrForPid
     ksceKernelCreateMutex ksceKernelDeleteMutex ksceKernelLockMutex ksceKernelUnlockMutex
     sceClibMemcpy sceClibMemset
-    # Production guest-backed heaps. Statistics/stub exports remain unselected.
+    # Production guest-backed heaps.
     sceClibMspaceCreate sceClibMspaceDestroy sceClibMspaceMalloc
     sceClibMspaceCalloc sceClibMspaceRealloc sceClibMspaceMemalign sceClibMspaceFree
+    # Usage counters kept beside dlmalloc (KernelState::mspace_usage).
+    sceClibMspaceMallocStats sceClibMspaceIsHeapEmpty
+    # Firmware 3.74 system software version; the low word of the system clock.
+    sceKernelGetSystemSwVersion ksceKernelGetSystemTimeLow
     # Production kernel memset/memcpy, required by observed firmware imports.
     kmemset kmemcpy
     sceIoOpen sceIoClose
@@ -118,25 +122,27 @@ set(_hle_exports
     # Network init/term: production bodies are net-state writes only;
     # net_utils gets a loopback Emscripten branch.
     sceNetInit sceNetTerm
-    # Offline control initialization only; upstream stub parity, no connection.
+    # Offline control initialization (firmware 3.74: a second Init is
+    # 0x80412102); no connection.
     sceNetCtlInit sceNetCtlTerm
     # NP state initialization only; no sign-in or remote service is supplied.
     sceNpInit sceNpTerm
-    # Config-based upstream service state (STUBBED); default is signed out.
+    # Signed-out service state with firmware 3.74's checks; one state
+    # notification per registered callback.
     sceNpGetServiceState sceNpManagerGetNpId
     sceNpRegisterServiceStateCallback sceNpUnregisterServiceStateCallback
     sceNpCheckCallback
-    # Existing upstream UNIMPLEMENTED bodies: desktop stub parity, not commerce support.
+    # Init/Term state of firmware 3.74 (a second Init fails); no store,
+    # social, authentication or signaling service is reachable offline.
     sceNpCommerce2Init sceNpCommerce2Term
-    # Upstream NP Basic lifecycle/handler stubs only; no social service support.
     sceNpBasicInit sceNpBasicTerm
     sceNpBasicRegisterHandler sceNpBasicUnregisterHandler
-    # Upstream auth/signaling init stubs do not supply authentication or connections.
     sceNpAuthInit sceNpAuthTerm sceNpSignalingInit sceNpSignalingTerm
     # Production local trophy-state lifecycle (no online trophy service).
     sceNpTrophyInit sceNpTrophyTerm
     # Limbo trophy frontier (imports=30690 missing_nids=1 PC=8126bac0):
-    # upstream production context/handle lifecycle over the staged TRP files.
+    # production contexts over the staged TRP files; handles with firmware
+    # 3.74's limits (four live) and checks.
     sceNpTrophyCreateContext sceNpTrophyDestroyContext
     sceNpTrophyCreateHandle sceNpTrophyDestroyHandle sceNpTrophyAbortHandle
     # Limbo trophy-state frontier (imports=40062 missing_nids=1 PC=8126c330):
@@ -279,12 +285,10 @@ set(_hle_exports
     # presenting display queue advances. No input wired yet (keyboard/gamepad
     # mapping is follow-up); the game will sit at its input screen, correctly.
     sceCtrlReadBufferPositive
-    # App-state poll (imports=610599 missing_nids=1 PC=8126b640): the 513 s
-    # browser run rendered 43 frames then stopped here. Upstream
-    # _sceAppMgrGetAppState is a forwarder (CALL_EXPORT) to
-    # __sceAppMgrGetAppState, whose body memsets the struct to 0 and returns
-    # 0 — the game asks about system/app events and UI overlay, gets "none",
-    # and proceeds. Production parity, not a new stub.
+    # App-state poll (imports=610599 missing_nids=1 PC=8126b640):
+    # _sceAppMgrGetAppState forwards (CALL_EXPORT) to __sceAppMgrGetAppState,
+    # firmware 3.74's size/version/pointer checks over a state with nothing
+    # pending (no system or app event, no system UI overlay).
     _sceAppMgrGetAppState
     # Found statically by the AOT build's unserviced-import scan (vita_app.cpp
     # build_aot_image) before the guest reached them. Production bodies in TUs
@@ -626,7 +630,7 @@ endif()
 # The bundled header disables mmap/morecore, so heaps stay in guest backing.
 add_library(vita3k_web_mspace STATIC "${_HLE_EXT}/dlmalloc/dlmalloc.cc")
 target_include_directories(vita3k_web_mspace PUBLIC "${_HLE_EXT}/dlmalloc")
-target_compile_definitions(vita3k_web_mspace PRIVATE ONLY_MSPACES=1)
+target_compile_definitions(vita3k_web_mspace PUBLIC ONLY_MSPACES=1)
 target_link_libraries(vita3k_web_runtime_hle
     PUBLIC vita3k_web_runtime_core
     PRIVATE SDL3::SDL3-static vita3k_web_mspace)

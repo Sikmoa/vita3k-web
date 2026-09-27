@@ -53,6 +53,7 @@ typedef struct SceAppMgrAppState {
     SceBool isSystemUiOverlaid; //!< Truth-value of UI overlaid of system software
     SceUInt8 reserved[128 - sizeof(SceUInt32) * 2 - sizeof(SceBool)]; //!< Reserved area
 } SceAppMgrAppState;
+static_assert(sizeof(SceAppMgrAppState) == 0x80);
 
 typedef struct SceAppMgrLoadExecOptParam {
     int reserved[256 / 4]; //!< Reserved area

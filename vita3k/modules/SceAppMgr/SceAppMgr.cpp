@@ -27,9 +27,16 @@ TRACY_MODULE_NAME(SceAppMgr);
 
 EXPORT(SceInt32, __sceAppMgrGetAppState, SceAppMgrAppState *appState, SceUInt32 sizeofSceAppMgrAppState, SceUInt32 buildVersion) {
     TRACY_FUNC(__sceAppMgrGetAppState, appState, sizeofSceAppMgrAppState, buildVersion);
-    memset(appState, 0, sizeofSceAppMgrAppState);
-
-    return STUBBED("Set to 0.");
+    // Firmware 3.74 copies its whole zeroed state out whatever the result.
+    // Nothing is pending here: no system event (sceAppMgrReceiveSystemEvent),
+    // no app event (sceAppUtilReceiveAppEvent) and no system UI overlay.
+    if (appState)
+        memset(appState, 0, sizeof(*appState));
+    if (sizeofSceAppMgrAppState != sizeof(SceAppMgrAppState) || buildVersion > 0x03740011)
+        return RET_ERROR(SCE_APPMGR_ERROR_INVALID);
+    if (!appState)
+        return RET_ERROR(SCE_APPMGR_ERROR_NULL_POINTER);
+    return 0;
 }
 
 EXPORT(int, _sceAppMgrAcidDirSet) {

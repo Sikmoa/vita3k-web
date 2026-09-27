@@ -137,9 +137,22 @@ struct SceNpTrophyData {
     SceRtcTick timestamp;
 };
 
-EXPORT(int, sceNpTrophyAbortHandle) {
-    TRACY_FUNC(sceNpTrophyAbortHandle);
-    STUBBED("Stubbed with SCE_OK");
+// Firmware 3.74 np_trophy handle checks. Every operation here completes
+// synchronously, so an abort finds nothing pending.
+static int check_trophy_handle(const NpTrophyState &state, SceNpTrophyHandle handle) {
+    if (!state.inited)
+        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+    if (handle == -1)
+        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+    if (!state.handles.contains(handle))
+        return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
+    return 0;
+}
+
+EXPORT(int, sceNpTrophyAbortHandle, SceNpTrophyHandle handle) {
+    TRACY_FUNC(sceNpTrophyAbortHandle, handle);
+    if (const int error = check_trophy_handle(emuenv.np.trophy_state, handle))
+        return RET_ERROR(error);
     return 0;
 }
 
@@ -179,12 +192,19 @@ EXPORT(int, sceNpTrophyCreateContext, np::trophy::ContextHandle *context, const 
     return 0;
 }
 
+// At most four live handles per process (firmware 3.74 np_trophy).
 EXPORT(int, sceNpTrophyCreateHandle, SceNpTrophyHandle *handle) {
     TRACY_FUNC(sceNpTrophyCreateHandle, handle);
-    // We don't handle "handle" for now. It's just a mechanic for async and its abortion.
-    // Everything emulated here is sync :)
-    STUBBED("Stubbed handle with 1");
-    *handle = 1;
+    auto &state = emuenv.np.trophy_state;
+    if (!state.inited)
+        return RET_ERROR(SCE_NP_TROPHY_ERROR_NOT_INITIALIZED);
+    if (!handle)
+        return RET_ERROR(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+    *handle = -1;
+    if (state.handles.size() >= 4)
+        return RET_ERROR(SCE_NP_TROPHY_ERROR_EXCEEDS_MAX);
+    *handle = state.next_handle++;
+    state.handles.insert(*handle);
     return 0;
 }
 
@@ -201,7 +221,9 @@ EXPORT(int, sceNpTrophyDestroyContext, np::trophy::ContextHandle handle) {
 
 EXPORT(int, sceNpTrophyDestroyHandle, SceNpTrophyHandle handle) {
     TRACY_FUNC(sceNpTrophyDestroyHandle, handle);
-    STUBBED("Stubbed with SCE_OK");
+    if (const int error = check_trophy_handle(emuenv.np.trophy_state, handle))
+        return RET_ERROR(error);
+    emuenv.np.trophy_state.handles.erase(handle);
     return 0;
 }
 
