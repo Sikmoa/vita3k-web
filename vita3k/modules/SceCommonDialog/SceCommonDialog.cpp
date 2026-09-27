@@ -20,6 +20,7 @@
 #include <dialog/state.h>
 #include <dialog/types.h>
 #include <emuenv/app_util.h>
+#include <gxm/state.h>
 #include <ime/state.h>
 #include <io/device.h>
 #include <io/functions.h>
@@ -125,7 +126,8 @@ EXPORT(int, sceCommonDialogUpdate, const SceCommonDialogUpdateParam *updateParam
     TRACY_FUNC(sceCommonDialogUpdate, updateParam);
     if (!updateParam)
         return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NULL);
-    if (!emuenv.renderer)
+    // sceGxmInitialize allocates the notification region (desktop and browser).
+    if (!emuenv.gxm.notification_region)
         return RET_ERROR(SCE_COMMON_DIALOG_ERROR_GXM_IS_UNINITIALIZED);
     complete_trophy_setup_dialog(emuenv.common_dialog);
     return 0;

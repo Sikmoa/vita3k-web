@@ -5,27 +5,10 @@
 #include <ctrl/ctrl.h>
 #include <dialog/state.h>
 #include <lang/state.h>
-#include <renderer/state.h>
+#include <gxm/state.h>
 #include <cstring>
 #include <new>
 
-// A renderer only so sceCommonDialogUpdate sees GXM as initialized.
-struct CommonDialogFixtureRenderer final : renderer::State {
-    bool init() override { return true; }
-    void late_init(const Config &, std::string_view, MemState &) override {}
-    renderer::TextureCache *get_texture_cache() override { return nullptr; }
-    void render_frame(DisplayState &, const GxmState &, MemState &) override {}
-    void swap_window() override {}
-    std::vector<uint32_t> dump_frame(DisplayState &, uint32_t &, uint32_t &) override { return {}; }
-    int get_supported_filters() override { return 0; }
-    void set_screen_filter(const std::string_view &) override {}
-    int get_max_anisotropic_filtering() override { return 1; }
-    void set_anisotropic_filtering(int) override {}
-    int get_max_2d_texture_width() override { return 4096; }
-    std::string_view get_gpu_name() override { return "fixture"; }
-    void precompile_shader(const renderer::ShadersHash &) override {}
-    void preclose_action() override {}
-};
 
 inline void test_guest_msg_dialog(EmuEnvState &env, ThreadState &thread) {
     auto call = [&](uint32_t nid, uint32_t a = 0) {
@@ -118,9 +101,9 @@ inline void test_guest_msg_dialog(EmuEnvState &env, ThreadState &thread) {
     const Address update_param = block + 0x300;
     static_assert(sizeof(SceCommonDialogUpdateParam) <= 0x100);
     REQUIRE(call(update, 0) == SCE_COMMON_DIALOG_ERROR_NULL);
-    REQUIRE(!env.renderer);
+    REQUIRE(!env.gxm.notification_region);
     REQUIRE(call(update, update_param) == SCE_COMMON_DIALOG_ERROR_GXM_IS_UNINITIALIZED);
-    env.renderer = std::make_unique<CommonDialogFixtureRenderer>();
+    env.gxm.notification_region = Ptr<uint32_t>(block + 0x3f0); // as sceGxmInitialize leaves it
     REQUIRE(call(update, update_param) == 0);
     p->mode = SCE_MSG_DIALOG_MODE_USER_MSG;
     REQUIRE(call(init, param) == 0);
@@ -135,7 +118,7 @@ inline void test_guest_msg_dialog(EmuEnvState &env, ThreadState &thread) {
     REQUIRE(call(update, update_param) == 0);
     REQUIRE(dialog.status == SCE_COMMON_DIALOG_STATUS_FINISHED && dialog.result == SCE_COMMON_DIALOG_RESULT_OK);
     REQUIRE(call(trophy_status) == SCE_COMMON_DIALOG_STATUS_FINISHED && call(trophy_term) == 0);
-    env.renderer.reset();
+    env.gxm.notification_region.reset();
     free(env.mem, block);
     std::puts("Guest message dialog: init, status, close, result, term, page answers, English catalog texts and sceCommonDialogUpdate passed");
 }
