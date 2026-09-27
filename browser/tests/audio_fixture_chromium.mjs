@@ -4,21 +4,19 @@
 // A peak of 16000 proves the HLE->worker->page chain carries real audio;
 // retail silence is then a game-state fact (loading screen, no input), not a
 // routing bug. Usage: node browser/tests/audio_fixture_chromium.mjs
-//   [build/web/dist] [build/vita-audio-fixture/eboot.bin]
-// Environment: PLAYWRIGHT_MODULE_URL, JIT_FIXTURE_TIMEOUT_MS (default 120000).
+//   [build/vita-audio-fixture/eboot.bin]
+// The runtime is served by runtime_routes.mjs (GXM_RUNTIME_DIST selects the
+// module directory). Environment: PLAYWRIGHT_MODULE_URL,
+// PLAYWRIGHT_CHROMIUM_EXECUTABLE, JIT_FIXTURE_TIMEOUT_MS (default 120000).
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { dirname, extname, resolve, sep } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { readRuntimeFile } from './runtime_routes.mjs';
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const root = resolve(process.argv[2] || resolve(repository, 'build/web64/browser'));
-// worker.js/storage.js/bridges ship from source (as limbo_serve.mjs does); the
-// compiled module directory only holds vita3k_web*.{js,wasm}. Module files
-// are requested under ./wasm64/ and stripped to the module directory.
-const webDir = resolve(repository, 'browser/web');
-const fixture = resolve(process.argv[3] || resolve(repository, 'build/vita-audio-fixture/eboot.bin'));
+const fixture = resolve(process.argv[2] || resolve(repository, 'build/vita-audio-fixture/eboot.bin'));
 const timeoutMs = Number(process.env.JIT_FIXTURE_TIMEOUT_MS || 120000);
 const fixtureBytes = await readFile(fixture);
 assert.deepEqual([...fixtureBytes.subarray(0, 4)], [0x53, 0x43, 0x45, 0x00], 'expected a SELF eboot.bin');
@@ -33,15 +31,8 @@ const server = createServer(async (req, res) => {
     } else if (pathname === '/__audio_fixture.bin') {
       type = 'application/octet-stream';
       content = fixtureBytes;
-    } else if (pathname === '/worker.js' || pathname === '/storage.js') {
-      type = 'text/javascript';
-      content = await readFile(resolve(webDir, `.${pathname}`));
     } else {
-      const file = resolve(root, `.${pathname.replace(/^\/wasm64\//, '/')}`);
-      if (!file.startsWith(root + sep)) throw new Error('Path outside dist');
-      type = { '.js': 'text/javascript', '.wasm': 'application/wasm',
-        '.html': 'text/html' }[extname(file)] || 'application/octet-stream';
-      content = await readFile(file);
+      ({ content, type } = await readRuntimeFile(pathname));
     }
     res.writeHead(200, {
       'Content-Type': type,
@@ -59,7 +50,9 @@ const playwright = process.env.PLAYWRIGHT_MODULE_URL
 const { chromium } = await import(playwright);
 let browser;
 try {
-  browser = await chromium.launch({ headless: true, args: ['--autoplay-policy=no-user-gesture-required'] });
+  browser = await chromium.launch({ headless: true, args: ['--autoplay-policy=no-user-gesture-required'],
+    ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+      ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}) });
   const page = await browser.newPage();
   const pageErrors = [];
   page.on('pageerror', (error) => pageErrors.push(String(error)));
