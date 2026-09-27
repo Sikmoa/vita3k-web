@@ -1877,6 +1877,8 @@ int main() {
     f64_tests::integer_to_double();
     f64_tests::float_to_int32();
     f64_tests::float_to_uint32();
+    f64_tests::float_to_fixed_scaled();
+    f64_tests::guest_float_to_fixed(mem);
     f64_tests::negate_and_absolute();
     f64_tests::single_to_double();
     f64_tests::double_to_single();
@@ -1892,6 +1894,7 @@ int main() {
     tofixed_tests::run();
     vectormul_tests::run();
     fpsqrt_tests::run();
+    fpsqrt_tests::guest64(mem);
     helpers(mem);
     tls_read(mem);
     memory_barriers(mem);

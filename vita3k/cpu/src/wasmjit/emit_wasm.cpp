@@ -2357,17 +2357,19 @@ public:
     uint32_t ssa_words() const { return next_local - ssa_base; }
 
 private:
-    // Float-to-integer conversion (VCVT.S32/U32.F32/F64, fbits == 0).
-    // Pure bit-pattern integer lowering: no host FP and no trapping Wasm
-    // conversion is used, so NaN/infinity/overflow saturation, rounding
-    // and cumulative flags match Dynarmic's FPToFixed exactly. Plain VCVT
-    // truncates towards zero; VCVTR snapshots the FPSCR mode into the
+    // Float-to-integer and float-to-fixed conversion (VCVT.S32/U32.F32/F64,
+    // with fbits 0..32 fraction bits). Pure bit-pattern integer lowering: no
+    // host FP and no trapping Wasm conversion is used, so NaN/infinity/
+    // overflow saturation, rounding and cumulative flags match Dynarmic's
+    // FPToFixed exactly. Scaling by 2^fbits only adds fbits to the exponent
+    // before the range decisions. Plain VCVT and the fixed-point form
+    // truncate towards zero; VCVTR snapshots the FPSCR mode into the
     // rounding immediate, of which only nearest-even is emitted (wasm has
-    // no round-to-nearest float-to-int). Scaled fixed-point forms and the
-    // other explicit rounding modes stay rejected rather than silently
-    // converting with the wrong scale or mode.
+    // no round-to-nearest float-to-int). The other explicit rounding modes
+    // stay rejected rather than silently converting with the wrong mode.
     bool fp_to_fixed(const Inst &inst, bool is_signed, bool is_double) {
-        if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0) return false;
+        if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() > 32) return false;
+        const uint32_t fbits = inst.GetArg(1).GetU8();
         if (!inst.GetArg(2).IsImmediate()) return false;
         const uint8_t rounding = inst.GetArg(2).GetU8();
         const bool to_nearest = rounding == 0;
@@ -2391,7 +2393,8 @@ private:
         };
         // Overflow tail shared by every magnitude path. A rounded-up 2^31
         // stays exact for a negative signed result only; anything larger
-        // saturates with IOC and never additionally IXC.
+        // saturates with IOC and never additionally IXC, which the binary64
+        // path has already raised for a dropped fraction.
         const auto publish_mag = [&] {
             if (is_signed) {
                 get(mag_slot); imm(0x80000000u); imm(0x7fffffffu); get(sign_slot); op(Select); op(GtU);
@@ -2399,7 +2402,7 @@ private:
                 get(mag_slot); imm(0xffffffffu); op(GtU);
             }
             begin_if();
-            accumulate(1);
+            get(flags_slot); mask(~0x10u); imm(1); op(Or); set(flags_slot);
             saturate(); set(next_local);
             op(Else);
             if (is_signed) { imm(0); get(mag_slot); op(Sub); get(mag_slot); get(sign_slot); op(Select); }
@@ -2419,8 +2422,11 @@ private:
             // Whole magnitudes of 2^23 and above shift left exactly; the
             // remaining range shifts right with at most 31 dropped bits.
             const auto range = [&] {
+                // From here on expr is the exponent of value * 2^fbits.
+                if (fbits) { get(expr); imm(fbits); op(Add); set(expr); }
                 // Tiny magnitudes truncate to zero (nearest-even cannot
-                // reach 1 below one half); non-FZ denormals land here too.
+                // reach 1 below one half); non-FZ denormals land here too,
+                // even scaled by 2^32.
                 get(expr); imm(118); op(LeU);
                 begin_if(); accumulate(0x10); imm(0); set(next_local);
                 op(Else);
@@ -2509,7 +2515,10 @@ private:
         // truncated bits are recovered by shifting the mantissa left, so
         // no third i64 word pair is needed for the rounding decision.
         const auto range = [&] {
-            // Tiny magnitudes truncate to zero in both modes.
+            // From here on expr is the exponent of value * 2^fbits.
+            if (fbits) { get(expr); imm(fbits); op(Add); set(expr); }
+            // Tiny magnitudes truncate to zero in both modes (denormals too,
+            // even scaled by 2^32).
             get(expr); imm(1011); op(LeU);
             begin_if(); accumulate(0x10); imm(0); set(next_local);
             op(Else);
@@ -2874,10 +2883,25 @@ private:
             return ok;
         }
         case Op::FPSqrt64:
-            if (!state.fast_fp() || start.FPSCR().FTZ() || (start.FPSCR().Value() & 0x00c00000u))
-                return false;
-            value64(inst.GetArg(0)); op(0xbf); op(0x9f); // f64.sqrt
-            store_f64_words(next_local);
+            if (state.fast_fp() && !start.FPSCR().FTZ() && !(start.FPSCR().Value() & 0x00c00000u)) {
+                value64(inst.GetArg(0)); op(0xbf); op(0x9f); // f64.sqrt
+                store_f64_words(next_local);
+                return ok;
+            }
+            // Exact result and cumulative flags from the native helper
+            // (fp64.cpp operation 10) under the live FPSCR, like FPAdd64.
+            load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+            begin_if(); ret(ExitReason::Unsupported); end_if();
+            for (unsigned word = 0; word < 2; ++word) {
+                get(0); value_word(inst.GetArg(0), word);
+                store(offsetof(JitState, memory_value) + 4 * word);
+            }
+            get(0); imm(10); load(offsetof(JitState, fpscr));
+            op(Call); uleb(code, 2); set(next_local + 2);
+            get(0); load(offsetof(JitState, fpscr)); get(next_local + 2); op(Or);
+            store(offsetof(JitState, fpscr));
+            load(offsetof(JitState, memory_value)); set(next_local);
+            load(offsetof(JitState, memory_value) + 4); set(next_local + 1);
             return ok;
         case Op::VectorZeroExtend8:
             // Low eight bytes widen to eight halfwords (pmovzxbw).

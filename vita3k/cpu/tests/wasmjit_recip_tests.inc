@@ -193,8 +193,9 @@ void helper_differential() {
             CHECK(result.flags == oracle_flags);
         }
     }
-    // Out-of-range selectors still reject (VCVT occupies 6/7, VRSQRTE/VRSQRTS 8/9).
-    const auto invalid = fp64_arithmetic(10, 0, 0, 0);
+    // Out-of-range selectors still reject (VCVT occupies 6/7, VRSQRTE/VRSQRTS
+    // 8/9, VSQRT.F64 10).
+    const auto invalid = fp64_arithmetic(11, 0, 0, 0);
     CHECK(invalid.bits == 0x7ff8000000000000ull && invalid.flags == 1);
     std::puts("recip helper differential: 400000 patterns x 4 operations passed");
 }

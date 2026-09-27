@@ -176,6 +176,48 @@ uint64_t quotient_jam(uint64_t a, uint64_t b) noexcept {
     return quotient | uint64_t(remainder != 0);
 }
 
+// ARM FPSqrt on binary64. The vendored Dynarmic has no portable square root
+// (its x64 backend uses the host instruction), so this follows the ARM
+// pseudocode directly and rounds through round_pack like the other operations.
+FP64Result sqrt64(uint64_t a, uint32_t fpscr) noexcept {
+    uint32_t flags = 0;
+    const Operand x = unpack(a, fpscr, flags);
+    if (is_nan(x.kind)) {
+        if (x.kind == Kind::SignalingNaN)
+            flags |= ioc;
+        return {(fpscr & dn) ? default_nan : (a | quiet_bit), flags};
+    }
+    if (x.kind == Kind::Zero) // includes an FZ-flushed subnormal (IDC already set)
+        return {x.sign ? sign_bit : 0, flags};
+    if (x.sign)
+        return {default_nan, flags | ioc};
+    if (x.kind == Kind::Infinity)
+        return {infinity, flags};
+    // value = m * 2^scale with an even scale; m < 2^54 is 27 bit pairs.
+    uint64_t m = x.significand;
+    int scale = x.exponent - 52;
+    if (scale & 1) {
+        m <<= 1;
+        --scale;
+    }
+    // Digit-by-digit floor(sqrt(m * 4^34)): a 61-bit root (8 bits below the
+    // 53-bit result) with the remainder jammed into bit zero. The remainder
+    // stays below 2^62, so the shifted remainder never overflows.
+    constexpr int extra_pairs = 34;
+    uint64_t root = 0, remainder = 0;
+    for (int pair = 27 + extra_pairs - 1; pair >= 0; --pair) {
+        const uint64_t bits = pair >= extra_pairs ? (m >> (2 * (pair - extra_pairs))) & 3 : 0;
+        remainder = (remainder << 2) | bits;
+        const uint64_t trial = (root << 2) | 1;
+        root <<= 1;
+        if (remainder >= trial) {
+            remainder -= trial;
+            root |= 1;
+        }
+    }
+    return round_pack(false, root | uint64_t(remainder != 0), scale / 2 - extra_pairs, fpscr, flags);
+}
+
 // Binary32 lane helpers backed by the vendored Dynarmic implementation
 // (common/fp/op/FPRecipEstimate.cpp, FPRecipStepFused.cpp, FPRSqrtEstimate.cpp,
 // FPRSqrtStepFused.cpp). The A32 decoder emits fpcr_controlled=false for the
@@ -237,7 +279,9 @@ FP64Result fp64_arithmetic(uint32_t operation, uint64_t a, uint64_t b, uint32_t 
         return fp32_lane_to_fixed(7, uint32_t(a));
     if (operation == 8 || operation == 9)
         return fp32_lane_estimate(operation, uint32_t(a), uint32_t(b));
-    if (operation > 9)
+    if (operation == 10)
+        return sqrt64(a, fpscr);
+    if (operation > 10)
         return {default_nan, ioc};
 
     uint32_t flags = 0;

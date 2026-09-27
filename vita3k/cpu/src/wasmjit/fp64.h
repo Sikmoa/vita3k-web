@@ -42,6 +42,8 @@ struct FP64Result {
 // Operations 8 and 9 are the reciprocal square root counterparts of 4 and 5,
 // under the same contract: operation 8 = vrsqrte.f32(a); operation 9 =
 // vrsqrts.f32(a, b) = (3.0 + (-a) * b) / 2 fused.
+// Operation 10 is the scalar binary64 square root (vsqrt.f64) of `a` under the
+// live FPSCR (all four rounding modes, FZ, DN), integer-only like 0..3.
 FP64Result fp64_arithmetic(uint32_t operation, uint64_t a, uint64_t b, uint32_t fpscr) noexcept;
 
 } // namespace vita3k::wasmjit
