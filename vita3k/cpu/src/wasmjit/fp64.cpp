@@ -8,8 +8,6 @@
 #include "dynarmic/common/fp/op.h"
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/common/fp/fpsr.h"
-#include "dynarmic/common/fp/op/FPToFixed.h"
-#include "dynarmic/common/fp/rounding_mode.h"
 
 namespace vita3k::wasmjit {
 namespace {
@@ -315,30 +313,37 @@ FP64Result recip_step_lane(uint32_t a, uint32_t b) noexcept {
     return {std::bit_cast<uint32_t>(rounded), flags};
 }
 
-// VCVT.S32/U32.F32 (fbits 0, towards zero, FZ): FPToFixed(32, 0).
-FP64Result to_fixed_lane(uint32_t lane, bool unsigned_) noexcept {
+// Vector VCVT.S32/U32.F32 (FZ): ARM ARM FPToFixed(32, fbits) for one binary32
+// lane in a Dynarmic::FP::RoundingMode. It rounds first and saturates second,
+// unlike Dynarmic's FPToFixed: a negative value that rounds to 0 converts to
+// an unsigned 0 with IXC, not IOC (wasmjit_tofixed_tests.inc). The scaled
+// value, its floor and the error below 1 are exact in binary64.
+FP64Result to_fixed_lane(uint32_t lane, bool unsigned_, uint32_t rounding, uint32_t fbits) noexcept {
     const uint32_t exponent = (lane >> 23) & 0xff, fraction = lane & 0x007fffffu;
-    const bool negative = lane >> 31;
+    const auto saturate = [unsigned_](bool below) {
+        return FP64Result{below ? (unsigned_ ? 0u : 0x80000000u) : (unsigned_ ? 0xffffffffu : 0x7fffffffu), ioc};
+    };
     if (exponent == 0)
         return {0, fraction ? idc : 0u}; // zero, or a subnormal flushed to zero
-    if (exponent == 0xff && fraction)
-        return {0, ioc}; // NaN
-    if (negative && unsigned_)
-        return {0, ioc};
     if (exponent == 0xff)
-        return {unsigned_ ? 0xffffffffu : negative ? 0x80000000u : 0x7fffffffu, ioc};
-    const double value = double(std::bit_cast<float>(lane));
-    const double truncated = std::trunc(value);
-    if (unsigned_) {
-        if (truncated >= 0x1p32)
-            return {0xffffffffu, ioc};
-    } else if (truncated >= 0x1p31) {
-        return {0x7fffffffu, ioc};
-    } else if (truncated < -0x1p31) {
-        return {0x80000000u, ioc};
+        return fraction ? FP64Result{0, ioc} : saturate(lane >> 31); // NaN, infinity
+    double value = double(std::bit_cast<float>(lane));
+    if (fbits)
+        value = std::ldexp(value, int(fbits));
+    const double down = std::floor(value);
+    const double error = value - down;
+    bool round_up = false;
+    switch (rounding) {
+    case 0: round_up = error > 0.5 || (error == 0.5 && std::floor(down * 0.5) != down * 0.5); break;
+    case 1: round_up = error != 0.0; break;
+    case 3: round_up = error != 0.0 && down < 0.0; break;
+    case 4: round_up = error > 0.5 || (error == 0.5 && down >= 0.0); break;
+    default: break;
     }
-    const uint32_t result = unsigned_ ? uint32_t(truncated) : uint32_t(int32_t(truncated));
-    return {result, truncated != value ? ixc : 0u};
+    const double result = down + (round_up ? 1.0 : 0.0);
+    if (result < (unsigned_ ? 0.0 : -0x1p31) || result > (unsigned_ ? 0x1p32 - 1 : 0x1p31 - 1))
+        return saturate(result < 0.0);
+    return {unsigned_ ? uint32_t(result) : uint32_t(int32_t(result)), error != 0.0 ? ixc : 0u};
 }
 
 } // namespace
@@ -358,18 +363,13 @@ FP64Result fp64_arithmetic(uint32_t operation, uint64_t a, uint64_t b, uint32_t 
     if (operation == 5)
         return recip_step_lane(uint32_t(a), uint32_t(b));
     if (operation == 6 || operation == 7)
-        return to_fixed_lane(uint32_t(a), operation == 7);
+        return to_fixed_lane(uint32_t(a), operation == 7, 3, 0);
     if (operation == 8 || operation == 9)
         return fp32_lane_estimate(operation, uint32_t(a), uint32_t(b));
     if (operation == 10)
         return sqrt64(a, fpscr);
-    if ((operation == 11 || operation == 12) && uint32_t(b) <= 4) {
-        const auto fpcr = Dynarmic::FP::FPCR{0}.ASIMDStandardValue(); // FZ=1, DN=1
-        Dynarmic::FP::FPSR fpsr{0};
-        const auto result = Dynarmic::FP::FPToFixed<uint32_t>(32, uint32_t(a), 0, operation == 12, fpcr,
-            static_cast<Dynarmic::FP::RoundingMode>(uint32_t(b)), fpsr);
-        return {result & 0xffffffffu, fpsr.Value() & 0x9f};
-    }
+    if ((operation == 11 || operation == 12) && (uint32_t(b) & 0xff) <= 4 && uint32_t(b) >> 8 <= 32)
+        return to_fixed_lane(uint32_t(a), operation == 12, uint32_t(b) & 0xff, uint32_t(b) >> 8);
     if (operation > 10)
         return {default_nan, ioc};
 

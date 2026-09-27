@@ -8,6 +8,7 @@
 #include <dynarmic/common/fp/op.h>
 #include <dynarmic/common/fp/fpcr.h>
 #include <dynarmic/common/fp/fpsr.h>
+#include "arm_fp_to_fixed.h"
 #include <bit>
 #include <cmath>
 #include <cstdlib>
@@ -2036,6 +2037,7 @@ int main() {
     recip_tests::run();
     tofixed_tests::run();
     tofixed_tests::guest_rounding(mem);
+    tofixed_tests::guest_fixed_point(mem);
     vectormul_tests::run();
     fpsqrt_tests::run();
     fpsqrt_tests::guest64(mem);

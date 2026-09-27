@@ -96,6 +96,9 @@ void run(const IR::Block &block, const JitState &initial, const JitState *expect
                 CHECK(state.fpu[i] == expected->fpu[i]);
             }
             for (unsigned i = 0; i < 15; ++i) CHECK(state.regs[i] == expected->regs[i]);
+            if (state.fpscr != expected->fpscr)
+                std::fprintf(stderr, "f64 region=%d fpscr=%08x expected=%08x input=%08x:%08x\n", region, state.fpscr,
+                    expected->fpscr, initial.fpu[1], initial.fpu[0]);
             CHECK(state.fpscr == expected->fpscr);
         }
         if (region) vita3k_jit_release_region(slot);
@@ -579,17 +582,18 @@ void float_to_int32() {
 void float_to_uint32() {
     struct Case { Op op; uint64_t input; uint32_t result; uint32_t flags; uint8_t rounding; };
     const Case cases[] = {
-        // binary32, towards-zero. Negative inputs (other than -0) saturate
-        // to zero with IOC, taking precedence over any truncation.
+        // binary32, towards-zero. Negative inputs round first: those that
+        // round to 0 give 0 with IXC, the others saturate to 0 with IOC.
         {Op::FPSingleToFixedU32, 0x3f800000, 1, 0, 3}, // 1.0
         {Op::FPSingleToFixedU32, 0x3fc00000, 1, 0x10, 3}, // 1.5
         {Op::FPSingleToFixedU32, 0x4f7fffff, 0xffffff00u, 0, 3}, // largest exact
         {Op::FPSingleToFixedU32, 0x4f800000, 0xffffffffu, 1, 3}, // 2^32 saturates
         {Op::FPSingleToFixedU32, 0x4f000000, 0x80000000u, 0, 3}, // 2^31 exact
         {Op::FPSingleToFixedU32, 0xcf800000, 0, 1, 3}, // -1.0
-        {Op::FPSingleToFixedU32, 0xbf800000, 0, 1, 3}, // -0.5, not IXC
+        {Op::FPSingleToFixedU32, 0xbf800000, 0, 1, 3}, // -1.0, not IXC
+        {Op::FPSingleToFixedU32, 0xbf000000, 0, 0x10, 3}, // -0.5 truncates to 0
         {Op::FPSingleToFixedU32, 0x80000000, 0, 0, 3}, // -0 exact, no IOC
-        {Op::FPSingleToFixedU32, 0x80000001, 0, 1, 3}, // negative denormal
+        {Op::FPSingleToFixedU32, 0x80000001, 0, 0x10, 3}, // negative denormal truncates to 0
         {Op::FPSingleToFixedU32, 0x7fc00000, 0, 1, 3}, // NaN
         {Op::FPSingleToFixedU32, 0x7f800000, 0xffffffffu, 1, 3}, // +inf
         {Op::FPSingleToFixedU32, 0xff800000, 0, 1, 3}, // -inf
@@ -627,8 +631,8 @@ void float_to_uint32() {
         expected.fpscr |= c.flags;
         run(block, state, &expected);
     }
-    // An FZ-flushed negative denormal raises IDC; without the flush the
-    // same input would be an invalid negative conversion.
+    // An FZ-flushed negative denormal raises IDC only; without the flush the
+    // same input truncates to 0 with IXC.
     for (uint64_t input : {0x80400000ull, 0x80000001ull}) {
         auto block = blank(fpscr_fz);
         write_s(block, append(block, Op::FPSingleToFixedU32,
@@ -809,9 +813,12 @@ void guest_float_to_int_rounding(MemState &mem) {
                         thumb ? "Thumb" : "ARM", jit.get_last_error().c_str());
                     CHECK(false);
                 }
-                const bool negative = c.input >> 31;
-                const uint32_t want = is_unsigned && negative ? 0 : c.by_mode[rm];
-                const uint32_t flags = is_unsigned && negative ? 1 : 0x10;
+                // ARM ARM FPToFixed rounds, then saturates: an unsigned
+                // conversion is invalid only when the rounded value is
+                // negative (-0.5 to nearest even or towards +inf is 0, IXC).
+                const bool invalid = is_unsigned && int32_t(c.by_mode[rm]) < 0;
+                const uint32_t want = invalid ? 0 : c.by_mode[rm];
+                const uint32_t flags = invalid ? 1 : 0x10;
                 const auto after = jit.save_context();
                 uint32_t result;
                 std::memcpy(&result, &after.fpu_registers[2], 4);
@@ -840,7 +847,8 @@ void guest_float_to_int(MemState &mem) {
         {0xeebd1a62u, false, 0x3fc00000, 2, 0x10}, // VCVTR.S32.F32 1.5 -> 2
         {0xeebd1a62u, false, 0x40200000, 2, 0x10}, // VCVTR 2.5 ties to 2
         {0xeebc1ae2u, false, 0x3fc00000, 1, 0x10}, // VCVT.U32.F32
-        {0xeebc1ae2u, false, 0xcf800000, 0, 1}, // -1.0 invalid, not inexact
+        {0xeebc1ae2u, false, 0xcf800000, 0, 1}, // -2^32 invalid, not inexact
+        {0xeebc1ae2u, false, 0xbf000000, 0, 0x10}, // -0.5 truncates to 0: inexact, not invalid
         {0xeebc1ae2u, false, 0x4f7fffff, 0xffffff00u, 0}, // largest exact u32
         {0xeebc1ae2u, false, 0x4f800000, 0xffffffffu, 1}, // 2^32 saturates
         {0xeebd1bc7u, true, 0xc004000000000000ull, 0xfffffffeu, 0x10}, // VCVT.S32.F64 -2.5
@@ -849,6 +857,7 @@ void guest_float_to_int(MemState &mem) {
         {0xeebd1bc7u, true, 0x7ff8000000000000ull, 0, 1}, // NaN
         {0xeebc1bc7u, true, 0x3ff8000000000000ull, 1, 0x10}, // VCVT.U32.F64 1.5
         {0xeebc1bc7u, true, 0xbff0000000000000ull, 0, 1}, // -1.0 invalid
+        {0xeebc1bc7u, true, 0xbfefffffffffffffull, 0, 0x10}, // just above -1.0 truncates to 0
         {0xeebc1bc7u, true, 0x41e0000000000000ull, 0x80000000u, 0}, // 2^31 exact
         {0xeebc1bc7u, true, 0x41f0000000000000ull, 0xffffffffu, 1}, // 2^32
     };
@@ -986,18 +995,22 @@ void guest_half_to_single(MemState &mem) {
     std::printf("half->single: %u VCVTB/VCVTT guest cases passed\n", count);
 }
 
-// Fixed-point VCVT (fbits 0..32; Limbo's VCVT.S32.F32 s15, s15, #16). The
-// emitted lowering is pure integer code; the oracle is the vendored Dynarmic
-// FPToFixed, which that code never calls, under the location FPSCR. Pinned
-// cases below are hand-derived and do not use the oracle at all.
+// Float-to-integer and fixed-point VCVT (fbits 0..32; Limbo's VCVT.S32.F32
+// s15, s15, #16), 32- and 16-bit results. The emitted lowering is pure
+// integer code; the expectation is the ARM ARM FPToFixed (arm_fp_to_fixed.h)
+// under the location FPSCR. Dynarmic's FPToFixed stays a second oracle: it
+// must agree everywhere except the two divergences that header names, and
+// both must occur in the sweep. Pinned cases below are hand-derived.
 void float_to_fixed_scaled() {
-    const Op ops[] = {Op::FPSingleToFixedS32, Op::FPSingleToFixedU32,
-        Op::FPDoubleToFixedS32, Op::FPDoubleToFixedU32};
+    const Op ops[] = {Op::FPSingleToFixedS32, Op::FPSingleToFixedU32, Op::FPDoubleToFixedS32, Op::FPDoubleToFixedU32,
+        Op::FPSingleToFixedS16, Op::FPSingleToFixedU16, Op::FPDoubleToFixedS16, Op::FPDoubleToFixedU16};
     std::vector<uint32_t> singles{0x00000000u, 0x80000000u, 0x00000001u, 0x807fffffu, 0x00800000u,
         0x3f800000u, 0xbf800000u, 0x3fc00000u, 0xbfc00000u, 0x3f000000u, 0x37000000u, 0x37800000u,
         0x37c00000u, 0x46ffffffu, 0x47000000u, 0xc7000000u, 0xc7000001u, 0x4f000000u, 0x4f800000u,
         0x7f7fffffu, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0x7f800001u, 0x2f800000u, 0x30000000u,
-        0x40200000u, 0xc0200000u, 0x3e800000u, 0xbe800000u, 0x2f000000u, 0xaf000000u, 0xceffffffu};
+        0x40200000u, 0xc0200000u, 0x3e800000u, 0xbe800000u, 0x2f000000u, 0xaf000000u, 0xceffffffu,
+        // -0.5, +-0.75, and +-(2^15 - 1/2, 1/4, 3/4) for the 16-bit limits.
+        0xbf000000u, 0x3f400000u, 0xbf400000u, 0x46ffff00u, 0xc6ffff00u, 0xc6fffe80u, 0xc6ffff80u};
     std::vector<uint64_t> doubles{0, 0x8000000000000000ull, 1, 0x800fffffffffffffull, 0x0010000000000000ull,
         0x3ff0000000000000ull, 0xbff8000000000000ull, 0x3ef0000000000000ull, 0x3ee0000000000000ull,
         0x3ef8000000000000ull, 0x40dfffffffffffffull, 0x40e0000000000000ull, 0xc0e0000000000000ull,
@@ -1006,12 +1019,14 @@ void float_to_fixed_scaled() {
         0x41e0000000100000ull, 0xc1e0000000100000ull, 0x41efffffffe00000ull, // overflow after a fraction
         // +-(2^32 - 1/2) and 2^32 - 1/4: rounding up carries out of 32 bits.
         0x41effffffff00000ull, 0xc1effffffff00000ull, 0x41effffffff80000ull,
-        // -(2^31 - 1/4, 1/2, 3/4) and -(2^31 + 1/2): see dynarmic_quirk below.
+        // -(2^31 - 1/4, 1/2, 3/4) and -(2^31 + 1/2): SignedIntoRange.
         0xc1dffffffff00000ull, 0xc1dfffffffe00000ull, 0xc1dfffffffd00000ull, 0xc1e0000000100000ull,
         0x41dfffffffe00000ull, 0x41dffffffff00000ull, // 2^31 - 1/2, - 1/4
         // Ties and tiny magnitudes for the nearest and directed modes.
         0x3fe0000000000000ull, 0xbfe0000000000000ull, 0x4004000000000000ull, 0xc004000000000000ull,
-        0x3d70000000000000ull, 0xbd70000000000000ull};
+        0x3d70000000000000ull, 0xbd70000000000000ull, 0x3fe8000000000000ull, 0xbfe8000000000000ull,
+        // -(2^15 - 1/2, 1/4, 3/4): SignedIntoRange for 16-bit results.
+        0xc0dfffe000000000ull, 0xc0dfffd000000000ull, 0xc0dffff000000000ull};
     uint32_t rng32 = 0x2545f491u;
     uint64_t rng64 = 0x853c49e6748fea9bull;
     for (unsigned i = 0; i < 400; ++i) {
@@ -1021,30 +1036,26 @@ void float_to_fixed_scaled() {
         singles.push_back((rng32 & 0x807fffffu) | ((0x60u + (rng32 >> 24) % 0x40u) << 23));
         doubles.push_back((rng64 & 0x800fffffffffffffull) | (uint64_t(0x3c0u + (rng64 >> 52) % 0x80u) << 52));
     }
-    // FPToFixed decides overflow on the magnitude plus one rounding unit
-    // whenever it increments its (two's complement) result. For a negative
-    // signed value in (-2^31, -(2^31 - 1)) scaled units that increment goes
-    // towards zero into range, yet it reports IOC and returns INT_MIN; ARM
-    // ARM FPToFixed rounds first and returns -(2^31 - 1) with IXC. Only
-    // binary64 inputs can land there (binary32 has no fraction that high).
-    const auto dynarmic_quirk = [](uint64_t input, uint8_t fbits, uint8_t rounding, bool unsigned_) {
-        double scaled;
-        std::memcpy(&scaled, &input, sizeof(scaled));
-        scaled = std::ldexp(scaled, fbits);
-        const double magnitude = -scaled;
-        if (unsigned_ || !(magnitude > 2147483647.0 && magnitude < 2147483648.0)) return false;
-        const double fraction = magnitude - 2147483647.0;
-        // Towards zero: RZ and RP always, the nearest modes below one half.
-        return rounding == 1 || rounding == 3 || ((rounding == 0 || rounding == 4) && fraction < 0.5);
-    };
-    unsigned count = 0, quirks = 0;
+    using arm_reference::Divergence;
+    unsigned count = 0;
+    std::map<Divergence, unsigned> divergences;
     for (const Op op : ops) for (uint8_t fbits : {0, 1, 8, 16, 31, 32}) for (uint8_t rounding : {0, 1, 2, 3, 4})
         for (uint32_t location_fpscr : {0u, fpscr_fz}) {
-            const bool is_double = op == Op::FPDoubleToFixedS32 || op == Op::FPDoubleToFixedU32;
-            const bool unsigned_ = op == Op::FPSingleToFixedU32 || op == Op::FPDoubleToFixedU32;
+            const bool is_double = op == Op::FPDoubleToFixedS32 || op == Op::FPDoubleToFixedU32
+                || op == Op::FPDoubleToFixedS16 || op == Op::FPDoubleToFixedU16;
+            const bool unsigned_ = op == Op::FPSingleToFixedU32 || op == Op::FPDoubleToFixedU32
+                || op == Op::FPSingleToFixedU16 || op == Op::FPDoubleToFixedU16;
+            const unsigned ibits = op == Op::FPSingleToFixedS16 || op == Op::FPSingleToFixedU16
+                    || op == Op::FPDoubleToFixedS16 || op == Op::FPDoubleToFixedU16
+                ? 16 : 32;
+            if (fbits > ibits) continue;
             auto block = blank(location_fpscr);
             const auto input = is_double ? read_d(block, 1) : read_s(block, 1);
-            write_s(block, append(block, op, {input, Value{fbits}, Value{rounding}}));
+            auto result = append(block, op, {input, Value{fbits}, Value{rounding}});
+            // The translator widens a 16-bit result exactly like this.
+            if (ibits == 16)
+                result = append(block, unsigned_ ? Op::ZeroExtendHalfToWord : Op::SignExtendHalfToWord, {result});
+            write_s(block, result);
             const A32::LocationDescriptor at{block.Location()};
             for (bool region : {false, true}) {
                 const auto bytes = region
@@ -1058,20 +1069,25 @@ void float_to_fixed_scaled() {
                 CHECK(slot >= 0);
                 const size_t n = is_double ? doubles.size() : singles.size();
                 for (size_t i = 0; i < n; ++i) {
+                    const uint64_t bits = is_double ? doubles[i] : singles[i];
+                    const auto arm = arm_reference::fp_to_fixed(bits, is_double, fbits, unsigned_, rounding,
+                        location_fpscr & fpscr_fz, ibits);
                     Dynarmic::FP::FPSR fpsr{0};
                     const auto mode = static_cast<Dynarmic::FP::RoundingMode>(rounding);
-                    uint32_t want = is_double
-                        ? uint32_t(Dynarmic::FP::FPToFixed<uint64_t>(32, doubles[i], fbits, unsigned_,
+                    const uint32_t dynarmic = is_double
+                        ? uint32_t(Dynarmic::FP::FPToFixed<uint64_t>(ibits, doubles[i], fbits, unsigned_,
                             Dynarmic::FP::FPCR{location_fpscr}, mode, fpsr))
-                        : uint32_t(Dynarmic::FP::FPToFixed<uint32_t>(32, singles[i], fbits, unsigned_,
+                        : uint32_t(Dynarmic::FP::FPToFixed<uint32_t>(ibits, singles[i], fbits, unsigned_,
                             Dynarmic::FP::FPCR{location_fpscr}, mode, fpsr));
-                    uint32_t want_flags = fpsr.Value() & 0x9f;
-                    if (is_double && dynarmic_quirk(doubles[i], fbits, rounding, unsigned_)) {
-                        CHECK(want == 0x80000000u && want_flags == 1); // the quirk itself
-                        want = 0x80000001u;
-                        want_flags = 0x10;
-                        ++quirks;
-                    }
+                    const auto divergence = arm_reference::fp_to_fixed_divergence(arm, dynarmic, fpsr.Value() & 0x9f,
+                        unsigned_, ibits);
+                    if (divergence == Divergence::Unexplained)
+                        std::fprintf(stderr, "tofixed reference %s fbits=%u rounding=%u input=%llx arm=%08x/%02x dynarmic=%08x/%02x\n",
+                            IR::GetNameOf(op).c_str(), fbits, rounding, (unsigned long long)bits, arm.bits, arm.flags,
+                            dynarmic, fpsr.Value() & 0x9f);
+                    CHECK(divergence != Divergence::Unexplained);
+                    if (!region) ++divergences[divergence];
+                    const uint32_t want = ibits == 32 || unsigned_ ? arm.bits : uint32_t(int32_t(int16_t(arm.bits)));
                     auto state = base_state(location_fpscr | 0x90000000u);
                     if (is_double) set_d_bits(state, doubles[i], 1);
                     else set_s_bits(state, singles[i], 1);
@@ -1079,12 +1095,12 @@ void float_to_fixed_scaled() {
                         ? vita3k_jit_run(slot, reinterpret_cast<uintptr_t>(&state), 1)
                         : vita3k_jit_call(slot, reinterpret_cast<uintptr_t>(&state)));
                     CHECK(reason == (region ? Reason::Miss : Reason::Continue));
-                    if (s_bits(state) != want || state.fpscr != (location_fpscr | 0x90000000u | want_flags))
+                    if (s_bits(state) != want || state.fpscr != (location_fpscr | 0x90000000u | arm.flags))
                         std::fprintf(stderr, "tofixed %s fbits=%u rounding=%u fpscr=%08x input=%llx got=%08x/%08x want=%08x/%02x\n",
                             IR::GetNameOf(op).c_str(), fbits, rounding, location_fpscr,
-                            (unsigned long long)(is_double ? doubles[i] : singles[i]), s_bits(state), state.fpscr, want, want_flags);
+                            (unsigned long long)bits, s_bits(state), state.fpscr, want, arm.flags);
                     CHECK(s_bits(state) == want);
-                    CHECK(state.fpscr == (location_fpscr | 0x90000000u | want_flags));
+                    CHECK(state.fpscr == (location_fpscr | 0x90000000u | arm.flags));
                     ++count;
                 }
                 if (region) vita3k_jit_release_region(slot);
@@ -1095,7 +1111,7 @@ void float_to_fixed_scaled() {
     const Case pinned[] = {
         {Op::FPSingleToFixedS32, 0x3fc00000, 16, 3, 0x00018000u, 0}, // 1.5
         {Op::FPSingleToFixedS32, 0xbfc00000, 16, 3, 0xfffe8000u, 0}, // -1.5
-        {Op::FPSingleToFixedU32, 0xbfc00000, 16, 3, 0, 1}, // negative unsigned: IOC
+        {Op::FPSingleToFixedU32, 0xbfc00000, 16, 3, 0, 1}, // negative unsigned below -1 unit: IOC
         {Op::FPSingleToFixedS32, 0x46ffffff, 16, 3, 0x7fffff80u, 0}, // just below 2^15
         {Op::FPSingleToFixedS32, 0x47000000, 16, 3, 0x7fffffffu, 1}, // 2^15 overflows signed
         {Op::FPSingleToFixedU32, 0x47000000, 16, 3, 0x80000000u, 0}, // ... but fits unsigned
@@ -1126,7 +1142,29 @@ void float_to_fixed_scaled() {
         {Op::FPSingleToFixedS32, 0xaf000000, 0, 2, 0xffffffffu, 0x10}, // tiny negative
         {Op::FPSingleToFixedS32, 0xaf000000, 0, 1, 0, 0x10},
         {Op::FPSingleToFixedU32, 0x2f000000, 0, 1, 1, 0x10},
-        {Op::FPSingleToFixedU32, 0xbf000000, 0, 1, 0, 1}, // negative unsigned: IOC
+        // Negative unsigned: 0 with IXC when it rounds to 0 (ARM ARM, not
+        // Dynarmic's IOC: UnsignedRoundsToZero), else saturated with IOC.
+        {Op::FPSingleToFixedU32, 0xbf000000, 0, 1, 0, 0x10}, // -0.5 towards +inf
+        {Op::FPSingleToFixedU32, 0xbf000000, 0, 3, 0, 0x10}, // -0.5 towards zero
+        {Op::FPSingleToFixedU32, 0xbf000000, 0, 0, 0, 0x10}, // -0.5 ties to even 0
+        {Op::FPSingleToFixedU32, 0xbf000000, 0, 4, 0, 1}, // -0.5 ties away to -1
+        {Op::FPSingleToFixedU32, 0xbf000000, 0, 2, 0, 1}, // -0.5 towards -inf
+        {Op::FPSingleToFixedU32, 0xbe800000, 0, 4, 0, 0x10}, // -0.25 to nearest
+        {Op::FPSingleToFixedU32, 0xbf400000, 0, 0, 0, 1}, // -0.75 to nearest is -1
+        {Op::FPDoubleToFixedU32, 0xbfe8000000000000ull, 0, 3, 0, 0x10}, // -0.75 towards zero
+        {Op::FPDoubleToFixedU32, 0xbfe0000000000000ull, 16, 3, 0, 1}, // -0.5 * 2^16
+        {Op::FPSingleToFixedU32, 0xb7000000, 16, 3, 0, 0x10}, // -2^-17 * 2^16 = -1/2 unit
+        {Op::FPSingleToFixedU16, 0xbf000000, 0, 3, 0, 0x10},
+        // 16-bit results: saturation at +-2^15 / 2^16 and SignedIntoRange.
+        {Op::FPSingleToFixedS16, 0x46ffff00, 0, 3, 0x00007fffu, 0x10}, // 32767.5
+        {Op::FPSingleToFixedS16, 0x46ffff00, 0, 0, 0x00007fffu, 1}, // ties up to 2^15
+        {Op::FPSingleToFixedS16, 0xc6ffff00, 0, 3, 0xffff8001u, 0x10}, // -32767.5 towards zero
+        {Op::FPSingleToFixedS16, 0xc7000080, 0, 3, 0xffff8000u, 0x10}, // -32768.5 truncates into range
+        {Op::FPSingleToFixedS16, 0xc7000180, 0, 3, 0xffff8000u, 1}, // -32769.5 saturates
+        {Op::FPSingleToFixedU16, 0x477fff00, 0, 3, 0x0000ffffu, 0}, // 65535
+        {Op::FPSingleToFixedU16, 0x47800000, 0, 3, 0x0000ffffu, 1}, // 65536 saturates
+        {Op::FPSingleToFixedS16, 0x3fc00000, 8, 3, 0x00000180u, 0}, // 1.5 * 2^8
+        {Op::FPDoubleToFixedS16, 0xc0dfffe000000000ull, 0, 3, 0xffff8001u, 0x10}, // -32767.5
         {Op::FPDoubleToFixedS32, 0x3d70000000000000ull, 0, 1, 1, 0x10}, // 2^-40
         {Op::FPDoubleToFixedS32, 0xbd70000000000000ull, 0, 2, 0xffffffffu, 0x10},
         // 2^32 - 0.5 rounds up to 2^32: the 32-bit magnitude carries out.
@@ -1135,7 +1173,7 @@ void float_to_fixed_scaled() {
         {Op::FPDoubleToFixedU32, 0x41effffffff00000ull, 0, 2, 0xffffffffu, 0x10},
         {Op::FPDoubleToFixedS32, 0x41effffffff00000ull, 0, 4, 0x7fffffffu, 1},
         // Towards zero into range from just below -2^31 (ARM ARM, not
-        // FPToFixed's IOC; see dynarmic_quirk above).
+        // Dynarmic's IOC: SignedIntoRange).
         {Op::FPDoubleToFixedS32, 0xc1dfffffffe00000ull, 0, 3, 0x80000001u, 0x10}, // -(2^31 - 0.5)
         {Op::FPDoubleToFixedS32, 0xc1dfffffffe00000ull, 0, 1, 0x80000001u, 0x10},
         {Op::FPDoubleToFixedS32, 0xc1dfffffffe00000ull, 0, 2, 0x80000000u, 0x10},
@@ -1144,10 +1182,16 @@ void float_to_fixed_scaled() {
         {Op::FPDoubleToFixedS32, 0xc1dfffffffd00000ull, 0, 0, 0x80000001u, 0x10}, // -(2^31 - 0.75)
     };
     for (const auto &c : pinned) {
-        const bool is_double = c.op == Op::FPDoubleToFixedS32 || c.op == Op::FPDoubleToFixedU32;
+        const bool is_double = c.op == Op::FPDoubleToFixedS32 || c.op == Op::FPDoubleToFixedU32
+            || c.op == Op::FPDoubleToFixedS16 || c.op == Op::FPDoubleToFixedU16;
         auto block = blank(0);
         const auto input = is_double ? read_d(block) : read_s(block);
-        write_s(block, append(block, c.op, {input, Value{c.fbits}, Value{c.rounding}}));
+        auto result = append(block, c.op, {input, Value{c.fbits}, Value{c.rounding}});
+        if (c.op == Op::FPSingleToFixedS16 || c.op == Op::FPDoubleToFixedS16)
+            result = append(block, Op::SignExtendHalfToWord, {result});
+        else if (c.op == Op::FPSingleToFixedU16 || c.op == Op::FPDoubleToFixedU16)
+            result = append(block, Op::ZeroExtendHalfToWord, {result});
+        write_s(block, result);
         auto state = base_state(0x9000001cu), expected = state;
         if (is_double) set_d_bits(state, c.input);
         else set_s_bits(state, uint32_t(c.input));
@@ -1156,9 +1200,11 @@ void float_to_fixed_scaled() {
         expected.fpscr |= c.flags;
         run(block, state, &expected);
     }
-    CHECK(quirks != 0);
-    std::printf("fixed-point VCVT: %u oracle cases (fbits 0..32, five rounding modes, FZ, block+region; "
-                "%u FPToFixed overflow-quirk cases replaced) and pinned cases passed\n", count, quirks);
+    CHECK(divergences[Divergence::SignedIntoRange] != 0 && divergences[Divergence::UnsignedRoundsToZero] != 0);
+    std::printf("fixed-point VCVT: %u ARM ARM FPToFixed cases (S/U 32/16, fbits 0..32, five rounding modes, FZ, "
+                "block+region; Dynarmic agrees on %u, diverges on %u SignedIntoRange and %u UnsignedRoundsToZero) "
+                "and pinned cases passed\n", count, divergences[Divergence::None],
+        divergences[Divergence::SignedIntoRange], divergences[Divergence::UnsignedRoundsToZero]);
 }
 
 // Real fixed-point VCVT encodings (ARM and Thumb) through the translator.
@@ -1176,6 +1222,13 @@ void guest_float_to_fixed(MemState &mem) {
         {0xeefe7aefu, false, 0x3fc00000, 3, 0}, // VCVT.S32.F32 #1
         {0xeebe7bc8u, true, 0xbff8000000000000ull, 0xfffe8000u, 0}, // VCVT.S32.F64 d7, #16
         {0xeebf7bc0u, true, 0x3fe0000000000000ull, 0x80000000u, 0}, // VCVT.U32.F64 d7, #32
+        {0xeefe7a44u, false, 0x3fc00000, 0x00000180u, 0}, // VCVT.S16.F32 s15, s15, #8
+        {0xeefe7a44u, false, 0xc3000000, 0xffff8000u, 0}, // -128 * 2^8 is the minimum
+        {0xeefe7a44u, false, 0x43000000, 0x00007fffu, 1}, // 128 * 2^8 saturates
+        {0xeeff7a44u, false, 0xbb000000, 0, 0x10}, // VCVT.U16.F32: -2^-9 * 2^8 truncates to 0
+        {0xeeff7a44u, false, 0x43800000, 0x0000ffffu, 1}, // 256 * 2^8 saturates
+        {0xeebe7b44u, true, 0xbff8000000000000ull, 0xfffffe80u, 0}, // VCVT.S16.F64 d7, #8
+        {0xeebf7b44u, true, 0x3ff8000000000000ull, 0x00000180u, 0}, // VCVT.U16.F64 d7, #8
     };
     for (bool regions : {false, true}) for (bool thumb : {false, true}) for (const auto &c : cases) {
         jit.set_region_mode(regions);

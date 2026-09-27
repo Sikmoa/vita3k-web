@@ -33,23 +33,24 @@ struct FP64Result {
 // rounding to odd. The backend tests check both against Dynarmic directly.
 // Operations 6 and 7 implement the ARM vector float-to-int VCVT for one
 // binary32 lane packed in the low 32 bits of `a`: operation 6 = signed
-// (vcvt.s32.f32), operation 7 = unsigned (vcvt.u32.f32). The A32 translator
-// emits fbits=0, TowardsZero rounding and fpcr_controlled=false for these,
-// so both always execute as FPToFixed(ibits=32, fbits=0, TowardsZero) under
-// ASIMDStandardValue() (FZ=1, DN=1; explicit rounding overrides RN), regardless
-// of `fpscr` (checked against the vendored implementation). Only newly raised IOC/IXC/IDC
-// bits (mask 0x9f) are returned: either sign of subnormal input becomes zero
-// with IDC only. The 32-bit integer result rides in the low 32 result bits.
+// (vcvt.s32.f32), operation 7 = unsigned (vcvt.u32.f32), towards zero with no
+// fraction bits. The conversion is the ARM ARM FPToFixed(ibits=32) under
+// ASIMDStandardValue() (FZ=1; the explicit rounding overrides RN),
+// regardless of `fpscr`: it rounds, then saturates, so a negative value that
+// rounds to 0 gives an unsigned 0 with IXC (Dynarmic's FPToFixed raises IOC
+// there). Only newly raised IOC/IXC/IDC bits (mask 0x9f) are returned: either
+// sign of subnormal input becomes zero with IDC only. The 32-bit integer
+// result rides in the low 32 result bits.
 // Operations 8 and 9 are the reciprocal square root counterparts of 4 and 5,
 // under the same contract: operation 8 = vrsqrte.f32(a); operation 9 =
 // vrsqrts.f32(a, b) = (3.0 + (-a) * b) / 2 fused.
 // Operation 10 is the scalar binary64 square root (vsqrt.f64) of `a` under the
 // live FPSCR (all four rounding modes, FZ, DN), integer-only like 0..3.
 // Operations 11 (signed) and 12 (unsigned) are the vector float-to-int
-// conversions of 6/7 with an explicit rounding mode in the low 32 bits of `b`
-// (Dynarmic::FP::RoundingMode 0..4; VCVT{A,N,P,M}.S32/U32.F32): the vendored
-// FPToFixed(ibits=32, fbits=0) under ASIMDStandardValue(). Other modes return
-// the default NaN with IOC.
+// conversions of 6/7 with the rounding mode (Dynarmic::FP::RoundingMode 0..4)
+// in bits 0-7 and the fraction bits (0..32) in bits 8-15 of the low 32 bits
+// of `b` (VCVT{A,N,P,M}.S32/U32.F32 and fixed-point VCVT.S32/U32.F32 #fbits).
+// Other modes or fraction bit counts return the default NaN with IOC.
 FP64Result fp64_arithmetic(uint32_t operation, uint64_t a, uint64_t b, uint32_t fpscr) noexcept;
 
 } // namespace vita3k::wasmjit

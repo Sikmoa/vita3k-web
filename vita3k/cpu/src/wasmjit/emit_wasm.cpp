@@ -2635,17 +2635,16 @@ private:
     // Float-to-integer and float-to-fixed conversion (VCVT.S32/U32.F32/F64
     // with fbits 0..32 fraction bits, VCVTR and VCVT{A,N,P,M}). Pure
     // bit-pattern integer lowering: no host FP and no trapping Wasm
-    // conversion. NaN/infinity/overflow saturation, the five rounding modes
-    // and cumulative flags follow Dynarmic's FPToFixed, including its IOC for
-    // any nonzero negative unsigned input, with one exception: a negative
-    // signed binary64 value just below -2^31 whose rounding goes towards zero
-    // into range converts with IXC, as ARM ARM FPToFixed (round, then
-    // saturate) specifies; FPToFixed tests overflow on the magnitude plus one
-    // rounding unit and reports IOC there (f64_tests pins those cases).
+    // conversion. Results and cumulative flags are the ARM ARM FPToFixed
+    // (round, then saturate), which the Vita's Cortex-A9 implements; Dynarmic's
+    // FPToFixed differs for a negative signed binary64 value that rounds
+    // towards zero into range from just below -(2^31 - 1) and for a negative
+    // value that rounds to an unsigned 0 (tests/arm_fp_to_fixed.h).
     // Scaling by 2^fbits only adds fbits to the exponent before the range
     // decisions.
-    bool fp_to_fixed(const Inst &inst, bool is_signed, bool is_double) {
-        if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() > 32) return false;
+    // ibits is 32, or 16 for VCVT.{S,U}16 (a U16 result in the low half).
+    bool fp_to_fixed(const Inst &inst, bool is_signed, bool is_double, uint32_t ibits = 32) {
+        if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() > ibits) return false;
         const uint32_t fbits = inst.GetArg(1).GetU8();
         if (!inst.GetArg(2).IsImmediate()) return false;
         // Dynarmic::FP::RoundingMode: 0 nearest-even, 1 towards +inf,
@@ -2665,15 +2664,34 @@ private:
         };
         // Pushes the saturated result for a NaN/infinity/overflow input:
         // the signed extrema by sign, or unsigned max/zero by sign.
+        const uint32_t signed_max = (1u << (ibits - 1)) - 1, unsigned_max = ibits == 32 ? 0xffffffffu : 0xffffu;
         const auto saturate = [&] {
-            if (is_signed) { imm(0x80000000u); imm(0x7fffffffu); }
-            else { imm(0); imm(0xffffffffu); }
+            if (is_signed) { imm(~signed_max); imm(signed_max); }
+            else { imm(0); imm(unsigned_max); }
             get(sign_slot); op(Select);
         };
         // Result for a nonzero magnitude below one unit (IXC is raised by
         // the caller): 1 or -1 when the directed mode rounds away from zero,
         // otherwise 0 (below 2^-8, the nearest modes never reach one half).
         // A negative unsigned input never gets here.
+        // A nonzero finite negative input to an unsigned conversion: 0 with
+        // IXC when it rounds to 0, else saturated to 0 with IOC. Its
+        // magnitude rounds to 0 below one (towards zero or +inf), below one
+        // half (nearest, ties away) or up to one half (nearest even), never
+        // towards -inf. `exponent` holds the biased exponent before scaling.
+        const auto negative_unsigned = [&](uint32_t exponent, uint32_t bias, const auto &fraction_zero) {
+            switch (rounding) {
+            case 1: case 3: get(exponent); imm(bias - fbits); op(LtU); break;
+            case 4: get(exponent); imm(bias - 1 - fbits); op(LtU); break;
+            case 0:
+                get(exponent); imm(bias - 1 - fbits); op(LtU);
+                get(exponent); imm(bias - 1 - fbits); op(Eq); fraction_zero(); op(And); op(Or);
+                break;
+            default: imm(0); break;
+            }
+            begin_if(); accumulate(0x10); op(Else); accumulate(1); end_if();
+            imm(0); set(next_local);
+        };
         const auto tiny = [&] {
             if (rounding == 1) { get(sign_slot); op(Eqz); }
             else if (rounding == 2 && is_signed) { imm(0); get(sign_slot); op(Sub); }
@@ -2697,9 +2715,11 @@ private:
         // additionally IXC, which the dropped fraction has already raised.
         const auto publish_mag = [&](uint32_t carry_slot) {
             if (is_signed) {
-                get(mag_slot); imm(0x80000000u); imm(0x7fffffffu); get(sign_slot); op(Select); op(GtU);
-            } else {
+                get(mag_slot); imm(signed_max + 1); imm(signed_max); get(sign_slot); op(Select); op(GtU);
+            } else if (ibits == 32) {
                 imm(0);
+            } else {
+                get(mag_slot); imm(unsigned_max); op(GtU);
             }
             if (carry_slot) { get(carry_slot); op(Or); }
             begin_if();
@@ -2773,9 +2793,8 @@ private:
                 begin_if(); accumulate(1); saturate(); set(next_local);
                 op(Else);
                 if (!is_signed) {
-                    // A nonzero negative input is invalid (zero returned above).
                     get(sign_slot);
-                    begin_if(); accumulate(1); imm(0); set(next_local);
+                    begin_if(); negative_unsigned(expr, 127, [&] { get(frac); op(Eqz); });
                     op(Else);
                 }
                 range();
@@ -2789,6 +2808,7 @@ private:
                 begin_if(); accumulate(0x80); imm(0); set(next_local);
                 op(Else); classify(); end_if();
             } else classify();
+            if (ibits == 16) { get(next_local); mask(0xffff); set(next_local); }
             get(0); load(offsetof(JitState, fpscr)); get(flags_slot); op(Or);
             store(offsetof(JitState, fpscr));
             return ok;
@@ -2866,7 +2886,8 @@ private:
             op(Else);
             if (!is_signed) {
                 get(sign_slot);
-                begin_if(); accumulate(1); imm(0); set(next_local);
+                begin_if();
+                negative_unsigned(expr, 1023, [&] { get(frac_lo); get(frac_hi); op(Or); op(Eqz); });
                 op(Else);
             }
             range();
@@ -2879,6 +2900,7 @@ private:
             begin_if(); accumulate(0x80); imm(0); set(next_local);
             op(Else); classify(); end_if();
         } else classify();
+        if (ibits == 16) { get(next_local); mask(0xffff); set(next_local); }
         get(0); load(offsetof(JitState, fpscr)); get(flags_slot); op(Or);
         store(offsetof(JitState, fpscr));
         return ok;
@@ -3541,21 +3563,22 @@ private:
         }
         case Op::FPVectorToSignedFixed32:
         case Op::FPVectorToUnsignedFixed32: {
-            // ARM vector float-to-int VCVT (vcvt.s32/u32.f32) and VCVT{A,N,P,M}
-            // (v8), one helper call per lane. The A32 translator emits
-            // fbits=0 and fpcr_controlled=false for these, so the conversion
-            // always runs under the standard FPSCR value; the native helper
-            // re-derives every result from the vendored Dynarmic FPToFixed
-            // (operations 6/7 towards zero, 11/12 with the rounding mode in
-            // memory_value[2]; memory_value[3] is not read and may be stale).
-            // Any other immediate shape rejects the block,
-            // as does any live exception enable.
-            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0
+            // ARM vector float-to-int VCVT (vcvt.s32/u32.f32, fixed-point
+            // #fbits) and VCVT{A,N,P,M} (v8), one helper call per lane. The
+            // A32 translator emits fpcr_controlled=false for these, so the
+            // conversion always runs under the standard FPSCR value; the
+            // native helper implements the ARM ARM FPToFixed (operations 6/7
+            // towards zero without fraction bits, 11/12 with the rounding
+            // mode and fraction bits in memory_value[2]; memory_value[3] is
+            // not read and may be stale). Any other immediate shape rejects
+            // the block, as does any live exception enable.
+            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() > 32
                 || !inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU8() > 4
                 || !inst.GetArg(3).IsImmediate() || inst.GetArg(3).GetU1() != 0)
                 return false;
+            const uint8_t fbits = inst.GetArg(1).GetU8();
             const uint8_t rounding = inst.GetArg(2).GetU8();
-            const bool towards_zero = rounding == 3;
+            const bool towards_zero = rounding == 3 && fbits == 0;
             load(offsetof(JitState, fpscr)); mask(0x00009f00u);
             begin_if(); ret(ExitReason::Unsupported); end_if();
             // fp64.h contract for operations 6/7/11/12: the lane rides in the
@@ -3563,7 +3586,7 @@ private:
             // scalar ops pack). The helper overwrites memory_value[0] with
             // the result bits on every call, so the lane is republished
             // per lane exactly like the reciprocal estimates.
-            if (!towards_zero) store_constant(offsetof(JitState, memory_value) + 8, rounding);
+            if (!towards_zero) store_constant(offsetof(JitState, memory_value) + 8, rounding | uint32_t(fbits) << 8);
             for (unsigned word = 0; word < 4; ++word) {
                 get(0); value_word(inst.GetArg(0), word);
                 store(offsetof(JitState, memory_value));
@@ -3826,6 +3849,10 @@ private:
         case Op::FPSingleToFixedU32: return fp_to_fixed(inst, false, false);
         case Op::FPDoubleToFixedS32: return fp_to_fixed(inst, true, true);
         case Op::FPDoubleToFixedU32: return fp_to_fixed(inst, false, true);
+        case Op::FPSingleToFixedS16: return fp_to_fixed(inst, true, false, 16);
+        case Op::FPSingleToFixedU16: return fp_to_fixed(inst, false, false, 16);
+        case Op::FPDoubleToFixedS16: return fp_to_fixed(inst, true, true, 16);
+        case Op::FPDoubleToFixedU16: return fp_to_fixed(inst, false, true, 16);
         case Op::FPSingleToDouble: {
             // Widening binary32 to binary64 is exact for every finite input,
             // so the rounding mode cannot change the result. FZ flushes a
@@ -4188,6 +4215,11 @@ private:
             value_word(inst.GetArg(0)); set(next_local);
             // U64 SSA slots are two i32 words; replicate the source sign bit.
             value_word(inst.GetArg(0)); imm(31); op(ShrS); set(next_local + 1);
+            return ok;
+        case Op::SignExtendHalfToLong:
+            // U16 source in a word slot (VCVT.S16.F64 fixed-point writeback).
+            value_word(inst.GetArg(0)); imm(16); op(Shl); imm(16); op(ShrS); set(next_local);
+            get(next_local); imm(31); op(ShrS); set(next_local + 1);
             return ok;
         case Op::ZeroExtendWordToLong:
             value_word(inst.GetArg(0)); set(next_local);
