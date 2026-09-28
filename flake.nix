@@ -28,7 +28,7 @@
           # Native Vita3K dependencies
           openssl
           boost
-          SDL3
+          sdl3
 
           # Qt 6.11.x
           qt6.qtbase
