@@ -1,5 +1,6 @@
 #include "guest_thread_runtime.h"
 #include "guest_fiber_scheduler.h"
+#include "gles_webgl_bridge.h"
 
 #include <cpu/disasm/functions.h>
 #include <cpu/functions.h>
@@ -40,6 +41,17 @@ bool classify_unsupported_import(uint32_t nid) {
     // delay_thread parks until its deadline (SceThreadmgr execution_host
     // branch); the CB variant still runs host callbacks first.
     if (n.find("DelayThread") != n.npos && n.find("CB") == n.npos)
+        return false;
+    // Balatro's main loop paces itself with sceKernelDelayThreadCB: with no
+    // callbacks registered, process_callbacks is an empty guarded walk and
+    // the call is exactly delay_thread (fiber-safe, same as above), so
+    // rejecting it with ILLEGAL_CONTEXT leaves the title spinning on the
+    // failed delay with no frames. Narrow exception: other CB waits still
+    // need host-callback machinery the fibers do not have. NOTE: the bridge
+    // must also exist (runtime_hle.cmake selects these two); without it the
+    // classifier passes but resolution fails, the NID lands in missing_nids,
+    // and run_app_impl aborts the whole run at the next module_start.
+    if (n == "sceKernelDelayThreadCB" || n == "sceKernelDelayThreadCB200")
         return false;
     // The display waits are the guest's frame pacing (sceDisplayWaitSetFrameBuf,
     // ...Multi, sceDisplayWaitVblankStart, ...Multi). wait_vblank registers the
@@ -364,6 +376,9 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
 
     uint32_t module_entry(const SceKernelModuleInfo &info, Ptr<const void> entry_address,
         SceSize args, Ptr<const void> argp) {
+        // The runtime owns the module-entry hook while attached. Apply optional
+        // browser user-library HLE here as well as in the interpreter launcher.
+        if (env && ::browser::gles::replace_module(*env, info)) return 0;
         auto thread = kernel->create_thread(*mem, info.module_name, entry_address,
             SCE_KERNEL_DEFAULT_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT,
             SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);

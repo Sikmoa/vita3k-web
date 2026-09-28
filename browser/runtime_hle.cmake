@@ -39,6 +39,11 @@ set(_hle_exports
     # Limbo gameplay: resets the power-save timer; the production body only
     # returns SCE_KERNEL_OK.
     sceKernelPowerTick
+    # Balatro boot frontier (imports=23 missing_nids=1 PC=81469104): the
+    # title's first import is the RNG; the production SceLibRng body
+    # (random_device-seeded mt19937_64, capped at 64 bytes) fills guest
+    # memory directly and needs no host device.
+    sceKernelGetRandomNumber
     sceKernelGetMainModuleSdkVersion
     sceKernelGetThreadCurrentPriority sceKernelGetThreadExitStatus
     sceKernelGetThreadCpuAffinityMask sceKernelGetThreadCpuAffinityMask2
@@ -213,18 +218,35 @@ set(_hle_exports
     # Keep DelayThreadCB, WaitThreadEndCB, WaitEventFlagCB and WaitLwCondCB
     # unselected: their production paths wait on host condition variables
     # (or sleep) and cannot yield guest threads.
+    # Narrow Balatro exception (imports=9936 missing_nids=1 PC=814690c4):
+    # delay_thread takes the execution_host branch (fiber-safe wait_sync),
+    # and delay_thread_cb is that plus a guarded empty callback walk when
+    # nothing is registered. Without the bridge the classifier passes but
+    # resolution fails, missing_nids fills, and run_app_impl aborts the run.
+    sceKernelDelayThreadCB sceKernelDelayThreadCB200
     # GetSystemTime and GetThreadRunStatus are UNIMPLEMENTED upstream. There
     # is no user sceKernelGetSystemTimeLow in nids.inc; do not invent one.
     # Immediate Limbo frontier (imports=3995 missing_nids=1 PC=8126af40):
     # sceCtrlSetSamplingMode is a production body (validates the mode range,
     # stores emuenv.ctrl.input_mode, returns the previous mode), not a stub.
     sceCtrlSetSamplingMode
+    # Balatro boot frontier (imports=23 missing_nids=1 PC=81469104): the Ext
+    # twin validates the range, stores emuenv.ctrl.input_mode_ext and
+    # returns the previous mode. Production body, not a stub.
+    sceCtrlSetSamplingModeExt
+    # Balatro controller init (imports=8141 missing_nids=1 PC=814688c4):
+    # port info reports the physical pad, the sampling-mode getters read
+    # emuenv state. All three are host-free production bodies.
+    sceCtrlGetControllerPortInfo sceCtrlGetSamplingMode sceCtrlGetSamplingModeExt
     # Next Limbo frontier (imports=4005 missing_nids=1 PC=8126af50):
     # sceTouchGetPanelInfo fills constant panel geometry, sceTouchSetSamplingState
     # stores the per-port mode, and sceTouchPeek takes the non-blocking
     # touch_get peek path (no vblank wait; the blocking sceTouchRead is not
     # imported by the game). All three are production bodies, not stubs.
     sceTouchGetPanelInfo sceTouchSetSamplingState sceTouchPeek
+    # Balatro touch init (imports=8296 missing_nids=1 PC=81468a04): enable/
+    # disable touch force validate the port and store the mode; no host I/O.
+    sceTouchEnableTouchForce sceTouchDisableTouchForce
     # Limbo graphics-memory mapping (imports=4033 missing_nids=1 PC=8126b2d0):
     # sceGxmMap/UnmapMemory record regions in gxm.memory_mapped_regions and
     # return 0 while enable_memory_mapping stays false (the default); the
@@ -295,6 +317,21 @@ set(_hle_exports
     # presenting display queue advances. No input wired yet (keyboard/gamepad
     # mapping is follow-up); the game will sit at its input screen, correctly.
     sceCtrlReadBufferPositive
+    # Balatro input poll (imports=8164 missing_nids=1 PC=814688d4): the peek
+    # family takes ctrl_get's non-blocking path (is_peek, no vblank wait),
+    # same TU as the already-selected blocking read above.
+    sceCtrlPeekBufferPositive sceCtrlPeekBufferPositive2 sceCtrlPeekBufferPositiveExt
+    sceCtrlPeekBufferPositiveExt2 sceCtrlPeekBufferNegative sceCtrlPeekBufferNegative2
+    # Balatro media init (imports=17640 missing_nids=1 PC=81469034, right after
+    # a VideoWorker thread spawns): load-and-start by path via CALL_EXPORT to
+    # _sceKernelLoadStartModule. Production body; a missing file fails the
+    # call, it does not hang the thread.
+    sceKernelLoadStartModule
+    # Balatro HID probe (imports=8318 missing_nids=1 PC=81468a44, then 81468a64):
+    # keyboard/mouse enumeration on a host with neither. Upstream
+    # UNIMPLEMENTED() logs once and returns 0 (no devices), which is the
+    # truth here; the mouse read takes the same non-blocking path.
+    sceHidKeyboardEnumerate sceHidMouseEnumerate sceHidMouseRead
     # App-state poll (imports=610599 missing_nids=1 PC=8126b640):
     # _sceAppMgrGetAppState forwards (CALL_EXPORT) to __sceAppMgrGetAppState,
     # firmware 3.74's size/version/pointer checks over a state with nothing
@@ -367,6 +404,10 @@ set(_hle_exports
     sceKernelLibcGmtime_r sceKernelLibcLocaltime_r sceKernelLibcMktime
     sceKernelFindMemBlockByAddr sceKernelOpenMemBlock
     sceRtcSetTime64_t
+    # Balatro's settings loader uses the 32-bit Vita newlib time API. These
+    # are the production, pointer-checked date/tick conversions (no host wait).
+    sceRtcSetTime_t sceRtcGetTime_t sceRtcSetTick
+    sceRtcConvertUtcToLocalTime _sceRtcConvertUtcToLocalTime
     # libfios2 overlays: the IOState overlay table with SceFios2Kernel's
     # access rules and per-thread disable flag; the scheduler query is a pure
     # path test.
@@ -473,6 +514,8 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceGxm/SceGxmInternal.cpp"
     "${_HLE_ROOT}/modules/SceNearUtil/SceNearUtil.cpp"
     "${_HLE_ROOT}/modules/SceLibKernel/SceLibKernel.cpp"
+    # Balatro boot: home of sceKernelGetRandomNumber (see above).
+    "${_HLE_ROOT}/modules/SceLibKernel/SceLibRng.cpp"
     "${_HLE_ROOT}/modules/SceLibDbg/SceDbg.cpp"
     "${_HLE_ROOT}/modules/SceKernelThreadMgr/SceThreadmgr.cpp"
     "${_HLE_ROOT}/modules/SceKernelThreadMgr/SceThreadmgrCoredumpTime.cpp"
@@ -520,6 +563,8 @@ set(_hle_module_sources
     # controller-state reads only; no host input device needed).
     "${_HLE_ROOT}/ctrl/src/ctrl.cpp"
     "${_HLE_ROOT}/modules/SceTouch/SceTouch.cpp"
+    # Balatro HID probe: SceHid.cpp is all UNIMPLEMENTED() stubs (see above).
+    "${_HLE_ROOT}/modules/SceHid/SceHid.cpp"
     "${_HLE_ROOT}/modules/ScePower/ScePower.cpp"
     # Audio port registry (null device sink is hle_audio_null.cpp, linked
     # separately below; this adapter only registers the selected bridges).
@@ -593,6 +638,7 @@ add_library(vita3k_web_runtime_hle STATIC
     # decrypt_fself for module_parent.cpp's module loader.
     "${_HLE_BROWSER_ROOT}/src/vita_self_decrypt.cpp"
     "${_HLE_BROWSER_ROOT}/src/gxm_webgpu_bridge.cpp"
+    "${_HLE_BROWSER_ROOT}/src/gles_webgl_bridge.cpp"
     "${_HLE_BROWSER_ROOT}/src/msg_dialog_bridge.cpp"
     "${_HLE_BROWSER_ROOT}/src/ime_bridge.cpp"
     "${_lang_root}/src/lang.cpp"

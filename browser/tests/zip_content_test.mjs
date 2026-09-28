@@ -14,6 +14,9 @@ const prefixed = join(dir, 'prefixed.zip');  // wrapper/ux0/app/<id>/…
 const other = join(dir, 'other.zip');        // a different title entirely
 const noapp = join(dir, 'noapp.zip');        // nothing that looks like a game
 const withFirmware = join(dir, 'firmware.zip'); // whole Vita tree (ux0/ + os0/)
+const bareZip = join(dir, 'bare.zip');          // bare .vpk: root is the app dir
+const nosfoZip = join(dir, 'nosfo.zip');        // root files, but no param.sfo
+const badsfoZip = join(dir, 'badsfo.zip');      // unreadable param.sfo
 const expectPath = join(dir, 'expect.json');
 
 const fixture = `
@@ -48,6 +51,29 @@ with zipfile.ZipFile(r'${withFirmware}', 'w', zipfile.ZIP_DEFLATED) as z:
     for name, data in base.items():
         z.writestr(name if name.startswith('os0/') else 'ux0/' + name, data)
     z.writestr('vs0/sys/external/libhttp.suprx', random.randbytes(2048))
+def make_sfo(title_id):
+    import struct
+    pairs = [(b'TITLE_ID', title_id)]
+    n = len(pairs)
+    key_start = 20 + 16 * n
+    keys = b''.join(k + b'\\0' for k, _ in pairs)
+    data_start = key_start + len(keys)
+    out = [struct.pack('<4sIIII', b'PSF\\0', 0x101, key_start, data_start, n)]
+    off, data = 0, b''
+    for i, (k, v) in enumerate(pairs):
+        out.append(struct.pack('<HHIII', sum(len(kk) + 1 for kk, _ in pairs[:i]), 0x0004, len(v), len(v), off))
+        data += v
+        off += len(v)
+    return b''.join(out) + keys + data
+with zipfile.ZipFile(r'${bareZip}', 'w', zipfile.ZIP_DEFLATED) as z:
+    z.writestr('sce_sys/param.sfo', make_sfo(b'BARE00001\\0'))
+    z.writestr('eboot.bin', random.randbytes(512))
+    z.writestr('data/x.bin', random.randbytes(1024))
+with zipfile.ZipFile(r'${nosfoZip}', 'w', zipfile.ZIP_DEFLATED) as z:
+    z.writestr('eboot.bin', random.randbytes(512))
+with zipfile.ZipFile(r'${badsfoZip}', 'w', zipfile.ZIP_DEFLATED) as z:
+    z.writestr('sce_sys/param.sfo', b'not a param sfo file at all........')
+    z.writestr('eboot.bin', random.randbytes(512))
 with open(r'${expectPath}', 'w') as f:
     f.write(json.dumps([{'n': n, 's': len(d), 'head': list(d[:8])} for n, d in base.items()]))
 `;
@@ -108,6 +134,15 @@ assert.ok(!tree.files.some((f) => f.path.startsWith('ux0/os0/')), 'device roots 
 
 // Not a game package at all.
 await assert.rejects(cache.packageContents(new Blob([readFileSync(noapp)])), /no game found/);
+// Bare .vpk: no app/ folder, the title id comes from sce_sys/param.sfo and
+// the root becomes the title's ux0/app/<id> tree.
+const bareContents = await cache.packageContents(new Blob([readFileSync(bareZip)]));
+assert.equal(bareContents.title, 'BARE00001');
+assert.deepEqual(bareContents.files.map((f) => f.path).sort(),
+  ['ux0/app/BARE00001/data/x.bin', 'ux0/app/BARE00001/eboot.bin', 'ux0/app/BARE00001/sce_sys/param.sfo']);
+// Without a readable param.sfo there is nothing to name the title after.
+await assert.rejects(cache.packageContents(new Blob([readFileSync(nosfoZip)])), /no game found/);
+await assert.rejects(cache.packageContents(new Blob([readFileSync(badsfoZip)])), /cannot read the title id/);
 await assert.rejects(cache.packageContents(new Blob([new Uint8Array(64)])), /not a zip archive/);
 
 // --- OPFS cache ---
@@ -202,11 +237,15 @@ assert.equal(await cache.cacheReadFile(key, 'ux0/app/TEST00001/nope.bin'), null)
 assert.equal(cache.cacheIndexFor(manifest.files, manifest.files).size, contents.files.length);
 assert.equal(cache.cacheIndexFor(manifest.files, [{ path: 'ux0/app/TEST00001/eboot.bin', size: 999 }]).size, 0);
 assert.equal(cache.cacheIndexFor(null, manifest.files).size, 0);
+// The bare layout unpacks under the title id from param.sfo (needs OPFS).
+assert.equal((await cache.unpackPackageToCache(new Blob([readFileSync(bareZip)]),
+  cache.cacheKeyFor('BARE00001', 'BARE00001'), () => {})).files, 3);
+assert.ok(await cache.cacheReadFile(cache.cacheKeyFor('BARE00001', 'BARE00001'), 'ux0/app/BARE00001/eboot.bin'));
 
 // The picker lists what this browser holds.
 const listed = await cache.listCachedTitles();
 assert.deepEqual(listed.map((entry) => [entry.title, entry.files]),
-  [['TEST00001', contents.files.length]]);
+  [['BARE00001', 3], ['TEST00001', contents.files.length]]);
 
 // Each title keeps its own namespace: a second package under a different
 // key leaves the first untouched, and both show up in the picker's list.
@@ -215,7 +254,7 @@ const otherKey = cache.cacheKeyFor('OTHER0001', 'OTHER0001');
 await cache.unpackPackageToCache(otherBlob, otherKey, () => {});
 assert.ok(await cache.cacheReadFile(key, 'ux0/app/TEST00001/eboot.bin'), 'other title did not clobber this one');
 assert.ok(await cache.cacheReadFile(otherKey, 'ux0/app/OTHER0001/eboot.bin'));
-assert.deepEqual((await cache.listCachedTitles()).map((entry) => entry.title), ['OTHER0001', 'TEST00001']);
+assert.deepEqual((await cache.listCachedTitles()).map((entry) => entry.title), ['BARE00001', 'OTHER0001', 'TEST00001']);
 
 // Re-uploading under the same key replaces its content: no stale files.
 await cache.unpackPackageToCache(otherBlob, key, () => {});

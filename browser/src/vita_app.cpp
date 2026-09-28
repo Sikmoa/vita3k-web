@@ -42,6 +42,7 @@
 #include <regmgr/functions.h>
 #include <emscripten/emscripten.h>
 
+#include "gles_webgl_bridge.h"
 #include "ime_bridge.h"
 #include "msg_dialog_bridge.h"
 #include "vita_runtime.h"
@@ -81,6 +82,11 @@ static std::array<float, 4> g_host_axes{};
 static bool g_host_input_changed = false;
 
 namespace {
+
+const char *app_import_name(uint32_t nid) {
+    if (const char *name = browser::gles::import_name(nid)) return name;
+    return ::import_name(nid);
+}
 
 // Staged launch configuration. Plain POD + std::string; set from JS/bench
 // before vita3k_web_run_app(). One app per process, like the desktop flow.
@@ -126,6 +132,7 @@ bool needs_module_start(const char *path) {
 // with the same init/start/run_loop(true) sequence as the main thread.
 std::uint32_t run_module_entry(EmuEnvState &env, const SceKernelModuleInfo &info,
     Ptr<const void> entry, SceSize args, Ptr<const void> argp) {
+    if (browser::gles::replace_module(env, info)) return 0;
     auto module_thread = std::make_shared<ThreadState>(
         env.kernel.get_next_uid(), env.kernel, env.mem);
     if (module_thread->init(info.module_name, entry,
@@ -293,7 +300,7 @@ static int build_aot_image(EmuEnvState &env, const char *out_path) {
     }
     std::printf("[vita3k-web] AOT scan: %zu imported NIDs without an HLE implementation in this build\n", unserviced.size());
     for (const auto &[nid, stubs] : unserviced)
-        std::printf("[vita3k-web]   unserviced NID=%08x %s\n", nid, import_name(nid));
+        std::printf("[vita3k-web]   unserviced NID=%08x %s\n", nid, app_import_name(nid));
     std::printf("[vita3k-web] AOT roots: entries=%zu exidx=%zu relocations=%zu exports=%zu seeds=%zu\n",
         entry_roots, exidx_roots, relocation_roots, export_roots, seeds);
     std::vector<std::uint8_t> image;
@@ -326,6 +333,7 @@ static int run_app_impl() {
     }
     auto env = std::make_unique<EmuEnvState>();
     if (!init(env->mem, true)) return -2;
+    browser::gles::Session gles_session(*env);
     env->vita_fs_path = config.vita_fs;
     env->io.title_id = config.title_id;
     env->io.app_path = config.app_path;
@@ -414,7 +422,7 @@ static int run_app_impl() {
         for (std::size_t i = shown; i > 0; --i) {
             const auto &[nid, stats] = ranked[i - 1];
             std::printf("[vita3k-web] jit hle NID=%08x %-28s calls=%u ms=%.1f avg_us=%.0f\n",
-                nid, import_name(nid), stats.first, stats.second,
+                nid, app_import_name(nid), stats.first, stats.second,
                 stats.first ? stats.second * 1000.0 / stats.first : 0.0);
         }
         for (const auto &[id, active] : env->kernel.threads) {
@@ -436,7 +444,7 @@ static int run_app_impl() {
             if (!active || last == last_import.end()) continue;
             std::printf("[vita3k-web] thread=%d %s status=%d last_import=%s PC=%08x\n", id,
                 active->name.c_str(), static_cast<int>(active->status),
-                import_name(last->second.first), last->second.second);
+                app_import_name(last->second.first), last->second.second);
         }
     };
 #endif
@@ -466,7 +474,7 @@ static int run_app_impl() {
                 recent_imports[import_sequence % recent_imports.size()] = { import_sequence, tid, nid, read_pc(cpu), read_lr(cpu) };
                 if (trace_hle) {
                     std::fprintf(stderr, "[vita3k-web] HLE enter #%u tid=%d NID=%08x PC=%08x name=%s args=%08x,%08x,%08x,%08x LR=%08x\n",
-                        import_sequence, tid, nid, read_pc(cpu), import_name(nid),
+                        import_sequence, tid, nid, read_pc(cpu), app_import_name(nid),
                         read_reg(cpu, 0), read_reg(cpu, 1), read_reg(cpu, 2), read_reg(cpu, 3), read_lr(cpu));
                     std::fflush(stderr);
                 }
@@ -483,7 +491,7 @@ static int run_app_impl() {
                 }
                 if (report) {
                     std::printf("[vita3k-web] Vita import #%u: %s NID=%08x PC=%08x\n",
-                        imports, import_name(nid), nid, read_pc(cpu));
+                        imports, app_import_name(nid), nid, read_pc(cpu));
 #ifdef VITA3K_USE_WASM_JIT
                     jit_report("progress", true);
 #endif
@@ -491,14 +499,15 @@ static int run_app_impl() {
                 if (hle_profile) {
                     last_import[tid] = { nid, read_pc(cpu) };
                     const auto hle_started = std::chrono::steady_clock::now();
-                    ::call_import(*env, cpu, nid, tid);
+                    if (!browser::gles::call_import(*env, cpu, nid))
+                        ::call_import(*env, cpu, nid, tid);
                     const double hle_cost = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - hle_started).count();
                     hle_ms += hle_cost;
                     auto &hle_slot = hle_nids[nid];
                     ++hle_slot.first;
                     hle_slot.second += hle_cost;
-                } else {
+                } else if (!browser::gles::call_import(*env, cpu, nid)) {
                     ::call_import(*env, cpu, nid, tid);
                 }
                 browser::sync_message_dialog(*env);
@@ -511,6 +520,8 @@ static int run_app_impl() {
                 if (nid == 0x7A410B64 /* sceDisplaySetFrameBuf */
                     || nid == 0xF51523CB /* _sceDisplaySetFrameBuf */) {
                     vita3k_web_present_frame(*env);
+                    ++frames_presented;
+                } else if (nid == 0x02AB000E /* eglSwapBuffers */) {
                     ++frames_presented;
                 }
                 // Module-start imports run before the main thread exists.
@@ -565,7 +576,7 @@ static int run_app_impl() {
                     std::printf("[vita3k-web] module_start %s returned %08x\n", info.module_name, result);
                     if (!env->missing_nids.empty()) {
                         for (const auto nid : env->missing_nids)
-                            std::printf("[vita3k-web] missing NID=%08x (%s)\n", nid, import_name(nid));
+                            std::printf("[vita3k-web] missing NID=%08x (%s)\n", nid, app_import_name(nid));
                         return -8;
                     }
                     if (exited) return exit_code;
@@ -765,6 +776,9 @@ static int run_app_impl() {
                 }
                 progress.idle = false;
             }
+        // Unsupported imports remain fatal. A return-zero missing-import stub
+        // is not an implementation (PVRSRVConnect must provide a connection).
+        // The opt-in GLES adapter handles its APIs explicitly before this point.
         } while (!exited && env->missing_nids.empty() && !progress.failed
             && !progress.idle);
         std::printf("[vita3k-web] Guest scheduler: dispatches=%zu runnable=%zu waiting=%zu dormant=%zu failed=%zu idle=%d\n",
@@ -774,7 +788,7 @@ static int run_app_impl() {
             std::sort(ordered.begin(), ordered.end(), [](const auto &a, const auto &b) { return a.sequence < b.sequence; });
             for (const auto &r : ordered)
                 if (r.sequence)
-                    std::printf("[vita3k-web] recent import #%u tid=%d %s PC=%08x LR=%08x\n", r.sequence, r.tid, import_name(r.nid), r.pc, r.lr);
+                    std::printf("[vita3k-web] recent import #%u tid=%d %s PC=%08x LR=%08x\n", r.sequence, r.tid, app_import_name(r.nid), r.pc, r.lr);
         }
 #else
         thread->run_loop(true);
@@ -791,7 +805,7 @@ static int run_app_impl() {
         std::printf("[vita3k-web] Vita result: process_exit=%d code=%d imports=%u missing_nids=%zu PC=%08x\n",
             exited, exit_code, imports, env->missing_nids.size(), read_pc(*thread->cpu));
         for (const auto nid : env->missing_nids)
-            std::printf("[vita3k-web] missing NID=%08x (%s)\n", nid, import_name(nid));
+            std::printf("[vita3k-web] missing NID=%08x (%s)\n", nid, app_import_name(nid));
         return exited && env->missing_nids.empty() ? exit_code : -8;
     } catch (const std::exception &error) {
         std::fprintf(stderr, "[vita3k-web] Vita app runtime error: %s\n", error.what());

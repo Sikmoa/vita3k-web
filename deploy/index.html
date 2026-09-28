@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vita3K Web — M1 Bootstrap</title>
+</head>
+<body>
+  <main>
+    <h1>Vita3K Web</h1>
+    <p id="status">Loading browser bootstrap…</p>
+    <p id="capabilities"></p>
+    <label>Homebrew ELF <input id="elf-file" type="file" accept=".elf,application/x-elf"></label>
+  </main>
+  <script type="module">
+    import { detectBrowserCapabilities, requiredCapabilities, formatCapabilities } from './capabilities.js';
+    import { createWebStorage } from './storage.js';
+    import { createAudioInputBridge } from './audio_input.js';
+
+    const status = document.querySelector('#status');
+    const capabilities = detectBrowserCapabilities();
+    document.querySelector('#capabilities').textContent = formatCapabilities(capabilities);
+    const missing = requiredCapabilities(capabilities).filter((name) => !capabilities[name]);
+    if (missing.length) {
+      status.textContent = `Missing required browser capabilities: ${missing.join(', ')}`;
+      throw new Error(status.textContent);
+    }
+
+    const storage = createWebStorage();
+    const elfFile = document.querySelector('#elf-file');
+    const audioInput = createAudioInputBridge();
+    const worker = new Worker('./worker.js', { type: 'module' });
+    worker.onmessage = ({ data }) => {
+      if (data.type === 'lifecycle') console.log('[vita3k-web] lifecycle:', data.state);
+      if (data.type === 'ready') {
+        status.textContent = 'Vita3K WebAssembly bootstrap ready.';
+        console.log('[vita3k-web] bridges:', { storage, audioInput });
+        worker.postMessage({ type: 'run-guest', path: 'guest.elf' });
+      }
+      if (data.type === 'guest-exit') {
+        console.log('[vita3k-web] guest exit:', data.exitCode);
+        if (!data.ok) status.textContent = `Guest execution probe failed: ${data.message || 'invalid ELF'}`;
+      }
+      if (data.type === 'log') console.log('[vita3k-web]', data.message);
+      if (data.type === 'error') status.textContent = `Error: ${data.message}`;
+    };
+    elfFile.addEventListener('change', () => {
+      const [file] = elfFile.files;
+      if (file) worker.postMessage({ type: 'run-guest', path: file.name, file });
+    });
+    worker.onerror = (event) => {
+      status.textContent = `Worker error: ${event.message || 'unknown error'}`;
+    };
+    globalThis.vita3kWeb = { worker, storage, audioInput };
+  </script>
+</body>
+</html>

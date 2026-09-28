@@ -44,9 +44,9 @@ try {
     const context = await browser.newContext(options);
     await context.addInitScript(() => {
       const NativeWorker = Worker;
-      window.sent = []; window.testWorkers = [];
+      window.sent = []; window.testWorkers = []; window.workerUrls = [];
       window.Worker = class extends NativeWorker {
-        constructor(...args) { super(...args); window.testWorkers.push(this); }
+        constructor(...args) { super(...args); window.testWorkers.push(this); window.workerUrls.push(String(args[0])); }
         postMessage(message, ...args) {
           if (message.type !== 'attach-canvas') window.sent.push(message);
           return super.postMessage(message, ...args);
@@ -55,7 +55,7 @@ try {
     });
     const page = await context.newPage();
     page.on('pageerror', (error) => errors.push(String(error)));
-    await page.goto(url);
+    await page.goto(url + '?cores=1&scale=1&maxInFlight=2&hleProfile=1');
     await page.waitForFunction(() => !document.querySelector('#run').disabled);
     return page;
   }
@@ -75,6 +75,9 @@ try {
   assert.equal(await desktop.locator('#diagnostics').getAttribute('open'), null);
   await desktop.locator('#run').click();
   await expectPad(desktop, 0, [0, 0, 0, 0]);
+  const workerUrl = new URL(await desktop.evaluate(() => window.workerUrls.at(-1)), url);
+  for (const [key, value] of Object.entries({ cores: '1', scale: '1', maxInFlight: '2', hleProfile: '1' }))
+    assert.equal(workerUrl.searchParams.get(key), value, `${key} must reach the Worker`);
   await desktop.keyboard.down('ArrowRight'); await desktop.keyboard.down('KeyX');
   await expectPad(desktop, 0x4020, [1, 0, 0, 0]);
   await desktop.keyboard.up('ArrowRight');

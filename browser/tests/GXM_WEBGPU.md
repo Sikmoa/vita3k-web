@@ -24,9 +24,13 @@ its command list. Nothing is rendered implicitly.
 - `sceGxmInitialize` (`browser::gxm_initialize`) acquires the device through
   `gxm_scene.js` `init()` (`web_gxm_init`) and creates the `SceGxmDisplayQueue`
   guest thread; there are no host threads.
-- Each command list is encoded and submitted synchronously; its completions
-  (notifications, sync objects) are published right after the submission.
-  `sceGxmFinish` returns at once: nothing guest-visible waits on the GPU.
+- Each command list is encoded and submitted in order; its completions
+  (notifications, sync objects) are published right after accepted submission.
+  If the GPU queue is full, the producer suspends through Asyncify and retries
+  the same stream when capacity returns. No scene, upload or target update
+  is dropped. `sceGxmFinish` does not add a GPU completion fence.
+  Presentation/readback submissions share the same bounded queue. See
+  `../PLAYER.md` for limits, telemetry and the required Wasm rebuild.
 - Surface sync is opt-in (`VITA3K_SURFACE_SYNC=1`; Worker `?surfaceSync=1`,
   `limbo_serve.mjs` `?surfaceSync=1`, probe `LIMBO_SURFACE_SYNC=1`): a scene
   that drew into a color surface is read back into guest memory, in the

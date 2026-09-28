@@ -81,6 +81,7 @@ try {
     const logs = [];
     const scene = await import('./gxm_scene.js');
     await scene.init({
+      submissionProtocol: 1,
       compilerURL: new URL('shaders/gxp_compiler.mjs', location.href).href,
       nagaURL: new URL('shaders/naga.wasm', location.href).href,
       wasiShimURL: new URL('shaders/wasi/index.js', location.href).href,

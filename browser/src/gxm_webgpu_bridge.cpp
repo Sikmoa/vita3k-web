@@ -5,7 +5,8 @@
 // browser/web/gxm_scene.js: pass begin/end, draws with their fixed-function
 // state, and the vertex/index/uniform/texture bytes the draws reference, all
 // copied at submission so the guest may reuse its buffers immediately. The
-// stream is submitted synchronously: render targets live on the GPU, sampled
+// stream is submitted in order, suspending on queue back-pressure without
+// discarding its data: render targets live on the GPU, sampled
 // when a texture covers their texels, and are presented from there.
 // Command-list completion (notifications, sync objects) is published as soon
 // as the scene is submitted. Opt-in surface sync (VITA3K_SURFACE_SYNC=1, like
@@ -49,6 +50,7 @@ EM_ASYNC_JS(int, web_gxm_init, (), {
         const scene = await import(new URL('gxm_scene.js', globalThis.location.href).href);
         const base = globalThis.location.href;
         await scene.init({
+            submissionProtocol: 1,
             compilerURL: new URL('shaders/gxp_compiler.mjs', base).href,
             nagaURL: new URL('shaders/naga.wasm', base).href,
             wasiShimURL: new URL('shaders/wasi/index.js', base).href,
@@ -79,11 +81,23 @@ EM_JS(int, web_gxm_submit, (const uint32_t *words, uint32_t count, const uint8_t
     if (!scene) return 0;
     try {
         const offset = Module['vita3kHostOffset'](words, count * 4);
-        scene.submitScene(new Uint32Array(wasmMemory.buffer, offset, count),
-            Module['vita3kHostBytes'](data, size));
-        return 0;
+        return scene.trySubmitScene(new Uint32Array(wasmMemory.buffer, offset, count),
+            Module['vita3kHostBytes'](data, size)) ? 0 : 1;
     } catch (error) {
         err('[vita3k-web] GXM scene submission failed: ' + (error.stack || error));
+        return -1;
+    }
+});
+
+// Called only after the synchronous submit/present reports a full queue.
+// Asyncify preserves the producer's stack and stream; the Worker event loop
+// can process input and GPU completion while guest execution is suspended.
+EM_ASYNC_JS(int, web_gxm_wait_capacity, (), {
+    try {
+        await Module['vita3kGxm'].waitForCapacity();
+        return 0;
+    } catch (error) {
+        err('[vita3k-web] GXM queue wait failed: ' + (error.stack || error));
         return -1;
     }
 });
@@ -110,8 +124,9 @@ EM_ASYNC_JS(int, web_gxm_sync_surface, (uint32_t address, uint8_t *dest, uint32_
     }
 });
 
-// Presents the GPU render target at `address` (1) or reports that none exists
-// there (0). Frames go to the Worker's page hook; pixels are read back only
+// Presents the GPU render target at `address` (1), reports no target (0),
+// needs queue capacity (2), or fails (-1). Frames go to the Worker's page hook;
+// pixels are read back only
 // every Module.VITA3K_FRAME_READBACK frames (0 = never; default every frame
 // when the page attached no canvas, else never).
 EM_JS(int, web_gxm_present, (uint32_t address), {
@@ -119,9 +134,15 @@ EM_JS(int, web_gxm_present, (uint32_t address), {
     if (!scene) return 0;
     const configured = Module['VITA3K_FRAME_READBACK'];
     const every = configured !== undefined ? Number(configured) : (globalThis.vita3kHasCanvas ? 0 : 1);
-    return scene.presentTarget(address >>> 0, (generation, width, height, pixels) => {
-        if (globalThis.vita3kWebOnGpuFrame) globalThis.vita3kWebOnGpuFrame(generation, width, height, pixels);
-    }, every) ? 1 : 0;
+    try {
+        const result = scene.presentTarget(address >>> 0, (generation, width, height, pixels) => {
+            if (globalThis.vita3kWebOnGpuFrame) globalThis.vita3kWebOnGpuFrame(generation, width, height, pixels);
+        }, every);
+        return result === null ? 2 : result ? 1 : 0;
+    } catch (error) {
+        err('[vita3k-web] GXM presentation failed: ' + (error.stack || error));
+        return -1;
+    }
 });
 
 // Benchmark survey (VITA3K_GXM_SURVEY=1 with VITA3K_NULL_GPU=1): a command the
@@ -135,7 +156,7 @@ EM_JS(int, web_gxm_survey_enabled, (), {
 namespace {
 // Host milliseconds per stage, reported with the run progress.
 struct Timing {
-    double build = 0, decode = 0, submit = 0, sync = 0;
+    double build = 0, decode = 0, submit = 0, sync = 0, queue_wait = 0;
     unsigned decodes = 0, hashes = 0, clean = 0, untracked = 0, syncs = 0;
 };
 // VITA3K_TEXTURE_VERIFY=1: hash every bound texture even when no write was
@@ -318,8 +339,8 @@ struct WebState final : renderer::State {
 namespace browser {
 void gxm_timing_report() {
     const auto &t = timing();
-    std::printf("[gxm] scene_ms=%.0f (decode_ms=%.0f decodes=%u hashes=%u clean=%u untracked=%u js_submit_ms=%.0f)",
-        t.build, t.decode, t.decodes, t.hashes, t.clean, t.untracked, t.submit);
+    std::printf("[gxm] scene_ms=%.0f (decode_ms=%.0f decodes=%u hashes=%u clean=%u untracked=%u js_submit_ms=%.0f) gpu_wait_ms=%.0f",
+        t.build, t.decode, t.decodes, t.hashes, t.clean, t.untracked, t.submit, t.queue_wait);
     if (surface_sync())
         std::printf(" surface_syncs=%u surface_sync_ms=%.0f", t.syncs, t.sync);
     std::printf("\n");
@@ -1591,15 +1612,29 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
     ++out.draws;
 }
 
+static bool wait_for_gpu_capacity() {
+    const double started = emscripten_get_now();
+    const int result = web_gxm_wait_capacity();
+    timing().queue_wait += emscripten_get_now() - started;
+    return result == 0;
+}
+
 // False when gxm_scene.js rejected the stream (its error is logged).
 static bool submit_scene(scene::Writer &out, MemState &mem) {
     end_pass(out);
     out.copy_streams(mem);
     int result = 0;
     if (out.words.size() > 1) {
-        const double started = emscripten_get_now();
-        result = web_gxm_submit(out.words.data(), uint32_t(out.words.size()), out.data.data(), uint32_t(out.data.size()));
-        timing().submit += emscripten_get_now() - started;
+        for (;;) {
+            const double started = emscripten_get_now();
+            result = web_gxm_submit(out.words.data(), uint32_t(out.words.size()), out.data.data(), uint32_t(out.data.size()));
+            timing().submit += emscripten_get_now() - started;
+            if (result != 1) break;
+            // Do not reset the writer or publish notifications until the
+            // complete stream has been accepted. No guest work runs during
+            // this browser wait, so the writer and copied bytes stay owned.
+            if (!wait_for_gpu_capacity()) { result = -1; break; }
+        }
     }
     out.reset();
     return result == 0;
@@ -2226,6 +2261,13 @@ namespace browser {
 // render target is shown from the GPU; otherwise the caller presents guest
 // memory.
 bool gxm_present_gpu_target(Address base) {
-    return web_gxm_present(base) != 0;
+    int result;
+    while ((result = web_gxm_present(base)) == 2) {
+        if (!renderer::wait_for_gpu_capacity())
+            unsupported("GXM presentation queue failed (see browser log)");
+    }
+    if (result < 0)
+        unsupported("GXM presentation failed (see browser log)");
+    return result == 1;
 }
 } // namespace browser

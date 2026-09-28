@@ -43,11 +43,13 @@ the touch overlay releases its touches. Guest dialogs have tappable response
 buttons, and the guest text-entry field uses the phone's keyboard. This is a
 virtual **controller**; it does not emulate Vita front/rear touch surfaces.
 
-While the game starts, the overlay reports its phase: the runtime module,
-then each staged file — **Reading** it from persistent storage or
-**Downloading** it, with counts, percentage and elapsed time behind a
-progress bar — then the launch (and the AOT compile when `LIMBO_AOT` is
-set). The byte fraction counts the whole title, so the read/download
+While the game starts, the overlay reports its phase with byte-level
+progress: the runtime `.wasm` download, then each staged file — **Reading**
+it from persistent storage or **Downloading** it, with counts, percentage
+and elapsed time behind a progress bar — then the launch. With `LIMBO_AOT`
+the AOT download is metered the same way, followed by the device-side
+compile (which exposes no progress events, so the bar holds full while it
+works). The byte fraction counts the whole title, so the read/download
 counters are the ones that say how much actually crosses the network. The
 UI has no borders; the rounded corners stay.
 
@@ -119,23 +121,77 @@ and stencil state (`stateSkips` counts the skipped calls). `uploadMs` vs
 overhead. If the GPU side is the bottleneck instead, `?scale=1` renders
 at 960x544 (a quarter of the default 1920x1088 pixels).
 
-**GPU back-pressure.** WebGPU's queue is unbounded, and a phone GPU that
-falls behind never catches up: field measurements showed 300-500 encoded
-scenes queued with `completedSerial` falling further behind every second.
-A permanently backlogged vendor driver stalls the whole display stack on
-Android — the *system* UI freezes, status-bar clock included — so the
-renderer now refuses to queue more than `maxInFlight` scenes (default 6).
-Past that limit scenes are dropped (`throttledScenes`), the page says so
-and suggests `?scale=1`, and encoding resumes automatically once the queue
-drains. `?maxInFlight=N` tunes the limit (`0` disables it); the 5 s stats
-line carries `inFlight`, `maxInFlight`, `throttledScenes`,
-`droppedScenes` and `completedSerial` for diagnosis.
+**GPU back-pressure.** Field measurements showed hundreds of submissions
+outstanding during phone freezes. The renderer limits outstanding GPU
+submissions with `?maxInFlight=N` (default 6; integer 0 disables the limit).
+This includes scene, canvas presentation, and readback submissions. A canvas
+blit and its optional pixel readback use one submission together.
+
+When full, the C++ producer suspends through Asyncify, letting the Worker
+handle browser events and completion callbacks. It then retries the same
+scene or presentation. Commands and texture uploads are never discarded.
+Load-preserving render targets and textures can retain data across frames;
+dropping a scene corrupts those dependencies, and suppressing a single
+presentation cannot repair them. The guest also receives no successful
+scene notification until the scene has actually been submitted.
+
+There is only one outstanding completion probe. It covers submissions made
+before its registration; its resolution immediately starts another probe
+for any uncovered tail. CPU execution continues synchronously whenever
+capacity is available. Device loss, a rejected completion, or a probe with
+no observed completion for 15 seconds releases the wait with an error.
+
+The 5 s `[gxm-scene] stats` line and `sceneStats()` include:
+
+| Field | Meaning |
+| --- | --- |
+| `submitSerial`, `completedSerial`, `inFlight` | All submitted batches vs observed completion; not frame counts |
+| `maxInFlight`, `peakInFlight` | Configured cap and highest observed number outstanding |
+| `throttledScenes`, `throttledPresents` | Busy attempts retried after waiting; **not drops** |
+| `queueWaits`, `queueWaitMs`, `queueWaitMaxMs` | Count, total time, and longest producer wait |
+| `completionProbes`, `completionLastMs`, `completionAvgMs`, `completionMaxMs` | Probe resolutions and request-to-callback latency |
+| `completionPendingMs` | Age of the current probe |
+| `submitMs`, `uploadMs` | Synchronous JS encoding/upload time, excluding queue waits |
+
+Probe latency includes GPU work, browser/IPC scheduling and Worker event-loop
+delay; it is **not GPU execution time**. Compare the same gameplay interval
+at `?scale=1&maxInFlight=2`, `6`, and `12`, using counter deltas for cumulative
+timings. FPS increasing with a larger window suggests sensitivity to the
+window/probe latency, but does not by itself prove where the GPU time goes.
+The cap stays explicit rather than automatically increasing on a slow phone.
+C++ `[gxm]` reports `gpu_wait_ms` separately from `js_submit_ms` (the former
+includes scene and presentation waits; `scene_ms` includes scene waits).
+
+**Rebuild required:** this changes the C++/JS submission protocol. Rebuild
+`vita3k_web_dist` for both deployed memory models, then merge their dists.
+The source-serving dev server loads JS edits immediately, so stop it during
+the rebuild or expect a renderer/runtime mismatch until Wasm is updated.
+Old runtimes fail at graphics initialization with a rebuild message.
+The guest AOT image does not need regeneration for this host renderer change.
+
+```sh
+cmake --build build/web --target vita3k_web_dist
+cmake --build build/web64 --target vita3k_web_dist
+cp -a build/web/dist/. deploy/
+cp -a build/web64/dist/. deploy/
+```
+
+`?cores=1` and `?hleProfile=1` are now forwarded from the player to the
+Worker, along with the other diagnostic switches understood by `worker.js`.
 
 ## Validation
 
 ```sh
+node --experimental-vm-modules browser/tests/gxm_queue_test.mjs
+node browser/tests/gxm_queue_chromium.mjs
 node browser/tests/player_controls_chromium.mjs
 ```
+
+The queue tests cover exact completion watermarks, ordered retries without
+GPU writes when busy, presentation/readback accounting, and loss/rejection/
+timeout recovery. The Chromium queue test checks actual persistent target
+pixels under forced saturation. These fixtures do not measure phone FPS or
+validate the rebuilt C++/Asyncify path with a retail title.
 
 Requires Playwright and Chromium. `PLAYWRIGHT_MODULE_URL` and
 `PLAYWRIGHT_CHROMIUM_EXECUTABLE` can select existing installations;

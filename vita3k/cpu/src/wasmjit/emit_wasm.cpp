@@ -4738,6 +4738,18 @@ private:
             get(scratch_local); op(Wrap); set(next_local);
             get(scratch_local); op(0x42); uleb(code, 32); op(ShrU64); op(Wrap); set(next_local + 1);
             return ok;
+        case Op::Add64:
+        case Op::Sub64: {
+            // SMLAL-style 64-bit accumulate (Balatro's OpenAL mixer hits
+            // Add64 on boot: Mul64 + Pack2x32To1x64 + carry). The carry is a
+            // U1 (immediate here, a flag word in ADC-style uses); value()
+            // pushes either as i32. No CPSR flags in the IR for these ops.
+            const bool sub = inst.GetOpcode() == Op::Sub64;
+            value64(inst.GetArg(0)); value64(inst.GetArg(1)); op(sub ? Sub64 : Add64);
+            value(inst.GetArg(2)); op(ExtendU); op(sub ? Sub64 : Add64);
+            store_i64_words(next_local);
+            return ok;
+        }
         case Op::Pack2x32To1x64:
             // U64 result: assemble in the i64 scratch local, then publish as
             // two words. Leaving the i64 on the stack would type-error on the
