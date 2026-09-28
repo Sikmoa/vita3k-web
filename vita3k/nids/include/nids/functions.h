@@ -20,3 +20,8 @@
 #include <cstdint>
 
 const char *import_name(uint32_t nid);
+
+// Prefer the database's library-specific spelling, falling back to the
+// canonical name when no alternate spelling is recorded. Name recognition
+// does not imply an HLE implementation exists.
+const char *import_name(uint32_t nid, uint32_t library_nid);
