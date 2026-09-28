@@ -48,15 +48,19 @@ use the retail ablation below for a disabled-path performance comparison.
 
 ```sh
 cmake -S external/dynarmic -B build/native-dynarmic -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DDYNARMIC_FRONTENDS=A32 -DDYNARMIC_TESTS=OFF -DDYNARMIC_USE_BUNDLED_EXTERNALS=ON
+  -DDYNARMIC_FRONTENDS=A32 -DDYNARMIC_TESTS=OFF -DDYNARMIC_USE_BUNDLED_EXTERNALS=ON \
+  '-DCMAKE_CXX_FLAGS=-DFMT_CONSTEVAL= -Wno-deprecated-literal-operator' \
+  -DDYNARMIC_WARNINGS_AS_ERRORS=OFF
 cmake --build build/native-dynarmic
-c++ -std=c++20 -O1 -Wall -Wextra -Werror \
+bash vita3k/cpu/tests/build_wasmjit_fp_helper.sh /tmp/wasmjit-fp-helper.wasm
+c++ -std=c++20 -O1 -DFMT_CONSTEVAL= -Wno-deprecated-literal-operator \
   -Ivita3k/cpu/include -Ivita3k/mem/include \
   -Iexternal/dynarmic/src \
   -Iexternal/dynarmic/externals/mcl/include \
   -Iexternal/dynarmic/externals/fmt/include -Iexternal/boost \
   vita3k/cpu/src/wasmjit/emit_wasm.cpp \
   vita3k/cpu/tests/wasmjit_emitter_test.cpp \
+  vita3k/cpu/src/wasmjit/fp64.cpp /tmp/wasmjit-fp-helper.wasm.fused.cpp \
   build/native-dynarmic/src/dynarmic/libdynarmic.a \
   build/native-dynarmic/externals/mcl/src/libmcl.a \
   build/native-dynarmic/externals/fmt/libfmt.a \
@@ -64,7 +68,8 @@ c++ -std=c++20 -O1 -Wall -Wextra -Werror \
   build/native-dynarmic/externals/zydis/zycore/libZycore.a \
   -o /tmp/wasmjit-emitter-test
 /tmp/wasmjit-emitter-test /tmp/wasmjit-emitter-fixtures
-node vita3k/cpu/tests/wasmjit_emitter_test.mjs /tmp/wasmjit-emitter-fixtures
+node vita3k/cpu/tests/wasmjit_emitter_test.mjs /tmp/wasmjit-emitter-fixtures \
+  /tmp/wasmjit-fp-helper.wasm
 ```
 
 The first two commands build a standalone native Dynarmic (with its x64
@@ -74,6 +79,18 @@ goldens do not record) and its bundled fmt; the headers must be that fmt
 exists for it; see `vita3k/cpu/tests/wasmjit_emitter_README.md`), translates
 real ARM/Thumb into `.wasm` fixtures with expected-state JSON, and Node executes
 every module. Expected last line: `Wasm execution passed: ...`.
+
+The FP helper build requires Emscripten and CMake. Node executes the real
+portable arithmetic compiled to Wasm through a WASI reactor; it does not use
+JavaScript arithmetic as the oracle for the extended FP operations. The
+native fixture generator links the same corrected FMA source before the
+Dynarmic archive. The fmt flags above accommodate modern Clang with the
+vendored fmt version.
+
+If the external vitaslop corpus is unavailable, pass `--core-only` as the
+generator's second argument to explicitly omit it. The default still requires
+that corpus. See [IR_COVERAGE.md](vita3k/cpu/src/wasmjit/IR_COVERAGE.md) for the
+portable opcode scope, native callback exclusions and validation limits.
 
 ## Audio audibility probe (square-wave homebrew through the Worker path)
 

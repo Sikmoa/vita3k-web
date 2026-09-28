@@ -5,9 +5,13 @@
 The sections below retain historical design/source-only review records; their
 old layout sizes and validation disclaimers are not the current status.
 `emit_wasm.h` is authoritative for the live layout. The current wasm32
-`JitState` is 456 bytes; Memory64 uses wider host-address fields and emitted
-`offsetof` accesses. Both ABIs pass the full backend and cooperative-runtime
-suites (Node for wasm32, Chromium for Memory64).
+`JitState` is 492 bytes; Memory64 uses wider host-address fields and emitted
+`offsetof` accesses. Earlier ABI revisions passed the full backend and cooperative-runtime suites
+(Node for wasm32, Chromium for Memory64). The latest portable IR extension
+appends six private FP operand words, preserves previous offsets, and bumps
+AOT metadata to version 7. Its core emitted-module suite passes in Node, and
+the emitter compiles for both memory widths; full integration was not rerun.
+See [IR_COVERAGE.md](IR_COVERAGE.md) for this change’s scope and validation.
 
 Whole-program ahead-of-time modules reuse this region shape with the
 differences listed in [AOT.md](AOT.md).

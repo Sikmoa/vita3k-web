@@ -53,4 +53,20 @@ struct FP64Result {
 // Other modes or fraction bit counts return the default NaN with IOC.
 FP64Result fp64_arithmetic(uint32_t operation, uint64_t a, uint64_t b, uint32_t fpscr) noexcept;
 
+enum class FPOperation : uint32_t {
+    MulAdd = 1, MulSub, MulX, Min, Max, MinNumeric, MaxNumeric,
+    RecipEstimate, RecipExponent, RecipStep, RSqrtEstimate, RSqrtStep,
+    RoundInt, Convert, ToFixed, FromFixed,
+    Add, Sub, Mul, Div, Sqrt, Equal, Greater, GreaterEqual,
+};
+inline constexpr uint32_t extended_fp_marker = 0x10000;
+constexpr uint32_t fp_operation(FPOperation operation, unsigned source_bits, unsigned result_bits = 0, bool unsigned_ = false) {
+    const auto format = [](unsigned bits) { return bits == 64 ? 2u : bits == 32 ? 1u : 0u; };
+    return extended_fp_marker | (uint32_t(operation) << 8) | (format(source_bits) << 4)
+        | format(result_bits ? result_bits : source_bits) | (unsigned_ ? 0x40 : 0);
+}
+// Exact ARM bit-pattern arithmetic shared by JIT and AOT. Operation/format
+// selectors are constants chosen by the emitter, never instruction names.
+FP64Result fp_extended_arithmetic(uint32_t operation, uint64_t a, uint64_t b, uint64_t c, uint32_t fpscr) noexcept;
+
 } // namespace vita3k::wasmjit

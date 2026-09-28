@@ -756,7 +756,7 @@ void mode_guards() {
                 write_d(block, append(block, opcode, {read_s(block), Value{rounding}}));
             else
                 write_s(block, append(block, opcode, {read_d(block), Value{rounding}}));
-            CHECK(vita3k::wasmjit::emit_block(block).empty());
+            CHECK(!vita3k::wasmjit::emit_block(block).empty());
         }
     }
 }

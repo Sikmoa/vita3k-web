@@ -117,6 +117,9 @@ struct JitState {
     // stores can never write through a null base (tests, block mode). See
     // scratch_write_epochs() for native generator builds.
     HostAddress write_epochs_base = scratch_write_epochs(); // +464 MemState::write_epochs
+    // Private operands/result for exact FP operations unavailable in Wasm
+    // (notably fused multiply-add). Generated code preserves these words.
+    uint32_t fp_arguments[6]{};
 };
 static_assert(std::is_standard_layout_v<JitState>);
 static_assert(sizeof(JitState::regs) == 16 * sizeof(uint32_t));
@@ -150,7 +153,8 @@ static_assert(offsetof(JitState, mutex_fast_fallback) == 452);
 static_assert(offsetof(JitState, aot_entry) == 456);
 static_assert(offsetof(JitState, write_epoch) == 460);
 static_assert(offsetof(JitState, write_epochs_base) == 464);
-static_assert(sizeof(JitState) == 468);
+static_assert(offsetof(JitState, fp_arguments) == 468);
+static_assert(sizeof(JitState) == 492);
 #else
 static_assert(sizeof(HostAddress) == sizeof(void *));
 static_assert(offsetof(JitState, memory_cookie) % alignof(HostAddress) == 0);

@@ -458,3 +458,5 @@ FP64Result fp64_arithmetic(uint32_t operation, uint64_t a, uint64_t b, uint32_t 
 }
 
 } // namespace vita3k::wasmjit
+
+#include "fp_extended.inc"

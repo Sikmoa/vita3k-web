@@ -674,9 +674,17 @@ EMSCRIPTEN_KEEPALIVE uint32_t checked_memory_write(JitState *state, uint32_t add
     }
     return 0;
 }
-// Native Wasm helper: only the four scratch words are read/written. Flags
-// are returned, not stored, so no promoted architectural state is observed.
+// Native Wasm helper: only memory_value (legacy operations) or fp_arguments
+// (extended operations) is read/written. Flags are returned, not stored, so
+// no promoted architectural state is observed.
 uint32_t fp64_helper(JitState *state, uint32_t operation, uint32_t fpscr) noexcept {
+    if (operation & vita3k::wasmjit::extended_fp_marker) {
+        const auto operand = [&](unsigned i) { return uint64_t(state->fp_arguments[i * 2]) | (uint64_t(state->fp_arguments[i * 2 + 1]) << 32); };
+        const auto result = vita3k::wasmjit::fp_extended_arithmetic(operation, operand(0), operand(1), operand(2), fpscr);
+        state->fp_arguments[0] = uint32_t(result.bits);
+        state->fp_arguments[1] = uint32_t(result.bits >> 32);
+        return result.flags;
+    }
     const auto a = uint64_t(state->memory_value[0]) | (uint64_t(state->memory_value[1]) << 32);
     const auto b = uint64_t(state->memory_value[2]) | (uint64_t(state->memory_value[3]) << 32);
     const auto result = vita3k::wasmjit::fp64_arithmetic(operation, a, b, fpscr);

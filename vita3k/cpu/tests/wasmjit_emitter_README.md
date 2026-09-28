@@ -1,69 +1,24 @@
-# M14 Wasm emitter prototype tests and interface
+# Wasm emitter tests and interface
 
 The emitter implementation is `../src/wasmjit/emit_wasm.{h,cpp}`. It consumes **actual
 Dynarmic A32 IR**, not ARM bytes. The native fixture generator additionally uses
 Dynarmic's real ARM/Thumb translator; the JavaScript test executes raw emitted
 modules in Node's Wasm engine. It does not emulate Wasm or ARM.
 
-## Promoted-state candidate: validation pending
+## Current coverage and validation
 
-The optional implementation and all new tests are **implemented but unvalidated
-in this source-only environment**. No build, generated-Wasm execution, tests or
-benchmarks were run. See [REGION_ABI.md](../src/wasmjit/REGION_ABI.md#optional-promoted-region-state-candidate-september-2026)
-for the state ABI, switches, access audit, limitations and required validation.
+The shared JIT/AOT emitter now accounts for all 668 generic/A32 opcode entries,
+with explicit unsupported native callback operations. See
+[IR_COVERAGE.md](../src/wasmjit/IR_COVERAGE.md) for the scope, FP helper strategy,
+ABI changes and remaining runtime restrictions.
 
-The existing generator/harness now emits an explicit reference region and
-P/K/PK variants for every input corpus. Single-block architectural expectations
-remain checked through `block`; their additional region cases compare against
-reference `run`, since its cumulative accounting and exit ABI differ. Existing
-explicit region expectations are also checked. Each candidate receives the same
-fresh input and guest memory at both nonzero state offsets; return reason and
-the complete test memory image (including all JitState bytes) are compared.
-Module validation, imports/exports and OOB-state traps are checked per variant.
-The reference region is always emitted with `{false, false}`, independent of
-environment switches. These are source tests, not reported test results.
-
-New/extended unexecuted coverage:
-
-- The existing arithmetic random/edge corpus, carry/overflow SSA lifetime,
-  LSL/LSR/ASR/ROR/RRX counts 0..256, all EQ..AL conditions over all NZCV
-  combinations, selects, full CPSR reads, ARM/Thumb branches and IT faults,
-  memory probes, supported VFP/NEON data paths, now as A/P/K/PK regions.
-- Translated ADD/ADDS, ADC/ADCS, SUB/SUBS, SBC/SBCS, RSB/RSBS, CMP, CMN,
-  AND/ANDS, EOR/EORS, ORR/ORRS, MOV/MOVS and MVN/MVNS immediately followed
-  by SVC, over zero/negative/overflow/carry inputs and all incoming flags.
-- NZ-only writes preserving C/V, later carry consumption and full CPSR read;
-  ADDS immediately before read/write fault with a nonzero next_pc sentinel.
-- Existing rejection corpus for all four region policies, preserving the
-  unsupported opcode/terminal boundary. This adds no multiply, saturation,
-  Q/GE-write or FPSCR-write instruction support.
-- Backend region regressions, store continuations and M16 pump cases under
-  all four explicit policies: budgets 0/1/below/equal/above block cost,
-  non-divisible/exact exhaustion, zero progress, SVC/fault, stop, SMC, miss,
-  stale epoch, wraparound counters and continuation prefixes.
-- Cross-member flag production/conditional consumption/NZ-only update/full
-  read/SVC; flags before a continuation's Budget/Stop/Smc exit; mixed-policy
-  M16 carry production/consumption, true Miss and resumed invocation.
-
-In the real environment, use the commands below to build/generate/run the
-emitter suite. Then run the existing backend and InterpreterCPU integration
-test entry points in four fresh processes, setting both independent switches:
-
-| Mode | `VITA3K_WASMJIT_PROMOTE_FLAGS` | `VITA3K_WASMJIT_PROMOTE_ACCOUNTING` |
-| --- | --- | --- |
-| A | 0 | 0 |
-| P | 1 | 0 |
-| K | 0 | 1 |
-| PK | 1 | 1 |
-
-Unset `VITA3K_ABLATE`/`VITA3K_ABLATE_PC`. CPU integration tests use the process
-selection, while direct emitter/backend cases explicitly exercise the matrix.
-Run genuine exit-42 and display fixtures in each mode before benchmarking;
-repeat the hot-region WAT census on exactly that build. Record profile option
-fields so results cannot be mistaken for another policy. The public external
-cache-invalidation epoch discrepancy noted in REGION_ABI.md has a source fix
-in the Memory64 patch; that fix remains unbuilt and unvalidated. A stale-epoch
-unit case is not a proof that every host eviction path bumps the epoch.
+The core emitter suite has been built and executed in Node, including the
+reference/P/K/PK region variants at two state offsets. Extended FP operations
+execute the real portable helper compiled to Wasm. The suite compares complete
+state/memory, verifies module structure, and checks canaries and OOB traps.
+The external vitaslop corpus was explicitly omitted with `--core-only`.
+Full backend/browser integration and retail benchmarks were not rerun for
+this change; their separate recipes remain in SCRIPTS.md and REGION_ABI.md.
 
 ## Run from repository root
 
@@ -207,12 +162,14 @@ regenerate fixtures, and run the Node suite to green.
 **empty on unsupported input**. It neither executes guest code nor invokes
 helper callbacks. No exception is used for ordinary rejection.
 
-The standard-layout `JitState` is 420 bytes. Its original fields in order are
+The standard-layout wasm32 `JitState` is 492 bytes; Memory64 widens host-address
+fields. `emit_wasm.h` defines the current layout. Its original fields in order are
 `regs[16]`, `cpsr`, `fpscr`, `svc`, `exit_reason`, `executed`,
 `memory_cookie`, `fault_address`, `fault_write`, `memory_value[4]`,
 `fpu[64]` and `tpidruro`, followed by `next_pc`, `fault_pc`, `page_table_base`,
 `page_perms_base`, `smc_dirty`, `stop_flag`, `dispatches`, `code_pages_base`,
-`mem_fast_reads`, `mem_fast_writes`, `smc_page` and `tx_wasm`, all `uint32_t`; static asserts pin the layout.
+`mem_fast_reads`, `mem_fast_writes`, `smc_page` and `tx_wasm`. Later fields include dispatch/accounting metadata and the six
+private `fp_arguments` words. Static asserts pin the wasm32 layout.
 Extended registers overlay `fpu` exactly as the x64 backend's MJitStateExtReg:
 Sn is word n, Dn words 2n/2n+1, Qn words 4n..4n+3. The emitter uses
 `offsetof`, not native Dynarmic state layout. Export `block(i32 stateOffset)`
@@ -228,7 +185,8 @@ state after a successful block. On a faulting helper the module stores
 `executed=0`, `exit_reason=2` and returns 2; the parent restores its
 pre-block state snapshot (which contains the fault fields) and re-executes
 the block interpretively. There is no private memory, data segment, start
-function or table, and no helper other than the two memory functions.
+function or table. The `env.fp64(state, operation, fpscr)` import implements
+exact FP operations and returns exception flags; see IR_COVERAGE.md.
 
 Every invocation overwrites `svc`, `exit_reason`, and `executed`. Execution
 returns to host after **one** block, even for LinkBlockFast. `regs[15]` is the
@@ -247,55 +205,16 @@ and check it between block calls; cached blocks exceeding that budget cannot
 be invoked as-is. There is no mid-block interrupt/budget check. Cache lookup
 must match the full frontend location/mode; entry state must match that mode.
 
-## Exact supported IR whitelist
+## IR support
 
-- `Void` (Dynarmic invalidated-instruction marker), scalar `Identity`.
-- `A32GetRegister`, `A32SetRegister` (R0..R15); `A32GetCpsr`, `A32GetCFlag`.
-- `A32SetCpsrNZ`, `A32SetCpsrNZC`, `A32SetCpsrNZCV`, `A32SetCpsrNZCVRaw`.
-- `Add32`, `Sub32` (including carry-in), `LogicalShiftLeft32`,
-  `LogicalShiftRight32`, `ArithmeticShiftRight32`, `RotateRight32`,
-  `RotateRightExtended`.
-- `GetCarryFromOp` on those arithmetic/shifts; `GetOverflowFromOp` and
-  `GetNZCVFromOp` **only on Add32/Sub32**; `GetNZFromOp` on U32 values (including
-  immediates). Each producer's carry/overflow is explicitly lowered and saved.
-- `NZCVFromPackedFlags`, `GetCFlagFromNZCV` (internal NZCV uses CPSR bit positions).
-- `And32`, `Or32`, `Eor32`, `Not32`, `AndNot32`, `IsZero32`, `MostSignificantBit`.
-- `LeastSignificantByte`, `LeastSignificantHalf`, `LeastSignificantWord`,
-  `ZeroExtendByteToWord`, `ZeroExtendHalfToWord`, `SignExtendByteToWord`,
-  `SignExtendHalfToWord`, `ZeroExtendWordToLong` (U32 in, low word out),
-  `ConditionalSelect32`, `ConditionalSelectNZCV`.
-- `MostSignificantWord` (word 1 of a U64; the carry pseudo is bit 0 of word 1,
-  like the x64 backend's `shr r64,32`+`setc`), `LogicalShiftRight64` and
-  `Pack2x32To1x64` (U64 producers whose **both** words are published via the
-  i64 scratch local), `VectorBroadcast32` (all four lanes).
-- `FPSingleToFixedS32`, `FPSingleToFixedU32`, `FPDoubleToFixedS32`,
-  `FPDoubleToFixedU32` (VCVT.S32/U32.F32/F64 with fbits == 0; rounding
-  immediates 0 = nearest-even and 3 = towards-zero only, matching plain
-  VCVT and VCVTR under a default FPSCR; other explicit modes and scaled
-  fixed-point forms fail closed). Bit-pattern integer lowering with no
-  host FP and no trapping Wasm conversion: NaN/infinity/overflow and
-  negative-to-unsigned inputs saturate with IOC, dropped fractions raise
-  IXC, FZ-flushed denormals raise IDC, DN is ignored, and live trap
-  enables bail to Unsupported like every other FP lowering.
-- `A32GetVector`/`A32SetVector` with explicit D or Q registers (Dn words
-  2n/2n+1, Qn words 4n..4n+3; a D access never touches its neighbour's
-  words; S registers are rejected), `A32GetExtendedRegister64`/
-  `A32SetExtendedRegister64` with explicit D registers only (both words;
-  S/Q rejected).
-- `A32ReadMemory8/16/32/64` and `A32WriteMemory8/16/32/64`. 1/2/4-byte accesses
-  lower INLINE when the M15 fast path is armed (see REGION_ABI.md); every
-  fallback and the 64-bit width call the checked helpers (arg0 is the location
-  immediate, arg1 the guest address, writes publish their value first). The
-  helper's `bytes` argument carries a fallback reason in its HIGH byte (1..5,
-  see emit_wasm.h) which the host must mask off before use. `A32UpdateUpperLocationDescriptor`,
-  `A32BXWritePC`, `A32SetCheckBit`, `PushRSB` (prediction-only hint; no RSB),
-  `A32CallSupervisor` (must follow PC write and be final IR op).
+The authoritative implementation is the enum switch in `emit_wasm.cpp`.
+[IR_COVERAGE.md](../src/wasmjit/IR_COVERAGE.md) describes the supported portable
+families and native callback exclusions. Invalid operand shapes still reject
+emission, even when the opcode itself has a lowering. Guest memory accesses
+retain their checked helper or guarded inline paths.
 
-All other opcodes fail, even if unused. Supported scalar values are U1/U8/U16/
-U32/U64/NZCVFlags; the empty NZCV marker is rejected. Arithmetic uses i64 only as
-an internal widened intermediate (plus the explicit U64 producers above).
-Supported memory accesses go through the checked helpers; there is no
-unchecked load/store lowering, and guest memory is not the Wasm linear memory.
+The following terminal/location notes describe the original block interface;
+region and AOT contracts are documented in REGION_ABI.md and AOT.md.
 
 Terminals: `LinkBlock`, `LinkBlockFast`, recursive `If`; `ReturnToDispatch`,
 `PopRSBHint`, `FastDispatchHint` require an explicit PC write. `CheckHalt` is

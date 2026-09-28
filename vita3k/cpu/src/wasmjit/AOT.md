@@ -40,6 +40,10 @@ against the build-time hash and refuses the module on any mismatch.
 
 ## Module ABI
 
+Metadata version 7 includes the extended portable FP operand area and the
+shared generic/A32 lowerings described in [IR_COVERAGE.md](IR_COVERAGE.md).
+Rebuild older AOT images; the runtime rejects their metadata version.
+
 Imports: `env.memory` (the building runtime's linear memory: Memory64 from the
 web64 build, 32-bit from web32; the metadata records the width and
 `load_aot` refuses an image for the other one), `env.mem_read`,

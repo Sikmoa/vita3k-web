@@ -2,11 +2,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Standalone native fixture generator; run wasmjit_emitter_test.mjs afterward.
 #include "../src/wasmjit/emit_wasm.h"
+#include "../src/wasmjit/fp64.h"
+#include "dynarmic/common/crypto/aes.h"
+#include "dynarmic/common/crypto/sm4.h"
+#include "dynarmic/common/crypto/crc32.h"
+#include "dynarmic/common/math_util.h"
 
 #include <array>
 #include <bit>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -1021,9 +1027,9 @@ void reject_block(const IR::Block &block, const char *context = "") {
 
 void rejects() {
     const auto reject = [](const IR::Block &b) { reject_block(b); };
-    auto block = blank(); append(block, Opcode::Breakpoint, {}); reject(block);
-    // Full CPSR writes stay unsupported (VMSR/VMRS FPSCR access is supported).
-    block = blank(); append(block, Opcode::A32SetCpsr, {Value{uint32_t(0)}}); reject(block);
+    auto block = blank(); append(block, Opcode::Breakpoint, {}); CHECK(!emit_block(block).empty());
+    block = blank(); append(block, Opcode::CallHostFunction, {Value{uint64_t(0)}, Value{}, Value{}, Value{}}); reject(block);
+    block = blank(); append(block, Opcode::A32SetCpsr, {Value{uint32_t(0)}}); CHECK(!emit_block(block).empty());
     block = blank(); append(block, Opcode::A32GetFpscr, {}); CHECK(!emit_block(block).empty());
     block = blank(); block.ReplaceTerminal(IR::Term::Interpret{loc()}); reject(block);
     block = blank(); block.ReplaceTerminal(IR::Term::Invalid{}); reject(block);
@@ -1743,12 +1749,27 @@ void import_conformance(Suite &suite, const std::string &dir,
     }
 }
 } // namespace vitaslop
+#include "wasmjit_integer_lowerings_tests.inc"
+#include "wasmjit_extended_fp_tests.inc"
+#include "wasmjit_vector_lowerings_tests.inc"
+#include "wasmjit_saturation_lowerings_tests.inc"
+#include "wasmjit_vector_fp_tests.inc"
+#include "wasmjit_crypto_lowerings_tests.inc"
+#include "wasmjit_portable_boundary_tests.inc"
 } // namespace
 
 int main(int argc, char **argv) {
     CHECK(argc == 2 || argc == 3);
     rejects();
     Suite suite{argv[1]};
+    portable_aot_fixture(argv[1]);
+    portable_boundaries(suite);
+    crypto_lowerings(suite);
+    vector_fp_lowerings(suite);
+    saturation_lowerings(suite);
+    vector_lowerings(suite);
+    integer_lowerings(suite);
+    extended_fp_lowerings(suite);
     arithmetic(suite);
     shifts(suite);
     shifts_imm(suite);
@@ -1766,8 +1787,11 @@ int main(int argc, char **argv) {
     region_it_faults(suite);
     size_t vitaslop_passed = 0, vitaslop_skipped = 0;
     std::vector<vitaslop::Gap> vitaslop_gaps;
-    vitaslop::import_conformance(suite, argc == 3 ? argv[2] : vitaslop::kDefaultDir,
-        vitaslop_passed, vitaslop_skipped, vitaslop_gaps);
+    if (argc == 3 && std::string(argv[2]) == "--core-only")
+        std::cout << "External vitaslop corpus explicitly omitted (--core-only)\n";
+    else
+        vitaslop::import_conformance(suite, argc == 3 ? argv[2] : vitaslop::kDefaultDir,
+            vitaslop_passed, vitaslop_skipped, vitaslop_gaps);
     std::cout << "Native rejection/determinism checks passed; generated " << suite.modules
               << " reference modules + " << suite.candidate_modules << " candidate modules and "
               << suite.runs << " input cases (region inputs also run under P/K/PK)\n";

@@ -1,6 +1,9 @@
 // Copyright (C) 2026 Vita3K team
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "emit_wasm.h"
+#include "fp64.h"
+#include "dynarmic/common/crypto/aes.h"
+#include "dynarmic/common/crypto/sm4.h"
 
 #include <algorithm>
 #include <array>
@@ -93,6 +96,7 @@ namespace Term = Dynarmic::IR::Term;
 // MVP operations plus the opt-in Memory64 address/import types. No Table64
 // region table, sign-extension proposal, multivalue or additional memory.
 enum Wasm : uint8_t {
+    Unreachable = 0x00,
     Block = 0x02, Loop = 0x03, If = 0x04, Else = 0x05, End = 0x0b,
     Br = 0x0c, BrIf = 0x0d, BrTable = 0x0e, Return = 0x0f, Call = 0x10,
     CallIndirect = 0x11, ReturnCall = 0x12, ReturnCallIndirect = 0x13, Select = 0x1b,
@@ -100,10 +104,13 @@ enum Wasm : uint8_t {
     Store = 0x36, Store8 = 0x3a, Store16 = 0x3b, Const = 0x41,
     Eqz = 0x45, Eq = 0x46, Ne = 0x47, LtS = 0x48, LtU = 0x49, GtS = 0x4a, GtU = 0x4b, LeS = 0x4c, LeU = 0x4d, GeS = 0x4e, GeU = 0x4f, Eqz64 = 0x50,
     Clz = 0x67, Add = 0x6a, Sub = 0x6b, Mul = 0x6c, And = 0x71, Or = 0x72, Xor = 0x73,
-    Shl = 0x74, ShrS = 0x75, ShrU = 0x76, RotR = 0x78,
-    Eq64 = 0x51, LtS64 = 0x53, LtU64 = 0x54, GtS64 = 0x55,
-    Add64 = 0x7c, Sub64 = 0x7d, Mul64 = 0x7e, And64 = 0x83, Or64 = 0x84, Xor64 = 0x85, Shl64 = 0x86, ShrU64 = 0x88,
-    ShrS64 = 0x87, Wrap = 0xa7, ExtendS = 0xac, ExtendU = 0xad,
+    Shl = 0x74, ShrS = 0x75, ShrU = 0x76, RotR = 0x78, RotL = 0x77,
+    DivS = 0x6d, DivU = 0x6e,
+    Eq64 = 0x51, Ne64 = 0x52, LtS64 = 0x53, LtU64 = 0x54, GtS64 = 0x55, GtU64 = 0x56,
+    LeS64 = 0x57, LeU64 = 0x58, GeS64 = 0x59, GeU64 = 0x5a,
+    Add64 = 0x7c, Sub64 = 0x7d, Mul64 = 0x7e, DivS64 = 0x7f, DivU64 = 0x80,
+    And64 = 0x83, Or64 = 0x84, Xor64 = 0x85, Shl64 = 0x86, ShrS64 = 0x87, ShrU64 = 0x88,
+    RotL64 = 0x89, RotR64 = 0x8a, Wrap = 0xa7, ExtendS = 0xac, ExtendU = 0xad,
 };
 
 constexpr bool memory64 = memory_address_type == MemoryAddressType::I64;
@@ -1303,6 +1310,10 @@ private:
         push_i64_words(slot);
         op(0xbf); // f64.reinterpret_i64
     }
+    void push_f64_value(const Value &value) {
+        value64(value);
+        op(0xbf); // f64.reinterpret_i64
+    }
     void push_f64_imm(int64_t bits) {
         constant64(code, bits);
         op(0xbf);
@@ -1350,8 +1361,8 @@ private:
         // Read SSA sources and publish ALL four words before architectural
         // writeback, including for D-form operations whose high half is dead.
         if (bits == 64) {
-            if (operation != Add && operation != Sub) {
-                reject("64-bit vector integer arithmetic only supports add/subtract");
+            if (operation != Add && operation != Sub && operation != Mul) {
+                reject("unsupported 64-bit vector integer arithmetic");
                 return false;
             }
             for (unsigned word = 0; word < 4; word += 2) {
@@ -1360,7 +1371,7 @@ private:
                     value_word(inst.GetArg(source), word + 1); op(ExtendU);
                     constant64(code, 32); op(Shl64); op(Or64);
                 }
-                op(operation == Add ? Add64 : Sub64);
+                op(operation == Add ? Add64 : operation == Mul ? Mul64 : Sub64);
                 set(scratch_local);
                 get(scratch_local); op(Wrap); set(next_local + word);
                 get(scratch_local); constant64(code, 32); op(ShrU64); op(Wrap);
@@ -1550,7 +1561,7 @@ private:
         }
         return ok;
     }
-    bool vector_broadcast(const Inst &inst, unsigned bits, bool element = false) {
+    bool vector_broadcast(const Inst &inst, unsigned bits, bool element = false, bool lower = false) {
         unsigned index = 0;
         if (element && !vector_index(inst, bits, index)) return false;
         const unsigned words = bits == 64 ? 2 : 1;
@@ -1563,7 +1574,11 @@ private:
             }
             set(next_local + i);
         }
-        for (unsigned i = words; i < 4; ++i) { get(next_local + i % words); set(next_local + i); }
+        for (unsigned i = words; i < 4; ++i) {
+            if (lower && i >= 2) imm(0);
+            else get(next_local + i % words);
+            set(next_local + i);
+        }
         return ok;
     }
     bool vector_get_element(const Inst &inst, unsigned bits) {
@@ -1672,10 +1687,49 @@ private:
     // VUZP and VPMIN/VPMAX: the even (or odd) lanes of a, then those of b.
     // The Lower forms read only a[63:0] and b[63:0] and zero the upper half.
     bool vector_deinterleave(const Inst &inst, unsigned bits, bool odd, bool lower) {
+        if (bits == 64) {
+            for (unsigned operand = 0; operand < 2; ++operand) {
+                push_i64_value(inst.GetArg(operand), odd ? 2 : 0);
+                store_i64_words(next_local + operand * 2);
+            }
+            return ok;
+        }
         const unsigned per_operand = (lower ? 32 : 64) / bits; // selected lanes per operand
         pack_lanes(bits, lower ? 2 : 4, [&](unsigned i) {
             vector_element_word(inst.GetArg(i / per_operand), bits, 2 * (i % per_operand) + (odd ? 1 : 0));
         });
+        return ok;
+    }
+
+    bool vector_transpose(const Inst &inst, unsigned bits) {
+        if (!inst.GetArg(2).IsImmediate()) return false;
+        const unsigned part = inst.GetArg(2).GetU1();
+        if (bits == 64) {
+            for (unsigned operand = 0; operand < 2; ++operand) {
+                push_i64_value(inst.GetArg(operand), part * 2);
+                store_i64_words(next_local + operand * 2);
+            }
+        } else {
+            pack_lanes(bits, 4, [&](unsigned i) {
+                vector_element_word(inst.GetArg(i % 2), bits, (i / 2) * 2 + part);
+            });
+        }
+        return ok;
+    }
+
+    bool vector_reduce_add(const Inst &inst, unsigned bits) {
+        if (bits == 64) {
+            push_i64_value(inst.GetArg(0), 0); push_i64_value(inst.GetArg(0), 2); op(Add64);
+            store_i64_words(next_local);
+        } else {
+            for (unsigned lane = 0; lane < 128 / bits; ++lane) {
+                vector_element_word(inst.GetArg(0), bits, lane);
+                if (lane) op(Add);
+            }
+            if (bits < 32) mask((1u << bits) - 1);
+            set(next_local); imm(0); set(next_local + 1);
+        }
+        imm(0); set(next_local + 2); imm(0); set(next_local + 3);
         return ok;
     }
     // VPADDL: result lane i (twice the width) = a[2i] + a[2i + 1], each
@@ -1782,6 +1836,656 @@ private:
         });
         return ok;
     }
+
+    bool scalar_shift64(const Inst &inst, bool left, bool arithmetic_, bool rotate, bool masked) {
+        value64(inst.GetArg(0));
+        value_word(inst.GetArg(1)); op(ExtendU);
+        op(rotate ? RotR64 : left ? Shl64 : arithmetic_ ? ShrS64 : ShrU64);
+        if (!masked && !rotate) {
+            if (arithmetic_) { value64(inst.GetArg(0)); constant64(code, 63); op(ShrS64); }
+            else constant64(code, 0);
+            value_word(inst.GetArg(1)); imm(64); op(LtU); op(Select);
+        }
+        store_i64_words(next_local);
+        return ok;
+    }
+
+    bool scalar_shift32(const Inst &inst, bool left, bool arithmetic_, bool rotate, bool masked) {
+        value_word(inst.GetArg(0));
+        value_word(inst.GetArg(1));
+        op(rotate ? RotR : left ? Shl : arithmetic_ ? ShrS : ShrU);
+        if (!masked && !rotate) {
+            if (arithmetic_) { value_word(inst.GetArg(0)); imm(31); op(ShrS); }
+            else imm(0);
+            value_word(inst.GetArg(1)); imm(32); op(LtU); op(Select);
+        }
+        set(next_local); return ok;
+    }
+
+    bool scalar_div(const Inst &inst, bool wide, bool signed_) {
+        if (wide) {
+            value64(inst.GetArg(1));
+            set(scratch_local);
+            get(scratch_local); op(Eqz64); begin_if();
+            constant64(code, 0); store_i64_words(next_local); op(Else);
+            if (signed_) {
+                value64(inst.GetArg(0)); constant64(code, INT64_MIN); op(Eq64);
+                value64(inst.GetArg(1)); constant64(code, -1); op(Eq64); op(And); begin_if();
+                constant64(code, INT64_MIN); store_i64_words(next_local); op(Else);
+            }
+            value64(inst.GetArg(0)); value64(inst.GetArg(1)); op(signed_ ? DivS64 : DivU64);
+            store_i64_words(next_local);
+            if (signed_) end_if();
+            end_if();
+        } else {
+            value_word(inst.GetArg(1)); set(next_local + 4);
+            get(next_local + 4); op(Eqz); begin_if(true);
+            imm(0); op(Else);
+            if (signed_) {
+                value_word(inst.GetArg(0)); imm(0x80000000); op(Eq);
+                get(next_local + 4); imm(0xffffffff); op(Eq); op(And); begin_if(true);
+                imm(0x80000000); op(Else);
+            }
+            value_word(inst.GetArg(0)); get(next_local + 4); op(signed_ ? DivS : DivU);
+            if (signed_) end_if();
+            end_if(); set(next_local);
+        }
+        return ok;
+    }
+
+    bool scalar_minmax(const Inst &inst, unsigned bits, bool maximum, bool signed_) {
+        if (bits == 64) {
+            value64(inst.GetArg(0)); store_i64_words(next_local + 4);
+            value64(inst.GetArg(1)); store_i64_words(next_local + 6);
+            push_i64_words(next_local + 4); push_i64_words(next_local + 6);
+            op(signed_ ? GtS64 : GtU64); set(next_local + 8);
+            push_i64_words(maximum ? next_local + 4 : next_local + 6);
+            push_i64_words(maximum ? next_local + 6 : next_local + 4);
+            get(next_local + 8); op(Select);
+            store_i64_words(next_local);
+        } else {
+            value_word(inst.GetArg(0)); set(next_local + 4);
+            value_word(inst.GetArg(1)); set(next_local + 5);
+            get(next_local + 4); get(next_local + 5);
+            op(signed_ ? GtS : GtU); set(next_local + 6);
+            get(next_local + (maximum ? 4 : 5)); get(next_local + (maximum ? 5 : 4));
+            get(next_local + 6); op(Select); set(next_local);
+        }
+        return ok;
+    }
+
+    bool multiply_high64(const Inst &inst, bool is_signed) {
+        const auto limb = [&](unsigned operand, unsigned word) {
+            value_word(inst.GetArg(operand), word); op(ExtendU);
+        };
+        // Base-2^32 long multiplication. Both cross-term accumulators fit
+        // in 64 bits; their upper halves carry into the high product.
+        limb(0, 0); limb(1, 0); op(Mul64); constant64(code, 32); op(ShrU64);
+        limb(0, 1); limb(1, 0); op(Mul64); op(Add64); store_i64_words(next_local + 4);
+        limb(0, 0); limb(1, 1); op(Mul64);
+        get(next_local + 4); op(ExtendU); op(Add64); constant64(code, 32); op(ShrU64);
+        get(next_local + 5); op(ExtendU); op(Add64);
+        limb(0, 1); limb(1, 1); op(Mul64); op(Add64);
+        if (is_signed) {
+            for (unsigned operand = 0; operand < 2; ++operand) {
+                value64(inst.GetArg(1 - operand));
+                value64(inst.GetArg(operand)); constant64(code, 63); op(ShrS64); op(And64); op(Sub64);
+            }
+        }
+        store_i64_words(next_local);
+        return ok;
+    }
+
+    // Compact constant table: five comparisons choose an eight-byte i64,
+    // then a shift extracts its byte. No guest-memory table or host call.
+    void byte_lookup(const std::array<uint8_t, 256> &table, uint32_t index, unsigned begin = 0, unsigned count = 256) {
+        if (count == 8) {
+            uint64_t bytes = 0;
+            for (unsigned i = 0; i < 8; ++i) bytes |= uint64_t(table[begin + i]) << (8 * i);
+            constant64(code, int64_t(bytes)); get(index); mask(7); imm(3); op(Shl); op(ExtendU); op(ShrU64); op(Wrap); mask(0xff);
+            return;
+        }
+        get(index); imm(begin + count / 2); op(LtU); begin_if(true);
+        byte_lookup(table, index, begin, count / 2); op(Else);
+        byte_lookup(table, index, begin + count / 2, count / 2); end_if();
+    }
+
+    bool aes_round(const Inst &inst, bool inverse) {
+        namespace AES = Dynarmic::Common::Crypto::AES;
+        static const auto tables = [] {
+            std::array<std::array<uint8_t, 256>, 2> result{};
+            for (unsigned i = 0; i < 256; ++i) {
+                AES::State input{}, output{}; input.fill(uint8_t(i));
+                AES::EncryptSingleRound(output, input); result[0][i] = output[0];
+                AES::DecryptSingleRound(output, input); result[1][i] = output[0];
+            }
+            return result;
+        }();
+        pack_lanes(8, 4, [&](unsigned i) {
+            const unsigned row = i % 4, column = i / 4;
+            const unsigned source = 4 * ((column + (inverse ? 4 - row : row)) % 4) + row;
+            vector_element_word(inst.GetArg(0), 8, source); set(next_local + 4);
+            byte_lookup(tables[inverse], next_local + 4);
+        });
+        return ok;
+    }
+
+    bool aes_mix_columns(const Inst &inst, bool inverse) {
+        constexpr unsigned forward[4]{2, 3, 1, 1}, backward[4]{14, 11, 13, 9};
+        pack_lanes(8, 4, [&](unsigned i) {
+            const unsigned row = i % 4, column = i / 4;
+            for (unsigned j = 0; j < 4; ++j) {
+                vector_element_word(inst.GetArg(0), 8, column * 4 + j); set(next_local + 5);
+                for (unsigned power = 1; power <= (inverse ? 3u : 1u); ++power) {
+                    get(next_local + 4 + power); imm(1); op(Shl);
+                    imm(0); get(next_local + 4 + power); imm(7); op(ShrU); op(Sub); mask(0x1b); op(Xor); mask(0xff);
+                    set(next_local + 5 + power);
+                }
+                const unsigned multiplier = (inverse ? backward : forward)[(j + 4 - row) % 4];
+                bool first = true;
+                for (unsigned power = 0; power < 4; ++power) if (multiplier & (1u << power)) {
+                    get(next_local + 5 + power); if (!first) op(Xor); first = false;
+                }
+                if (j) op(Xor);
+            }
+        });
+        return ok;
+    }
+
+    bool sha256(const Inst &inst, Op kind) {
+        const auto sigma = [&](uint32_t slot, unsigned a, unsigned b, unsigned c, bool shift) {
+            get(slot); imm(a); op(RotR); get(slot); imm(b); op(RotR); op(Xor);
+            get(slot); imm(c); op(shift ? ShrU : RotR); op(Xor);
+        };
+        if (kind == Op::SHA256Hash) {
+            if (!inst.GetArg(3).IsImmediate()) return false;
+            for (unsigned i = 0; i < 8; ++i) { value_word(inst.GetArg(i / 4), i % 4); set(next_local + i); }
+            for (unsigned round = 0; round < 4; ++round) {
+                get(next_local + 7); sigma(next_local + 4, 6, 11, 25, false); op(Add);
+                get(next_local + 4); get(next_local + 5); op(And);
+                get(next_local + 4); imm(UINT32_MAX); op(Xor); get(next_local + 6); op(And); op(Xor); op(Add);
+                value_word(inst.GetArg(2), round); op(Add); set(next_local + 8);
+                sigma(next_local, 2, 13, 22, false);
+                get(next_local); get(next_local + 1); op(And);
+                get(next_local); get(next_local + 2); op(And); op(Xor);
+                get(next_local + 1); get(next_local + 2); op(And); op(Xor); op(Add); set(next_local + 9);
+                for (unsigned i = 7; i > 0; --i) {
+                    get(next_local + i - 1);
+                    if (i == 4) { get(next_local + 8); op(Add); }
+                    set(next_local + i);
+                }
+                get(next_local + 8); get(next_local + 9); op(Add); set(next_local);
+            }
+            if (!inst.GetArg(3).GetU1()) for (unsigned i = 0; i < 4; ++i) { get(next_local + 4 + i); set(next_local + i); }
+        } else {
+            for (unsigned i = 0; i < 4; ++i) {
+                value_word(inst.GetArg(0), i);
+                if (kind == Op::SHA256MessageSchedule0) {
+                    value_word(inst.GetArg(i == 3 ? 1 : 0), (i + 1) % 4); set(next_local + 4);
+                    sigma(next_local + 4, 7, 18, 3, true);
+                } else {
+                    value_word(inst.GetArg(i == 3 ? 2 : 1), (i + 1) % 4); op(Add);
+                    if (i < 2) value_word(inst.GetArg(2), i + 2);
+                    else get(next_local + i - 2);
+                    set(next_local + 4); sigma(next_local + 4, 17, 19, 10, true);
+                }
+                op(Add); set(next_local + i);
+            }
+        }
+        return ok;
+    }
+
+    bool crc32(const Inst &inst, unsigned bits, uint32_t polynomial) {
+        value_word(inst.GetArg(0)); set(next_local);
+        for (unsigned byte = 0; byte < bits / 8; ++byte) {
+            get(next_local);
+            value_word(inst.GetArg(1), byte / 4);
+            if (byte % 4) { imm((byte % 4) * 8); op(ShrU); }
+            mask(0xff); op(Xor); set(next_local);
+            for (unsigned bit = 0; bit < 8; ++bit) {
+                get(next_local); imm(1); op(ShrU);
+                imm(0); get(next_local); mask(1); op(Sub); mask(polynomial); op(Xor); set(next_local);
+            }
+        }
+        return ok;
+    }
+
+    bool vector_full_multiply(const Inst &inst, unsigned bits, bool is_signed) {
+        for (unsigned word = 0; word < 4; ++word) {
+            if (bits == 32) {
+                value_word(inst.GetArg(0), word); op(is_signed ? ExtendS : ExtendU);
+                value_word(inst.GetArg(1), word); op(is_signed ? ExtendS : ExtendU);
+                op(Mul64); set(scratch_local);
+                get(scratch_local); op(Wrap); set(next_local + word);
+                get(scratch_local); constant64(code, 32); op(ShrU64); op(Wrap); set(next_local + 4 + word);
+            } else {
+                for (unsigned half = 0; half < 2; ++half) {
+                    for (unsigned lane = 0; lane < 2; ++lane) {
+                        vector_lane(inst.GetArg(0), 16, word * 2 + lane, is_signed);
+                        vector_lane(inst.GetArg(1), 16, word * 2 + lane, is_signed); op(Mul);
+                        if (half) { imm(16); op(ShrU); }
+                        mask(0xffff);
+                        if (lane) { imm(16); op(Shl); op(Or); }
+                    }
+                    set(next_local + half * 4 + word);
+                }
+            }
+        }
+        return ok;
+    }
+
+    bool scalar_misc(const Inst &inst, Op kind) {
+        const unsigned bits = inst.GetType() == Type::U64 ? 64 : 32;
+        if (kind == Op::IsZero64 || kind == Op::IsZero32) {
+            if (kind == Op::IsZero64) value64(inst.GetArg(0)); else value_word(inst.GetArg(0));
+            op(kind == Op::IsZero64 ? Eqz64 : Eqz); set(next_local); return ok;
+        }
+        if (kind == Op::TestBit) {
+            value64(inst.GetArg(0)); value_word(inst.GetArg(1)); op(ExtendU); op(ShrU64);
+            constant64(code, 1); op(And64); op(Wrap); set(next_local); return ok;
+        }
+        if (kind == Op::ConditionalSelect64) {
+            if (!inst.GetArg(0).IsImmediate() || inst.GetArg(0).GetType() != Type::Cond) return false;
+            value64(inst.GetArg(1)); value64(inst.GetArg(2)); condition(inst.GetArg(0).GetCond()); op(Select); store_i64_words(next_local); return ok;
+        }
+        if (kind == Op::SignExtendByteToLong) {
+            value_word(inst.GetArg(0)); imm(24); op(Shl); imm(24); op(ShrS); op(ExtendS); store_i64_words(next_local); return ok;
+        }
+        if (kind == Op::CountLeadingZeros64) {
+            value64(inst.GetArg(0)); op(0x79); store_i64_words(next_local); return ok;
+        }
+        if (kind == Op::ExtractRegister32 || kind == Op::ExtractRegister64) {
+            if (!inst.GetArg(2).IsImmediate()) return false;
+            const unsigned shift_amount = inst.GetArg(2).GetU8();
+            if (shift_amount >= bits) return false;
+            if (bits == 64) {
+                value64(inst.GetArg(0));
+                if (shift_amount) { constant64(code, shift_amount); op(ShrU64); value64(inst.GetArg(1)); constant64(code, 64 - shift_amount); op(Shl64); op(Or64); }
+                store_i64_words(next_local);
+            } else {
+                value_word(inst.GetArg(0));
+                if (shift_amount) { imm(shift_amount); op(ShrU); value_word(inst.GetArg(1)); imm(32 - shift_amount); op(Shl); op(Or); }
+                set(next_local);
+            }
+            return ok;
+        }
+        if (kind == Op::ReplicateBit32 || kind == Op::ReplicateBit64) {
+            if (bits == 64) {
+                constant64(code, 0); value64(inst.GetArg(0)); value_word(inst.GetArg(1)); op(ExtendU); op(ShrU64); constant64(code, 1); op(And64); op(Sub64); store_i64_words(next_local);
+            } else {
+                imm(0); value_word(inst.GetArg(0)); value_word(inst.GetArg(1)); op(ShrU); mask(1); op(Sub); set(next_local);
+            }
+            return ok;
+        }
+        return false;
+    }
+
+    bool packed_arithmetic(const Inst &inst, unsigned bits, bool signed_, bool subtract, bool halving, bool exchange = false) {
+        imm(0); set(next_local);
+        imm(0); set(next_local + 4);
+        for (unsigned lane = 0; lane < 32 / bits; ++lane) {
+            const bool sub = exchange ? (lane == 0 ? subtract : !subtract) : subtract;
+            vector_lane(inst.GetArg(0), bits, lane, signed_);
+            vector_lane(inst.GetArg(1), bits, exchange ? lane ^ 1 : lane, signed_);
+            op(sub ? Sub : Add); set(next_local + 5);
+            if (!halving && carry_needed.count(&inst)) {
+                get(next_local + 4);
+                imm(0); get(next_local + 5);
+                imm(signed_ || sub ? 0 : 1u << bits); op(GeS); op(Sub);
+                mask(((1u << bits) - 1) << (lane * bits)); op(Or); set(next_local + 4);
+            }
+            get(next_local + 5);
+            if (halving) { imm(1); op(signed_ ? ShrS : ShrU); }
+            mask((1u << bits) - 1);
+            if (lane) { imm(lane * bits); op(Shl); }
+            get(next_local); op(Or); set(next_local);
+        }
+        return ok;
+    }
+
+    bool scalar_saturating(const Inst &inst, unsigned bits, bool signed_, bool add) {
+        return vector_saturated_add_sub(inst, bits, signed_, add, true);
+    }
+
+    bool vector_mixed_accumulate(const Inst &inst, unsigned bits, bool signed_result) {
+        const auto saturated = next_local + 4, overflow = next_local + 5;
+        imm(0); set(saturated);
+        if (bits < 64) {
+            pack_lanes(bits, 4, [&](unsigned i) {
+                vector_lane(inst.GetArg(0), bits, i, !signed_result); op(signed_result ? ExtendU : ExtendS);
+                vector_lane(inst.GetArg(1), bits, i, signed_result); op(signed_result ? ExtendS : ExtendU);
+                op(Add64); set(scratch_local);
+                clamp_i64_low(signed_result ? -(int64_t(1) << (bits - 1)) : 0,
+                    signed_result ? (int64_t(1) << (bits - 1)) - 1 : (int64_t(1) << bits) - 1, saturated);
+            });
+        } else {
+            for (unsigned word = 0; word < 4; word += 2) {
+                const auto a = [&] { push_i64_value(inst.GetArg(0), word); };
+                const auto b = [&] { push_i64_value(inst.GetArg(1), word); };
+                a(); b(); op(Add64); set(scratch_local);
+                if (signed_result) {
+                    // a is unsigned, b signed; INT64_MAX-b fits in u64.
+                    a(); constant64(code, INT64_MAX); b(); op(Sub64); op(GtU64); set(overflow);
+                    constant64(code, INT64_MAX);
+                } else {
+                    // a is signed, b unsigned. A negative a can underflow;
+                    // a nonnegative a can carry above UINT64_MAX.
+                    b(); constant64(code, 0); a(); op(Sub64); op(LtU64);
+                    get(scratch_local); b(); op(LtU64);
+                    a(); constant64(code, 0); op(LtS64); op(Select); set(overflow);
+                    constant64(code, 0); constant64(code, -1);
+                    a(); constant64(code, 0); op(LtS64); op(Select);
+                }
+                get(scratch_local); get(overflow); op(Select); store_i64_words(next_local + word);
+                get(saturated); get(overflow); op(Or); set(saturated);
+            }
+        }
+        set_qc_if(saturated);
+        return ok;
+    }
+
+    bool saturated_doubling_multiply(const Inst &inst, unsigned bits, bool rounding, bool widen, bool scalar = false) {
+        const auto saturated = next_local + 4, overflow = next_local + 5;
+        imm(0); set(saturated);
+        const auto lane = [&](unsigned i) {
+            vector_lane(inst.GetArg(0), bits, i, true); op(ExtendS);
+            vector_lane(inst.GetArg(1), bits, i, true); op(ExtendS); op(Mul64);
+            if (widen && bits == 32) {
+                set(scratch_local);
+                get(scratch_local); constant64(code, INT64_C(1) << 62); op(Eq64); set(overflow);
+                get(saturated); get(overflow); op(Or); set(saturated);
+                constant64(code, INT64_MAX); get(scratch_local); constant64(code, 1); op(Shl64);
+                get(overflow); op(Select);
+            } else {
+                if (widen) { constant64(code, 1); op(Shl64); }
+                else {
+                    if (rounding) { constant64(code, int64_t(1) << (bits - 2)); op(Add64); }
+                    constant64(code, bits - 1); op(ShrS64);
+                }
+                set(scratch_local);
+                const unsigned output_bits = widen ? bits * 2 : bits;
+                clamp_i64_low(-(int64_t(1) << (output_bits - 1)), (int64_t(1) << (output_bits - 1)) - 1, saturated);
+            }
+        };
+        if (widen && bits == 32) {
+            for (unsigned i = 0; i < 2; ++i) { lane(i); store_i64_words(next_local + i * 2); }
+        } else if (scalar) {
+            lane(0); if (bits == 16) mask(0xffff); set(next_local);
+        } else pack_lanes(widen ? bits * 2 : bits, 4, lane);
+        set_qc_if(saturated);
+        return ok;
+    }
+
+    bool vector_rounding_or_saturated_shift(const Inst &inst, unsigned bits, bool signed_, bool saturate, bool unsigned_output = false) {
+        const auto saturated = next_local + 4, amount = next_local + 5, overflow = next_local + 6;
+        if (unsigned_output && (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() >= bits)) return false;
+        imm(0); set(saturated);
+        const auto lane = [&](unsigned i) {
+            const auto source = [&] {
+                if (bits == 64) push_i64_value(inst.GetArg(0), i * 2);
+                else { vector_lane(inst.GetArg(0), bits, i, signed_); op(signed_ ? ExtendS : ExtendU); }
+            };
+            const auto clamp = [&] {
+                if (signed_ && !unsigned_output) {
+                    constant64(code, bits == 64 ? INT64_MIN : -(int64_t(1) << (bits - 1)));
+                    constant64(code, bits == 64 ? INT64_MAX : (int64_t(1) << (bits - 1)) - 1);
+                    source(); constant64(code, 0); op(LtS64); op(Select);
+                } else constant64(code, bits == 64 ? -1 : (int64_t(1) << bits) - 1);
+            };
+            if (unsigned_output) imm(inst.GetArg(1).GetU8());
+            else {
+                value_word(inst.GetArg(1), i * bits / 32);
+                if ((i * bits) % 32) { imm((i * bits) % 32); op(ShrU); }
+                imm(24); op(Shl); imm(24); op(ShrS);
+            }
+            set(amount);
+            if (unsigned_output) {
+                source(); constant64(code, 0); op(LtS64); begin_if();
+                constant64(code, 0); set(scratch_local); imm(1); set(saturated); op(Else);
+            }
+            get(amount); imm(0); op(GeS); begin_if();
+            get(amount); imm(bits); op(GeU); begin_if();
+            if (saturate) {
+                source(); op(Eqz64); op(Eqz); set(overflow);
+                clamp(); constant64(code, 0); get(overflow); op(Select); set(scratch_local);
+                get(saturated); get(overflow); op(Or); set(saturated);
+            } else { constant64(code, 0); set(scratch_local); }
+            op(Else);
+            source(); get(amount); op(ExtendU); op(Shl64);
+            if (bits < 64) {
+                constant64(code, 64 - bits); op(Shl64); constant64(code, 64 - bits);
+                op(signed_ && !unsigned_output ? ShrS64 : ShrU64);
+            }
+            set(scratch_local);
+            if (saturate) {
+                get(scratch_local); get(amount); op(ExtendU); op(signed_ && !unsigned_output ? ShrS64 : ShrU64);
+                source(); op(Ne64); set(overflow);
+                clamp(); get(scratch_local); get(overflow); op(Select); set(scratch_local);
+                get(saturated); get(overflow); op(Or); set(saturated);
+            }
+            end_if();
+            op(Else);
+            imm(0); get(amount); op(Sub); set(amount);
+            get(amount); imm(bits); op(GtU); begin_if();
+            if (saturate && signed_) { source(); constant64(code, 63); op(ShrS64); }
+            else constant64(code, 0);
+            set(scratch_local);
+            op(Else);
+            get(amount); imm(64); op(Eq); begin_if();
+            if (signed_) { source(); constant64(code, 63); op(ShrS64); }
+            else constant64(code, 0);
+            set(scratch_local);
+            op(Else);
+            source(); get(amount); op(ExtendU); op(signed_ ? ShrS64 : ShrU64); set(scratch_local);
+            end_if();
+            if (!saturate) {
+                get(scratch_local); source(); get(amount); imm(1); op(Sub); op(ExtendU); op(ShrU64);
+                constant64(code, 1); op(And64); op(Add64); set(scratch_local);
+            }
+            end_if(); end_if();
+            if (unsigned_output) end_if();
+            get(scratch_local);
+        };
+        if (bits == 64) {
+            for (unsigned i = 0; i < 2; ++i) { lane(i); store_i64_words(next_local + i * 2); }
+        } else pack_lanes(bits, 4, [&](unsigned i) { lane(i); op(Wrap); });
+        if (saturate) set_qc_if(saturated);
+        return ok;
+    }
+
+    bool vector_simple64(const Inst &inst, Op kind) {
+        if (kind == Op::VectorSignExtend64) {
+            for (unsigned word = 0; word < 2; ++word) {
+                value_word(inst.GetArg(0), word); set(next_local + word);
+            }
+            value_word(inst.GetArg(0), 1); imm(31); op(ShrS); set(next_local + 2);
+            get(next_local + 2); set(next_local + 3);
+        } else if (kind == Op::VectorEqual128) {
+            imm(0);
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(0), word); value_word(inst.GetArg(1), word); op(Eq);
+                if (word) op(And);
+            }
+            op(Sub); set(next_local);
+            for (unsigned word = 1; word < 4; ++word) { get(next_local); set(next_local + word); }
+        } else {
+            for (unsigned word = 0; word < 4; word += 2) {
+                push_i64_value(inst.GetArg(0), word); set(scratch_local);
+                constant64(code, 0); get(scratch_local); op(Sub64);
+                get(scratch_local);
+                get(scratch_local); constant64(code, 0); op(LtS64); op(Select);
+                store_i64_words(next_local + word);
+            }
+        }
+        return ok;
+    }
+
+    bool vector_halving_sub(const Inst &inst, unsigned bits, bool signed_, bool rounding) {
+        if (bits == 32) {
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(0), word); op(signed_ ? ExtendS : ExtendU);
+                value_word(inst.GetArg(1), word); op(signed_ ? ExtendS : ExtendU); op(Sub64);
+                if (rounding) { constant64(code, 1); op(Add64); }
+                constant64(code, 1); op(signed_ ? ShrS64 : ShrU64); op(Wrap); set(next_local + word);
+            }
+        } else {
+            pack_lanes(bits, 4, [&](unsigned index) {
+                vector_lane(inst.GetArg(0), bits, index, signed_);
+                vector_lane(inst.GetArg(1), bits, index, signed_); op(Sub);
+                if (rounding) { imm(1); op(Add); }
+                imm(1); op(signed_ ? ShrS : ShrU);
+            });
+        }
+        return ok;
+    }
+
+    bool vector_paired(const Inst &inst, unsigned bits, bool lower, unsigned mode, bool signed_) {
+        const unsigned count = (lower ? 64 : 128) / bits;
+        if (bits == 64) {
+            if (lower || mode != 0) return false;
+            for (unsigned i = 0; i < 2; ++i) {
+                push_i64_value(inst.GetArg(i), 0); push_i64_value(inst.GetArg(i), 2);
+                op(Add64); store_i64_words(next_local + 2 * i);
+            }
+            return ok;
+        }
+        pack_lanes(bits, lower ? 2 : 4, [&](unsigned i) {
+            const auto source = inst.GetArg(i < count / 2 ? 0 : 1);
+            const unsigned index = 2 * (i % (count / 2));
+            vector_lane(source, bits, index, signed_); set(next_local + 4);
+            vector_lane(source, bits, index + 1, signed_); set(next_local + 5);
+            if (mode != 0) {
+                get(next_local + 4); get(next_local + 5); op(signed_ ? GtS : GtU); set(next_local + 6);
+                if (mode == 2) { get(next_local + 6); op(Eqz); set(next_local + 6); }
+                get(next_local + 4); get(next_local + 5); get(next_local + 6); op(Select);
+            } else { get(next_local + 4); get(next_local + 5); op(Add); }
+        });
+        if (lower) { imm(0); set(next_local + 2); imm(0); set(next_local + 3); }
+        return ok;
+    }
+
+    bool vector_count_leading_zeros(const Inst &inst, unsigned bits) {
+        pack_lanes(bits, 4, [&](unsigned i) {
+            vector_element_word(inst.GetArg(0), bits, i); op(Clz); imm(32 - bits); op(Sub);
+        });
+        return ok;
+    }
+
+    bool fp_extended(const Inst &inst, FPOperation operation, unsigned bits, unsigned result_bits = 0, bool unsigned_ = false) {
+        if (!result_bits) result_bits = bits;
+        if (operation == FPOperation::Convert || operation == FPOperation::RoundInt) {
+            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() > (operation == FPOperation::Convert ? 5 : 4)) return false;
+        }
+        if (operation == FPOperation::FromFixed || operation == FPOperation::ToFixed) {
+            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() > (operation == FPOperation::FromFixed ? bits : result_bits)
+                || !inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU8() > (operation == FPOperation::FromFixed ? 5 : 4)) return false;
+        }
+        load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+        begin_if(); ret(ExitReason::Unsupported); end_if();
+        fp_extended_call(fp_operation(operation, bits, result_bits, unsigned_), [&](unsigned i) {
+            if (i >= inst.NumArgs()) constant64(code, 0);
+            else if (inst.GetArg(i).GetType() == Type::U64) value64(inst.GetArg(i));
+            else { value_word(inst.GetArg(i)); op(ExtendU); }
+        }, true);
+        if (result_bits == 64) store_i64_words(next_local);
+        else { op(Wrap); set(next_local); }
+        return ok;
+    }
+
+    // Operand emitter pushes i64 bit patterns; the returned i64 stays on the
+    // Wasm stack. This works inside pack_lanes without overwriting SSA words.
+    template <typename Operand>
+    void fp_extended_call(uint32_t selector, const Operand &operand, bool controlled) {
+        for (unsigned i = 0; i < 6; ++i) {
+            load(offsetof(JitState, fp_arguments) + 4 * i); set(next_local + 4 + i);
+        }
+        for (unsigned i = 0; i < 3; ++i) {
+            operand(i); set(scratch_local);
+            get(0); get(scratch_local); op(Wrap); store(offsetof(JitState, fp_arguments) + 8 * i);
+            get(0); get(scratch_local); constant64(code, 32); op(ShrU64); op(Wrap);
+            store(offsetof(JitState, fp_arguments) + 8 * i + 4);
+        }
+        get(0); load(offsetof(JitState, fpscr));
+        get(0); imm(selector); load(offsetof(JitState, fpscr));
+        if (!controlled) { mask(0x04080000); imm(0x03000000); op(Or); }
+        op(Call); uleb(code, 2); op(Or); store(offsetof(JitState, fpscr));
+        load(offsetof(JitState, fp_arguments)); op(ExtendU);
+        load(offsetof(JitState, fp_arguments) + 4); op(ExtendU); constant64(code, 32); op(Shl64); op(Or64); set(scratch_local);
+        for (unsigned i = 0; i < 6; ++i) {
+            get(0); get(next_local + 4 + i); store(offsetof(JitState, fp_arguments) + 4 * i);
+        }
+        get(scratch_local);
+    }
+
+    bool fp_vector_extended(const Inst &inst, FPOperation operation, unsigned bits,
+        unsigned result_bits = 0, bool unsigned_ = false, bool paired = false, bool lower = false) {
+        if (!result_bits) result_bits = bits;
+        const auto control = inst.GetArg(inst.NumArgs() - 1);
+        if (!control.IsImmediate() || control.GetType() != Type::U1) return false;
+        const bool controlled = control.GetU1();
+        if (operation == FPOperation::Convert || operation == FPOperation::RoundInt) {
+            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() > (operation == FPOperation::Convert ? 5 : 4)) return false;
+        }
+        if (operation == FPOperation::FromFixed || operation == FPOperation::ToFixed) {
+            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() > (operation == FPOperation::FromFixed ? bits : result_bits)
+                || !inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU8() > (operation == FPOperation::FromFixed ? 5 : 4)) return false;
+        }
+        if (controlled) {
+            load(offsetof(JitState, fpscr)); mask(0x00009f00u);
+            begin_if(); ret(ExitReason::Unsupported); end_if();
+        }
+        const unsigned count = (lower ? 64u : 128u) / std::max(bits, result_bits);
+        const auto lane = [&](unsigned index) {
+            fp_extended_call(fp_operation(operation, bits, result_bits, unsigned_), [&](unsigned operand) {
+                if (operand >= inst.NumArgs() - 1) { constant64(code, 0); return; }
+                auto source = inst.GetArg(operand);
+                unsigned source_lane = index;
+                if (paired && operand < 2) {
+                    if (lower && bits == 64) source_lane = 0;
+                    else {
+                        source = inst.GetArg(index / (count / 2));
+                        source_lane = (index % (count / 2)) * 2 + operand;
+                    }
+                }
+                if (source.GetType() == Type::U128) {
+                    if (bits == 64) push_i64_value(source, source_lane * 2);
+                    else { vector_element_word(source, bits, source_lane); op(ExtendU); }
+                } else { value_word(source); op(ExtendU); }
+            }, controlled);
+        };
+        if (result_bits == 64) {
+            for (unsigned i = 0; i < count; ++i) { lane(i); store_i64_words(next_local + i * 2); }
+            if (lower) { imm(0); set(next_local + 2); imm(0); set(next_local + 3); }
+        } else {
+            pack_lanes(result_bits, count * result_bits / 32, [&](unsigned i) { lane(i); op(Wrap); });
+        }
+        return ok;
+    }
+
+    bool fp_fixed_to_float(const Inst &inst, unsigned source_bits, unsigned target_bits, bool signed_) {
+        if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() > source_bits
+            || !inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU8() > 5) return false;
+        if (source_bits == 64 || (source_bits == 32 && target_bits == 32))
+            return fp_extended(inst, FPOperation::FromFixed, source_bits, target_bits, !signed_);
+        // These integers fit exactly in the destination significand. Scaling
+        // by 2^-fbits stays normal and exact, independent of rounding mode.
+        value_word(inst.GetArg(0));
+        if (source_bits == 16) {
+            mask(0xffff);
+            if (signed_) { imm(16); op(Shl); imm(16); op(ShrS); }
+        }
+        const unsigned fraction = inst.GetArg(1).GetU8();
+        if (target_bits == 32) {
+            op(signed_ ? 0xb2 : 0xb3);
+            if (fraction) { imm((127 - fraction) << 23); op(0xbe); op(0x94); }
+            op(0xbc); set(next_local);
+        } else {
+            op(signed_ ? 0xb7 : 0xb8);
+            if (fraction) { constant64(code, uint64_t(1023 - fraction) << 52); op(0xbf); op(0xa2); }
+            store_f64_words(next_local);
+        }
+        return ok;
+    }
     // Pushes the i64 formed by words `word` and `word + 1` of a value.
     void push_i64_value(const Value &v, unsigned word) {
         value_word(v, word); op(ExtendU);
@@ -1839,21 +2543,23 @@ private:
     }
     // VQADD/VQSUB .S/.U: per-lane saturating add or subtract; any clamp
     // sets FPSCR.QC (Dynarmic Emit{Signed,Unsigned}SaturatedOp).
-    bool vector_saturated_add_sub(const Inst &inst, unsigned bits, bool is_signed, bool is_add) {
+    bool vector_saturated_add_sub(const Inst &inst, unsigned bits, bool is_signed, bool is_add, bool scalar = false) {
         const auto saturated = next_local + 4, sum = next_local + 5, overflow = next_local + 6;
         imm(0); set(saturated);
         if (bits < 32) {
             const int32_t lo = is_signed ? -(1 << (bits - 1)) : 0;
             const int32_t hi = is_signed ? (1 << (bits - 1)) - 1 : (1 << bits) - 1;
-            pack_lanes(bits, 4, [&](unsigned i) {
+            const auto lane = [&](unsigned i) {
                 vector_lane(inst.GetArg(0), bits, i, is_signed);
                 vector_lane(inst.GetArg(1), bits, i, is_signed);
                 op(is_add ? Add : Sub); set(sum);
                 clamp_i32(sum, lo, hi, saturated);
-            });
+            };
+            if (scalar) { lane(0); mask((1u << bits) - 1); set(next_local); }
+            else pack_lanes(bits, 4, lane);
         } else if (bits == 32) {
             const uint8_t extend = is_signed ? ExtendS : ExtendU;
-            for (unsigned word = 0; word < 4; ++word) {
+            for (unsigned word = 0; word < (scalar ? 1u : 4u); ++word) {
                 value_word(inst.GetArg(0), word); op(extend);
                 value_word(inst.GetArg(1), word); op(extend);
                 op(is_add ? Add64 : Sub64); set(scratch_local);
@@ -1861,7 +2567,7 @@ private:
                 set(next_local + word);
             }
         } else {
-            for (unsigned word = 0; word < 4; word += 2) {
+            for (unsigned word = 0; word < (scalar ? 2u : 4u); word += 2) {
                 push_i64_value(inst.GetArg(0), word); push_i64_value(inst.GetArg(1), word);
                 op(is_add ? Add64 : Sub64); set(scratch_local);
                 if (is_signed) {
@@ -2421,7 +3127,22 @@ private:
             const bool arith = arithmetic(producer->GetOpcode());
             switch (inst.GetOpcode()) {
             case Op::GetGEFromOp:
-                if (producer->GetOpcode() != Op::PackedAddU8) return false;
+                switch (producer->GetOpcode()) {
+                case Op::PackedAddU8:
+                case Op::PackedAddS8:
+                case Op::PackedSubU8:
+                case Op::PackedSubS8:
+                case Op::PackedAddU16:
+                case Op::PackedAddS16:
+                case Op::PackedSubU16:
+                case Op::PackedSubS16:
+                case Op::PackedAddSubU16:
+                case Op::PackedAddSubS16:
+                case Op::PackedSubAddU16:
+                case Op::PackedSubAddS16:
+                    break;
+                default: return false;
+                }
                 get(it->second + 4);
                 break;
             case Op::GetCarryFromOp:
@@ -3130,6 +3851,130 @@ private:
         if (shift(kind)) { shifted(inst); return ok; }
         const auto arg = [&](size_t n) { value(inst.GetArg(n)); };
         switch (kind) {
+        case Op::SignedMultiplyHigh64: return multiply_high64(inst, true);
+        case Op::UnsignedMultiplyHigh64: return multiply_high64(inst, false);
+        case Op::AESEncryptSingleRound: return aes_round(inst, false);
+        case Op::AESDecryptSingleRound: return aes_round(inst, true);
+        case Op::AESMixColumns: return aes_mix_columns(inst, false);
+        case Op::AESInverseMixColumns: return aes_mix_columns(inst, true);
+        case Op::SM4AccessSubstitutionBox: {
+            static const auto table = [] {
+                std::array<uint8_t, 256> result{};
+                for (unsigned i = 0; i < 256; ++i) result[i] = Dynarmic::Common::Crypto::SM4::AccessSubstitutionBox(uint8_t(i));
+                return result;
+            }();
+            arg(0); mask(0xff); set(next_local + 4); byte_lookup(table, next_local + 4); break;
+        }
+        case Op::SHA256Hash:
+        case Op::SHA256MessageSchedule0:
+        case Op::SHA256MessageSchedule1: return sha256(inst, kind);
+        case Op::CRC32Castagnoli8: return crc32(inst, 8, 0x82f63b78u);
+        case Op::CRC32Castagnoli16: return crc32(inst, 16, 0x82f63b78u);
+        case Op::CRC32Castagnoli32: return crc32(inst, 32, 0x82f63b78u);
+        case Op::CRC32Castagnoli64: return crc32(inst, 64, 0x82f63b78u);
+        case Op::CRC32ISO8: return crc32(inst, 8, 0xedb88320u);
+        case Op::CRC32ISO16: return crc32(inst, 16, 0xedb88320u);
+        case Op::CRC32ISO32: return crc32(inst, 32, 0xedb88320u);
+        case Op::CRC32ISO64: return crc32(inst, 64, 0xedb88320u);
+        case Op::VectorSignedMultiply16: return vector_full_multiply(inst, 16, true);
+        case Op::VectorSignedMultiply32: return vector_full_multiply(inst, 32, true);
+        case Op::VectorUnsignedMultiply16: return vector_full_multiply(inst, 16, false);
+        case Op::VectorUnsignedMultiply32: return vector_full_multiply(inst, 32, false);
+        case Op::IsZero64:
+        case Op::TestBit:
+        case Op::ConditionalSelect64:
+        case Op::SignExtendByteToLong:
+        case Op::CountLeadingZeros64:
+        case Op::ExtractRegister32:
+        case Op::ExtractRegister64:
+        case Op::ReplicateBit32:
+        case Op::ReplicateBit64:
+            return scalar_misc(inst, kind);
+        case Op::LogicalShiftLeft64: return scalar_shift64(inst, true, false, false, false);
+        case Op::LogicalShiftRight64: return scalar_shift64(inst, false, false, false, false);
+        case Op::ArithmeticShiftRight64: return scalar_shift64(inst, false, true, false, false);
+        case Op::RotateRight64: return scalar_shift64(inst, false, false, true, false);
+        case Op::LogicalShiftLeftMasked32: return scalar_shift32(inst, true, false, false, true);
+        case Op::LogicalShiftRightMasked32: return scalar_shift32(inst, false, false, false, true);
+        case Op::ArithmeticShiftRightMasked32: return scalar_shift32(inst, false, true, false, true);
+        case Op::RotateRightMasked32: return scalar_shift32(inst, false, false, true, true);
+        case Op::LogicalShiftLeftMasked64: return scalar_shift64(inst, true, false, false, true);
+        case Op::LogicalShiftRightMasked64: return scalar_shift64(inst, false, false, false, true);
+        case Op::ArithmeticShiftRightMasked64: return scalar_shift64(inst, false, true, false, true);
+        case Op::RotateRightMasked64: return scalar_shift64(inst, false, false, true, true);
+        case Op::UnsignedDiv32: return scalar_div(inst, false, false);
+        case Op::SignedDiv32: return scalar_div(inst, false, true);
+        case Op::UnsignedDiv64: return scalar_div(inst, true, false);
+        case Op::SignedDiv64: return scalar_div(inst, true, true);
+        case Op::MaxSigned32: return scalar_minmax(inst, 32, true, true);
+        case Op::MaxUnsigned32: return scalar_minmax(inst, 32, true, false);
+        case Op::MinSigned32: return scalar_minmax(inst, 32, false, true);
+        case Op::MinUnsigned32: return scalar_minmax(inst, 32, false, false);
+        case Op::MaxSigned64: return scalar_minmax(inst, 64, true, true);
+        case Op::MaxUnsigned64: return scalar_minmax(inst, 64, true, false);
+        case Op::MinSigned64: return scalar_minmax(inst, 64, false, true);
+        case Op::MinUnsigned64: return scalar_minmax(inst, 64, false, false);
+        case Op::VectorRoundingShiftLeftS8: return vector_rounding_or_saturated_shift(inst, 8, true, false);
+        case Op::VectorRoundingShiftLeftU8: return vector_rounding_or_saturated_shift(inst, 8, false, false);
+        case Op::VectorSignedSaturatedShiftLeft8: return vector_rounding_or_saturated_shift(inst, 8, true, true);
+        case Op::VectorUnsignedSaturatedShiftLeft8: return vector_rounding_or_saturated_shift(inst, 8, false, true);
+        case Op::VectorSignedSaturatedShiftLeftUnsigned8: return vector_rounding_or_saturated_shift(inst, 8, true, true, true);
+        case Op::VectorRoundingShiftLeftS16: return vector_rounding_or_saturated_shift(inst, 16, true, false);
+        case Op::VectorRoundingShiftLeftU16: return vector_rounding_or_saturated_shift(inst, 16, false, false);
+        case Op::VectorSignedSaturatedShiftLeft16: return vector_rounding_or_saturated_shift(inst, 16, true, true);
+        case Op::VectorUnsignedSaturatedShiftLeft16: return vector_rounding_or_saturated_shift(inst, 16, false, true);
+        case Op::VectorSignedSaturatedShiftLeftUnsigned16: return vector_rounding_or_saturated_shift(inst, 16, true, true, true);
+        case Op::VectorRoundingShiftLeftS32: return vector_rounding_or_saturated_shift(inst, 32, true, false);
+        case Op::VectorRoundingShiftLeftU32: return vector_rounding_or_saturated_shift(inst, 32, false, false);
+        case Op::VectorSignedSaturatedShiftLeft32: return vector_rounding_or_saturated_shift(inst, 32, true, true);
+        case Op::VectorUnsignedSaturatedShiftLeft32: return vector_rounding_or_saturated_shift(inst, 32, false, true);
+        case Op::VectorSignedSaturatedShiftLeftUnsigned32: return vector_rounding_or_saturated_shift(inst, 32, true, true, true);
+        case Op::VectorRoundingShiftLeftS64: return vector_rounding_or_saturated_shift(inst, 64, true, false);
+        case Op::VectorRoundingShiftLeftU64: return vector_rounding_or_saturated_shift(inst, 64, false, false);
+        case Op::VectorSignedSaturatedShiftLeft64: return vector_rounding_or_saturated_shift(inst, 64, true, true);
+        case Op::VectorUnsignedSaturatedShiftLeft64: return vector_rounding_or_saturated_shift(inst, 64, false, true);
+        case Op::VectorSignedSaturatedShiftLeftUnsigned64: return vector_rounding_or_saturated_shift(inst, 64, true, true, true);
+        case Op::VectorSignedSaturatedAccumulateUnsigned8: return vector_mixed_accumulate(inst, 8, true);
+        case Op::VectorUnsignedSaturatedAccumulateSigned8: return vector_mixed_accumulate(inst, 8, false);
+        case Op::VectorSignedSaturatedAccumulateUnsigned16: return vector_mixed_accumulate(inst, 16, true);
+        case Op::VectorUnsignedSaturatedAccumulateSigned16: return vector_mixed_accumulate(inst, 16, false);
+        case Op::VectorSignedSaturatedAccumulateUnsigned32: return vector_mixed_accumulate(inst, 32, true);
+        case Op::VectorUnsignedSaturatedAccumulateSigned32: return vector_mixed_accumulate(inst, 32, false);
+        case Op::VectorSignedSaturatedAccumulateUnsigned64: return vector_mixed_accumulate(inst, 64, true);
+        case Op::VectorUnsignedSaturatedAccumulateSigned64: return vector_mixed_accumulate(inst, 64, false);
+        case Op::SignedSaturatedDoublingMultiplyReturnHigh16: return saturated_doubling_multiply(inst, 16, false, false, true);
+        case Op::VectorSignedSaturatedDoublingMultiplyHigh16: return saturated_doubling_multiply(inst, 16, false, false);
+        case Op::VectorSignedSaturatedDoublingMultiplyHighRounding16: return saturated_doubling_multiply(inst, 16, true, false);
+        case Op::VectorSignedSaturatedDoublingMultiplyLong16: return saturated_doubling_multiply(inst, 16, false, true);
+        case Op::SignedSaturatedDoublingMultiplyReturnHigh32: return saturated_doubling_multiply(inst, 32, false, false, true);
+        case Op::VectorSignedSaturatedDoublingMultiplyHigh32: return saturated_doubling_multiply(inst, 32, false, false);
+        case Op::VectorSignedSaturatedDoublingMultiplyHighRounding32: return saturated_doubling_multiply(inst, 32, true, false);
+        case Op::VectorSignedSaturatedDoublingMultiplyLong32: return saturated_doubling_multiply(inst, 32, false, true);
+        case Op::SignedSaturatedAdd8: return scalar_saturating(inst, 8, true, true);
+        case Op::SignedSaturatedAdd16: return scalar_saturating(inst, 16, true, true);
+        case Op::SignedSaturatedAdd32: return scalar_saturating(inst, 32, true, true);
+        case Op::SignedSaturatedAdd64: return scalar_saturating(inst, 64, true, true);
+        case Op::SignedSaturatedSub8: return scalar_saturating(inst, 8, true, false);
+        case Op::SignedSaturatedSub16: return scalar_saturating(inst, 16, true, false);
+        case Op::SignedSaturatedSub32: return scalar_saturating(inst, 32, true, false);
+        case Op::SignedSaturatedSub64: return scalar_saturating(inst, 64, true, false);
+        case Op::UnsignedSaturatedAdd8: return scalar_saturating(inst, 8, false, true);
+        case Op::UnsignedSaturatedAdd16: return scalar_saturating(inst, 16, false, true);
+        case Op::UnsignedSaturatedAdd32: return scalar_saturating(inst, 32, false, true);
+        case Op::UnsignedSaturatedAdd64: return scalar_saturating(inst, 64, false, true);
+        case Op::UnsignedSaturatedSub8: return scalar_saturating(inst, 8, false, false);
+        case Op::UnsignedSaturatedSub16: return scalar_saturating(inst, 16, false, false);
+        case Op::UnsignedSaturatedSub32: return scalar_saturating(inst, 32, false, false);
+        case Op::UnsignedSaturatedSub64: return scalar_saturating(inst, 64, false, false);
+        case Op::Breakpoint: op(Unreachable); return true;
+        case Op::CallHostFunction:
+            reject("native function addresses are unavailable in portable Wasm"); return false;
+        case Op::A32CoprocInternalOperation:
+        case Op::A32CoprocSendTwoWords:
+        case Op::A32CoprocGetTwoWords:
+        case Op::A32CoprocLoadWords:
+        case Op::A32CoprocStoreWords:
+            reject("no browser callback is registered for this coprocessor operation"); return false;
         case Op::Void: return true; // Dynarmic's invalidated/dead instruction marker
         case Op::A32DataMemoryBarrier:
         case Op::A32DataSynchronizationBarrier:
@@ -3252,7 +4097,7 @@ private:
             // Ordered GT/GE signal IOC for ANY NaN; EQ only for an sNaN.
             if (!inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetType() != Type::U1
                 || inst.GetArg(2).GetU1())
-                return false;
+                return fp_vector_extended(inst, kind == Op::FPVectorEqual32 ? FPOperation::Equal : kind == Op::FPVectorGreater32 ? FPOperation::Greater : FPOperation::GreaterEqual, 32);
             load(offsetof(JitState, fpscr)); mask(0x00009f00u);
             begin_if(); ret(ExitReason::Unsupported); end_if();
             const auto a = next_local + 4, b = next_local + 5;
@@ -3299,10 +4144,10 @@ private:
         case Op::FPFixedS32ToSingle:
         case Op::FPFixedU32ToSingle:
             // The IR carries an explicit rounding mode (scalar integer VCVT
-            // gets it from FPSCR). Only unscaled nearest/ties-even is supported.
+            // gets it from FPSCR). Keep the unscaled nearest-even fast path.
             if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0
                 || !inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU8() != 0)
-                return false;
+                return fp_extended(inst, FPOperation::FromFixed, 32, 32, kind == Op::FPFixedU32ToSingle);
             load(offsetof(JitState, fpscr)); mask(0x00009f00u);
             begin_if(); ret(ExitReason::Unsupported); end_if();
             arg(0); op(kind == Op::FPFixedU32ToSingle ? 0xb3 : 0xb2); // f32.convert_i32_u/s
@@ -3329,7 +4174,7 @@ private:
             if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0
                 || !inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU8() != 0
                 || !inst.GetArg(3).IsImmediate() || inst.GetArg(3).GetU1() != 0)
-                return false;
+                return fp_vector_extended(inst, FPOperation::FromFixed, 32, 32, kind == Op::FPVectorFromUnsignedFixed32);
             for (unsigned word = 0; word < 4; ++word) {
                 value_word(inst.GetArg(0), word);
                 op(kind == Op::FPVectorFromUnsignedFixed32 ? 0xb3 : 0xb2); // f32.convert_i32_u/s
@@ -3369,7 +4214,7 @@ private:
             // max(+0,-0) = +0 (Wasm f32.min/max order zeros the same way).
             // fast_fp drops the cumulative flags like the other FP operations.
             if (!inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU1())
-                return false;
+                return fp_vector_extended(inst, kind == Op::FPVectorMin32 ? FPOperation::Min : FPOperation::Max, 32);
             const bool minimum = kind == Op::FPVectorMin32;
             const bool flags = !state.fast_fp();
             const auto la = next_local + 4, lb = next_local + 5, lflags = next_local + 6;
@@ -3443,7 +4288,10 @@ private:
         case Op::VectorTable:
             // Tuple of 1..4 table registers; VectorTableLookup reads its args.
             return ok;
-        case Op::VectorTableLookup64: {
+        case Op::VectorTableLookup64:
+        case Op::VectorTableLookup128: {
+            const bool wide = kind == Op::VectorTableLookup128;
+            const unsigned register_words = wide ? 4 : 2;
             // VTBL/VTBX: byte i = idx < 8n ? table byte idx : defaults byte i.
             const auto &table_value = inst.GetArg(1);
             if (table_value.IsImmediate() || table_value.GetInst()->GetOpcode() != Op::VectorTable)
@@ -3453,22 +4301,22 @@ private:
             for (size_t i = 0; i < table->NumArgs(); ++i) {
                 const Value reg = table->GetArg(i);
                 if (reg.IsEmpty()) break;
-                if (reg.GetType() != Type::U64) return false;
+                if (reg.GetType() != (wide ? Type::U128 : Type::U64)) return false;
                 registers.push_back(reg);
             }
             if (registers.empty()) return false;
-            const uint32_t table_words = static_cast<uint32_t>(registers.size() * 2);
-            const auto idx = next_local + 2, acc = next_local + 3;
-            for (unsigned i = 0; i < 8; ++i) {
+            const uint32_t table_words = static_cast<uint32_t>(registers.size() * register_words);
+            const auto idx = next_local + 4, acc = next_local + 5;
+            for (unsigned i = 0; i < (wide ? 16u : 8u); ++i) {
                 const unsigned word = i / 4, shift = (i % 4) * 8;
                 if (shift == 0) { imm(0); set(acc); }
                 value_word(inst.GetArg(2), word); if (shift) { imm(shift); op(ShrU); } mask(0xff); set(idx);
                 // Word (idx >> 2) of the table by a select chain.
                 value_word(registers[0], 0);
                 for (uint32_t k = 1; k < table_words; ++k) {
-                    set(next_local + 4);
-                    value_word(registers[k / 2], k % 2);
-                    get(next_local + 4);
+                    set(next_local + 6);
+                    value_word(registers[k / register_words], k % register_words);
+                    get(next_local + 6);
                     get(idx); imm(2); op(ShrU); imm(k); op(Eq);
                     op(Select);
                 }
@@ -3480,6 +4328,7 @@ private:
                 get(acc); op(Or); set(acc);
                 if (i % 4 == 3) { get(acc); set(next_local + word); }
             }
+            if (!wide) { imm(0); set(next_local + 2); imm(0); set(next_local + 3); }
             return ok;
         }
         case Op::VectorZeroExtend16:
@@ -3516,16 +4365,10 @@ private:
             }
             imm(0); set(next_local + 2); imm(0); set(next_local + 3);
             return ok;
-        case Op::VectorTranspose32: {
-            // part 0: {a0, b0, a2, b2}; part 1: {a1, b1, a3, b3} (VTRN.32).
-            if (!inst.GetArg(2).IsImmediate()) return false;
-            const unsigned part = inst.GetArg(2).GetU1() ? 1 : 0;
-            for (unsigned word = 0; word < 4; ++word) {
-                value_word(inst.GetArg(word % 2), (word / 2) * 2 + part);
-                set(next_local + word);
-            }
-            return ok;
-        }
+        case Op::VectorTranspose8: return vector_transpose(inst, 8);
+        case Op::VectorTranspose16: return vector_transpose(inst, 16);
+        case Op::VectorTranspose32: return vector_transpose(inst, 32);
+        case Op::VectorTranspose64: return vector_transpose(inst, 64);
         case Op::VectorHalvingAddS8: return vector_halving_add(inst, 8, true);
         case Op::VectorHalvingAddS16: return vector_halving_add(inst, 16, true);
         case Op::VectorHalvingAddS32: return vector_halving_add(inst, 32, true);
@@ -3545,9 +4388,11 @@ private:
         case Op::VectorInterleaveUpper64: return vector_interleave(inst, 64, true);
         case Op::VectorDeinterleaveEven8: return vector_deinterleave(inst, 8, false, false);
         case Op::VectorDeinterleaveEven16: return vector_deinterleave(inst, 16, false, false);
+        case Op::VectorDeinterleaveEven64: return vector_deinterleave(inst, 64, false, false);
         case Op::VectorDeinterleaveEven32: return vector_deinterleave(inst, 32, false, false);
         case Op::VectorDeinterleaveOdd8: return vector_deinterleave(inst, 8, true, false);
         case Op::VectorDeinterleaveOdd16: return vector_deinterleave(inst, 16, true, false);
+        case Op::VectorDeinterleaveOdd64: return vector_deinterleave(inst, 64, true, false);
         case Op::VectorDeinterleaveOdd32: return vector_deinterleave(inst, 32, true, false);
         case Op::VectorDeinterleaveEvenLower8: return vector_deinterleave(inst, 8, false, true);
         case Op::VectorDeinterleaveEvenLower16: return vector_deinterleave(inst, 16, false, true);
@@ -3645,6 +4490,59 @@ private:
             // new FPSCR mode through the normal location checks.
             get(0); arg(0); store(offsetof(JitState, fpscr));
             return ok;
+        case Op::FPVectorAdd64: return fp_vector_extended(inst, FPOperation::Add, 64);
+        case Op::FPVectorSub64: return fp_vector_extended(inst, FPOperation::Sub, 64);
+        case Op::FPVectorMul64: return fp_vector_extended(inst, FPOperation::Mul, 64);
+        case Op::FPVectorDiv32: return fp_vector_extended(inst, FPOperation::Div, 32);
+        case Op::FPVectorDiv64: return fp_vector_extended(inst, FPOperation::Div, 64);
+        case Op::FPVectorEqual16: return fp_vector_extended(inst, FPOperation::Equal, 16);
+        case Op::FPVectorEqual64: return fp_vector_extended(inst, FPOperation::Equal, 64);
+        case Op::FPVectorGreater64: return fp_vector_extended(inst, FPOperation::Greater, 64);
+        case Op::FPVectorGreaterEqual64: return fp_vector_extended(inst, FPOperation::GreaterEqual, 64);
+        case Op::FPVectorMin64: return fp_vector_extended(inst, FPOperation::Min, 64);
+        case Op::FPVectorMax64: return fp_vector_extended(inst, FPOperation::Max, 64);
+        case Op::FPVectorMinNumeric32: return fp_vector_extended(inst, FPOperation::MinNumeric, 32);
+        case Op::FPVectorMinNumeric64: return fp_vector_extended(inst, FPOperation::MinNumeric, 64);
+        case Op::FPVectorMaxNumeric32: return fp_vector_extended(inst, FPOperation::MaxNumeric, 32);
+        case Op::FPVectorMaxNumeric64: return fp_vector_extended(inst, FPOperation::MaxNumeric, 64);
+        case Op::FPVectorMulAdd16: return fp_vector_extended(inst, FPOperation::MulAdd, 16);
+        case Op::FPVectorMulAdd32: return fp_vector_extended(inst, FPOperation::MulAdd, 32);
+        case Op::FPVectorMulAdd64: return fp_vector_extended(inst, FPOperation::MulAdd, 64);
+        case Op::FPVectorMulX32: return fp_vector_extended(inst, FPOperation::MulX, 32);
+        case Op::FPVectorMulX64: return fp_vector_extended(inst, FPOperation::MulX, 64);
+        case Op::FPVectorRecipEstimate16: return fp_vector_extended(inst, FPOperation::RecipEstimate, 16);
+        case Op::FPVectorRecipEstimate64: return fp_vector_extended(inst, FPOperation::RecipEstimate, 64);
+        case Op::FPVectorRecipStepFused16: return fp_vector_extended(inst, FPOperation::RecipStep, 16);
+        case Op::FPVectorRecipStepFused64: return fp_vector_extended(inst, FPOperation::RecipStep, 64);
+        case Op::FPVectorRSqrtEstimate16: return fp_vector_extended(inst, FPOperation::RSqrtEstimate, 16);
+        case Op::FPVectorRSqrtEstimate64: return fp_vector_extended(inst, FPOperation::RSqrtEstimate, 64);
+        case Op::FPVectorRSqrtStepFused16: return fp_vector_extended(inst, FPOperation::RSqrtStep, 16);
+        case Op::FPVectorRSqrtStepFused64: return fp_vector_extended(inst, FPOperation::RSqrtStep, 64);
+        case Op::FPVectorRoundInt16: return fp_vector_extended(inst, FPOperation::RoundInt, 16);
+        case Op::FPVectorRoundInt32: return fp_vector_extended(inst, FPOperation::RoundInt, 32);
+        case Op::FPVectorRoundInt64: return fp_vector_extended(inst, FPOperation::RoundInt, 64);
+        case Op::FPVectorSqrt32: return fp_vector_extended(inst, FPOperation::Sqrt, 32);
+        case Op::FPVectorSqrt64: return fp_vector_extended(inst, FPOperation::Sqrt, 64);
+        case Op::FPVectorToSignedFixed16: return fp_vector_extended(inst, FPOperation::ToFixed, 16, 16, false);
+        case Op::FPVectorToSignedFixed64: return fp_vector_extended(inst, FPOperation::ToFixed, 64, 64, false);
+        case Op::FPVectorToUnsignedFixed16: return fp_vector_extended(inst, FPOperation::ToFixed, 16, 16, true);
+        case Op::FPVectorToUnsignedFixed64: return fp_vector_extended(inst, FPOperation::ToFixed, 64, 64, true);
+        case Op::FPVectorFromSignedFixed64: return fp_vector_extended(inst, FPOperation::FromFixed, 64, 64, false);
+        case Op::FPVectorFromUnsignedFixed64: return fp_vector_extended(inst, FPOperation::FromFixed, 64, 64, true);
+        case Op::FPVectorPairedAdd32: return fp_vector_extended(inst, FPOperation::Add, 32, 32, false, true, false);
+        case Op::FPVectorPairedAdd64: return fp_vector_extended(inst, FPOperation::Add, 64, 64, false, true, false);
+        case Op::FPVectorPairedAddLower32: return fp_vector_extended(inst, FPOperation::Add, 32, 32, false, true, true);
+        case Op::FPVectorPairedAddLower64: return fp_vector_extended(inst, FPOperation::Add, 64, 64, false, true, true);
+        case Op::FPVectorFromHalf32: return fp_vector_extended(inst, FPOperation::Convert, 16, 32);
+        case Op::FPVectorToHalf32: return fp_vector_extended(inst, FPOperation::Convert, 32, 16);
+        case Op::FPVectorNeg16:
+        case Op::FPVectorNeg64:
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(0), word);
+                imm(kind == Op::FPVectorNeg16 ? 0x80008000 : word % 2 ? 0x80000000 : 0); op(Xor);
+                set(next_local + word);
+            }
+            return ok;
         case Op::FPVectorMul32:
         case Op::FPVectorAdd32:
         case Op::FPVectorSub32: {
@@ -3665,7 +4563,7 @@ private:
             // tininess; reverse sums catch lost addends in add/sub. A tiny
             // nonzero result is flushed with UFC but without IXC.
             if (!inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU1() != 0)
-                return false;
+                return fp_vector_extended(inst, kind == Op::FPVectorMul32 ? FPOperation::Mul : kind == Op::FPVectorSub32 ? FPOperation::Sub : FPOperation::Add, 32);
             const bool multiply = kind == Op::FPVectorMul32;
             const bool subtract = kind == Op::FPVectorSub32;
             const uint8_t narrow_op = multiply ? 0x94 : subtract ? 0x93 : 0x92;
@@ -3770,7 +4668,7 @@ private:
             const bool fused = kind == Op::FPVectorRecipStepFused32 || kind == Op::FPVectorRSqrtStepFused32;
             const auto control = inst.GetArg(fused ? 2 : 1);
             if (!control.IsImmediate() || control.GetType() != Type::U1 || control.GetU1())
-                return false;
+                return fp_vector_extended(inst, kind == Op::FPVectorRecipEstimate32 ? FPOperation::RecipEstimate : kind == Op::FPVectorRecipStepFused32 ? FPOperation::RecipStep : kind == Op::FPVectorRSqrtEstimate32 ? FPOperation::RSqrtEstimate : FPOperation::RSqrtStep, 32);
             load(offsetof(JitState, fpscr)); mask(0x00009f00u);
             begin_if(); ret(ExitReason::Unsupported); end_if();
             // fp64.h contract for operations 4/5: the a lane rides in the
@@ -3813,7 +4711,7 @@ private:
             if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() > 32
                 || !inst.GetArg(2).IsImmediate() || inst.GetArg(2).GetU8() > 4
                 || !inst.GetArg(3).IsImmediate() || inst.GetArg(3).GetU1() != 0)
-                return false;
+                return fp_vector_extended(inst, FPOperation::ToFixed, 32, 32, kind == Op::FPVectorToUnsignedFixed32);
             const uint8_t fbits = inst.GetArg(1).GetU8();
             const uint8_t rounding = inst.GetArg(2).GetU8();
             const bool towards_zero = rounding == 3 && fbits == 0;
@@ -3890,8 +4788,9 @@ private:
             const uint8_t narrow_op = division ? 0x95 : multiply ? 0x94 : subtract ? 0x93 : 0x92;
             const uint8_t wide_op = division ? 0xa3 : multiply ? 0xa2 : subtract ? 0xa1 : 0xa0;
             // Wasm arithmetic rounds to nearest-even. Other guest rounding
-            // modes remain unsupported rather than silently giving RN results.
-            if (start.FPSCR().Value() & 0x00c00000u) return false;
+            // modes use the exact arithmetic helper.
+            if (start.FPSCR().Value() & 0x00c00000u)
+                return fp_extended(inst, division ? FPOperation::Div : multiply ? FPOperation::Mul : subtract ? FPOperation::Sub : FPOperation::Add, 32);
             if (state.fast_fp() && !start.FPSCR().FTZ()) {
                 arg(0); op(0xbe); arg(1); op(0xbe); op(narrow_op); op(0xbc); set(next_local);
                 return ok;
@@ -4007,7 +4906,7 @@ private:
             // the default NaN; inexact results raise IXC (plus UFC when the
             // result is tiny — overflow is impossible for a square root).
             // Exactness via the f64 square: w*w holds exactly for a 24-bit w.
-            if (start.FPSCR().Value() & 0x00c00000u) return false;
+            if (start.FPSCR().Value() & 0x00c00000u) return fp_extended(inst, FPOperation::Sqrt, 32);
             if (state.fast_fp() && !start.FPSCR().FTZ()) {
                 arg(0); op(0xbe); op(0x91); op(0xbc); set(next_local);
                 return ok;
@@ -4061,6 +4960,55 @@ private:
         }
         case Op::FPNeg32: arg(0); imm(0x80000000); op(Xor); break;
         case Op::FPAbs32: arg(0); mask(0x7fffffff); break;
+        case Op::FPNeg16: arg(0); imm(0x8000); op(Xor); break;
+        case Op::FPAbs16: arg(0); mask(0x7fff); break;
+        case Op::FPMax32: return fp_extended(inst, FPOperation::Max, 32);
+        case Op::FPMax64: return fp_extended(inst, FPOperation::Max, 64);
+        case Op::FPMin32: return fp_extended(inst, FPOperation::Min, 32);
+        case Op::FPMin64: return fp_extended(inst, FPOperation::Min, 64);
+        case Op::FPMaxNumeric32: return fp_extended(inst, FPOperation::MaxNumeric, 32);
+        case Op::FPMaxNumeric64: return fp_extended(inst, FPOperation::MaxNumeric, 64);
+        case Op::FPMinNumeric32: return fp_extended(inst, FPOperation::MinNumeric, 32);
+        case Op::FPMinNumeric64: return fp_extended(inst, FPOperation::MinNumeric, 64);
+        case Op::FPMulX32: return fp_extended(inst, FPOperation::MulX, 32);
+        case Op::FPMulX64: return fp_extended(inst, FPOperation::MulX, 64);
+        case Op::FPMulAdd16: return fp_extended(inst, FPOperation::MulAdd, 16);
+        case Op::FPMulAdd32: return fp_extended(inst, FPOperation::MulAdd, 32);
+        case Op::FPMulAdd64: return fp_extended(inst, FPOperation::MulAdd, 64);
+        case Op::FPMulSub16: return fp_extended(inst, FPOperation::MulSub, 16);
+        case Op::FPMulSub32: return fp_extended(inst, FPOperation::MulSub, 32);
+        case Op::FPMulSub64: return fp_extended(inst, FPOperation::MulSub, 64);
+        case Op::FPRecipEstimate16: return fp_extended(inst, FPOperation::RecipEstimate, 16);
+        case Op::FPRecipEstimate32: return fp_extended(inst, FPOperation::RecipEstimate, 32);
+        case Op::FPRecipEstimate64: return fp_extended(inst, FPOperation::RecipEstimate, 64);
+        case Op::FPRecipExponent16: return fp_extended(inst, FPOperation::RecipExponent, 16);
+        case Op::FPRecipExponent32: return fp_extended(inst, FPOperation::RecipExponent, 32);
+        case Op::FPRecipExponent64: return fp_extended(inst, FPOperation::RecipExponent, 64);
+        case Op::FPRecipStepFused16: return fp_extended(inst, FPOperation::RecipStep, 16);
+        case Op::FPRecipStepFused32: return fp_extended(inst, FPOperation::RecipStep, 32);
+        case Op::FPRecipStepFused64: return fp_extended(inst, FPOperation::RecipStep, 64);
+        case Op::FPRSqrtEstimate16: return fp_extended(inst, FPOperation::RSqrtEstimate, 16);
+        case Op::FPRSqrtEstimate32: return fp_extended(inst, FPOperation::RSqrtEstimate, 32);
+        case Op::FPRSqrtEstimate64: return fp_extended(inst, FPOperation::RSqrtEstimate, 64);
+        case Op::FPRSqrtStepFused16: return fp_extended(inst, FPOperation::RSqrtStep, 16);
+        case Op::FPRSqrtStepFused32: return fp_extended(inst, FPOperation::RSqrtStep, 32);
+        case Op::FPRSqrtStepFused64: return fp_extended(inst, FPOperation::RSqrtStep, 64);
+        case Op::FPRoundInt16: return fp_extended(inst, FPOperation::RoundInt, 16);
+        case Op::FPRoundInt32: return fp_extended(inst, FPOperation::RoundInt, 32);
+        case Op::FPRoundInt64: return fp_extended(inst, FPOperation::RoundInt, 64);
+        case Op::FPHalfToDouble: return fp_extended(inst, FPOperation::Convert, 16, 64);
+        case Op::FPSingleToHalf: return fp_extended(inst, FPOperation::Convert, 32, 16);
+        case Op::FPDoubleToHalf: return fp_extended(inst, FPOperation::Convert, 64, 16);
+        case Op::FPHalfToFixedS16: return fp_extended(inst, FPOperation::ToFixed, 16, 16, false);
+        case Op::FPHalfToFixedU16: return fp_extended(inst, FPOperation::ToFixed, 16, 16, true);
+        case Op::FPHalfToFixedS32: return fp_extended(inst, FPOperation::ToFixed, 16, 32, false);
+        case Op::FPHalfToFixedU32: return fp_extended(inst, FPOperation::ToFixed, 16, 32, true);
+        case Op::FPHalfToFixedS64: return fp_extended(inst, FPOperation::ToFixed, 16, 64, false);
+        case Op::FPHalfToFixedU64: return fp_extended(inst, FPOperation::ToFixed, 16, 64, true);
+        case Op::FPSingleToFixedS64: return fp_extended(inst, FPOperation::ToFixed, 32, 64, false);
+        case Op::FPSingleToFixedU64: return fp_extended(inst, FPOperation::ToFixed, 32, 64, true);
+        case Op::FPDoubleToFixedS64: return fp_extended(inst, FPOperation::ToFixed, 64, 64, false);
+        case Op::FPDoubleToFixedU64: return fp_extended(inst, FPOperation::ToFixed, 64, 64, true);
         case Op::FPNeg64:
         case Op::FPAbs64:
             // Sign-bit operations on the two binary64 words; NaN payloads and
@@ -4071,18 +5019,16 @@ private:
             else mask(0x7fffffffu);
             set(next_local + 1);
             return ok;
-        case Op::FPFixedU32ToDouble:
-        case Op::FPFixedS32ToDouble:
-            // fbits == 0 converts an exact integer, and binary64 represents
-            // every 32-bit integer exactly, so no exception flag can be raised
-            // and the rounding mode cannot change the result. Scaled
-            // fixed-point forms stay unimplemented rather than silently
-            // returning an unscaled value.
-            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0) return false;
-            arg(0);
-            op(kind == Op::FPFixedU32ToDouble ? 0xb8 : 0xb7); // f64.convert_i32_u/s
-            store_f64_words(next_local);
-            return ok;
+        case Op::FPFixedU32ToDouble: return fp_fixed_to_float(inst, 32, 64, false);
+        case Op::FPFixedS32ToDouble: return fp_fixed_to_float(inst, 32, 64, true);
+        case Op::FPFixedS16ToSingle: return fp_fixed_to_float(inst, 16, 32, true);
+        case Op::FPFixedU16ToSingle: return fp_fixed_to_float(inst, 16, 32, false);
+        case Op::FPFixedS16ToDouble: return fp_fixed_to_float(inst, 16, 64, true);
+        case Op::FPFixedU16ToDouble: return fp_fixed_to_float(inst, 16, 64, false);
+        case Op::FPFixedS64ToSingle: return fp_fixed_to_float(inst, 64, 32, true);
+        case Op::FPFixedU64ToSingle: return fp_fixed_to_float(inst, 64, 32, false);
+        case Op::FPFixedS64ToDouble: return fp_fixed_to_float(inst, 64, 64, true);
+        case Op::FPFixedU64ToDouble: return fp_fixed_to_float(inst, 64, 64, false);
         case Op::FPSingleToFixedS32: return fp_to_fixed(inst, true, false);
         case Op::FPSingleToFixedU32: return fp_to_fixed(inst, false, false);
         case Op::FPDoubleToFixedS32: return fp_to_fixed(inst, true, true);
@@ -4097,7 +5043,7 @@ private:
             // denormal input to a signed zero and raises IDC; a signaling NaN
             // raises IOC and is quieted with its payload widened explicitly
             // instead of relying on the host's NaN propagation.
-            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0) return false;
+            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0) return fp_extended(inst, FPOperation::Convert, 32, 64);
             load(offsetof(JitState, fpscr)); mask(0x00009f00u);
             begin_if(); ret(ExitReason::Unsupported); end_if();
             const auto a = next_local + 2, flags = next_local + 3;
@@ -4189,7 +5135,7 @@ private:
             // Narrowing conversion. Only round-to-nearest is emitted (wasm's
             // f32.demote_f64); every flag below is derived from the exact
             // binary64 operand rather than approximated.
-            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0) return false;
+            if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0) return fp_extended(inst, FPOperation::Convert, 64, 32);
             load(offsetof(JitState, fpscr)); mask(0x00009f00u);
             begin_if(); ret(ExitReason::Unsupported); end_if();
             const auto a = next_local + 2, flags = next_local + 4;
@@ -4342,6 +5288,17 @@ private:
                 arg(0); imm(27); op(Shl); op(Or);
             });
             return ok;
+        case Op::A32SetCpsr:
+            state.write_nzcv(code, 0xf0000000, [&] { arg(0); }, [] {});
+            state.write_psr_field(code, 0x0fffffff, [&] { arg(0); mask(0x090f03ff); });
+            return ok;
+        case Op::A32SetCpsrNZCVQ:
+            state.write_nzcv(code, 0xf0000000, [&] { arg(0); }, [] {});
+            state.write_psr_field(code, 0x08000000, [&] { arg(0); mask(0x08000000); });
+            return ok;
+        case Op::A32SetGEFlagsCompressed:
+            state.write_psr_field(code, 0x000f0000, [&] { arg(0); mask(0x000f0000); });
+            return ok;
         case Op::A32SetCpsrNZ:
         case Op::A32SetCpsrNZC:
         case Op::A32SetCpsrNZCV:
@@ -4349,6 +5306,24 @@ private:
             const uint32_t bits = kind == Op::A32SetCpsrNZ ? 0xc0000000
                 : kind == Op::A32SetCpsrNZC ? 0xe0000000 : 0xf0000000;
             state.write_nzcv(code, bits, [&] { arg(0); }, [&] { arg(1); });
+            return ok;
+        }
+        case Op::GetUpperFromOp:
+        case Op::GetLowerFromOp: {
+            const auto source = inst.GetArg(0);
+            if (source.IsImmediate()) return false;
+            const auto *producer = source.GetInstRecursive();
+            switch (producer->GetOpcode()) {
+            case Op::VectorSignedMultiply16:
+            case Op::VectorSignedMultiply32:
+            case Op::VectorUnsignedMultiply16:
+            case Op::VectorUnsignedMultiply32: break;
+            default: return false;
+            }
+            const auto it = locals.find(producer);
+            if (it == locals.end()) return false;
+            const unsigned offset = kind == Op::GetUpperFromOp ? 4 : 0;
+            for (unsigned word = 0; word < 4; ++word) { get(it->second + offset + word); set(next_local + word); }
             return ok;
         }
         case Op::GetNZFromOp:
@@ -4391,6 +5366,29 @@ private:
             }
             return ok;
         }
+        case Op::PackedAddSubU16: return packed_arithmetic(inst, 16, false, true, false, true);
+        case Op::PackedAddSubS16: return packed_arithmetic(inst, 16, true, true, false, true);
+        case Op::PackedSubAddU16: return packed_arithmetic(inst, 16, false, false, false, true);
+        case Op::PackedSubAddS16: return packed_arithmetic(inst, 16, true, false, false, true);
+        case Op::PackedHalvingAddSubU16: return packed_arithmetic(inst, 16, false, true, true, true);
+        case Op::PackedHalvingAddSubS16: return packed_arithmetic(inst, 16, true, true, true, true);
+        case Op::PackedHalvingSubAddU16: return packed_arithmetic(inst, 16, false, false, true, true);
+        case Op::PackedHalvingSubAddS16: return packed_arithmetic(inst, 16, true, false, true, true);
+        case Op::PackedAddS8: return packed_arithmetic(inst, 8, true, false, false);
+        case Op::PackedSubU8: return packed_arithmetic(inst, 8, false, true, false);
+        case Op::PackedSubS8: return packed_arithmetic(inst, 8, true, true, false);
+        case Op::PackedAddU16: return packed_arithmetic(inst, 16, false, false, false);
+        case Op::PackedAddS16: return packed_arithmetic(inst, 16, true, false, false);
+        case Op::PackedSubU16: return packed_arithmetic(inst, 16, false, true, false);
+        case Op::PackedSubS16: return packed_arithmetic(inst, 16, true, true, false);
+        case Op::PackedHalvingAddU8: return packed_arithmetic(inst, 8, false, false, true);
+        case Op::PackedHalvingAddS8: return packed_arithmetic(inst, 8, true, false, true);
+        case Op::PackedHalvingSubU8: return packed_arithmetic(inst, 8, false, true, true);
+        case Op::PackedHalvingSubS8: return packed_arithmetic(inst, 8, true, true, true);
+        case Op::PackedHalvingAddU16: return packed_arithmetic(inst, 16, false, false, true);
+        case Op::PackedHalvingAddS16: return packed_arithmetic(inst, 16, true, false, true);
+        case Op::PackedHalvingSubU16: return packed_arithmetic(inst, 16, false, true, true);
+        case Op::PackedHalvingSubS16: return packed_arithmetic(inst, 16, true, true, true);
         case Op::SignedSaturation: {
             // SSAT (and SSAT16 per halfword): clamp to the signed N-bit
             // range, 1 <= N <= 32; +5 = saturated, for CPSR.Q
@@ -4442,6 +5440,15 @@ private:
             state.read_dispatch_psr(code); imm(16); op(ShrU); mask(0xf);
             imm(0x00204081u); op(Mul); mask(0x01010101u); imm(0xff); op(Mul);
             break;
+        case Op::PackedAbsDiffSumU8:
+            for (unsigned lane = 0; lane < 4; ++lane) {
+                vector_element_word(inst.GetArg(0), 8, lane);
+                vector_element_word(inst.GetArg(1), 8, lane); op(Sub); set(next_local + 4);
+                imm(0); get(next_local + 4); op(Sub); get(next_local + 4);
+                get(next_local + 4); imm(0); op(LtS); op(Select);
+                if (lane) op(Add);
+            }
+            break;
         case Op::PackedSelect:
             // SEL: bytes of b where the GE byte mask is set, else of a
             // (Dynarmic EmitPackedSelect(ge, a, b)).
@@ -4492,19 +5499,6 @@ private:
                 value_word(inst.GetArg(0), 0); imm(31); op(ShrU); set(next_local + 4);
             }
             return ok;
-        case Op::LogicalShiftRight64:
-            // U64 result: publish both words via the i64 scratch local,
-            // exactly like Pack2x32To1x64, so word-1 consumers never see a
-            // stale/unset slot.
-            value64(inst.GetArg(0)); value(inst.GetArg(1)); op(ExtendU); op(ShrU64);
-            // Wasm masks the shift count modulo 64; Dynarmic requires zero
-            // for every U8 count >= 64.
-            op(0x42); op(0); // i64.const 0
-            value(inst.GetArg(1)); imm(64); op(LtU); op(Select);
-            set(scratch_local);
-            get(scratch_local); op(Wrap); set(next_local);
-            get(scratch_local); op(0x42); uleb(code, 32); op(ShrU64); op(Wrap); set(next_local + 1);
-            return ok;
         case Op::SignExtendByteToWord: arg(0); imm(24); op(Shl); imm(24); op(ShrS); break;
         case Op::SignExtendHalfToWord: arg(0); imm(16); op(Shl); imm(16); op(ShrS); break;
         case Op::SignExtendWordToLong:
@@ -4531,17 +5525,6 @@ private:
             value_word(inst.GetArg(0)); mask(0xffff); set(next_local);
             imm(0); set(next_local + 1);
             return ok;
-        case Op::LogicalShiftLeft64: {
-            // Dynarmic shifts by an unsigned byte and returns zero at >=64;
-            // Wasm alone masks counts modulo 64. Guard before the i64 shift.
-            value_word(inst.GetArg(1)); mask(0xff); imm(64); op(LtU);
-            op(If); op(0x7e); // i64 block result
-            value64(inst.GetArg(0));
-            value_word(inst.GetArg(1)); mask(0xff); op(ExtendU); op(Shl64);
-            op(Else); constant64(code, 0); op(End);
-            store_i64_words(next_local);
-            return ok;
-        }
         case Op::ZeroExtendByteToWord: arg(0); mask(0xff); break;
         case Op::ZeroExtendHalfToWord: arg(0); mask(0xffff); break;
         case Op::ConditionalSelect32:
@@ -4596,6 +5579,144 @@ private:
                 get(next_local + word); set(next_local + word + 1);
             }
             return ok;
+        case Op::VectorReduceAdd8: return vector_reduce_add(inst, 8);
+        case Op::VectorReduceAdd16: return vector_reduce_add(inst, 16);
+        case Op::VectorReduceAdd32: return vector_reduce_add(inst, 32);
+        case Op::VectorReduceAdd64: return vector_reduce_add(inst, 64);
+        case Op::VectorPolynomialMultiplyLong64:
+            for (unsigned word = 0; word < 4; ++word) { imm(0); set(next_local + word); }
+            for (unsigned bit = 0; bit < 64; ++bit) {
+                constant64(code, 0); push_i64_value(inst.GetArg(1), 0);
+                constant64(code, bit); op(ShrU64); constant64(code, 1); op(And64); op(Sub64); set(scratch_local);
+                // Keep the selection mask in two i32 scratch words because
+                // publishing an i64 result reuses the i64 scratch local.
+                get(scratch_local); store_i64_words(next_local + 4);
+                push_i64_words(next_local); push_i64_value(inst.GetArg(0), 0);
+                constant64(code, bit); op(Shl64); push_i64_words(next_local + 4); op(And64); op(Xor64); store_i64_words(next_local);
+                if (bit) {
+                    push_i64_words(next_local + 2); push_i64_value(inst.GetArg(0), 0);
+                    constant64(code, 64 - bit); op(ShrU64); push_i64_words(next_local + 4); op(And64); op(Xor64); store_i64_words(next_local + 2);
+                }
+            }
+            return ok;
+        case Op::VectorUnsignedRecipEstimate:
+        case Op::VectorUnsignedRecipSqrtEstimate:
+            for (unsigned word = 0; word < 4; ++word) {
+                const bool square_root = kind == Op::VectorUnsignedRecipSqrtEstimate;
+                value_word(inst.GetArg(0), word); imm(square_root ? 0x40000000 : 0x80000000); op(LtU); begin_if(true);
+                imm(UINT32_MAX); op(Else);
+                value_word(inst.GetArg(0), word); imm(23); op(ShrU); set(next_local + 4);
+                if (square_root) {
+                    get(next_local + 4); imm(1); op(Shl); imm(1); op(Or);
+                    get(next_local + 4); imm(1); op(Or); imm(1); op(Shl);
+                    get(next_local + 4); imm(256); op(LtU); op(Select); set(next_local + 4);
+                    // The integer estimate is <=1023; binary64 sqrt has ample
+                    // precision to distinguish adjacent squared integers.
+                    imm(0x0fffffff); op(0xb8); get(next_local + 4); op(0xb8); op(0xa3); op(0x9f); op(0xab);
+                } else {
+                    imm(1u << 19); get(next_local + 4); imm(1); op(Shl); imm(1); op(Or); op(DivU);
+                }
+                imm(1); op(Add); imm(1); op(ShrU); mask(0xff); imm(0x100); op(Or); imm(23); op(Shl);
+                end_if(); set(next_local + word);
+            }
+            return ok;
+        case Op::VectorPopulationCount:
+            pack_lanes(8, 4, [&](unsigned i) { vector_element_word(inst.GetArg(0), 8, i); op(0x69); });
+            return ok;
+        case Op::VectorReverseBits:
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(0), word); set(next_local + 4);
+                for (unsigned shift : {1u, 2u, 4u}) {
+                    const uint32_t m = shift == 1 ? 0x55555555 : shift == 2 ? 0x33333333 : 0x0f0f0f0f;
+                    get(next_local + 4); imm(shift); op(ShrU); mask(m);
+                    get(next_local + 4); mask(m); imm(shift); op(Shl); op(Or); set(next_local + 4);
+                }
+                get(next_local + 4); set(next_local + word);
+            }
+            return ok;
+        case Op::VectorRotateWholeVectorRight: {
+            if (!inst.GetArg(1).IsImmediate()) return false;
+            const unsigned count = inst.GetArg(1).GetU8() % 128;
+            for (unsigned word = 0; word < 4; ++word) {
+                value_word(inst.GetArg(0), (word + count / 32) % 4);
+                if (count % 32) {
+                    imm(count % 32); op(ShrU);
+                    value_word(inst.GetArg(0), (word + count / 32 + 1) % 4);
+                    imm(32 - count % 32); op(Shl); op(Or);
+                }
+                set(next_local + word);
+            }
+            return ok;
+        }
+        case Op::VectorAbs64:
+        case Op::VectorEqual128:
+        case Op::VectorSignExtend64:
+            return vector_simple64(inst, kind);
+        case Op::VectorMultiply64: return vector_integer_arithmetic(inst, 64, Mul);
+        case Op::VectorBroadcastLower8: return vector_broadcast(inst, 8, false, true);
+        case Op::VectorBroadcastLower16: return vector_broadcast(inst, 16, false, true);
+        case Op::VectorBroadcastLower32: return vector_broadcast(inst, 32, false, true);
+        case Op::VectorBroadcastElementLower8: return vector_broadcast(inst, 8, true, true);
+        case Op::VectorBroadcastElementLower16: return vector_broadcast(inst, 16, true, true);
+        case Op::VectorBroadcastElementLower32: return vector_broadcast(inst, 32, true, true);
+        case Op::VectorCountLeadingZeros8: return vector_count_leading_zeros(inst, 8);
+        case Op::VectorCountLeadingZeros16: return vector_count_leading_zeros(inst, 16);
+        case Op::VectorCountLeadingZeros32: return vector_count_leading_zeros(inst, 32);
+        case Op::VectorPairedAdd8: return vector_paired(inst, 8, false, false, false);
+        case Op::VectorPairedAdd16: return vector_paired(inst, 16, false, false, false);
+        case Op::VectorPairedAdd64: return vector_paired(inst, 64, false, 0, false);
+        case Op::VectorPairedAdd32: return vector_paired(inst, 32, false, false, false);
+        case Op::VectorPairedMaxS8: return vector_paired(inst, 8, false, true, true);
+        case Op::VectorPairedMaxS16: return vector_paired(inst, 16, false, true, true);
+        case Op::VectorPairedMaxS32: return vector_paired(inst, 32, false, true, true);
+        case Op::VectorPairedMaxU8: return vector_paired(inst, 8, false, true, false);
+        case Op::VectorPairedMaxU16: return vector_paired(inst, 16, false, true, false);
+        case Op::VectorPairedMaxU32: return vector_paired(inst, 32, false, true, false);
+        case Op::VectorPairedMinS8: return vector_paired(inst, 8, false, 2, true);
+        case Op::VectorPairedMinS16: return vector_paired(inst, 16, false, 2, true);
+        case Op::VectorPairedMinS32: return vector_paired(inst, 32, false, 2, true);
+        case Op::VectorPairedMinU8: return vector_paired(inst, 8, false, 2, false);
+        case Op::VectorPairedMinU16: return vector_paired(inst, 16, false, 2, false);
+        case Op::VectorPairedMinU32: return vector_paired(inst, 32, false, 2, false);
+        case Op::VectorPairedMaxLowerS8: return vector_paired(inst, 8, true, true, true);
+        case Op::VectorPairedMaxLowerS16: return vector_paired(inst, 16, true, true, true);
+        case Op::VectorPairedMaxLowerS32: return vector_paired(inst, 32, true, true, true);
+        case Op::VectorPairedMaxLowerU8: return vector_paired(inst, 8, true, true, false);
+        case Op::VectorPairedMaxLowerU16: return vector_paired(inst, 16, true, true, false);
+        case Op::VectorPairedMaxLowerU32: return vector_paired(inst, 32, true, true, false);
+        case Op::VectorPairedMinLowerS8: return vector_paired(inst, 8, true, 2, true);
+        case Op::VectorPairedMinLowerS16: return vector_paired(inst, 16, true, 2, true);
+        case Op::VectorPairedMinLowerS32: return vector_paired(inst, 32, true, 2, true);
+        case Op::VectorPairedMinLowerU8: return vector_paired(inst, 8, true, 2, false);
+        case Op::VectorPairedMinLowerU16: return vector_paired(inst, 16, true, 2, false);
+        case Op::VectorPairedMinLowerU32: return vector_paired(inst, 32, true, 2, false);
+        case Op::VectorHalvingSubS8: return vector_halving_sub(inst, 8, true, false);
+        case Op::VectorHalvingSubS16: return vector_halving_sub(inst, 16, true, false);
+        case Op::VectorHalvingSubS32: return vector_halving_sub(inst, 32, true, false);
+        case Op::VectorHalvingSubU8: return vector_halving_sub(inst, 8, false, false);
+        case Op::VectorHalvingSubU16: return vector_halving_sub(inst, 16, false, false);
+        case Op::VectorHalvingSubU32: return vector_halving_sub(inst, 32, false, false);
+        case Op::VectorGreaterS64:
+        case Op::VectorMinS64:
+        case Op::VectorMinU64:
+        case Op::VectorMaxS64:
+        case Op::VectorMaxU64: {
+            const bool maximum = kind == Op::VectorMaxS64 || kind == Op::VectorMaxU64;
+            const bool signed_ = kind == Op::VectorGreaterS64 || kind == Op::VectorMinS64 || kind == Op::VectorMaxS64;
+            for (unsigned word = 0; word < 4; word += 2) {
+                push_i64_value(inst.GetArg(0), word); push_i64_value(inst.GetArg(1), word);
+                op(signed_ ? GtS64 : GtU64); set(next_local + 4);
+                if (kind == Op::VectorGreaterS64) {
+                    constant64(code, 0); get(next_local + 4); op(ExtendU); op(Sub64);
+                } else {
+                    push_i64_value(inst.GetArg(maximum ? 0 : 1), word);
+                    push_i64_value(inst.GetArg(maximum ? 1 : 0), word);
+                    get(next_local + 4); op(Select);
+                }
+                store_i64_words(next_local + word);
+            }
+            return ok;
+        }
         case Op::VectorGreaterS8: return vector_integer_select(inst, 8, VectorLaneOp::Greater, true);
         case Op::VectorGreaterS16: return vector_integer_select(inst, 16, VectorLaneOp::Greater, true);
         case Op::VectorGreaterS32: return vector_integer_select(inst, 32, VectorLaneOp::Greater, true);

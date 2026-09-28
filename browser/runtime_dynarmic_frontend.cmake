@@ -72,6 +72,12 @@ endforeach()
 set(_dynarmic_portable_three_regs "${CMAKE_CURRENT_BINARY_DIR}/dynarmic-frontend/asimd_three_regs.cpp")
 file(GENERATE OUTPUT "${_dynarmic_portable_three_regs}" CONTENT "${_dynarmic_three_regs_text}")
 
+# Exact FMA cancellation must keep the low product limb's binary point.
+set(DYNARMIC_ROOT "${_dynarmic_root}")
+set(FUSED_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/dynarmic-frontend/fused.cpp")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_dynarmic_src}/common/fp/fused.cpp")
+include("${VITA_ROOT}/cpu/src/wasmjit/prepare_fused.cmake")
+
 # All visitor implementations are required by the upstream decoder tables,
 # including VFP/ASIMD. This glob is deliberately confined to the A32 frontend.
 file(GLOB _dynarmic_a32_impl CONFIGURE_DEPENDS
@@ -103,7 +109,7 @@ add_library(vita3k_dynarmic_frontend STATIC
     # Portable FP helpers: the wasmjit fp64 host helper delegates the ARM
     # vector RECPE/VRECPS/VRSQRTE/VRSQRTS estimates to these implementations instead of
     # re-deriving the algorithms (correct-by-construction, one copy).
-    "${_dynarmic_src}/common/fp/fused.cpp"
+    "${FUSED_OUTPUT}"
     "${_dynarmic_src}/common/fp/process_exception.cpp"
     "${_dynarmic_src}/common/fp/process_nan.cpp"
     "${_dynarmic_src}/common/fp/unpacked.cpp"
@@ -114,8 +120,12 @@ add_library(vita3k_dynarmic_frontend STATIC
     "${_dynarmic_src}/common/fp/op/FPToFixed.cpp"
     # Oracle for the emitted FPHalfToSingle lowering in the backend tests.
     "${_dynarmic_src}/common/fp/op/FPConvert.cpp"
+    "${_dynarmic_src}/common/fp/op/FPMulAdd.cpp"
+    "${_dynarmic_src}/common/fp/op/FPRoundInt.cpp"
     "${_dynarmic_src}/common/u128.cpp"
     "${_dynarmic_src}/common/math_util.cpp"
+    "${_dynarmic_src}/common/crypto/aes.cpp"
+    "${_dynarmic_src}/common/crypto/sm4.cpp"
     "${VITA_ROOT}/cpu/src/wasmjit/frontend.cpp"
 )
 target_compile_features(vita3k_dynarmic_frontend PUBLIC cxx_std_20)

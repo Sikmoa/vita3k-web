@@ -1,9 +1,10 @@
 // Copyright (C) 2026 Vita3K team
 // SPDX-License-Identifier: GPL-2.0-or-later
-// node vita3k/cpu/tests/wasmjit_emitter_test.mjs <fixture-directory>
+// node vita3k/cpu/tests/wasmjit_emitter_test.mjs <fixture-directory> <fp-helper.wasm>
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {join} from 'node:path';
+import {WASI} from 'node:wasi';
 
 const directory = process.argv[2];
 const fixtures = JSON.parse(readFileSync(join(directory, 'cases.json'), 'utf8'));
@@ -17,6 +18,14 @@ const guestBytes = 0x20000;
 const epochTable = guestBytes, epochTableBytes = 0x20000;
 const memory = new WebAssembly.Memory({initial: (epochTable + epochTableBytes) / 65536});
 const bytes = new Uint8Array(memory.buffer);
+const wasi = new WASI({version: 'preview1', args: [], env: {}, preopens: {}});
+const exactFPInstance = process.argv[3] ? new WebAssembly.Instance(
+    new WebAssembly.Module(readFileSync(process.argv[3])), {
+        wasi_snapshot_preview1: wasi.wasiImport,
+        env: {abort() { throw new Error('FP helper aborted'); }},
+    }) : null;
+if (exactFPInstance) wasi.initialize(exactFPInstance);
+const exactFP = exactFPInstance?.exports;
 // Helper contract (wasm_jit_cpu.cpp checked_memory_read/write): reads zero
 // memory_value[0..3] then fill the addressed guest bytes little-endian;
 // writes consume bytes across all four words, so 8-byte transfers use two.
@@ -71,8 +80,16 @@ let regionRuns = 0;
 // into FPSCR by the generated code. Fixtures only exercise the operation
 // selection shape, so ordinary JS binary64 arithmetic suffices; x/0 raises
 // IOC with the default quiet NaN like the native helper.
-const fp64 = (stateOffset, operation) => {
+const fp64 = (stateOffset, operation, fpscr) => {
     const view = new DataView(memory.buffer);
+    if (operation & 0x10000) {
+        assert.ok(exactFP, 'extended FP fixtures require the compiled helper Wasm as argv[3]');
+        const base = stateOffset + 468;
+        const result = exactFP.extended_fp(operation, view.getBigUint64(base, true),
+            view.getBigUint64(base + 8, true), view.getBigUint64(base + 16, true), fpscr);
+        view.setBigUint64(base, result, true);
+        return exactFP.extended_flags();
+    }
     const low = word => view.getUint32(stateOffset + 96 + 4 * word, true);
     const a = low(0) + low(1) * 0x100000000, b = low(2) + low(3) * 0x100000000;
     const box = new DataView(new Float64Array(1).buffer);
@@ -185,3 +202,37 @@ for (const fixture of fixtures) {
         assert.throws(() => variant.run(memory.buffer.byteLength - 4, fixture.budget), WebAssembly.RuntimeError);
 }
 console.log(`Wasm execution passed: ${fixtures.length} reference fixtures plus P/K/PK variants, ${runs} call_indirect calls, ${regionRuns} region calls (two state offsets), table insertion and OOB traps`);
+
+const aotState = JSON.parse(readFileSync(join(directory, 'portable_aot_state.json'), 'utf8'));
+const aotLut = 0x8000;
+for (let mode = 0; mode < 4; ++mode) {
+    const module = new WebAssembly.Module(readFileSync(join(directory, `portable_aot_${mode}.wasm`)));
+    const {entry} = new WebAssembly.Instance(module,
+        {env: {memory, mem_read, mem_write, fp64, aot_lut: aotLut}}).exports;
+    for (const offset of [0x400, 0x10404]) {
+        new Uint32Array(memory.buffer).fill(0xcafebabe);
+        const state = new Uint32Array(memory.buffer, offset, aotState.length);
+        state.set(aotState);
+        new Uint32Array(memory.buffer, aotLut, 2).set([1, 0]); // slot 0, member 0, ARM
+        assert.equal(entry(offset, 10), 1, `AOT mode ${mode}: SVC exit`);
+        assert.equal(state[5], 0xa8800000, 'AOT fused cancellation result');
+        const value = new DataView(memory.buffer).getFloat64(offset + 6 * 4, true);
+        assert.equal(value, 0xffffffff / 65536, 'AOT direct FPFixedU32ToDouble');
+        assert.equal(state[15], 0x1004, 'AOT next PC');
+        assert.equal(state[17], 0, 'AOT FPSCR');
+        assert.equal(state[18], 42, 'AOT SVC immediate');
+        // Region/AOT accounting ACCUMULATES into state.executed (REGION_ABI.md:
+        // "state.executed accumulates monotonically across calls"; the host
+        // reads the per-call delta), unlike single-block emission, which
+        // overwrites it. The seed state starts at 99, so exactly one executed
+        // instruction must land at 100. Assert the delta and the sum so neither
+        // an overwrite nor an extra tick can hide.
+        assert.equal((state[20] - aotState[20]) >>> 0, 1, 'AOT executed ticks delta');
+        assert.equal(state[20], (aotState[20] + 1) >>> 0, 'AOT executed ticks accumulate');
+        assert.deepEqual(Array.from(state.slice(117, 123)), aotState.slice(117, 123), 'AOT FP scratch preservation');
+        const whole = new Uint32Array(memory.buffer);
+        assert.equal(whole[offset / 4 - 1], 0xcafebabe, 'AOT leading canary');
+        assert.equal(whole[offset / 4 + state.length], 0xcafebabe, 'AOT trailing canary');
+    }
+}
+console.log('AOT execution passed: direct fixed conversion and fused FP helper under all four state policies');
