@@ -34,6 +34,7 @@ struct IOState;
 inline SceUID invalid_fd = -1;
 
 void init_device_paths(IOState &io);
+void create_standard_directories(const fs::path &vita_fs_path);
 bool init_savedata_app_path(IOState &io, const fs::path &vita_fs_path);
 bool init(IOState &io, const fs::path &cache_path, const fs::path &log_path, const fs::path &vita_fs_path, bool redirect_stdio);
 void io_deinit(IOState &io);

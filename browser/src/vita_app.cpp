@@ -545,6 +545,11 @@ static int run_app_impl() {
         if (!runtime.attach(*env)) return -11;
 #endif
         init_device_paths(env->io);
+        // Desktop io::init() creates the standard device tree (ux0:/data,
+        // ux0:/user, ...); the browser stages files but never creates empty
+        // standard directories, so LÖVE's save-dir probe fails with
+        // 0x80010002. Mirror the desktop tree (no cache/log paths here).
+        create_standard_directories(env->vita_fs_path);
         init_savedata_app_path(env->io, env->vita_fs_path);
         // SceRegMgr values: firmware template defaults, then vd0/registry/system.dreg.
         regmgr::init_regmgr(env->regmgr, env->vita_fs_path);

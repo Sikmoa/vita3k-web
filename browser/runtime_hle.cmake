@@ -25,6 +25,57 @@ set(_hle_exports
     sceGxmGetNotificationRegion
     sceKernelExitProcess
     sceKernelAllocMemBlock sceKernelFreeMemBlock sceKernelGetMemBlockBase
+    # Balatro save-manager frontier (exit -8, NID e2d7e137): production
+    # SceSysmem body (page-aligned alloc + UID bookkeeping under a short
+    # mutex, same TU as the selected memblock entries); no host wait.
+    sceKernelAllocMemBlockForVM
+    # Balatro unserviced-import sweep (AOT build scan, 66 NIDs without an HLE
+    # body): everything below is either a production body that is host-free
+    # in the fiber runtime, or an upstream stub whose return is the truth on
+    # this host (same precedent as the selected Hid enumerates). Deliberately
+    # NOT selected, with reasons: msgpipe send/recv (host-condvar waits, no
+    # execution_host branch — would hand fibers ILLEGAL_CONTEXT or hang),
+    # sceKernelWaitThreadEndCB (host wait_thread_end, needs a DelayThreadCB-
+    # style cooperative mirror), AudioIn open/input/release (needs host mic
+    # capture; SDL AUDIO is off), Motion ×7 (motion.cpp needs SDL_OpenSensor,
+    # absent from the browser SDL build), sceGxmDisplayQueueFinish (host
+    # wait_empty), sceIoChstatByFd/sceGxmSetYuvProfile/sceImeSetText/
+    # sceSblDmac5HashTransform (bare stubs with no truth argument; crypto
+    # fake-success is dangerous), taiGetModuleInfo (TU defines LIBRARY_INIT),
+    # ksceSblACMgr* (no upstream EXPORT exists), egl×20 + PVRSRV×2 (covered
+    # by the ?gles=1 bridge, verified in gles_functions.inc), Power ×4
+    # (SDL_GetPowerInfo absent from the browser SDL build).
+    # VM domains (vitasdk: open/close take no UID; they make all VM-domain
+    # memblocks executable/non-executable globally, and Sync flushes caches
+    # for a location). The emulator has no NX enforcement on guest RAM, so
+    # the upstream open/close stubs (return 0) are already the full
+    # executable-toggle semantics here; Sync keeps its production range
+    # check + jit invalidate over vm_blocks.
+    sceKernelSyncVMDomain sceKernelOpenVMDomain sceKernelCloseVMDomain
+    # Pure SysmemState struct fill (SFO-adjusted user budget).
+    sceKernelGetFreeMemorySize
+    # Forwards to the already-selected _sceKernelStopUnloadModule; the
+    # Modulemgr TU is compiled (same machinery as selected LoadStartModule).
+    sceKernelStopUnloadModule
+    # Non-blocking close; harmless with no pipes, required once creation is.
+    sceKernelDeleteMsgPipe
+    # Stub returns 0: correct for a game process (cf. selected IsGameProgram).
+    sceAppMgrIsNonGameProgram
+    # Cosmetic output stubs: 0 with no device is the honest answer.
+    sceCtrlSetLightBar sceHidKeyboardRead
+    # Production truth on this host (NOT_SUPPORTED off PSTV; rtl rumble loop
+    # is a no-op with no controllers).
+    sceCtrlSetActuator
+    # Pure display-state read; underscore twin selected alongside (same
+    # pattern as the SetFrameBuf pair).
+    sceDisplayGetFrameBuf _sceDisplayGetFrameBuf
+    # GXM descriptor readers and context-state writers (SetCullMode
+    # precedent: record + renderer append under alloc_space).
+    sceGxmTextureGetData sceGxmTextureGetFormat sceGxmSetUniformDataF
+    sceGxmReserveFragmentDefaultUniformBuffer sceGxmReserveVertexDefaultUniformBuffer
+    sceGxmSetFrontStencilRef sceGxmSetFrontStencilFunc
+    # Production body; same guest-callback pattern as selected sceImeUpdate.
+    sceImeSetCaret
     sceKernelCreateLwMutex sceKernelDeleteLwMutex sceKernelLockLwMutex
     sceKernelTryLockLwMutex sceKernelUnlockLwMutex
     sceKernelCreateMutex sceKernelDeleteMutex sceKernelLockMutex sceKernelUnlockMutex
@@ -672,6 +723,13 @@ add_library(vita3k_web_runtime_hle STATIC
     "${_HLE_ROOT}/io/src/filesystem.cpp"
     "${_HLE_ROOT}/io/src/state_functions.cpp"
     "${_HLE_ROOT}/util/src/net_utils.cpp"
+    # Portable f32->f16 for the selected GXM uniform setters: the native TU
+    # needs x86 AVX+F16C, so the browser builds the scalar path (bit-identical
+    # over the same header-only encoder) from browser/src instead.
+    "${_HLE_BROWSER_ROOT}/src/float_to_half_portable.cpp"
+    # SFO reader for sceKernelGetFreeMemorySize's memory-expansion query
+    # (header-only boost + fmt, both already in this graph).
+    "${_HLE_ROOT}/packages/src/sfo.cpp"
     "${_HLE_ROOT}/regmgr/src/regmgr.cpp"
     "${_HLE_ROOT}/net/src/offline_socket.cpp"
     "${_HLE_ROOT}/net/src/epoll.cpp"

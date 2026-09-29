@@ -125,7 +125,10 @@ static bool is_valid_output_path(const VitaIoDevice device) {
         || device == VitaIoDevice::music0 || device == VitaIoDevice::photo0 || device == VitaIoDevice::video0);
 }
 
-bool init(IOState &io, const fs::path &cache_path, const fs::path &log_path, const fs::path &vita_fs_path, bool redirect_stdio) {
+// Standard device tree every boot must see (ux0:/data, ux0:/user, ...).
+// Split out so hosts without cache/log paths (the browser, whose content is
+// staged rather than installed) can mirror desktop layout exactly.
+void create_standard_directories(const fs::path &vita_fs_path) {
     // Iterate through the entire list of devices and create the subdirectories if they do not exist
     boost::mp11::mp_for_each<boost::describe::describe_enumerators<VitaIoDevice>>([&vita_fs_path](auto i) {
         if (is_valid_output_path(i.value))
@@ -146,6 +149,10 @@ bool init(IOState &io, const fs::path &cache_path, const fs::path &log_path, con
     fs::create_directories(uma0 / "data");
     fs::create_directories(vd0 / "registry");
     fs::create_directories(vd0 / "network");
+}
+
+bool init(IOState &io, const fs::path &cache_path, const fs::path &log_path, const fs::path &vita_fs_path, bool redirect_stdio) {
+    create_standard_directories(vita_fs_path);
 
     fs::create_directories(cache_path / "shaders");
     fs::create_directory(log_path / "shaderlog");

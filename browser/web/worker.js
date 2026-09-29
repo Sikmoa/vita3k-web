@@ -424,10 +424,14 @@ self.onmessage = async ({ data }) => {
         post({ type: 'stage-progress', phase: 'aot', path: data.aotUrl,
           pathBytes: payload.byteLength, pathSize: payload.byteLength });
         const compiledAt = performance.now();
-        post({ type: 'stage-progress', phase: 'aot-compiling', path: data.aotUrl });
+        post({ type: 'stage-progress', phase: 'aot-compiling', path: data.aotUrl,
+          pathBytes: payload.byteLength, pathSize: total || payload.byteLength });
         module['vita3kAotModule'] = await WebAssembly.compile(payload);
+        const compileMs = Math.round(performance.now() - compiledAt);
         post({ type: 'log', message: `[vita3k-web] AOT module compiled in ` +
-          `${Math.round(performance.now() - compiledAt)} ms (downloaded ${Math.round((compiledAt - started) / 100) / 10}s)` });
+          `${compileMs} ms (downloaded ${Math.round((compiledAt - started) / 100) / 10}s)` });
+        post({ type: 'aot-compiled', path: data.aotUrl,
+          bytes: payload.byteLength, downloadMs: Math.round(compiledAt - started), compileMs });
       }
       module._vita3k_web_set_trace?.(data.trace ? 1 : 0);
       module._vita3k_web_set_fast_vblank?.(data.fastVblank ? 1 : 0);

@@ -55,7 +55,7 @@
 //   LIMBO_AOT           ahead-of-time module for the title (AOT.md), served as
 //                       /aot.wasm and passed to run-app as aotUrl
 import { createServer } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { networkInterfaces } from 'node:os';
 import { resolve } from 'node:path';
 import { existsSync, readdirSync } from 'node:fs';
@@ -137,7 +137,23 @@ const server = createServer(async (req, res) => {
       return body(manifestFor(wanted, wantedTitle, stagedTitles.includes(wanted)), 'application/json');
     }
     if (path === '/favicon.ico') { res.writeHead(404); return res.end(); }
-    if (path === '/aot.wasm' && aotPath) return send(await readFile(aotPath), 'application/wasm');
+    // The AOT image is ~100+ MB and only changes when rebuilt. Unlike the
+    // live-edited web sources it is revalidatable: `no-cache` forces a cheap
+    // conditional request (304, served from the browser cache) instead of a
+    // full re-download on every launch, while a rebuilt image gets a new ETag
+    // and is picked up immediately. Correctness never depends on the cache:
+    // load_aot hash-verifies the module against the staged guest code anyway.
+    if (path === '/aot.wasm' && aotPath) {
+      const { size, mtimeMs } = await stat(aotPath);
+      const etag = `"${size.toString(36)}-${Math.floor(mtimeMs).toString(36)}"`;
+      if (req.headers['if-none-match'] === etag) {
+        res.writeHead(304, { ETag: etag, 'Cache-Control': 'no-cache' });
+        return res.end();
+      }
+      res.writeHead(200, { 'Content-Type': 'application/wasm', 'Content-Length': size,
+        'Cache-Control': 'no-cache', ETag: etag });
+      return res.end(await readFile(aotPath));
+    }
     if (path.startsWith('/stage/'))
       return send(await readStageFile(staged, path.slice('/stage/'.length)), 'application/octet-stream');
     const { content, type } = await readRuntimeFile(path);

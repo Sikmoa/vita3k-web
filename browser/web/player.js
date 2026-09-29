@@ -227,6 +227,10 @@ const showStats = () => {
 function countFrame() {
   const now = performance.now();
   lastPresentAt = now; presentedOnce = true; watchdogWarned = false;
+  // The launch overlay (staging / AOT download / compile status) has served
+  // its purpose once frames present; otherwise a stale "Compiling the AOT
+  // module…" phase lingers over gameplay even when AOT loaded fine.
+  if (!launchStatus.hidden) launch(null);
   frames += 1;
   if (!firstFrameAt) { firstFrameAt = now - startedAt; fpsSince = now; fpsFrames = 0; }
   fpsFrames += 1;
@@ -633,7 +637,8 @@ async function run() {
           const name = String(data.path || '').replace(/^.*\//, '') || 'WebAssembly runtime';
           const done = data.pathBytes || 0, total = data.pathSize || 0;
           if (data.phase === 'aot-compiling') {
-            launch('Compiling the AOT module…', `${name} · ${mib(done)} downloaded · compiling on this device…`, 1);
+            const have = data.pathSize ? `${mib(done)}${data.pathBytes ? ' downloaded' : ''}` : `${mib(done)} downloaded`;
+            launch('Compiling the AOT module…', `${name} · ${have} · compiling on this device…`, 1);
           } else {
             const verb = data.phase === 'aot' ? 'Downloading' : 'Loading';
             const filePct = total > 0 && done > 0 ? Math.min(99, Math.floor(done / total * 100)) : null;
@@ -683,6 +688,14 @@ async function run() {
         }
         break;
       }
+      case 'aot-compiled':
+        // Device-side compile finished; the worker now boots the title and the
+        // runtime reports `AOT on / off / REJECTED` in the log. Do not leave the
+        // overlay on "Compiling…" while the game runs (it used to stick there
+        // forever, with a 0.0 MiB byte count, even on successful AOT runs).
+        launch('Launching the game…', `${mib(data.bytes || 0)} MiB AOT ready` +
+          ` (download ${(data.downloadMs / 1000).toFixed(1)}s, compile ${(data.compileMs / 1000).toFixed(1)}s) · ${elapsed()}`, 1);
+        break;
       case 'staged':
         status.textContent = 'running';
         launch('Launching the game…', `${data.files} files` +
@@ -740,7 +753,17 @@ async function run() {
         log('exit: ' + JSON.stringify(data));
         stop(true);
         break;
-      case 'log': log(data.message); break;
+      case 'log': {
+        log(data.message);
+        // A rejected/stale AOT image otherwise fails silent (the run just
+        // continues on the fallback JIT with aot=0). Surface the runtime's
+        // own verdict so a version/content mismatch is visible in the UI.
+        if (typeof data.message === 'string' && data.message.includes('AOT REJECTED')) {
+          const reason = data.message.replace(/^.*AOT REJECTED:\s*/, '');
+          notice(`AOT module rejected (${reason}). Running on the JIT fallback — rebuild the AOT image.`);
+        }
+        break;
+      }
       case 'error': log('ERROR ' + data.message); status.textContent = 'Runtime error'; notice(data.message); stop(true); break;
       default: break;
     }

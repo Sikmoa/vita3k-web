@@ -40,7 +40,7 @@
 //   LIMBO_AOT               ahead-of-time module to supply to the run (AOT.md)
 //   LIMBO_LOG_OUT           write the retained worker log tail (4000 lines) to this file
 import { createServer } from 'node:http';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, stat, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
@@ -118,7 +118,19 @@ const server = createServer(async (req, res) => {
       return;
     }
     if (path === '/manifest.json') { send(manifestBytes, 'application/json'); return; }
-    if (path === '/aot.wasm' && aotPath) { send(await readFile(aotPath), 'application/wasm'); return; }
+    if (path === '/aot.wasm' && aotPath) {
+      const { size, mtimeMs } = await stat(aotPath);
+      const etag = `"${size.toString(36)}-${Math.floor(mtimeMs).toString(36)}"`;
+      if (req.headers['if-none-match'] === etag) {
+        res.writeHead(304, { ETag: etag, 'Cache-Control': 'no-cache' });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/wasm', 'Content-Length': size,
+        'Cache-Control': 'no-cache', ETag: etag });
+      res.end(await readFile(aotPath));
+      return;
+    }
     if (path.startsWith('/stage/')) {
       send(await readStageFile(staged, path.slice('/stage/'.length)), 'application/octet-stream');
       return;

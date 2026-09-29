@@ -25,7 +25,12 @@
 #include <packages/sfo.h>
 
 #include <util/align.h>
+#include <util/log.h>
 #include <util/string_utils.h>
+
+#include <cpu/functions.h>
+
+#include <fmt/format.h>
 
 #include <util/tracy.h>
 TRACY_MODULE_NAME(SceSysmem);
@@ -143,6 +148,14 @@ EXPORT(SceUID, sceKernelFindMemBlockByAddr, Address addr, uint32_t size) {
             return id;
         }
     }
+    const uint32_t caller = read_lr(*emuenv.kernel.get_thread(thread_id)->cpu);
+    std::string known;
+    for (const auto &[id, block] : state->blocks) {
+        known += fmt::format(" [uid=0x{:X} base=0x{:08X} size=0x{:X} {}]", id, block->mappedBase.address(),
+            block->mappedSize, block->name);
+    }
+    LOG_WARN("sceKernelFindMemBlockByAddr: no block contains addr=0x{:08X} size=0x{:X} caller=0x{:08X} blocks:{}", addr,
+        size, caller, known);
     return RET_ERROR(SCE_KERNEL_ERROR_BLOCK_ERROR);
 }
 
@@ -281,18 +294,41 @@ EXPORT(int, sceKernelSyncVMDomain, SceUID block_uid, Address base, uint32_t size
     const auto state = emuenv.kernel.obj_store.get<SysmemState>();
     const auto guard = std::lock_guard<std::mutex>(state->mutex);
 
+    const auto flush = [&](const KernelMemBlockPtr &block) {
+        invalidate_jit_cache(*emuenv.kernel.get_thread(thread_id)->cpu, base, size);
+    };
     const auto it = state->vm_blocks.find(block_uid);
-    if (it == state->vm_blocks.end()) {
-        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_BLOCK_ID);
+    if (it != state->vm_blocks.end()) {
+        const auto block = it->second;
+        const uint32_t block_base_end = block->mappedBase.address() + block->mappedSize;
+        const uint32_t base_end = base + size;
+        if (block->mappedBase.address() > base_end || base > block_base_end) {
+            return RET_ERROR(SCE_KERNEL_ERROR_BLOCK_ERROR);
+        }
+        flush(block);
+        return 0;
     }
-
-    const auto block = it->second;
-    const uint32_t block_base_end = block->mappedBase.address() + block->mappedSize;
-    const uint32_t base_end = base + size;
-    if (block->mappedBase.address() > base_end || base > block_base_end) {
-        return RET_ERROR(SCE_KERNEL_ERROR_BLOCK_ERROR);
+    // Lenient path (Balatro/LuaJIT: FindMemBlockByAddr's BLOCK_ERROR is
+    // passed through unchecked as the uid, while [base, base+size) genuinely
+    // lies inside the live LuaJIT code arena). The documented purpose is
+    // flushing caches for the location; dropping stale translations of
+    // freshly-written JIT code there is always safe, so do the flush when
+    // the range is provably inside a live VM block instead of failing.
+    const std::uint64_t base_end = static_cast<std::uint64_t>(base) + size;
+    for (const auto &[id, block] : state->vm_blocks) {
+        const std::uint64_t block_base = block->mappedBase.address();
+        if (base >= block_base && base_end <= block_base + block->mappedSize) {
+            const uint32_t caller = read_lr(*emuenv.kernel.get_thread(thread_id)->cpu);
+            LOG_WARN("sceKernelSyncVMDomain: uid=0x{:X} is not a live VM block; flushing [0x{:08X},+0x{:X}) inside '{}' "
+                     "anyway (caller=0x{:08X})",
+                block_uid, base, size, block->name, caller);
+            flush(block);
+            return 0;
+        }
     }
-    invalidate_jit_cache(*emuenv.kernel.get_thread(thread_id)->cpu, base, size);
-
-    return 0;
+    const uint32_t caller = read_lr(*emuenv.kernel.get_thread(thread_id)->cpu);
+    LOG_WARN("sceKernelSyncVMDomain: unknown VM block uid=0x{:X} base=0x{:08X} size=0x{:X} caller=0x{:08X} ({} live VM "
+             "blocks)",
+        block_uid, base, size, caller, state->vm_blocks.size());
+    return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_BLOCK_ID);
 }
