@@ -351,7 +351,7 @@ EM_JS(bool, vita3k_aot_install_bytes, (const uint8_t *data, uint32_t size), {
 // plus VITA3K_AOT_SEEDS when set) and load the result. Anything the static
 // roots miss stays on the lazy JIT fallback, correctly.
 static int build_aot_at_load(EmuEnvState &env) {
-    std::printf("[vita3k-web] AOT none supplied; building at load (VITA3K_AOT_BUILD_AT_LOAD)...\n");
+    std::printf("[vita3k-web] AOT not usable from download; building at load (VITA3K_AOT_BUILD_AT_LOAD)...\n");
     std::vector<std::uint8_t> image;
     // Reuse the offline path with a null out_path meaning "to memory".
     const int built = build_aot_image_to_memory(env, image);
@@ -648,7 +648,10 @@ static int run_app_impl() {
             const int aot = WasmJitCPU::load_aot(env->mem, aot_report);
             std::printf("[vita3k-web] AOT %s: %s\n", aot > 0 ? "on" : aot == 0 ? "off" : "REJECTED",
                 aot_report.c_str());
-            if (aot == 0 && std::getenv("VITA3K_AOT_BUILD_AT_LOAD"))
+            // A stale image is as good a trigger as a missing one: bytes
+            // built from the loaded code below always verify, so a REJECTED
+            // image heals itself into a fresh build instead of falling back.
+            if (aot != 1 && std::getenv("VITA3K_AOT_BUILD_AT_LOAD"))
                 build_aot_at_load(*env);
         }
 #endif
