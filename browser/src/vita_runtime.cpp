@@ -17,6 +17,7 @@
 
 #include "ime_bridge.h"
 #include "msg_dialog_bridge.h"
+#include "vita_aot.h"
 #include "vita_runtime.h"
 
 #include <bit>
@@ -158,6 +159,11 @@ static int run_vita(const uint8_t *bytes, uint32_t size) {
         env->kernel.process_program_authority_id = env->kernel.loaded_modules.at(uid)->program_authority_id;
         const auto &module = env->kernel.loaded_modules.at(uid)->info;
         std::printf("[vita3k-web] Vita module: %.28s entry=%08x\n", module.module_name, module.start_entry.address());
+#ifdef VITA3K_USE_WASM_JIT
+        if (const char *aot_out = std::getenv("VITA3K_AOT_BUILD"))
+            return build_aot_image(*env, aot_out);
+        load_aot_image(*env);
+#endif
         if (!module.start_entry) return -5;
         SceInt32 priority = SCE_KERNEL_DEFAULT_PRIORITY_USER;
         SceInt32 stack_size = SCE_KERNEL_STACK_SIZE_USER_MAIN;

@@ -36,7 +36,7 @@ set_property(TARGET vita3k_guest_thread_runtime PROPERTY INTERFACE_LINK_DEPENDS
 add_executable(vita3k_web_jit
     src/main.cpp src/vita_runtime.cpp src/vita_display_bridge.cpp
     src/memory.cpp src/interpreter.cpp src/guest.cpp
-    src/vita_app.cpp)
+    src/vita_aot.cpp src/vita_app.cpp)
 target_compile_definitions(vita3k_web_jit PRIVATE VITA3K_WEB=1 VITA3K_USE_WASM_JIT=1)
 target_link_libraries(vita3k_web_jit PRIVATE vita3k_web_runtime_hle vita3k_wasm_jit
     vita3k_guest_thread_runtime)
@@ -63,7 +63,7 @@ add_custom_command(TARGET vita3k_web_jit POST_BUILD
     VERBATIM)
 
 add_executable(vita3k_jit_fixture_node
-    src/vita_runtime.cpp src/vita_display_bridge.cpp tests/vita_bench_main.cpp)
+    src/vita_runtime.cpp src/vita_display_bridge.cpp src/vita_aot.cpp tests/vita_bench_main.cpp)
 target_compile_definitions(vita3k_jit_fixture_node PRIVATE VITA3K_USE_WASM_JIT=1)
 target_link_libraries(vita3k_jit_fixture_node PRIVATE vita3k_web_runtime_hle vita3k_wasm_jit)
 target_link_options(vita3k_jit_fixture_node PRIVATE -sNODERAWFS=1)
