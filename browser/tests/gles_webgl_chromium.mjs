@@ -70,6 +70,14 @@ try {
     const program = call('glCreateProgram');
     call('glAttachShader', program, vertex); call('glAttachShader', program, fragment); call('glLinkProgram', program);
     call('glGetProgramiv', program, 0x8B82, outputs); check(int(outputs) === 1, 'real program linking');
+    // Guest games compiled for the SGX driver rely on it not enforcing the
+    // GLSL ES 1.00 cross-stage uniform precision match (ANGLE does). The
+    // bridge must retry the link with the fragment default raised to highp.
+    const mismatchVertex = shader(0x8B31, 'uniform highp float value; attribute vec4 position; varying vec2 tex; uniform mat4 transform; void main(){ tex=position.xy; gl_Position=transform*position; }');
+    const mismatchFragment = shader(0x8B30, 'precision mediump float; varying vec2 tex; uniform mediump float value; uniform vec4 tint; void main(){ gl_FragColor=vec4(tint.rgb, value); }');
+    const mismatch = call('glCreateProgram');
+    call('glAttachShader', mismatch, mismatchVertex); call('glAttachShader', mismatch, mismatchFragment); call('glLinkProgram', mismatch);
+    call('glGetProgramiv', mismatch, 0x8B82, outputs); check(int(outputs) === 1, 'cross-stage uniform precision mismatch is bridged (highp retry)');
     call('glUseProgram', program);
     const tint = call('glGetUniformLocation', program, put('tint'));
     call('glUniform4f', tint, 0.5, 1, 1, 1);

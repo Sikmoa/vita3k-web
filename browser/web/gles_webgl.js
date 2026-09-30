@@ -345,11 +345,35 @@ export function createGlesBridge({ memory, logger = console.log, onFrame = () =>
   api.glDetachShader = (p, s) => gl.detachShader(object('Program', p), object('Shader', s));
   api.glBindAttribLocation = (p, index, name) => gl.bindAttribLocation(object('Program', p), index, cstring(name));
   api.glGetAttribLocation = (p, name) => gl.getAttribLocation(object('Program', p), cstring(name));
+  const shaderSources = new WeakMap();
+  const precisionHighp = source => {
+    // GLSL ES 1.00: raise the default float precision of a fragment shader.
+    // Replaces an existing default declaration (not per-declaration
+    // qualifiers), or inserts one before the first non-preprocessor line.
+    // Returns null when the source already defaults to highp float.
+    const lines = source.split('\n');
+    const declaration = /^[ \t]*precision[ \t]+\w+[ \t]+float[ \t]*;/;
+    for (let i = 0; i < lines.length; ++i) {
+      if (declaration.test(lines[i])) {
+        if (/precision[ \t]+highp[ \t]+float/.test(lines[i])) return null;
+        lines[i] = lines[i].replace(/precision[ \t]+\w+[ \t]+float/, 'precision highp float');
+        return lines.join('\n');
+      }
+    }
+    for (let i = 0; i < lines.length; ++i) {
+      if (lines[i] && !lines[i].startsWith('#')) {
+        lines.splice(i, 0, 'precision highp float;');
+        return lines.join('\n');
+      }
+    }
+    return null;
+  };
   api.glShaderSource = (shader, count, pointers, lengths) => {
     if (length(count) > 1024) invalid();
     const ps = typed(Uint32Array, pointers, count), sizes = lengths ? typed(Int32Array, lengths, count) : null;
     const source = Array.from(ps, (p, i) => sizes && sizes[i] >= 0 ? decoder.decode(bytes(p, length(sizes[i]))) : cstring(p)).join('');
     gl.shaderSource(object('Shader', shader), source);
+    shaderSources.set(object('Shader', shader), source);
   };
   api.glCompileShader = shader => {
     const s = object('Shader', shader); gl.compileShader(s);
@@ -360,7 +384,40 @@ export function createGlesBridge({ memory, logger = console.log, onFrame = () =>
     const p = object('Program', program); gl.linkProgram(p);
     for (const [id, value] of locations) if (value.program === program) locations.delete(id);
     locationNames.delete(program);
-    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) logger('[gles-webgl] program link: ' + (gl.getProgramInfoLog(p) || '').slice(0, 4000));
+    if (gl.getProgramParameter(p, gl.LINK_STATUS)) return;
+    // Real GLES2 drivers (SGX 543MP on the Vita, among others) do not enforce
+    // the GLSL ES 1.00 cross-stage uniform precision match that ANGLE's
+    // validator does. Guest games ship vertex shaders with highp-default
+    // uniforms that the fragment stage sees as mediump ('Uniform dissolve is
+    // not linkable between attached shaders' in Balatro). Match the hardware
+    // behaviour: retry once with the fragment shader's default float precision
+    // raised to highp. If the fragment stage cannot, this is a genuine error.
+    const log = (gl.getProgramInfoLog(p) || '');
+    if (!/precisions? of uniform/i.test(log) && !/not linkable/i.test(log)) {
+      logger('[gles-webgl] program link: ' + log.slice(0, 4000));
+      return;
+    }
+    const fragment = gl.getAttachedShaders(p).find(s => gl.getShaderParameter(s, gl.SHADER_TYPE) === gl.FRAGMENT_SHADER);
+    const source = fragment && shaderSources.get(fragment);
+    if (!fragment || source === undefined) {
+      logger('[gles-webgl] program link: ' + log.slice(0, 4000));
+      return;
+    }
+    const highpAvailable = gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT).precision > 0;
+    const upgraded = highpAvailable ? precisionHighp(source) : null;
+    if (upgraded === null) {
+      logger('[gles-webgl] program link: ' + log.slice(0, 4000));
+      return;
+    }
+    gl.shaderSource(fragment, upgraded);
+    shaderSources.set(fragment, upgraded);
+    gl.compileShader(fragment);
+    if (!gl.getShaderParameter(fragment, gl.COMPILE_STATUS)) {
+      logger('[gles-webgl] program link (highp retry): ' + (gl.getShaderInfoLog(fragment) || '').slice(0, 4000));
+      return;
+    }
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) logger('[gles-webgl] program link (highp retry): ' + (gl.getProgramInfoLog(p) || '').slice(0, 4000));
   };
   api.glUseProgram = program => gl.useProgram(object('Program', program, true));
   api.glValidateProgram = program => gl.validateProgram(object('Program', program));
