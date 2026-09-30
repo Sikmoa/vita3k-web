@@ -160,7 +160,7 @@ try {
         // First-boot AOT prototype: with no supplied image, translate from
         // static roots at load and run from it (vita_app.cpp). Seedless, so
         // dynamically discovered code stays on the lazy JIT fallback.
-        VITA3K_AOT_BUILD_AT_LOAD: workerParams.get('buildAot') === '1' ? '1' : undefined,
+        VITA3K_AOT_BUILD_AT_LOAD: (workerParams.get('buildAot') === '1' || workerParams.get('buildAot') === 'only') ? '1' : undefined,
         // Emulated guest CPU cores (vita_app.cpp); unset keeps the default.
         VITA3K_GUEST_CORES: workerParams.get('cores') ?? undefined,
         // Vita3K's fps-hack: display waits use one vblank (vita_app.cpp).
@@ -417,6 +417,12 @@ self.onmessage = async ({ data }) => {
       // Optional ahead-of-time module for this title (AOT.md). Compiled here,
       // off the guest's critical path; the runtime verifies it against the
       // loaded code and falls back to the lazy JIT when it does not match.
+      // buildAot=only skips the download entirely (slow link? just build it
+      // on-device via VITA3K_AOT_BUILD_AT_LOAD instead of fetching 100+ MB).
+      if (workerParams.get('buildAot') === 'only' && data.aotUrl) {
+        post({ type: 'log', message: '[vita3k-web] buildAot=only: skipping AOT download, building on this device' });
+        data.aotUrl = null;
+      }
       if (data.aotUrl) {
         const started = performance.now();
         // Buffer with progress instead of compileStreaming: the download
