@@ -52,6 +52,7 @@ if(EMSCRIPTEN)
     # Shared by the browser module, the bench harnesses and the JIT bench
     # variants below; backend selection stays a compile definition.
     set(VITA3K_WEB_APP_SOURCES
+        src/vita_aot.cpp
         src/vita_app.cpp
     )
     add_executable(vita3k_web_app_bench

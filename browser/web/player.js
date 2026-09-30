@@ -565,7 +565,7 @@ async function run() {
   ensureAudio();
   const workerParams = new URLSearchParams({ backend, memory, inlineMutex: params.get('inlineMutex') === '0' ? '0' : '1' });
   for (const name of ['fpsHack', 'scale', 'surfaceSync', 'maxInFlight', 'cores', 'hleProfile', 'gles',
-    'readback', 'stampLru', 'writeObserver', 'regionCache', 'textureVerify']) {
+    'readback', 'stampLru', 'writeObserver', 'regionCache', 'textureVerify', 'buildAot']) {
     if (params.has(name)) workerParams.set(name, params.get(name));
   }
   const currentWorker = worker = new Worker(`./worker.js?${workerParams}`, { type: 'module' });

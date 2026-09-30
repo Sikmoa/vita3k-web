@@ -157,6 +157,10 @@ try {
         VITA3K_HLE_PROFILE: workerParams.get('hleProfile') === '1' ? '1' : undefined,
         // Opt-in PVR user-library adapter (Balatro/LÖVE GLES2, not a raw GPU driver).
         VITA3K_GLES_BRIDGE: workerParams.get('gles') === '1' ? '1' : undefined,
+        // First-boot AOT prototype: with no supplied image, translate from
+        // static roots at load and run from it (vita_app.cpp). Seedless, so
+        // dynamically discovered code stays on the lazy JIT fallback.
+        VITA3K_AOT_BUILD_AT_LOAD: workerParams.get('buildAot') === '1' ? '1' : undefined,
         // Emulated guest CPU cores (vita_app.cpp); unset keeps the default.
         VITA3K_GUEST_CORES: workerParams.get('cores') ?? undefined,
         // Vita3K's fps-hack: display waits use one vblank (vita_app.cpp).

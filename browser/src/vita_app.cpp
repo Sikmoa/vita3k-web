@@ -199,7 +199,7 @@ void vita3k_web_set_license_key(const std::uint8_t *key16) {
 // Offline AOT build (VITA3K_AOT_BUILD=<out.wasm>): after the same module
 // loads the app performs, collect executable ranges and function roots and
 // write one ahead-of-time module (vita3k/cpu/src/wasmjit/AOT.md).
-static int build_aot_image(EmuEnvState &env, const char *out_path) {
+static int build_aot_image_to_memory(EmuEnvState &env, std::vector<std::uint8_t> &image) {
     WasmJitCPU::AotBuildSpec spec;
     const auto executable = [&](Address address) {
         return env.mem.page_permissions
@@ -303,7 +303,6 @@ static int build_aot_image(EmuEnvState &env, const char *out_path) {
         std::printf("[vita3k-web]   unserviced NID=%08x %s\n", nid, app_import_name(nid));
     std::printf("[vita3k-web] AOT roots: entries=%zu exidx=%zu relocations=%zu exports=%zu seeds=%zu\n",
         entry_roots, exidx_roots, relocation_roots, export_roots, seeds);
-    std::vector<std::uint8_t> image;
     std::string report;
     const auto started = std::chrono::steady_clock::now();
     const bool built = WasmJitCPU::build_aot(env.mem, spec, image, report);
@@ -311,12 +310,61 @@ static int build_aot_image(EmuEnvState &env, const char *out_path) {
     std::printf("[vita3k-web] AOT build %s in %.1fs: %s\n", built ? "ok" : "FAILED", seconds, report.c_str());
     if (!built)
         return -12;
+    return 0;
+}
+
+static int build_aot_write_image(const std::vector<std::uint8_t> &image, const char *out_path) {
     FILE *out = std::fopen(out_path, "wb");
     if (!out || std::fwrite(image.data(), 1, image.size(), out) != image.size() || std::fclose(out) != 0) {
         std::fprintf(stderr, "[vita3k-web] AOT image %s cannot be written\n", out_path);
         return -12;
     }
     std::printf("[vita3k-web] AOT image -> %s (%zu bytes)\n", out_path, image.size());
+    return 0;
+}
+
+static int build_aot_image(EmuEnvState &env, const char *out_path) {
+    std::vector<std::uint8_t> image;
+    const int built = build_aot_image_to_memory(env, image);
+    if (built != 0)
+        return built;
+    return build_aot_write_image(image, out_path);
+}
+
+// Synchronously compile freshly built image bytes into the host-supplied
+// module slot load_aot reads (Module.vita3kAotModule). new WebAssembly.Module
+// blocks like the build itself; the async compile() path the worker uses for
+// downloads would need an ASYNCIFY round trip for no benefit here.
+EM_JS(bool, vita3k_aot_install_bytes, (const uint8_t *data, uint32_t size), {
+    try {
+        const bytes = Module['vita3kHostBytes'](data, size).slice();
+        Module['vita3kAotModule'] = new WebAssembly.Module(bytes);
+        return true;
+    } catch (error) {
+        err('[vita3k-web] AOT build-at-load install failed: ' + error);
+        return false;
+    }
+});
+
+// First-boot AOT (VITA3K_AOT_BUILD_AT_LOAD=1): no image was supplied, so
+// translate from the static roots now (exidx/exports/relocations/entries
+// plus VITA3K_AOT_SEEDS when set) and load the result. Anything the static
+// roots miss stays on the lazy JIT fallback, correctly.
+static int build_aot_at_load(EmuEnvState &env) {
+    std::printf("[vita3k-web] AOT none supplied; building at load (VITA3K_AOT_BUILD_AT_LOAD)...\n");
+    std::vector<std::uint8_t> image;
+    // Reuse the offline path with a null out_path meaning "to memory".
+    const int built = build_aot_image_to_memory(env, image);
+    if (built != 0)
+        return built;
+    if (image.size() > 0xffffffffu || !vita3k_aot_install_bytes(image.data(), static_cast<uint32_t>(image.size()))) {
+        std::fprintf(stderr, "[vita3k-web] AOT build-at-load install failed\n");
+        return -12;
+    }
+    std::string aot_report;
+    const int aot = WasmJitCPU::load_aot(env.mem, aot_report);
+    std::printf("[vita3k-web] AOT %s: %s\n", aot > 0 ? "on" : aot == 0 ? "off" : "REJECTED",
+        aot_report.c_str());
     return 0;
 }
 #endif
@@ -600,6 +648,8 @@ static int run_app_impl() {
             const int aot = WasmJitCPU::load_aot(env->mem, aot_report);
             std::printf("[vita3k-web] AOT %s: %s\n", aot > 0 ? "on" : aot == 0 ? "off" : "REJECTED",
                 aot_report.c_str());
+            if (aot == 0 && std::getenv("VITA3K_AOT_BUILD_AT_LOAD"))
+                build_aot_at_load(*env);
         }
 #endif
         // Title patches, desktop Vita3K's patch directory format, staged at
