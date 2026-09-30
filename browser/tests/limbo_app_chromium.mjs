@@ -38,6 +38,8 @@
 //   LIMBO_IME               text typed into every guest on-screen keyboard (SceIme),
 //                           then Enter; unset leaves the keyboard open
 //   LIMBO_AOT               ahead-of-time module to supply to the run (AOT.md)
+//   LIMBO_AOT_DIR           per-title images (<TITLE>.aot.wasm); preferred,
+//                           on by default for the run's title when present
 //   LIMBO_LOG_OUT           write the retained worker log tail (4000 lines) to this file
 import { createServer } from 'node:http';
 import { readFile, stat, writeFile } from 'node:fs/promises';
@@ -94,6 +96,18 @@ const writeObserver = process.env.LIMBO_WRITE_OBSERVER !== '0';
 // Region-cache size A/B: unset keeps the built-in default, a number overrides.
 const regionCache = process.env.LIMBO_REGION_CACHE || '';
 const aotPath = process.env.LIMBO_AOT ? resolve(process.env.LIMBO_AOT) : '';
+const aotDir = process.env.LIMBO_AOT_DIR ? resolve(process.env.LIMBO_AOT_DIR) : '';
+const titleIdOk = (value) => /^[A-Za-z0-9_-]{1,24}$/.test(value);
+const aotFileForProbe = () => {
+  if (aotDir && titleIdOk(title)) {
+    const candidate = resolve(aotDir, `${title}.aot.wasm`);
+    if (existsSync(candidate)) return candidate;
+  }
+  return aotPath;
+};
+const aotProbePath = aotFileForProbe();
+if (aotProbePath && !existsSync(aotProbePath)) throw new Error(`no AOT module at ${aotProbePath}`);
+const aotProbeUrl = aotProbePath ? `/aot/${title}.wasm` : null;
 const dialogAnswer = process.env.LIMBO_DIALOG || 'cross';
 assert(['cross', 'circle', 'none'].includes(dialogAnswer), `LIMBO_DIALOG=${dialogAnswer}: use cross, circle or none`);
 const imeAnswer = process.env.LIMBO_IME ?? null;
@@ -118,8 +132,8 @@ const server = createServer(async (req, res) => {
       return;
     }
     if (path === '/manifest.json') { send(manifestBytes, 'application/json'); return; }
-    if (path === '/aot.wasm' && aotPath) {
-      const { size, mtimeMs } = await stat(aotPath);
+    const sendAot = async (file) => {
+      const { size, mtimeMs } = await stat(file);
       const etag = `"${size.toString(36)}-${Math.floor(mtimeMs).toString(36)}"`;
       if (req.headers['if-none-match'] === etag) {
         res.writeHead(304, { ETag: etag, 'Cache-Control': 'no-cache' });
@@ -128,9 +142,10 @@ const server = createServer(async (req, res) => {
       }
       res.writeHead(200, { 'Content-Type': 'application/wasm', 'Content-Length': size,
         'Cache-Control': 'no-cache', ETag: etag });
-      res.end(await readFile(aotPath));
-      return;
-    }
+      res.end(await readFile(file));
+    };
+    if (path === '/aot.wasm' && aotPath) { await sendAot(aotPath); return; }
+    if (aotProbeUrl && path === aotProbeUrl) { await sendAot(aotProbePath); return; }
     if (path.startsWith('/stage/')) {
       send(await readStageFile(staged, path.slice('/stage/'.length)), 'application/octet-stream');
       return;
@@ -328,7 +343,7 @@ try {
     });
   }
 
-  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale, surfaceSync, dialogAnswer, ctrlButtons, imeAnswer }) => {
+  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot, aotUrl, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale, surfaceSync, dialogAnswer, ctrlButtons, imeAnswer }) => {
     const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}${textureVerify ? '&textureVerify=1' : ''}${scale ? '&scale=' + scale : ''}${surfaceSync ? '&surfaceSync=1' : ''}`, { type: 'module' });
     const state = { logs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
       backend: null, memory: null, workerErrors: [], ready: false, timedOut: false,
@@ -440,7 +455,7 @@ try {
           state.staged = { files: data.files, bytes: data.bytes, root: data.root };
           state.runStartedAt = performance.now();
           worker.postMessage({ type: 'run-app', vitaFs: data.root, title, app,
-            fastVblank, ...(useAot ? { aotUrl: '/aot.wasm' } : {}) });
+            fastVblank, ...(useAot && aotUrl ? { aotUrl } : {}) });
           // At every press/release boundary send the combined state of all
           // inputs held then, so releasing one input keeps the others held.
           const boundaries = [...new Set(inputScript.flatMap(({ at, hold }) => [at, at + hold]))];
@@ -550,7 +565,7 @@ try {
       };
     });
     return result;
-  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot: Boolean(aotPath), fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '', surfaceSync: process.env.LIMBO_SURFACE_SYNC === '1', dialogAnswer, ctrlButtons, imeAnswer });
+  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot: Boolean(aotProbePath), aotUrl: aotProbeUrl, fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '', surfaceSync: process.env.LIMBO_SURFACE_SYNC === '1', dialogAnswer, ctrlButtons, imeAnswer });
 
   const saved = [];
   for (const frame of outcome.saved) {

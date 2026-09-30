@@ -52,8 +52,11 @@
 //   LIMBO_TITLE         title id (default PCSE00268)
 //   LIMBO_APP           app directory under ux0/app (default: LIMBO_TITLE)
 //   GXM_RUNTIME_DIST    built dist (default build/web64/dist; target vita3k_web_dist)
-//   LIMBO_AOT           ahead-of-time module for the title (AOT.md), served as
-//                       /aot.wasm and passed to run-app as aotUrl
+//   LIMBO_AOT           ahead-of-time module for the default title (AOT.md),
+//                       served as /aot.wasm and passed to run-app as aotUrl
+//   LIMBO_AOT_DIR       per-title AOT images (<TITLE>.aot.wasm), served as
+//                       /aot/<TITLE>.wasm; AOT is on by default for every
+//                       title that has an image (preferred over LIMBO_AOT)
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { networkInterfaces } from 'node:os';
@@ -67,6 +70,18 @@ const stage = resolve(process.env.LIMBO_STAGE || '.limbo_work/stage');
 const title = process.env.LIMBO_TITLE || 'PCSE00268';
 const app = process.env.LIMBO_APP || title;
 const aotPath = process.env.LIMBO_AOT ? resolve(process.env.LIMBO_AOT) : '';
+const aotDir = process.env.LIMBO_AOT_DIR ? resolve(process.env.LIMBO_AOT_DIR) : '';
+// The AOT image belongs to the title it was built for (its code hashes).
+// Prefer the per-title image; fall back to the legacy single file for the
+// default app only.
+const aotFileFor = (wantedTitle, wantedApp) => {
+  if (aotDir && titleIdOk(wantedTitle)) {
+    const candidate = resolve(aotDir, `${wantedTitle}.aot.wasm`);
+    if (existsSync(candidate)) return candidate;
+  }
+  if (aotPath && wantedApp === app) return aotPath;
+  return '';
+};
 
 // Every title staged under ux0/app with an eboot.bin is servable: the default
 // one (LIMBO_TITLE/LIMBO_APP) and, without restarting the server, any other
@@ -126,9 +141,10 @@ const server = createServer(async (req, res) => {
       if (!titleIdOk(wanted)) { res.writeHead(400, { 'Content-Type': 'text/plain' }); return res.end('bad title id'); }
       const isStaged = stagedTitles.includes(wanted);
       const wantedTitle = requestUrl.searchParams.get('title') || (wanted === app ? title : wanted);
+      const aotFile = isStaged ? aotFileFor(wantedTitle, wanted) : '';
       return body(Buffer.from(JSON.stringify({ title: wantedTitle, app: wanted, staged: isStaged,
-        // The AOT image belongs to the title it was built for.
-        aot: isStaged && Boolean(aotPath) && wanted === app, titles: stagedTitles })), 'application/json');
+        aot: Boolean(aotFile), aotUrl: aotFile ? `/aot/${wantedTitle}.wasm` : null,
+        titles: stagedTitles })), 'application/json');
     }
     if (path === '/manifest.json') {
       const wanted = requestUrl.searchParams.get('app') || requestUrl.searchParams.get('title') || app;
@@ -143,8 +159,8 @@ const server = createServer(async (req, res) => {
     // full re-download on every launch, while a rebuilt image gets a new ETag
     // and is picked up immediately. Correctness never depends on the cache:
     // load_aot hash-verifies the module against the staged guest code anyway.
-    if (path === '/aot.wasm' && aotPath) {
-      const { size, mtimeMs } = await stat(aotPath);
+    const sendAot = async (file) => {
+      const { size, mtimeMs } = await stat(file);
       const etag = `"${size.toString(36)}-${Math.floor(mtimeMs).toString(36)}"`;
       if (req.headers['if-none-match'] === etag) {
         res.writeHead(304, { ETag: etag, 'Cache-Control': 'no-cache' });
@@ -152,7 +168,15 @@ const server = createServer(async (req, res) => {
       }
       res.writeHead(200, { 'Content-Type': 'application/wasm', 'Content-Length': size,
         'Cache-Control': 'no-cache', ETag: etag });
-      return res.end(await readFile(aotPath));
+      return res.end(await readFile(file));
+    };
+    if (path === '/aot.wasm' && aotPath) return sendAot(aotPath);
+    if (path.startsWith('/aot/') && path.endsWith('.wasm')) {
+      const id = path.slice('/aot/'.length, -'.wasm'.length);
+      if (!titleIdOk(id)) { res.writeHead(400, { 'Content-Type': 'text/plain' }); return res.end('bad title id'); }
+      const file = aotFileFor(id, id);
+      if (!file) { res.writeHead(404); return res.end('no AOT image for ' + id); }
+      return sendAot(file);
     }
     if (path.startsWith('/stage/'))
       return send(await readStageFile(staged, path.slice('/stage/'.length)), 'application/octet-stream');
@@ -168,6 +192,11 @@ server.listen(port, host, () => {
   console.log(`  module root ${root}`);
   console.log(`  staged root ${stage}`);
   if (aotPath) console.log(`  AOT module  ${aotPath}`);
+  if (aotDir) {
+    const images = existsSync(aotDir)
+      ? readdirSync(aotDir).filter((file) => file.endsWith('.aot.wasm')).sort() : [];
+    console.log(`  AOT dir     ${aotDir} (${images.join(', ') || 'no images'})`);
+  }
   // Name every address the server actually answers on, so a browser on another
   // host does not have to guess which one to open.
   const addresses = host === '0.0.0.0' || host === '::'

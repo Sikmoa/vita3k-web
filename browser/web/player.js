@@ -47,7 +47,8 @@ try {
   warning.textContent = error.message; warning.style.display = 'block';
   throw error;
 }
-const { title: TITLE, app: APP, aot: AOT } = config;
+const { title: TITLE, app: APP, aot: AOT, aotUrl: AOT_URL } = config;
+const aotUrl = typeof AOT_URL === 'string' && AOT_URL ? AOT_URL : (AOT ? '/aot.wasm' : null);
 // Persistent content cache (OPFS) namespace for this title: staging reads
 // through it, and the package upload below fills it.
 const cacheKey = `${sanitizeSegment(TITLE)}/${sanitizeSegment(APP)}`;
@@ -103,7 +104,7 @@ function stagingDetail(index, bytes) {
 document.querySelector('#game-title').textContent = TITLE === 'PCSE00268' ? 'Limbo' : TITLE;
 document.title = 'Vita3K Web — ' + document.querySelector('#game-title').textContent;
 document.querySelector('#runtime-info').textContent = TITLE + ' · ' + backend.toUpperCase() + ' · ' + memory +
-  (AOT ? ' · AOT' : '') + (config.staged === false ? ' · package' : '');
+  (aotUrl ? ' · AOT' : '') + (config.staged === false ? ' · package' : '');
 function notice(message) {
   const element = document.querySelector('#player-notice');
   element.textContent = message; element.hidden = !message;
@@ -705,7 +706,7 @@ async function run() {
           cacheNS.cacheWriteManifest(cacheKey, stageNeeded).catch(() => {});
         log(`staged ${data.files} files (${(data.bytes / 1048576).toFixed(1)} MiB) — launching`);
         worker.postMessage({ type: 'run-app', vitaFs: data.root, title: TITLE, app: APP, fastVblank,
-          ...(AOT ? { aotUrl: '/aot.wasm' } : {}) });
+          ...(aotUrl ? { aotUrl } : {}) });
         running = true;
         sendPad();
         break;

@@ -331,6 +331,17 @@ VITA3K_NULL_GPU=1 VITA3K_AOT=.limbo_work/aot/limbo.aot.wasm \
 LIMBO_AOT=.limbo_work/aot/limbo.aot.wasm node browser/tests/limbo_serve.mjs
 ```
 
+AOT is on by default for every staged title that has an image: put one
+`<TITLE>.aot.wasm` per title in a directory and serve it with `LIMBO_AOT_DIR`
+(the single-file `LIMBO_AOT` remains as the default title's override).
+`player-config.json` then reports `aotUrl: /aot/<TITLE>.wasm` per title and
+the player passes it to run-app; images are revalidated (304) like the
+single file. The single-homebrew run-vita path (display fixtures, JIT
+smokes) builds and loads the same way via `VITA3K_AOT_BUILD` / `VITA3K_AOT`
+on its bench modules. Rebuild every image after a runtime change that bumps
+`aot_version` (`wasm_jit_cpu.h`); stale images log `AOT REJECTED` with the
+reason and fall back to the lazy JIT.
+
 `VITA3K_BENCH_INPUT` uses the probe's `LIMBO_INPUT` syntax. Every run logs
 `AOT on`, `off` or `REJECTED` with the reason: a module built from other game
 code or an older AOT format version is refused and has to be rebuilt.
