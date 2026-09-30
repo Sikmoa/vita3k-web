@@ -419,7 +419,7 @@ self.onmessage = async ({ data }) => {
       // loaded code and falls back to the lazy JIT when it does not match.
       // buildAot=only skips the download entirely (slow link? just build it
       // on-device via VITA3K_AOT_BUILD_AT_LOAD instead of fetching 100+ MB).
-      if (workerParams.get('buildAot') === 'only' && data.aotUrl) {
+      if (new URL(self.location.href).searchParams.get('buildAot') === 'only' && data.aotUrl) {
         post({ type: 'log', message: '[vita3k-web] buildAot=only: skipping AOT download, building on this device' });
         data.aotUrl = null;
       }
