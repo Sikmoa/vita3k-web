@@ -1,6 +1,9 @@
+limbo_work_archive.zip
 __limbo_game
 __persona
 .pi
+deploy/.bak-*/
+.pi-web
 
 /api.trace
 .vs/
