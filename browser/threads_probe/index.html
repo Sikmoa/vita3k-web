@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Threads probe</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, monospace; margin: 16px; background: #fff; color: #111; }
+  @media (prefers-color-scheme: dark) { body { background: #111; color: #eee; } }
+  pre { white-space: pre-wrap; word-break: break-word; }
+</style>
+<h1>Threads probe (THREADS.md phase 0)</h1>
+<pre id="out"></pre>
+<script type="module">
+  const out = document.getElementById('out');
+  const line = (text) => { out.textContent += text + '\n'; console.log(text); };
+  line(`[probe] browser: ${navigator.userAgent}`);
+  line(`[probe] crossOriginIsolated: ${self.crossOriginIsolated}, hardwareConcurrency: ${navigator.hardwareConcurrency}`);
+  if (!self.crossOriginIsolated) {
+    line('[probe] FAIL: not cross-origin isolated (COOP/COEP headers), so no SharedArrayBuffer');
+    document.title = 'probe done';
+  } else {
+    const worker = new Worker('./probe_worker.js', { type: 'module' });
+    worker.onmessage = ({ data }) => {
+      if (data.line) line(data.line);
+      if (data.done) { line('[probe] done'); document.title = 'probe done'; }
+    };
+    worker.onerror = (event) => { line('[probe] FAIL: worker error ' + event.message); document.title = 'probe done'; };
+  }
+</script>

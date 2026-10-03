@@ -351,12 +351,33 @@ vita3k_web_dist_copy(guest.elf "${VITA3K_GUEST_PROBE_ELF}")
 if(TARGET vita3k_vita_display_fixture)
     vita3k_web_dist_copy(display-eboot.bin "${CMAKE_CURRENT_BINARY_DIR}/tests/vita_display_fixture/eboot.bin")
 endif()
+# THREADS.md phase 0: whether a browser can run the threaded build (shared
+# 8 GiB Memory64, nested Workers, futexes, CAS) and what its Worker pool costs.
+# Served as dist/threads-probe/ from a cross-origin isolated page.
+if(VITA3K_WEB_MEMORY64)
+    add_executable(vita3k_threads_probe "${CMAKE_CURRENT_SOURCE_DIR}/threads_probe/probe.cpp")
+    target_compile_options(vita3k_threads_probe PRIVATE -pthread)
+    target_link_options(vita3k_threads_probe PRIVATE -pthread -sPTHREAD_POOL_SIZE=24
+        -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=createThreadsProbe
+        -sENVIRONMENT=web,worker -sNO_EXIT_RUNTIME=1
+        "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=['$PThread']")
+    set_target_properties(vita3k_threads_probe PROPERTIES SUFFIX ".js")
+    foreach(_file vita3k_threads_probe.js vita3k_threads_probe.wasm)
+        vita3k_web_dist_copy("threads-probe/${_file}" "$<TARGET_FILE_DIR:vita3k_threads_probe>/${_file}")
+    endforeach()
+    foreach(_file index.html probe_worker.js)
+        vita3k_web_dist_copy("threads-probe/${_file}" "${CMAKE_CURRENT_SOURCE_DIR}/threads_probe/${_file}")
+    endforeach()
+endif()
 vita3k_web_dist_module(vita3k_web)
 if(TARGET vita3k_web_jit)
     vita3k_web_dist_module(vita3k_web_jit)
 endif()
 add_custom_target(vita3k_web_dist ALL DEPENDS ${_dist_outputs})
 add_dependencies(vita3k_web_dist vita3k_gxp_compiler)
+if(TARGET vita3k_threads_probe)
+    add_dependencies(vita3k_web_dist vita3k_threads_probe)
+endif()
 if(TARGET vita3k_vita_display_fixture)
     add_dependencies(vita3k_web_dist vita3k_vita_display_fixture)
 endif()

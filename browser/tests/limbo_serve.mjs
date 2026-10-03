@@ -125,6 +125,10 @@ const server = createServer(async (req, res) => {
   try {
     const requestUrl = new URL(req.url, 'http://localhost');
     const path = decodeURIComponent(requestUrl.pathname);
+    // Cross-origin isolation: SharedArrayBuffer (the threaded build, see
+    // THREADS.md) exists only in isolated pages. Everything is same-origin.
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
     const send = (content, type) => {
       // Dev server: the tree is edited live (player/worker/scene come from
       // source), so browsers must never cache these responses.
