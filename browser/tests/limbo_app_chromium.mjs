@@ -32,6 +32,7 @@
 //   LIMBO_PATCHES=0         skip the title patches of browser/patches (staged as patch/)
 //   LIMBO_SCALE=N           internal resolution multiplier (default 2)
 //   LIMBO_SURFACE_SYNC=1    read rendered surfaces back into guest memory
+//   LIMBO_GXM_TRACE=N       trace passes, draws, textures and presents after N frames
 //   LIMBO_DIALOG            answer to every guest message dialog (sceMsgDialog):
 //                           cross (default; the highlighted first button), circle
 //                           (the last of several buttons) or none (leave it open)
@@ -47,7 +48,7 @@ import { resolve } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
 import assert from 'node:assert/strict';
-import { readRuntimeFile, readStageFile, runtimeRoot, stageFiles, stageManifest } from './runtime_routes.mjs';
+import { readRuntimeFile, runtimeRoot, sendStageFile, stageFiles, stageManifest } from './runtime_routes.mjs';
 
 const stage = resolve(process.env.LIMBO_STAGE || '.limbo_work/stage');
 const title = process.env.LIMBO_TITLE || 'PCSE00268';
@@ -147,7 +148,7 @@ const server = createServer(async (req, res) => {
     if (path === '/aot.wasm' && aotPath) { await sendAot(aotPath); return; }
     if (aotProbeUrl && path === aotProbeUrl) { await sendAot(aotProbePath); return; }
     if (path.startsWith('/stage/')) {
-      send(await readStageFile(staged, path.slice('/stage/'.length)), 'application/octet-stream');
+      await sendStageFile(req, res, staged, path.slice('/stage/'.length));
       return;
     }
     const { content, type } = await readRuntimeFile(path);
@@ -343,8 +344,8 @@ try {
     });
   }
 
-  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot, aotUrl, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale, surfaceSync, dialogAnswer, ctrlButtons, imeAnswer }) => {
-    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}${textureVerify ? '&textureVerify=1' : ''}${scale ? '&scale=' + scale : ''}${surfaceSync ? '&surfaceSync=1' : ''}`, { type: 'module' });
+  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot, aotUrl, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale, surfaceSync, gxmTrace, dialogAnswer, ctrlButtons, imeAnswer }) => {
+    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}${textureVerify ? '&textureVerify=1' : ''}${scale ? '&scale=' + scale : ''}${surfaceSync ? '&surfaceSync=1' : ''}${gxmTrace ? '&gxmTrace=' + gxmTrace : ''}`, { type: 'module' });
     const state = { logs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
       backend: null, memory: null, workerErrors: [], ready: false, timedOut: false,
       gxmSceneStats: null, gxmFailures: [], gxmSkips: [],
@@ -565,7 +566,7 @@ try {
       };
     });
     return result;
-  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot: Boolean(aotProbePath), aotUrl: aotProbeUrl, fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '', surfaceSync: process.env.LIMBO_SURFACE_SYNC === '1', dialogAnswer, ctrlButtons, imeAnswer });
+  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot: Boolean(aotProbePath), aotUrl: aotProbeUrl, fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '', surfaceSync: process.env.LIMBO_SURFACE_SYNC === '1', gxmTrace: process.env.LIMBO_GXM_TRACE || '', dialogAnswer, ctrlButtons, imeAnswer });
 
   const saved = [];
   for (const frame of outcome.saved) {

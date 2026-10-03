@@ -173,6 +173,9 @@ try {
         // Read rendered surfaces back into guest memory after each scene
         // (gxm_webgpu_bridge.cpp); off by default, it stalls on the GPU.
         VITA3K_SURFACE_SYNC: workerParams.get('surfaceSync') === '1' ? '1' : undefined,
+        // Trace passes, draws, texture binds and presents after N frames
+        // (gxm_webgpu_bridge.cpp VITA3K_GXM_TRACE).
+        VITA3K_GXM_TRACE: workerParams.get('gxmTrace') ?? undefined,
       });
       break;
     } catch (error) {
@@ -225,6 +228,65 @@ async function readStagedFile(response, onProgress) {
   for (const chunk of chunks) { payload.set(chunk, offset); offset += chunk.byteLength; }
   return payload;
 }
+
+  // Files at least this large are not copied into MEMFS: a retail title's
+  // archives (Persona 4 Golden's data.cpk is 1.8 GiB) would not fit below the
+  // runtime heap's 4 GiB bound. They become lazy nodes read on demand.
+  const LAZY_STAGE_BYTES = 8 << 20;
+  const LAZY_CHUNK = 4 << 20;
+  const LAZY_CACHE_CHUNKS = 96; // per file, least recently used evicted
+  // A MEMFS file node whose reads fetch LAZY_CHUNK-aligned byte ranges of
+  // `url` with synchronous XHR (allowed in workers; the emulator's file reads
+  // are synchronous) and copy them out in bulk. Emscripten's createLazyFile
+  // copies byte by byte through a getter, too slow for multi-MiB reads.
+  const stageLazyFile = (fs, target, url, size) => {
+    const slash = target.lastIndexOf('/');
+    const node = fs.createFile(target.slice(0, slash) || '/', target.slice(slash + 1), {}, true, false);
+    const chunks = new Map();
+    const chunk = (index) => {
+      let bytes = chunks.get(index);
+      if (bytes) {
+        chunks.delete(index);
+        chunks.set(index, bytes);
+        return bytes;
+      }
+      const from = index * LAZY_CHUNK;
+      const to = Math.min(from + LAZY_CHUNK, size) - 1;
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', url, false);
+      xhr.responseType = 'arraybuffer';
+      xhr.setRequestHeader('Range', `bytes=${from}-${to}`);
+      xhr.send(null);
+      if (xhr.status !== 206 && !(xhr.status === 200 && from === 0 && to === size - 1))
+        throw new Error(`lazy read of ${url} [${from}, ${to}] failed: HTTP ${xhr.status}`);
+      bytes = new Uint8Array(xhr.response);
+      if (bytes.byteLength !== to - from + 1)
+        throw new Error(`lazy read of ${url} [${from}, ${to}] returned ${bytes.byteLength} bytes`);
+      chunks.set(index, bytes);
+      if (chunks.size > LAZY_CACHE_CHUNKS) chunks.delete(chunks.keys().next().value);
+      return bytes;
+    };
+    Object.defineProperty(node, 'usedBytes', { get: () => size });
+    node.stream_ops = {
+      ...node.stream_ops,
+      read(stream, buffer, offset, length, position) {
+        position = Number(position);
+        if (position >= size) return 0;
+        const total = Math.min(length, size - position);
+        for (let done = 0; done < total;) {
+          const at = position + done;
+          const bytes = chunk(Math.floor(at / LAZY_CHUNK));
+          const begin = at % LAZY_CHUNK;
+          const count = Math.min(total - done, bytes.byteLength - begin);
+          buffer.set(bytes.subarray(begin, begin + count), offset + done);
+          done += count;
+        }
+        return total;
+      },
+      write() { throw new fs.ErrnoError(63 /* EPERM: staged content is read-only */); },
+      mmap() { throw new fs.ErrnoError(19 /* ENODEV */); },
+    };
+  };
 
   // Ask the page (OPFS owner) for staged-file bytes. Sequential: staging
   // awaits each answer. A 30 s safety timeout falls back to the network.
@@ -347,6 +409,15 @@ self.onmessage = async ({ data }) => {
         const path = String(entry?.path ?? '');
         if (!path || path.startsWith('/') || path.split('/').includes('..'))
           throw new RangeError(`unsafe staged path: ${path}`);
+        if (entry.url && sizeOf(entry) >= LAZY_STAGE_BYTES) {
+          const target = `${root}/${path}`;
+          const directory = target.slice(0, target.lastIndexOf('/'));
+          if (directory) fs.mkdirTree(directory);
+          stageLazyFile(fs, target, new URL(entry.url, self.location.href).href, sizeOf(entry));
+          report(path, sizeOf(entry), sizeOf(entry), true, 'lazy');
+          files += 1; bytes += sizeOf(entry);
+          continue;
+        }
         let payload = null;
         if (useContentCache) payload = await requestCachedBytes(path, sizeOf(entry));
         if (payload) {

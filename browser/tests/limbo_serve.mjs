@@ -62,7 +62,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { networkInterfaces } from 'node:os';
 import { resolve } from 'node:path';
 import { existsSync, readdirSync } from 'node:fs';
-import { readRuntimeFile, readStageFile, runtimeRoot as root, stageFiles, stageManifest } from './runtime_routes.mjs';
+import { readRuntimeFile, runtimeRoot as root, sendStageFile, stageFiles, stageManifest } from './runtime_routes.mjs';
 
 const port = Number(process.env.PORT || 8080);
 const host = process.env.HOST || '127.0.0.1';
@@ -179,7 +179,7 @@ const server = createServer(async (req, res) => {
       return sendAot(file);
     }
     if (path.startsWith('/stage/'))
-      return send(await readStageFile(staged, path.slice('/stage/'.length)), 'application/octet-stream');
+      return sendStageFile(req, res, staged, path.slice('/stage/'.length));
     const { content, type } = await readRuntimeFile(path);
     send(content, type);
   } catch (error) {

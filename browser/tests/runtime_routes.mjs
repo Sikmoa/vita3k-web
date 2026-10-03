@@ -3,7 +3,7 @@
 // dist as deployed (GXM_RUNTIME_DIST, target vita3k_web_dist), except that
 // the files of browser/web come from source so edits apply without a build.
 import { readFile } from 'node:fs/promises';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { createReadStream, existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -75,4 +75,35 @@ export async function readStageFile(files, path) {
   const entry = files.find((file) => file.path === path);
   if (!entry) throw Object.assign(new Error(`not staged: ${path}`), { code: 'ENOENT' });
   return readFile(entry.source);
+}
+
+// Streams a staged file, honouring a single `Range: bytes=a-b` (206) and HEAD.
+// The Worker reads large files (a retail title's multi-GiB archives) through
+// ranged requests instead of staging them whole (worker.js stageLazyFile).
+export async function sendStageFile(req, res, files, path) {
+  const entry = files.find((file) => file.path === path);
+  if (!entry) throw Object.assign(new Error(`not staged: ${path}`), { code: 'ENOENT' });
+  const size = entry.size;
+  const headers = { 'Content-Type': 'application/octet-stream', 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store' };
+  let start = 0, end = size - 1, status = 200;
+  const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+  if (range && (range[1] || range[2])) {
+    if (range[1]) { start = Number(range[1]); if (range[2]) end = Math.min(Number(range[2]), size - 1); }
+    else start = Math.max(0, size - Number(range[2]));
+    if (start > end || start >= size) {
+      res.writeHead(416, { ...headers, 'Content-Range': `bytes */${size}` });
+      return res.end();
+    }
+    status = 206;
+    headers['Content-Range'] = `bytes ${start}-${end}/${size}`;
+  }
+  headers['Content-Length'] = size ? end - start + 1 : 0;
+  res.writeHead(status, headers);
+  if (req.method === 'HEAD' || !size) return res.end();
+  await new Promise((done, fail) => {
+    const stream = createReadStream(entry.source, { start, end });
+    stream.on('error', fail);
+    res.on('close', done);
+    stream.pipe(res);
+  });
 }
