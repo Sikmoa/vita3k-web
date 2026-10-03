@@ -99,8 +99,21 @@ endif()
 # environment) has no ARM backend.
 set(VITASDK "$ENV{VITASDK}" CACHE PATH "VitaSDK root (containing bin/arm-vita-eabi-gcc)")
 set(VITA3K_ARM_GCC "${VITASDK}/bin/arm-vita-eabi-gcc")
+set(VITA3K_ARM_CC_FLAGS "")
+set(VITA3K_ARM_LAUNCHER "")
 if(NOT EXISTS "${VITA3K_ARM_GCC}")
-    message(FATAL_ERROR "Set VITASDK to a VitaSDK installation; missing ${VITA3K_ARM_GCC}")
+    # The guest probe is freestanding assembly, so a host LLVM clang (with its
+    # ARM backend, unlike emsdk's) can stand in for VitaSDK. The VitaSDK
+    # fixtures link the SDK's libraries and must be off without it.
+    find_program(VITA3K_HOST_CLANG NAMES clang NO_CMAKE_FIND_ROOT_PATH)
+    if(NOT VITA3K_HOST_CLANG OR VITA3K_WEB_DISPLAY_FIXTURE)
+        message(FATAL_ERROR "Set VITASDK to a VitaSDK installation; missing ${VITA3K_ARM_GCC} "
+            "(or configure with -DVITA3K_WEB_DISPLAY_FIXTURE=OFF and a host clang on PATH)")
+    endif()
+    # A Nix clang wrapper adds host hardening flags the ARM target rejects.
+    set(VITA3K_ARM_LAUNCHER ${CMAKE_COMMAND} -E env NIX_HARDENING_ENABLE=)
+    set(VITA3K_ARM_GCC "${VITA3K_HOST_CLANG}")
+    set(VITA3K_ARM_CC_FLAGS --target=armv7a-none-eabi -fuse-ld=lld)
 endif()
 
 # The browser runtime is an emulated machine: debug (-g, no optimization) Wasm
@@ -115,7 +128,8 @@ add_compile_options($<$<CONFIG:Release>:-O2> $<$<CONFIG:RelWithDebInfo>:-O2> $<$
 set(VITA3K_GUEST_PROBE_ELF "${CMAKE_CURRENT_BINARY_DIR}/guest_probe.elf")
 add_custom_command(
     OUTPUT "${VITA3K_GUEST_PROBE_ELF}"
-    COMMAND "${VITA3K_ARM_GCC}"
+    COMMAND ${VITA3K_ARM_LAUNCHER} "${VITA3K_ARM_GCC}"
+        ${VITA3K_ARM_CC_FLAGS}
         -mthumb
         -nostdlib
         "-Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/tests/guest_probe/guest.ld"

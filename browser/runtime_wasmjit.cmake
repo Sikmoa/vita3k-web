@@ -50,7 +50,7 @@ target_link_options(vita3k_web_jit PRIVATE
     -sFORCE_FILESYSTEM=1
     ${VITA3K_WEB_INITIAL_MEMORY_LINK_OPTION}
     "-sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_vita3k_web_set_app_paths','_vita3k_web_set_license_key','_vita3k_web_run_app']"
-    "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','cwrap']")
+    "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','cwrap','HEAPU8']")
 
 # The guest hot path must not call through invoke_* exception wrappers. The
 # symbol map names functions for the check without shipping a name section.

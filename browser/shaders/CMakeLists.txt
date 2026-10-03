@@ -49,7 +49,7 @@ if(EMSCRIPTEN)
         -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=33554432 -sMAXIMUM_MEMORY=268435456
         -sFILESYSTEM=0 --no-entry
         "-sEXPORTED_FUNCTIONS=['_malloc','_free','_gxp_compile','_gxp_output_data','_gxp_output_size','_gxp_error']"
-        "-sEXPORTED_RUNTIME_METHODS=['UTF8ToString']")
+        "-sEXPORTED_RUNTIME_METHODS=['UTF8ToString','HEAPU8','HEAPU32']")
     set_target_properties(gxp_compiler PROPERTIES SUFFIX ".mjs")
 else()
     target_link_options(gxp_compiler PRIVATE -Wl,--gc-sections -pthread)
