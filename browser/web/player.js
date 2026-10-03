@@ -142,7 +142,12 @@ let fps = 0, fpsSince = 0, fpsFrames = 0;
 // browser/src/hle_audio_null.cpp). AudioBuffers are chained on the context
 // clock; when the unpaced guest submits ahead of realtime (bursts while
 // loading) the chain is resynced instead of scheduling seconds of latency.
-let audioCtx = null, audioGain = null, audioNext = 0, muted = false;
+let audioCtx = null, audioGain = null, muted = false;
+// Next start time per guest audio port: ports that are open together (a
+// movie's audio next to the game's mixer) are separate streams Web Audio
+// mixes. One shared timeline played their chunks one after another, so audio
+// fell behind whenever a second port was open.
+const audioNext = new Map();
 const audioSources = new Set();
 let audioChunks = 0, audioBytes = 0, audioLogged = false, audioFirstAt = 0, audioPeak = 0;
 function ensureAudio() {
@@ -153,11 +158,11 @@ function ensureAudio() {
     audioGain = audioCtx.createGain();
     audioGain.gain.value = muted ? 0 : 1;
     audioGain.connect(audioCtx.destination);
-    audioNext = 0;
+    audioNext.clear();
   }
   if (audioCtx.state === 'suspended') audioCtx.resume().catch((error) => notice('Tap Sound on to enable audio: ' + error.message));
 }
-function playAudioPCM(freq, channels, frameCount, buffer) {
+function playAudioPCM(freq, channels, frameCount, buffer, port = 0) {
   if (!audioCtx || !buffer) return;
   const pcm = new Int16Array(buffer);
   if (frameCount <= 0 || channels < 1 || channels > 2 || pcm.length < frameCount * channels) return;
@@ -191,10 +196,12 @@ function playAudioPCM(freq, channels, frameCount, buffer) {
   audioSources.add(src);
   src.onended = () => { audioSources.delete(src); src.disconnect(); };
   const now = audioCtx.currentTime;
-  if (audioNext < now) audioNext = now;
-  if (audioNext > now + 1.0) audioNext = now;
-  src.start(audioNext);
-  audioNext += audio.duration;
+  let next = audioNext.get(port) ?? 0;
+  // A stream that ran dry (or a first chunk) restarts slightly ahead so the
+  // next few small chunks can arrive late without a gap.
+  if (next < now || next > now + 1.0) next = now + 0.04;
+  src.start(next);
+  audioNext.set(port, next + audio.duration);
 }
 const logLines = [];
 let logDirty = false;
@@ -524,7 +531,7 @@ function stop(keepsStatus) {
   if (worker) showStats();
   worker?.terminate(); worker = null; running = false;
   for (const source of audioSources) { source.stop(); source.disconnect(); }
-  audioSources.clear(); audioNext = 0;
+  audioSources.clear(); audioNext.clear();
   dialog = null; dialogBox.hidden = true;
   ime = null; imeBox.hidden = true;
   runButton.disabled = false; stopButton.disabled = true;
@@ -729,7 +736,7 @@ async function run() {
         break;
       }
       case 'vita-audio':
-        playAudioPCM(data.freq, data.channels, data.frames, data.data);
+        playAudioPCM(data.freq, data.channels, data.frames, data.data, data.port ?? 0);
         break;
       case 'vita-dialog': onDialog(data.dialog); break;
       case 'vita-ime': onIme(data.ime); break;

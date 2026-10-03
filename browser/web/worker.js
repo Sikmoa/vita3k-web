@@ -72,9 +72,9 @@ globalThis.vita3kWebOnGxmThrottle = (detail) => {
 // PCM tap (see browser/src/hle_audio_null.cpp): one copied buffer per
 // sceAudioOutOutput call. Transfer the copy; the Wasm scratch is reused by
 // the next call, so the page must not retain the view.
-globalThis.vita3kWebOnAudio = (freq, channels, frames, view) => {
+globalThis.vita3kWebOnAudio = (freq, channels, frames, view, port = 0) => {
   const data = view.slice().buffer;
-  post({ type: 'vita-audio', freq, channels, frames, data }, [data]);
+  post({ type: 'vita-audio', freq, channels, frames, data, port }, [data]);
 };
 
 const transition = (state) => {

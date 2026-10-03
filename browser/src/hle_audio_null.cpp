@@ -21,12 +21,14 @@
 // int16-interleaved PCM buffer per Output call. The scratch copy is ordinary
 // Wasm heap, so JS can read it under both memory models; the guest buffer is
 // never passed to JS directly. The page must copy the view synchronously.
-EM_JS(void, vita3k_web_post_audio_hook, (int freq, int channels, int frames, const uint8_t *ptr, int bytes), {
+// `port` tells concurrently open ports apart: each is its own stream, which
+// the page mixes (a movie's port plays alongside the game's mixer port).
+EM_JS(void, vita3k_web_post_audio_hook, (int freq, int channels, int frames, const uint8_t *ptr, int bytes, int port), {
     if (typeof vita3kWebOnAudio === 'function')
-        vita3kWebOnAudio(freq, channels, frames, Module['vita3kHostBytes'](ptr, bytes));
+        vita3kWebOnAudio(freq, channels, frames, Module['vita3kHostBytes'](ptr, bytes), port);
 });
 #else
-static void vita3k_web_post_audio_hook(int, int, int, const uint8_t *, int) {}
+static void vita3k_web_post_audio_hook(int, int, int, const uint8_t *, int, int) {}
 #endif
 
 struct NullAudioAdapter : AudioAdapter {
@@ -58,7 +60,8 @@ struct NullAudioAdapter : AudioAdapter {
         if (pcm.size() != bytes)
             pcm.resize(bytes);
         std::memcpy(pcm.data(), buffer, bytes);
-        vita3k_web_post_audio_hook(out_port.freq, channels, static_cast<int>(frames), pcm.data(), static_cast<int>(bytes));
+        vita3k_web_post_audio_hook(out_port.freq, channels, static_cast<int>(frames), pcm.data(), static_cast<int>(bytes),
+            static_cast<int>(reinterpret_cast<std::uintptr_t>(&out_port) & 0x7fffffff));
     }
 
     int get_rest_sample(AudioOutPort & /*out_port*/) override {
