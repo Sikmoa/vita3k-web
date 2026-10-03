@@ -924,11 +924,80 @@ struct DecodedTexture {
 };
 // `known_hash`: source hash of the copy the GPU already has; when the guest
 // bytes still hash to it, nothing is decoded and `decoded.levels` stays 0.
+// Video frames (libscemp4/avplayer): two-plane (Y, interleaved UV) or
+// three-plane (Y, U, V) 4:2:0, laid out as renderer/src/texture/yuv.cpp reads
+// them (chroma after a layout-sized luma plane, rows of the texture stride)
+// and converted like its swscale context: BT.601, limited range. Desktop maps
+// the YVU and CSC1 swizzles to the same conversion.
+static bool decode_yuv420(MemState &mem, const SceGxmTexture &t, scene::Writer &out, DecodedTexture &decoded,
+    uint64_t known_hash, uint64_t &source_hash, const char *&why) {
+    const auto type = t.texture_type();
+    const bool three_planes = gxm::get_base_format(gxm::get_format(t)) == SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P3;
+    const uint32_t width = gxm::get_width(t), height = gxm::get_height(t);
+    if (type != SCE_GXM_TEXTURE_LINEAR && type != SCE_GXM_TEXTURE_LINEAR_STRIDED) {
+        why = "YUV texture outside a linear layout";
+        return false;
+    }
+    if (!width || !height || width > 4096 || height > 4096) {
+        why = "texture dimensions";
+        return false;
+    }
+    uint32_t layout_width = width, layout_height = height;
+    if (!(t.mip_count == 0xF && type == SCE_GXM_TEXTURE_LINEAR)) {
+        layout_width = std::bit_ceil(width);
+        layout_height = std::bit_ceil(height);
+    }
+    const uint32_t stride = type == SCE_GXM_TEXTURE_LINEAR_STRIDED ? gxm::get_stride_in_bytes(t) : align(width, 8);
+    const uint64_t luma = uint64_t(layout_width) * layout_height;
+    const uint64_t footprint = std::max(luma + luma / 2, uint64_t(stride) * height + luma / 2);
+    const Address address = t.data_addr << 2;
+    if (!address || footprint > (64u << 20) || !is_valid_addr_range(mem, address, uint64_t(address) + footprint)) {
+        why = "texture memory range";
+        return false;
+    }
+    const uint8_t *source = Ptr<const uint8_t>(address).get(mem);
+    decoded.source = address;
+    decoded.footprint = static_cast<uint32_t>(footprint);
+    source_hash = XXH3_64bits(source, footprint);
+    if (known_hash && source_hash == known_hash)
+        return true;
+    decoded.width = width;
+    decoded.height = height;
+    decoded.levels = 1;
+    const uint8_t *u_plane = source + luma, *v_plane = source + luma + luma / 4;
+    uint32_t offset = 0;
+    uint8_t *dest = out.reserve(size_t(width) * height * 4, 4, offset);
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t *row = source + size_t(y) * stride;
+        for (uint32_t x = 0; x < width; ++x) {
+            int u, v;
+            if (three_planes) {
+                const size_t chroma = size_t(y / 2) * (stride / 2) + x / 2;
+                u = u_plane[chroma];
+                v = v_plane[chroma];
+            } else {
+                const size_t chroma = size_t(y / 2) * stride + (x & ~1u);
+                u = u_plane[chroma];
+                v = u_plane[chroma + 1];
+            }
+            const int c = 298 * (int(row[x]) - 16), d = u - 128, e = v - 128;
+            uint8_t *texel = dest + (size_t(y) * width + x) * 4;
+            texel[0] = uint8_t(std::clamp((c + 409 * e + 128) >> 8, 0, 255));
+            texel[1] = uint8_t(std::clamp((c - 100 * d - 208 * e + 128) >> 8, 0, 255));
+            texel[2] = uint8_t(std::clamp((c + 516 * d + 128) >> 8, 0, 255));
+            texel[3] = 255;
+        }
+    }
+    decoded.level_bytes[0] = {offset, width * height * 4};
+    return true;
+}
 static bool decode_texture(MemState &mem, const SceGxmTexture &t, scene::Writer &out, DecodedTexture &decoded,
     uint64_t known_hash, uint64_t &source_hash, const char *&why) {
     const auto type = t.texture_type();
     const auto format = gxm::get_format(t);
     const auto base = gxm::get_base_format(format);
+    if (base == SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P2 || base == SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P3)
+        return decode_yuv420(mem, t, out, decoded, known_hash, source_hash, why);
     ChannelMap map;
     if (!swizzle_map(base, format & SCE_GXM_TEXTURE_SWIZZLE_MASK, map)) {
         static std::map<uint32_t, std::string> reasons;

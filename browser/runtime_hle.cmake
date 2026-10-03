@@ -637,10 +637,12 @@ foreach(_export IN LISTS _hle_exports)
 endforeach()
 file(CONFIGURE OUTPUT "${_hle_generated}/startup_nids.inc" CONTENT "${_hle_nids}" @ONLY)
 # This is an initializer list, NOT an import-library allowlist. NID resolution
-# in module_parent.cpp uses startup_nids.inc alone. Only SceSysmem among these
-# source files defines LIBRARY_INIT; adding e.g. LIBRARY(SceLibKernel) would
-# reference a nonexistent import_library_init_SceLibKernel symbol.
-file(CONFIGURE OUTPUT "${_hle_generated}/startup_libraries.inc" CONTENT "LIBRARY(SceSysmem)\n" @ONLY)
+# in module_parent.cpp uses startup_nids.inc alone. List every selected source
+# file that defines LIBRARY_INIT (SceSysmem, SceAudiodec): one that is left out
+# never creates its state, and its exports then read a null object store entry.
+# Adding e.g. LIBRARY(SceLibKernel) would reference a nonexistent
+# import_library_init_SceLibKernel symbol.
+file(CONFIGURE OUTPUT "${_hle_generated}/startup_libraries.inc" CONTENT "LIBRARY(SceSysmem)\nLIBRARY(SceAudiodec)\n" @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${_HLE_ROOT}/nids/include/nids/nids.inc")
 
@@ -691,7 +693,7 @@ set(_hle_module_sources
     "${_HLE_ROOT}/modules/SceNpTrophy/SceNpTrophy.cpp"
     "${_HLE_ROOT}/modules/SceAppUtil/SceAppUtil.cpp"
     "${_HLE_ROOT}/modules/SceCommonDialog/SceCommonDialog.cpp"
-    # No LIBRARY_INIT; startup_libraries.inc stays LIBRARY(SceSysmem).
+    # No LIBRARY_INIT (startup_libraries.inc lists the sources that have one).
     "${_HLE_ROOT}/modules/SceCtrl/SceCtrl.cpp"
     "${_HLE_ROOT}/modules/SceRegistryMgr/SceRegMgrForGame.cpp"
     # ctrl_get implementation behind the selected SceCtrl bridges (chrono +
