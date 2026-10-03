@@ -42,8 +42,8 @@ target_include_directories(vita3k_web_runtime_core PUBLIC
     ${BOOST_HEADER_DIRS} ${BOOST_NUMERIC_HEADER_DIRS}
 )
 target_compile_definitions(vita3k_web_runtime_core PUBLIC VITA3K_INTERPRETER_CPU=1 SPDLOG_FMT_EXTERNAL)
-target_compile_options(vita3k_web_runtime_core PUBLIC -fexceptions)
-target_link_options(vita3k_web_runtime_core INTERFACE -fexceptions)
+target_compile_options(vita3k_web_runtime_core PUBLIC ${VITA3K_WEB_EXCEPTIONS})
+target_link_options(vita3k_web_runtime_core INTERFACE ${VITA3K_WEB_EXCEPTIONS})
 target_link_libraries(vita3k_web_runtime_core PUBLIC fmt::fmt spdlog::spdlog capstone vita3k_web_boost_filesystem vita3k_web_host_abi)
 add_executable(vita3k_web_runtime_tests "${VITA_ROOT}/cpu/tests/interpreter_runtime_tests.cpp")
 target_link_libraries(vita3k_web_runtime_tests PRIVATE vita3k_web_runtime_core)

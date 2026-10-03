@@ -71,3 +71,11 @@ if(CMAKE_CXX_FLAGS MATCHES "-pthread")
 else()
     set(VITA3K_WEB_THREADS OFF)
 endif()
+# C++ exceptions: native Wasm exceptions where nothing needs Asyncify (the
+# threaded build); the fiber build keeps JS-based ones, which Asyncify can
+# unwind. Every object in one link must use the same model.
+if(VITA3K_WEB_THREADS)
+    set(VITA3K_WEB_EXCEPTIONS -fwasm-exceptions)
+else()
+    set(VITA3K_WEB_EXCEPTIONS -fexceptions)
+endif()

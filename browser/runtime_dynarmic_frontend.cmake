@@ -160,8 +160,8 @@ target_include_directories(vita3k_dynarmic_frontend PUBLIC
 target_link_libraries(vita3k_dynarmic_frontend PUBLIC fmt::fmt merry::mcl)
 # Fetch faults propagate out of Translate. Consumers must enable exceptions too.
 if(EMSCRIPTEN)
-    target_compile_options(vita3k_dynarmic_frontend PUBLIC -fexceptions)
-    target_link_options(vita3k_dynarmic_frontend INTERFACE -fexceptions)
+    target_compile_options(vita3k_dynarmic_frontend PUBLIC ${VITA3K_WEB_EXCEPTIONS})
+    target_link_options(vita3k_dynarmic_frontend INTERFACE ${VITA3K_WEB_EXCEPTIONS})
 endif()
 # Deliberately no runtime-core dependency: the runtime can link this library;
 # the final consumer supplies mem_fetch. No DYNARMIC_IGNORE_ASSERTS workaround.
