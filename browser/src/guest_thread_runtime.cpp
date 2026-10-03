@@ -84,6 +84,17 @@ bool classify_unsupported_import(uint32_t nid) {
     // notified callbacks inline (run_callback) before each park.
     if (n == "sceNetEpollWait" || n == "sceNetEpollWaitCB")
         return false;
+    // Persona 4 Golden's waits. The CB variants run the thread's notified
+    // callbacks first (process_callbacks -> run_callback, which the fiber host
+    // runs on the calling fiber like sceNetEpollWaitCB above), then take the
+    // same cooperative wait as their plain twins: semaphore, event flag,
+    // lwmutex, lwcond and thread end (SceThreadmgr execution_host branch).
+    // Condition variables release the mutex and park on the condition queue
+    // (condvar_wait execution_host branch).
+    if (n == "sceKernelWaitSemaCB" || n == "sceKernelWaitEventFlagCB" || n == "sceKernelLockLwMutexCB"
+        || n == "sceKernelWaitLwCondCB" || n == "sceKernelWaitThreadEndCB"
+        || n == "sceKernelWaitCond" || n == "_sceKernelWaitCond")
+        return false;
     return n.find("Wait") != n.npos || n.find("DelayThread") != n.npos
         || n.find("CheckCallback") != n.npos || n.find("CB") != n.npos
         || n.find("ReceiveMsgPipe") != n.npos || n.find("SendMsgPipe") != n.npos;

@@ -5,6 +5,7 @@ include_guard(GLOBAL)
 set(_HLE_BROWSER_ROOT "${CMAKE_CURRENT_LIST_DIR}")
 set(_HLE_ROOT "${CMAKE_CURRENT_LIST_DIR}/../vita3k")
 set(_HLE_EXT "${CMAKE_CURRENT_LIST_DIR}/../external")
+include(${CMAKE_CURRENT_LIST_DIR}/runtime_codec.cmake)
 
 set(_hle_exports
     sceGxmInitialize sceGxmTerminate sceGxmCreateContext sceGxmDestroyContext sceGxmFinish
@@ -435,6 +436,8 @@ set(_hle_exports
     # BSD strlcpy/strlcat returns; strtoll stores the guest end address and
     # reports EINVAL/ERANGE in the SceLibKernel errno word, TLS slot 0x20.
     sceClibStrlcpy sceClibStrlcat sceClibStrtoll
+    # Persona 4 Golden (an LLE module): strcmp/strstr over guest strings.
+    sceClibStrcmp sceClibStrstr
     # Guest printf family: module::format_guest reads each argument with its
     # guest ARM EABI width (32-bit long, size_t and pointers; 8-byte aligned
     # long long and double), from registers, stack or a guest va_list; each
@@ -532,6 +535,87 @@ set(_hle_exports
     SceProcessmgrForDriver_61B9B6FA SceProcessmgrForDriver_B1C3EFCA
     SceProcessmgrForDriver_D141C076 SceProcessmgrForDriver_6599E5D9 sceKernelGetPMUSERENR
     ksceSblACMgrIsDevelopmentMode ksceSblACMgrIsGameProgram ksceSblACMgrIsPSMDevAssistant
+    # Persona 4 Golden (PCSE00120). Sysmodule loads: LLE modules come from the
+    # staged firmware (vs0:sys/external) or app0:sce_module, the rest are HLE
+    # and only marked loaded.
+    sceSysmoduleLoadModule sceSysmoduleUnloadModule sceSysmoduleIsLoaded
+    sceSysmoduleLoadModuleInternal sceSysmoduleLoadModuleInternalWithArg sceSysmoduleIsLoadedInternal
+    # The movie player (libscemp4 LLE) asks for the title id.
+    sceKernelGetProcessTitleId
+    # Persona 4 Golden: the remaining static imports of the eboot, libc and
+    # libfios2 (AOT build unserviced-import scan) whose bodies need no codec,
+    # plus their CALL_EXPORT targets. The CB waits run notified callbacks on
+    # the calling fiber (run_guest_function) and then take the cooperative wait.
+    sceAppMgrAcquireBgmPort sceAppUtilSaveDataSlotDelete sceAppUtilSaveDataSlotSetParam
+    sceAudioOutGetAdopt
+    sceCameraClose sceCameraOpen sceCameraRead sceCameraStart sceCameraStop
+    _sceFiosKernelOverlayAdd _sceFiosKernelOverlayAddForProcess _sceFiosKernelOverlayDHChstatSync
+    _sceFiosKernelOverlayDHCloseSync _sceFiosKernelOverlayDHOpenSync _sceFiosKernelOverlayDHReadSync
+    _sceFiosKernelOverlayDHStatSync _sceFiosKernelOverlayDHSyncSync _sceFiosKernelOverlayGetInfo
+    _sceFiosKernelOverlayGetInfoForProcess _sceFiosKernelOverlayGetList
+    _sceFiosKernelOverlayGetRecommendedScheduler _sceFiosKernelOverlayModify
+    _sceFiosKernelOverlayModifyForProcess _sceFiosKernelOverlayRemove
+    _sceFiosKernelOverlayRemoveForProcess _sceFiosKernelOverlayResolveSync
+    _sceFiosKernelOverlayResolveWithRangeSync _sceFiosKernelOverlayThreadIsDisabled
+    _sceFiosKernelOverlayThreadSetDisabled
+    sceGxmDrawInstanced sceGxmDrawPrecomputed sceGxmGetPrecomputedDrawSize
+    sceGxmGetPrecomputedFragmentStateSize sceGxmGetPrecomputedVertexStateSize
+    sceGxmGetRenderTargetMemSize sceGxmPrecomputedDrawInit sceGxmPrecomputedDrawSetAllVertexStreams
+    sceGxmPrecomputedDrawSetParams sceGxmPrecomputedDrawSetParamsInstanced
+    sceGxmPrecomputedFragmentStateGetDefaultUniformBuffer sceGxmPrecomputedFragmentStateInit
+    sceGxmPrecomputedFragmentStateSetAllTextures
+    sceGxmPrecomputedFragmentStateSetDefaultUniformBuffer sceGxmPrecomputedFragmentStateSetTexture
+    sceGxmPrecomputedVertexStateGetDefaultUniformBuffer sceGxmPrecomputedVertexStateInit
+    sceGxmPrecomputedVertexStateSetDefaultUniformBuffer _sceGxmProgramFindParameterBySemantic
+    sceGxmProgramGetDefaultUniformBufferSize sceGxmProgramGetSize sceGxmSetBackPolygonMode
+    sceGxmSetFrontDepthBias sceGxmSetFrontPointLineWidth sceGxmSetPrecomputedFragmentState
+    sceGxmSetPrecomputedVertexState sceGxmSetRegionClip sceGxmTextureGetHeight sceGxmTextureGetWidth
+    sceGxmTextureSetFormat sceGxmTextureSetPalette sceGxmTextureSetUAddrModeSafe
+    sceGxmTextureSetVAddrModeSafe
+    sceImeDialogGetResult sceImeDialogGetStatus sceImeDialogInit sceImeDialogTerm
+    ksceKernelGetThreadCurrentPriority sceKernelCloseMutex _sceKernelCreateCond sceKernelCreateCond
+    _sceKernelCreateSema sceKernelCreateSema_16XX sceKernelDeleteCond sceKernelGetMemBlockInfoByAddr
+    _sceKernelLockLwMutex sceKernelLockLwMutexCB sceKernelSignalCond _sceKernelWaitCond
+    sceKernelWaitCond _sceKernelWaitEventFlagCB sceKernelWaitEventFlagCB _sceKernelWaitLwCondCB
+    sceKernelWaitLwCondCB _sceKernelWaitSemaCB sceKernelWaitSemaCB _sceKernelWaitThreadEndCB
+    sceKernelWaitThreadEndCB
+    sceMotionGetBasicOrientation sceMotionGetDeadband sceMotionGetState sceMotionGetTiltCorrection
+    sceMotionReset sceMotionRotateYaw sceMotionSetDeadband sceMotionSetTiltCorrection
+    sceMotionStartSampling sceMotionStopSampling
+    sceNetCheckDialogGetResult sceNetCheckDialogInit sceNetCheckDialogTerm
+    sceNpActivityInit sceNpActivityTerm sceNpManagerGetChatRestrictionFlag
+    sceNpMatching2AbortContextStart sceNpMatching2ContextStart sceNpMatching2ContextStop
+    sceNpMatching2CreateContext sceNpMatching2CreateJoinRoom sceNpMatching2DestroyContext
+    sceNpMatching2GetServerLocal sceNpMatching2GetWorldInfoList sceNpMatching2Init
+    sceNpMatching2JoinRoom sceNpMatching2RegisterContextCallback
+    sceNpMatching2RegisterRoomEventCallback sceNpMatching2RegisterRoomMessageCallback
+    sceNpMatching2SearchRoom sceNpMatching2SendRoomMessage sceNpMatching2SetDefaultRequestOptParam
+    sceNpMatching2Term sceNpScoreCreateRequest sceNpScoreCreateTitleCtx sceNpScoreDeleteRequest
+    sceNpScoreDeleteTitleCtx sceNpScoreGetRankingByRange sceNpScoreGetRankingByRangeAsync
+    sceNpScoreInit sceNpScorePollAsync sceNpScoreRecordScore sceNpScoreRecordScoreAsync
+    sceNpScoreTerm
+    _sceRtcGetCurrentNetworkTick sceRtcGetCurrentNetworkTick sceRtcGetDayOfWeek
+    sceSaveDataDialogFinish sceSaveDataDialogGetResult sceSaveDataDialogGetStatus
+    sceSaveDataDialogGetSubStatus sceSaveDataDialogInit sceSaveDataDialogTerm
+    sceTouchGetSamplingState sceTouchRead
+    # Persona 4 Golden audio and video: NGS (ATRAC9 voices, mixing, buss
+    # effects), ATRAC9/AAC/MP3 decoders and the AVC decoder behind libscemp4,
+    # over vita3k/codec and vita3k/ngs (runtime_codec.cmake).
+    sceAudiodecCreateDecoderExternal sceAudiodecDecode sceAudiodecDeleteDecoder
+    sceAudiodecDeleteDecoderExternal sceAudiodecGetContextSize
+    sceAvcdecCreateDecoder sceAvcdecDecode sceAvcdecDecodeFlush sceAvcdecDecodeStop
+    sceAvcdecDeleteDecoder sceAvcdecQueryDecoderMemSize
+    sceCodecEngineAllocMemoryFromUnmapMemBlock sceCodecEngineCloseUnmapMemBlock
+    sceCodecEngineFreeMemoryFromUnmapMemBlock sceCodecEngineOpenUnmapMemBlock
+    sceNgsPatchCreateRouting sceNgsPatchGetInfo sceNgsPatchRemoveRouting
+    sceNgsRackGetRequiredMemorySize sceNgsRackGetVoiceHandle sceNgsRackInit sceNgsRackRelease
+    sceNgsSystemGetRequiredMemorySize sceNgsSystemInit sceNgsSystemRelease sceNgsSystemUpdate
+    sceNgsVoiceBypassModule sceNgsVoiceDefGetAtrac9Voice sceNgsVoiceDefGetMasterBuss
+    sceNgsVoiceDefGetReverbBuss sceNgsVoiceDefGetTemplate1 sceNgsVoiceGetInfo
+    sceNgsVoiceGetParamsOutOfRange sceNgsVoiceGetStateData sceNgsVoiceKeyOff sceNgsVoiceKill
+    sceNgsVoiceLockParams sceNgsVoicePatchSetVolumesMatrix sceNgsVoicePause sceNgsVoicePlay
+    sceNgsVoiceResume sceNgsVoiceSetModuleCallback sceNgsVoiceUnlockParams
+    sceVideodecInitLibraryWithUnmapMem sceVideodecQueryMemSize sceVideodecTermLibrary
 )
 
 # Take NID values from the one authoritative database, never a second resolver.
@@ -630,6 +714,17 @@ set(_hle_module_sources
     # threads) and define no EXPORTs, so they only contribute link symbols.
     "${_HLE_ROOT}/touch/src/touch.cpp"
     "${_HLE_ROOT}/display/src/display.cpp"
+    # Persona 4 Golden.
+    "${_HLE_ROOT}/modules/SceSysmodule/SceSysmodule.cpp"
+    "${_HLE_ROOT}/modules/SceCamera/SceCamera.cpp"
+    "${_HLE_ROOT}/modules/SceFios2Kernel/SceFios2Kernel.cpp"
+    "${_HLE_ROOT}/modules/SceDriverUser/SceMotion.cpp"
+    "${_HLE_ROOT}/modules/SceNpMatching2/SceNpMatching2.cpp"
+    "${_HLE_ROOT}/modules/SceNpScore/SceNpScore.cpp"
+    "${_HLE_ROOT}/modules/SceNgsUser/SceNgs.cpp"
+    "${_HLE_ROOT}/modules/SceAudiodec/SceAudiodecUser.cpp"
+    "${_HLE_ROOT}/modules/SceVideodec/SceVideodecUser.cpp"
+    "${_HLE_ROOT}/modules/SceCodecEngine/SceCodecEngineUser.cpp"
 )
 # Compile the existing implementation files through registration-only adapters.
 # This is necessary because EXPORT's make_bridge initialization roots even
@@ -686,6 +781,7 @@ add_custom_command(
     VERBATIM)
 
 add_library(vita3k_web_runtime_hle STATIC
+    ${VITA3K_WEB_CODEC_SOURCES}
     # decrypt_fself for module_parent.cpp's module loader.
     "${_HLE_BROWSER_ROOT}/src/vita_self_decrypt.cpp"
     "${_HLE_BROWSER_ROOT}/src/gxm_webgpu_bridge.cpp"
@@ -699,6 +795,8 @@ add_library(vita3k_web_runtime_hle STATIC
     "${_HLE_ROOT}/gxm/src/textures.cpp"
     # Guest texel layout helpers (swizzle/tiled -> linear) for the scene stream.
     "${_HLE_ROOT}/renderer/src/texture/format.cpp"
+    # P4/P8 palette expansion for the scene stream.
+    "${_HLE_ROOT}/renderer/src/texture/palette.cpp"
     "${_HLE_ROOT}/renderer/src/texture/pvrt-dec.cpp"
     "${_HLE_ROOT}/gxm/src/attributes.cpp"
     "${_HLE_ROOT}/shader/src/usse_program_analyzer.cpp"
@@ -743,6 +841,10 @@ add_library(vita3k_web_runtime_hle STATIC
     "${_HLE_ROOT}/emuenv/src/emuenv.cpp"
     "${_HLE_ROOT}/display/src/display.cpp"
     "${_HLE_ROOT}/motion/src/motion_input.cpp"
+    # MotionState without SDL sensors (no sensor subsystem in the browser SDL).
+    "${_HLE_BROWSER_ROOT}/src/motion_browser.cpp"
+    # stb_image for camera.cpp (its desktop provider is a renderer TU).
+    "${_HLE_BROWSER_ROOT}/src/stb_image_impl.c"
     "${_HLE_ROOT}/camera/src/camera.cpp"
     "${_HLE_ROOT}/overlay/src/display_manager.cpp"
 )
@@ -778,7 +880,7 @@ target_include_directories(vita3k_web_mspace PUBLIC "${_HLE_EXT}/dlmalloc")
 target_compile_definitions(vita3k_web_mspace PUBLIC ONLY_MSPACES=1)
 target_link_libraries(vita3k_web_runtime_hle
     PUBLIC vita3k_web_runtime_core
-    PRIVATE SDL3::SDL3-static vita3k_web_mspace)
+    PRIVATE SDL3::SDL3-static vita3k_web_mspace vita3k_web_ffmpeg vita3k_web_libatrac9)
 
 if(EMSCRIPTEN)
     target_compile_options(vita3k_web_runtime_hle PRIVATE

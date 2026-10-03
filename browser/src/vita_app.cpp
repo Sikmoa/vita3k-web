@@ -38,6 +38,7 @@
 #include <mem/functions.h>
 #include <modules/module_parent.h>
 #include <nids/functions.h>
+#include <ngs/state.h>
 #include <packages/license.h>
 #include <regmgr/functions.h>
 #include <emscripten/emscripten.h>
@@ -381,6 +382,9 @@ static int run_app_impl() {
     }
     auto env = std::make_unique<EmuEnvState>();
     if (!init(env->mem, true)) return -2;
+    // Desktop late_init: the NGS voice definitions live in guest memory and
+    // sceNgsVoiceDefGet* hands their addresses to the guest.
+    if (!ngs::init(env->ngs, env->mem)) return -2;
     browser::gles::Session gles_session(*env);
     env->vita_fs_path = config.vita_fs;
     env->io.title_id = config.title_id;
