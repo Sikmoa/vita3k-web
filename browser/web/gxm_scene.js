@@ -18,7 +18,8 @@
 import { createGXPShaderAdapter } from './gxp_shader_adapter.js';
 import { GpuQueue } from './gpu_queue.js';
 
-let device, compiler;
+let device, compiler, unclippedDepth = false, fragmentUnits = 16;
+const traceShaders = (() => { try { return new URL(self.location.href).searchParams.has('gxmTrace'); } catch { return false; } })();
 const programs = new Map();  // id -> { wgsl, fragment, module }
 const targets = new Map();   // guest color address -> target
 const textures = new Map();  // producer texture id -> { texture, view }
@@ -66,7 +67,7 @@ function record(ev, detail) {
   if (flight.length > 256) flight.splice(0, flight.length - 256);
 }
 const stagingBuffers = [], transientTextures = []; // per-submission texel writes, destroyed after submit
-const stats = { scenes: 0, draws: 0, pipelines: 0, textureUploads: 0, presents: 0, bindGroups: 0, submitMs: 0, uploadMs: 0, sceneBytes: 0, surfaceSyncs: 0, droppedScenes: 0, presentFailures: 0, stateSkips: 0, throttledScenes: 0, throttledPresents: 0 };
+const stats = { scenes: 0, draws: 0, pipelines: 0, textureUploads: 0, presents: 0, bindGroups: 0, submitMs: 0, uploadMs: 0, sceneBytes: 0, surfaceSyncs: 0, droppedScenes: 0, presentFailures: 0, stateSkips: 0, throttledScenes: 0, throttledPresents: 0, colorSnapshots: 0 };
 // Redundant state-change filter (reset per pass): every WebGPU call from a
 // worker crosses into the browser/GPU process, so re-emitting unchanged
 // bindings, buffers, viewport, scissor or stencil reference each draw costs
@@ -110,7 +111,21 @@ export async function init({ compilerURL, nagaURL, wasiShimURL, logger, onDevice
   deviceInfo = { vendor: info.vendor ?? '', architecture: info.architecture ?? '',
     device: info.device ?? '', description: info.description ?? '' };
   log(`[gxm-scene] adapter: ${info.vendor} ${info.architecture} ${info.device} ${info.description}`);
-  device = await adapter.requestDevice();
+  // GXM has no depth clipping to [0, w]: Persona 4 Golden's 2D draws sit at
+  // z = w after the viewport transform, which rounding pushes just outside
+  // WebGPU's clip volume. With depth-clip-control the depth is clamped to
+  // the viewport range instead of culling the primitive.
+  unclippedDepth = adapter.features.has('depth-clip-control');
+  // The fragment stage samples 16 GXM texture units plus the snapshot of the
+  // target a program reads its color from: 17 sampled textures, one over the
+  // default limit. Without a larger limit unit 15 is left out.
+  fragmentUnits = adapter.limits.maxSampledTexturesPerShaderStage >= 17 ? 16 : 15;
+  device = await adapter.requestDevice({
+    ...(unclippedDepth ? { requiredFeatures: ['depth-clip-control'] } : {}),
+    ...(fragmentUnits === 16 ? { requiredLimits: { maxSampledTexturesPerShaderStage: 17 } } : {}),
+  });
+  if (fragmentUnits < 16) log('[gxm-scene] 16 sampled textures per stage: fragment texture unit 15 is unavailable');
+  if (!unclippedDepth) log('[gxm-scene] depth-clip-control unavailable: primitives on the far plane may be clipped');
   // The bridge may pass this explicitly; otherwise fall back to the worker's
   // global hook (same pattern as vita3kGxmReady/vita3kWebOnGpuFrame).
   notifyDeviceLost = onDeviceLost ?? ((detail) => globalThis.vita3kWebOnGxmDevice?.(detail));
@@ -135,8 +150,8 @@ export async function init({ compilerURL, nagaURL, wasiShimURL, logger, onDevice
   compiler = await createGXPShaderAdapter({ compilerURL, nagaURL, wasiShimURL });
   const bufferEntry = (binding, visibility, type) =>
     ({ binding, visibility, buffer: { type, hasDynamicOffset: true } });
-  const textureGroup = visibility => device.createBindGroupLayout({ entries:
-    Array.from({ length: 32 }, (_, i) => i % 2 === 0
+  const textureGroup = (visibility, units = 16) => device.createBindGroupLayout({ entries:
+    Array.from({ length: units * 2 }, (_, i) => i % 2 === 0
       ? { binding: i, visibility, texture: { sampleType: 'float' } }
       : { binding: i, visibility, sampler: { type: 'filtering' } }) });
   const empty = device.createBindGroupLayout({ entries: [] });
@@ -149,10 +164,14 @@ export async function init({ compilerURL, nagaURL, wasiShimURL, logger, onDevice
     ] }),
     empty,
     vertexTextures: textureGroup(GPUShaderStage.VERTEX),
-    fragmentTextures: textureGroup(GPUShaderStage.FRAGMENT),
+    fragmentTextures: textureGroup(GPUShaderStage.FRAGMENT, fragmentUnits),
   };
+  // Group 1: the snapshot of the target a fragment program reads its current
+  // color from (the browser compiler's sampled_fragcolor feature).
+  layouts.fragColor = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } }] });
   layouts.pipeline = device.createPipelineLayout({ bindGroupLayouts:
-    [layouts.buffers, empty, layouts.vertexTextures, layouts.fragmentTextures] });
+    [layouts.buffers, layouts.fragColor, layouts.vertexTextures, layouts.fragmentTextures] });
   // Unbound texture slots of a 16-unit group still need valid resources.
   layouts.dummyView = device.createTexture({ size: [1, 1], format: 'rgba8unorm',
     usage: GPUTextureUsage.TEXTURE_BINDING }).createView();
@@ -165,11 +184,15 @@ export async function registerProgram(id, gxp, fragment) {
   if (deviceState !== 'active') throw new Error('WebGPU device lost; restart the run');
   const textureFormats = new Uint32Array(32).fill(0x0c000000); // RGBA8 after producer decode
   const { wgsl } = await compiler.translate(gxp, { textureFormats });
+  // ?gxmTrace=N (gxm_webgpu_bridge.cpp): also print each translated program.
+  if (traceShaders) log(`[gxm-trace] program ${id} ${fragment ? 'fragment' : 'vertex'} WGSL:\n${wgsl}`);
   const module = device.createShaderModule({ code: wgsl });
   const info = await module.getCompilationInfo();
   const errors = info.messages.filter(message => message.type === 'error');
   if (errors.length) throw new Error(`GXP ${id} WGSL: ${errors.map(m => m.message).join('\n')}`);
-  programs.set(id, { module, fragment });
+  // A program that reads the current color gets a snapshot of the target
+  // before each of its draws (DRAW below).
+  programs.set(id, { module, fragment, readsColor: fragment && wgsl.includes('fragColorSnapshot') });
 }
 
 export function attachCanvas(offscreen) {
@@ -215,6 +238,7 @@ function targetFor(address, format, width, height, scale, renderScale) {
     return target;
   target?.texture.destroy();
   target?.snapshot?.texture.destroy();
+  target?.fragColor?.texture.destroy();
   target?.resolved?.texture.destroy();
   target?.guestCopy?.destroy();
   const gpuFormat = colorFormat(format);
@@ -369,12 +393,14 @@ function createPipeline(d, target, depth) {
   const face = s => ({ compare: compareFuncs[s[0]], failOp: stencilOps[s[1]],
     depthFailOp: stencilOps[s[2]], passOp: stencilOps[s[3]] });
   const hasStencil = depth && depth.format === 'depth24plus-stencil8';
+  if (traceShaders) log(`[gxm-trace] pipeline vs=${d.vs} fs=${d.fs} mask=${colorMask} fragmentDisabled=${d.fragmentDisabled} blend=${JSON.stringify(d.blend)} depth=${depth?.format} func=${d.depthFunc} write=${d.depthWrite} cull=${d.cull} topology=${d.topology} stencil=${JSON.stringify(d.stencil ?? null)}`);
   const descriptor = {
     layout: layouts.pipeline,
     vertex: { module: vertex.module, entryPoint: 'main_vs', buffers },
     fragment: { module: fragment.module, entryPoint: 'main_fs',
       targets: [{ format: target.gpuFormat, writeMask: d.fragmentDisabled ? 0 : writeMask, ...(blend ? { blend } : {}) }] },
     primitive: { topology: d.topology, cullMode: ['none', 'back', 'front'][d.cull] ?? 'none',
+      ...(unclippedDepth ? { unclippedDepth: true } : {}),
       frontFace: 'ccw', ...(d.topology.endsWith('strip') ? { stripIndexFormat: d.indexSize === 2 ? 'uint16' : 'uint32' } : {}) },
     ...(depth ? { depthStencil: { format: depth.format, depthWriteEnabled: d.depthWrite,
       depthCompare: compareFuncs[d.depthFunc],
@@ -457,7 +483,7 @@ function textureGroupFor(stage) {
       if (sameWords(bucket[i].words, words, length)) return bucket[i].group;
   }
   const entries = [];
-  for (let unit = 0; unit < 16; ++unit) {
+  for (let unit = 0, units = stage === 0 ? fragmentUnits : 16; unit < units; ++unit) {
     let at = -1;
     for (let i = 0; i < length; i += 8) if ((words[i] & 15) === unit) at = i;
     entries.push({ binding: unit * 2, resource: at >= 0 ? textureView(words[at + 1]) : layouts.dummyView });
@@ -473,7 +499,8 @@ function textureGroupFor(stage) {
 }
 const emptyGroupCache = {};
 function emptyGroup() {
-  return emptyGroupCache.group ??= device.createBindGroup({ layout: layouts.empty, entries: [] });
+  return emptyGroupCache.group ??= device.createBindGroup({ layout: layouts.fragColor,
+    entries: [{ binding: 0, resource: layouts.dummyView }] });
 }
 
 // WRITE_TEXELS: the guest texels are uploaded at surface size and drawn
@@ -605,7 +632,7 @@ function encodeScene(words, data) {
   const word = () => words[cursor++];
   if (word() !== 0x31535847) throw new Error('unknown GXM scene stream');
   const encoder = device.createCommandEncoder();
-  let pass = null, target = null, depth = null;
+  let pass = null, target = null, depth = null, passSplits = false;
   while (cursor < words.length) {
     const command = word();
     switch (command) {
@@ -615,7 +642,8 @@ function encodeScene(words, data) {
       const clearDepth = floats[cursor++], clearStencil = word();
       const depthAddress = word(), stencilAddress = word(), snapshot = word(), scale = word(), renderScale = word();
       target = targetFor(address, format, width, height, scale, renderScale);
-      if (snapshot) {
+      passSplits = (snapshot & 2) !== 0;
+      if (snapshot & 1) {
         // A draw samples this target: give it the contents from before the pass.
         const width = target.width * target.renderScale, height = target.height * target.renderScale;
         if (!target.snapshot) {
@@ -636,9 +664,9 @@ function encodeScene(words, data) {
           clearValue: [0, 0, 0, 1] }],
         ...(depth ? { depthStencilAttachment: { view: depth.view,
           depthLoadOp: depthLoad && depthKept ? 'load' : 'clear',
-          depthClearValue: clearDepth, depthStoreOp: depthStore || depthMode === 2 ? 'store' : 'discard',
+          depthClearValue: clearDepth, depthStoreOp: depthStore || depthMode === 2 || passSplits ? 'store' : 'discard',
           ...(stencil ? { stencilLoadOp: depthLoad && depthKept ? 'load' : 'clear',
-            stencilClearValue: clearStencil, stencilStoreOp: depthStore || depthMode === 2 ? 'store' : 'discard' } : {}) } } : {}),
+            stencilClearValue: clearStencil, stencilStoreOp: depthStore || depthMode === 2 || passSplits ? 'store' : 'discard' } : {}) } } : {}),
       });
       target.fresh = false;
       if (depth && depthMode === 2) depth.fresh = false; // mode 2 always stores
@@ -674,12 +702,35 @@ function encodeScene(words, data) {
         for (let i = 0; i < 8; ++i) unitWords[stage][at + i] = word();
       }
       if (!pass) throw new Error('draw outside a pass');
+      // Programmable blending: a fragment program that reads the current
+      // color samples a copy of the target taken here, so the pass ends,
+      // the target is copied and the pass resumes with everything loaded.
+      const readsColor = programs.get(pipelineWords[1])?.readsColor;
+      if (readsColor) {
+        pass.end();
+        if (!target.fragColor) {
+          const texture = device.createTexture({ size: [target.gpuWidth, target.gpuHeight], format: target.gpuFormat,
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+          target.fragColor = { texture, group: device.createBindGroup({ layout: layouts.fragColor,
+            entries: [{ binding: 0, resource: texture.createView() }] }) };
+        }
+        encoder.copyTextureToTexture({ texture: target.texture }, { texture: target.fragColor.texture },
+          [target.gpuWidth, target.gpuHeight]);
+        const stencil = depth && depth.format === 'depth24plus-stencil8';
+        pass = encoder.beginRenderPass({
+          colorAttachments: [{ view: target.view, loadOp: 'load', storeOp: 'store' }],
+          ...(depth ? { depthStencilAttachment: { view: depth.view, depthLoadOp: 'load', depthStoreOp: 'store',
+            ...(stencil ? { stencilLoadOp: 'load', stencilStoreOp: 'store' } : {}) } } : {}),
+        });
+        resetPassState();
+        ++stats.colorSnapshots;
+      }
       const pipeline = cachedPipeline(target, depth);
       if (pipeline !== lastPipeline) { pass.setPipeline(pipeline); lastPipeline = pipeline; }
       else ++stats.stateSkips;
       dynamicOffsets[0] = vsInfo; dynamicOffsets[1] = fsInfo; dynamicOffsets[2] = vsUniforms; dynamicOffsets[3] = fsUniforms;
       setGroupDyn(bufferGroupFor(vsUniformSize, fsUniformSize));
-      setGroup(1, emptyGroup());
+      setGroup(1, readsColor ? target.fragColor.group : emptyGroup());
       setGroup(2, textureGroupFor(1));
       setGroup(3, textureGroupFor(0));
       for (let i = 0; i < streamCount; ++i) {
@@ -747,8 +798,12 @@ function encodeScene(words, data) {
         textures.set(id, entry);
         textureGroups.clear();
       }
-      encoder.copyTextureToTexture({ texture: sampled(source).texture, origin: { x: x * scale, y: y * scale } },
-        { texture: entry.texture }, [w, h]);
+      // A texture larger than the target (same pitch) keeps its texels past
+      // the surface undefined: copy the part inside it.
+      const cw = Math.min(width, source.width - x) * scale, ch = Math.min(height, source.height - y) * scale;
+      if (cw > 0 && ch > 0)
+        encoder.copyTextureToTexture({ texture: sampled(source).texture, origin: { x: x * scale, y: y * scale } },
+          { texture: entry.texture }, [cw, ch]);
       break;
     }
     case 4: // END_PASS

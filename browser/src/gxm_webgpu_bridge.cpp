@@ -21,6 +21,7 @@
 #include <kernel/state.h>
 #include <mem/functions.h>
 #include <renderer/functions.h>
+#include <renderer/pvrt-dec.h>
 #include <renderer/state.h>
 #include <util/align.h>
 #include <emscripten.h>
@@ -195,6 +196,19 @@ bool surface_sync() {
     }();
     return enabled;
 }
+// VITA3K_GXM_TRACE=N (worker ?gxmTrace=N): after N presented frames, print
+// the next passes, draws, texture binds and presents (a few hundred lines)
+// to see where a frame's pixels come from.
+static uint32_t trace_presents = 0;
+static int trace_budget = 600;
+static bool gxm_tracing() {
+    static const long after = [] {
+        const char *value = std::getenv("VITA3K_GXM_TRACE");
+        return value ? std::strtol(value, nullptr, 10) : -1L;
+    }();
+    return after >= 0 && trace_presents >= static_cast<unsigned long>(after) && trace_budget > 0;
+}
+#define GXM_TRACE(...) do { if (gxm_tracing()) { --trace_budget; std::printf("[gxm-trace] " __VA_ARGS__); } } while (0)
 bool texture_verify() {
     static const bool enabled = std::getenv("VITA3K_TEXTURE_VERIFY") != nullptr;
     return enabled;
@@ -801,6 +815,26 @@ static bool swizzle_map(SceGxmTextureBaseFormat base, uint32_t swizzle, ChannelM
         map = two[mode];
         return true;
     }
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC4:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_SBC4:
+        // One decompressed component, swizzled like U8.
+        return swizzle_map(SCE_GXM_TEXTURE_BASE_FORMAT_U8, swizzle, map);
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC5:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_SBC5:
+        return swizzle_map(SCE_GXM_TEXTURE_BASE_FORMAT_U8U8, swizzle, map);
+    // Formats decoded to four unorm8 components in memory order (palette
+    // entries, PVRTC and BC1-3 blocks, U8U3U3U2 expanded) take the
+    // four-component orders.
+    case SCE_GXM_TEXTURE_BASE_FORMAT_P4:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_P8:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC1:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC2:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC3:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_PVRT2BPP:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_PVRT4BPP:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_PVRTII2BPP:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_PVRTII4BPP:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U8U3U3U2:
     case SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8:
     case SCE_GXM_TEXTURE_BASE_FORMAT_U4U4U4U4:
     case SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5: {
@@ -852,6 +886,33 @@ static void decode_texel(SceGxmTextureBaseFormat base, const uint8_t *src, uint8
     }
 }
 
+// Block decompression without renderer::texture::decompress_compressed_texture
+// and resolve_z_order_compressed_texture: their unknown-format log builds a
+// std::string, and once Binaryen inlines them into the command loop that call
+// goes through an exception wrapper (hot_path_invokes.mjs). The callers only
+// pass BCn or PVRT formats.
+static uint8_t bc_format_id(SceGxmTextureBaseFormat base) {
+    switch (base) {
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC1: return 1;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC2: return 2;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC3: return 3;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC4: return 4;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_SBC4: return 5;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC5: return 6;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_SBC5: return 7;
+    default: return 0;
+    }
+}
+static void decompress_blocks(SceGxmTextureBaseFormat base, uint8_t *dest, const uint8_t *src, uint32_t width, uint32_t height) {
+    if (const uint8_t id = bc_format_id(base)) {
+        renderer::texture::decompress_bc_image(width, height, src, reinterpret_cast<uint32_t *>(dest), id);
+        return;
+    }
+    const bool two_bpp = base == SCE_GXM_TEXTURE_BASE_FORMAT_PVRT2BPP || base == SCE_GXM_TEXTURE_BASE_FORMAT_PVRTII2BPP;
+    const bool pvrtii = base == SCE_GXM_TEXTURE_BASE_FORMAT_PVRTII2BPP || base == SCE_GXM_TEXTURE_BASE_FORMAT_PVRTII4BPP;
+    pvr::PVRTDecompressPVRTC(src, two_bpp, width, height, pvrtii, dest);
+}
+
 // RGBA8 mip chain of a 2D texture, laid out like renderer/src/texture/cache.cpp
 // upload_texture (levels, alignment and swizzle/tiled order), or false with a
 // reason when the layout/format is not supported yet.
@@ -882,10 +943,16 @@ static bool decode_texture(MemState &mem, const SceGxmTexture &t, scene::Writer 
         return false;
     }
     const bool swizzled = type == SCE_GXM_TEXTURE_SWIZZLED || type == SCE_GXM_TEXTURE_SWIZZLED_ARBITRARY;
+    const bool paletted = base == SCE_GXM_TEXTURE_BASE_FORMAT_P4 || base == SCE_GXM_TEXTURE_BASE_FORMAT_P8;
+    const bool pvrt = gxm::is_pvrt_format(base), bcn = gxm::is_bcn_format(base);
     const uint32_t width = gxm::get_width(t), height = gxm::get_height(t);
-    const uint32_t bpp = gxm::bits_per_pixel(base), bytes_per_pixel = bpp / 8;
-    if (!width || !height || width > 4096 || height > 4096 || !bytes_per_pixel) {
+    const uint32_t bpp = gxm::bits_per_pixel(base);
+    if (!width || !height || width > 4096 || height > 4096 || !bpp) {
         why = "texture dimensions";
+        return false;
+    }
+    if (pvrt && !swizzled) {
+        why = "linear PVRT texture";
         return false;
     }
     const uint32_t max_levels = std::bit_width(std::min(width, height));
@@ -895,23 +962,38 @@ static bool decode_texture(MemState &mem, const SceGxmTexture &t, scene::Writer 
         layout_width = std::bit_ceil(width);
         layout_height = std::bit_ceil(height);
     }
-    uint32_t align_width = 1, align_height = 1;
+    // renderer/src/texture/cache.cpp upload_texture: rows and strides align
+    // to the compression block, and further for linear and tiled layouts;
+    // a level's source size counts whole blocks.
+    const auto [block_width, block_height] = gxm::get_block_size(base);
+    const uint32_t block_bytes = block_width * block_height * bpp / 8;
+    const uint32_t block_shift = std::bit_width(block_width * block_height) - 1;
+    uint32_t align_width = block_width, align_height = block_height;
     if (type == SCE_GXM_TEXTURE_LINEAR)
-        align_width = 8;
+        align_width = std::max(align_width, 8u);
     else if (type == SCE_GXM_TEXTURE_TILED)
-        align_width = align_height = 32;
+        align_width = align_height = std::max(align_width, 32u);
+    const auto level_shape = [&](uint32_t w, uint32_t h, uint32_t &stride, uint32_t &rows) {
+        stride = w, rows = h;
+        if (type == SCE_GXM_TEXTURE_SWIZZLED_ARBITRARY) { stride = std::bit_ceil(w); rows = std::bit_ceil(h); }
+        if (type == SCE_GXM_TEXTURE_LINEAR_STRIDED) {
+            stride = gxm::get_stride_in_bytes(t) * 8 / bpp;
+        }
+        stride = align(stride, align_width);
+        rows = align(rows, align_height);
+    };
+    const auto level_size = [&](uint32_t lw, uint32_t lh) {
+        return uint64_t((uint64_t(align(lw, align_width)) * align(lh, align_height)) >> block_shift) * block_bytes;
+    };
     // Source footprint of the whole chain (hashing and bounds).
     uint64_t footprint = 0;
     {
         uint32_t lw = layout_width, lh = layout_height, w = width, h = height;
         for (uint32_t level = 0; level < levels; ++level) {
-            uint32_t stride = w, rows = h;
-            if (type == SCE_GXM_TEXTURE_SWIZZLED_ARBITRARY) { stride = std::bit_ceil(w); rows = std::bit_ceil(h); }
-            if (type == SCE_GXM_TEXTURE_LINEAR_STRIDED) stride = gxm::get_stride_in_bytes(t) / bytes_per_pixel;
-            stride = align(stride, align_width); rows = align(rows, align_height);
-            const uint64_t level_end = footprint + uint64_t(stride) * rows * bytes_per_pixel;
-            const uint64_t mip_size = uint64_t(align(lw, align_width)) * align(lh, align_height) * bytes_per_pixel;
-            footprint = std::max(level_end, footprint + mip_size);
+            uint32_t stride, rows;
+            level_shape(w, h, stride, rows);
+            const uint64_t level_end = footprint + uint64_t(stride) * rows * bpp / 8;
+            footprint = std::max(level_end, footprint + level_size(lw, lh));
             lw = std::max(lw / 2, 1u); lh = std::max(lh / 2, 1u); w = std::max(w / 2, 1u); h = std::max(h / 2, 1u);
         }
     }
@@ -920,48 +1002,94 @@ static bool decode_texture(MemState &mem, const SceGxmTexture &t, scene::Writer 
         why = "texture memory range";
         return false;
     }
+    const uint32_t palette_entries = base == SCE_GXM_TEXTURE_BASE_FORMAT_P4 ? 16 : 256;
+    const Address palette_address = t.palette_addr << 6;
+    if (paletted && (!palette_address
+            || !is_valid_addr_range(mem, palette_address, uint64_t(palette_address) + palette_entries * 4))) {
+        why = "texture palette range";
+        return false;
+    }
     const uint8_t *source = Ptr<const uint8_t>(address).get(mem);
     decoded.source = address;
     decoded.footprint = static_cast<uint32_t>(footprint);
     source_hash = XXH3_64bits(source, footprint);
+    // A palette edit changes the texels without touching the indices.
+    if (paletted)
+        source_hash ^= XXH3_64bits(Ptr<const uint8_t>(palette_address).get(mem), palette_entries * 4) * 0x9E3779B97F4A7C15ull;
     if (known_hash && source_hash == known_hash)
         return true;
     decoded.width = width;
     decoded.height = height;
     decoded.levels = levels;
     // Kept across calls: the draw path holds no locals with destructors (skip_draw).
-    static std::vector<uint8_t> linear;
+    static std::vector<uint8_t> linear, expanded;
     uint64_t level_source = 0;
     uint32_t lw = layout_width, lh = layout_height, w = width, h = height;
     for (uint32_t level = 0; level < levels; ++level) {
-        uint32_t stride = w, rows = h;
-        if (type == SCE_GXM_TEXTURE_SWIZZLED_ARBITRARY) { stride = std::bit_ceil(w); rows = std::bit_ceil(h); }
-        if (type == SCE_GXM_TEXTURE_LINEAR_STRIDED) stride = gxm::get_stride_in_bytes(t) / bytes_per_pixel;
-        stride = align(stride, align_width);
-        rows = align(rows, align_height);
+        uint32_t stride, rows;
+        level_shape(w, h, stride, rows);
         const uint8_t *pixels = source + level_source;
-        if (swizzled || type == SCE_GXM_TEXTURE_TILED) {
-            linear.resize(size_t(stride) * rows * bytes_per_pixel);
-            if (swizzled)
-                renderer::texture::swizzled_texture_to_linear_texture(linear.data(), pixels, uint16_t(stride), uint16_t(rows), uint8_t(bpp));
+        // Bytes per texel of `pixels` once expanded; 0 = decode_texel(base).
+        uint32_t texel_bytes = 0;
+        uint32_t texel_bpp = bpp;
+        if (paletted) {
+            // P4 expands two texels per byte: an odd stride writes one past the row.
+            expanded.resize((size_t(stride) * rows + 1) * 4);
+            const auto *palette = Ptr<const uint32_t>(palette_address).get(mem);
+            if (base == SCE_GXM_TEXTURE_BASE_FORMAT_P8)
+                renderer::texture::palette_texture_to_rgba_8(reinterpret_cast<uint32_t *>(expanded.data()), pixels, stride, rows, palette);
             else
-                renderer::texture::tiled_texture_to_linear_texture(linear.data(), pixels, uint16_t(stride), uint16_t(rows), uint8_t(bpp));
+                renderer::texture::palette_texture_to_rgba_4(reinterpret_cast<uint32_t *>(expanded.data()), pixels, stride, rows, palette);
+            pixels = expanded.data();
+            texel_bytes = 4, texel_bpp = 32;
+        } else if (base == SCE_GXM_TEXTURE_BASE_FORMAT_U8U3U3U2) {
+            expanded.resize(size_t(stride) * rows * 4);
+            renderer::texture::convert_U8U3U3U2_to_U8U8U8U8(expanded.data(), pixels, stride, rows);
+            pixels = expanded.data();
+            texel_bytes = 4, texel_bpp = 32;
+        } else if (pvrt) {
+            // Decompression also unswizzles.
+            expanded.resize(size_t(stride) * rows * 4);
+            decompress_blocks(base, expanded.data(), pixels, stride, rows);
+            pixels = expanded.data();
+            texel_bytes = 4;
+        }
+        if (!pvrt && (swizzled || type == SCE_GXM_TEXTURE_TILED)) {
+            linear.resize(size_t(stride) * rows * texel_bpp / 8);
+            if (swizzled && bcn)
+                renderer::texture::resolve_z_order_compressed_image(stride, rows, pixels, linear.data(),
+                    gxm::get_block_size(base).first * gxm::get_block_size(base).second * bpp / 8);
+            else if (swizzled)
+                renderer::texture::swizzled_texture_to_linear_texture(linear.data(), pixels, uint16_t(stride), uint16_t(rows), uint8_t(texel_bpp));
+            else
+                renderer::texture::tiled_texture_to_linear_texture(linear.data(), pixels, uint16_t(stride), uint16_t(rows), uint8_t(texel_bpp));
             pixels = linear.data();
         }
+        if (bcn) {
+            texel_bytes = gxm::get_num_components(base);
+            expanded.resize(size_t(stride) * rows * 4);
+            decompress_blocks(base, expanded.data(), pixels, stride, rows);
+            pixels = expanded.data();
+        }
+        const uint32_t bytes_per_pixel = texel_bytes ? texel_bytes : bpp / 8;
         uint32_t offset = 0;
         uint8_t *dest = out.reserve(size_t(w) * h * 4, 4, offset);
         for (uint32_t y = 0; y < h; ++y) {
             const uint8_t *row = pixels + size_t(y) * stride * bytes_per_pixel;
             for (uint32_t x = 0; x < w; ++x) {
                 uint8_t c[4] = {0, 0, 0, 255};
-                decode_texel(base, row + size_t(x) * bytes_per_pixel, c);
+                const uint8_t *src = row + size_t(x) * bytes_per_pixel;
+                if (texel_bytes)
+                    std::memcpy(c, src, texel_bytes);
+                else
+                    decode_texel(base, src, c);
                 uint8_t *texel = dest + (size_t(y) * w + x) * 4;
                 for (int i = 0; i < 4; ++i)
                     texel[i] = map[i] == Z ? 0 : map[i] == O ? 255 : c[map[i]];
             }
         }
         decoded.level_bytes[level] = {offset, w * h * 4};
-        level_source += uint64_t(align(lw, align_width)) * align(lh, align_height) * bytes_per_pixel;
+        level_source += level_size(lw, lh);
         lw = std::max(lw / 2, 1u); lh = std::max(lh / 2, 1u); w = std::max(w / 2, 1u); h = std::max(h / 2, 1u);
     }
     return true;
@@ -1034,12 +1162,18 @@ static TargetMatch match_target(const MemState &mem, const SceGxmTexture &t, Add
             return TargetMatch::Mismatch;
         break;
     }
-    if (x + width > g.width || y + height > g.height)
+    // A linear or tiled texture may extend past the surface on the same
+    // pitch (a power-of-two texture over a 960x544 target, Persona 4
+    // Golden): its texels inside the surface are the target's, the rest is
+    // padding the guest never shows. The region copy clips to the surface.
+    if (x >= g.width || y >= g.height
+        || (g.layout == Layout::Swizzled && (x + width > g.width || y + height > g.height)))
         return TargetMatch::Mismatch;
-    // Bytes the texture covers: to its last row, tile row or Morton block.
+    const uint32_t covered_width = std::min(width, g.width - x), covered_height = std::min(height, g.height - y);
+    // Bytes the texture covers inside the surface: to its last row, tile row or Morton block.
     const uint64_t span = g.layout == Layout::Linear
-        ? (uint64_t(height) - 1) * g.stride_px * g.pixel_bytes + uint64_t(width) * g.pixel_bytes
-        : g.layout == Layout::Tiled ? uint64_t((height + 31) / 32) * g.stride_px * 32 * g.pixel_bytes
+        ? (uint64_t(covered_height) - 1) * g.stride_px * g.pixel_bytes + uint64_t(covered_width) * g.pixel_bytes
+        : g.layout == Layout::Tiled ? uint64_t((covered_height + 31) / 32) * g.stride_px * 32 * g.pixel_bytes
                                     : uint64_t(width) * height * g.pixel_bytes;
     if (mem_written_epoch(mem, address, span) >= target.rendered_epoch)
         return TargetMatch::Written;
@@ -1097,7 +1231,7 @@ static void bind_target_texels(const SceGxmTexture &t, const TargetTexels &at, s
     if (at.whole) {
         bound.id = 0x80000000u | (at.base >> 2);
         if (out.pass_open && at.base == out.pass_address) {
-            out.words[out.pass_snapshot_word] = 1;
+            out.words[out.pass_snapshot_word] |= 1;
             bound.id |= 0x40000000u;
         }
         return;
@@ -1130,7 +1264,11 @@ static bool bind_texture(MemState &mem, const SceGxmTexture &t, scene::Writer &o
     bound.lod_max = std::max<uint32_t>(t.true_mip_count(), 1) - 1;
     TargetTexels at;
     bool overlaps = false;
-    if (texels_in_target(mem, t, at, overlaps)) {
+    const bool in_target = texels_in_target(mem, t, at, overlaps);
+    GXM_TRACE("texture %08x format=%08x type=%08x %ux%u target=%s base=%08x at=%u,%u whole=%d\n", address,
+        uint32_t(gxm::get_format(t)), uint32_t(t.texture_type()), gxm::get_width(t), gxm::get_height(t),
+        in_target ? "texels" : overlaps ? "overlap" : "none", at.base, at.x, at.y, int(at.whole));
+    if (in_target) {
         bind_target_texels(t, at, out, bound);
         return true;
     }
@@ -1360,6 +1498,8 @@ static void end_pass(scene::Writer &out) {
 static void begin_pass(WebContext &ctx, scene::Writer &out) {
     end_pass(out);
     const auto &color = ctx.record.color_surface;
+    GXM_TRACE("pass target=%08x format=%08x %ux%u stride=%u type=%d downscale=%d\n", color.data.address(),
+        uint32_t(color.colorFormat), color.width, color.height, color.strideInPixels, int(color.surfaceType), int(color.downscale));
     out.pass_begin_word = out.words.size();
     out.pass_regions.clear();
     out.word(scene::BeginPass);
@@ -1379,8 +1519,10 @@ static void begin_pass(WebContext &ctx, scene::Writer &out) {
     // A guest depth/stencil surface keeps its GPU copy by its own addresses.
     out.word(ctx.has_depth_surface ? depth.depth_data.address() : 0);
     out.word(ctx.has_depth_surface ? depth.stencil_data.address() : 0);
-    // Snapshot flag, set by bind_texture when a draw samples this pass's own
-    // target: the tile-based GPU reads what memory held before the scene.
+    // Snapshot flags: bit 0 set by bind_texture when a draw samples this
+    // pass's own target (the tile-based GPU reads what memory held before the
+    // scene); bit 1 set by a draw whose fragment program reads the current
+    // color, which splits the pass, so depth and stencil must be kept.
     out.pass_snapshot_word = out.words.size();
     out.word(0);
     // GPU texels per surface texel, and per render pixel (viewport, scissor).
@@ -1427,10 +1569,13 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
     const auto *fp = ctx.record.fragment_program.get(mem);
     if (!vp->renderer_data || !fp->renderer_data)
         return skip_draw("program without renderer data");
+    if (fp->program.get(mem)->is_frag_color_used())
+        out.words[out.pass_snapshot_word] |= 2;
     const int vs = program_id(mem, *vp->renderer_data, vp->program, false);
     const int fs = program_id(mem, *fp->renderer_data, fp->program, true);
     if (vs < 0 || fs < 0)
         return skip_draw("untranslated program");
+    GXM_TRACE("draw prim=%d count=%u vs=%d fs=%d\n", int(primitive), count, vs, fs);
     for (int i = 0; i < 2; ++i) {
         const auto &program = i == 0 ? static_cast<const renderer::ShaderProgram &>(*vp->renderer_data) : *fp->renderer_data;
         if (ctx.uniforms[i].size() != program.max_total_uniform_buffer_storage * 4)
@@ -1479,8 +1624,7 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
         const auto info = vp->renderer_data->attribute_infos.find(a.regIndex);
         if (info == vp->renderer_data->attribute_infos.end())
             continue; // stripped symbol: the shader does not read it
-        const bool small = a.format <= SCE_GXM_ATTRIBUTE_FORMAT_F16 && a.componentCount != 2 && a.componentCount != 4;
-        if (small || a.format > SCE_GXM_ATTRIBUTE_FORMAT_F32 || a.streamIndex >= stream_count)
+        if (a.format > SCE_GXM_ATTRIBUTE_FORMAT_F32 || a.streamIndex >= stream_count || !a.componentCount || a.componentCount > 4)
             return skip_attribute(a.format, a.componentCount);
         if (attribute_count == attributes.size())
             unsupported("more vertex attributes than GXM allows");
@@ -1490,6 +1634,86 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
     // Indices; fans become lists with the same provoking vertex.
     const size_t index_size = format == SCE_GXM_INDEX_FORMAT_U16 ? 2 : 4;
     require_guest(mem, indices.address(), size_t(count) * index_size);
+
+    // Attributes WebGPU cannot fetch as the shader reads them become float32
+    // copies in extra streams: GXM converts non-normalized integers to float
+    // (desktop uses USCALED/SSCALED formats, which WebGPU lacks), and WebGPU
+    // has no one- or three-component 8/16-bit formats. A mismatched format
+    // invalidates the pipeline and with it the whole scene's command buffer.
+    struct Converted { uint32_t offset, size; };
+    std::array<Converted, SCE_GXM_MAX_VERTEX_STREAMS> converted;
+    uint32_t converted_count = 0, vertex_count = 0;
+    for (uint32_t k = 0; k < attribute_count; ++k) {
+        auto &attr = attributes[k];
+        const bool scaled = attr.format <= SCE_GXM_ATTRIBUTE_FORMAT_S16;
+        const bool odd = attr.format <= SCE_GXM_ATTRIBUTE_FORMAT_F16 && attr.components != 2 && attr.components != 4;
+        if (!scaled && !odd)
+            continue;
+        if (stream_count + converted_count == SCE_GXM_MAX_VERTEX_STREAMS)
+            return skip_draw("too many converted vertex attributes");
+        if (!vertex_count) {
+            const uint8_t *index_bytes = indices.get(mem);
+            uint32_t highest = 0;
+            for (uint32_t n = 0; n < count; ++n) {
+                uint32_t index;
+                if (index_size == 2) { uint16_t v; std::memcpy(&v, index_bytes + n * 2, 2); index = v; }
+                else std::memcpy(&index, index_bytes + n * 4, 4);
+                highest = std::max(highest, index);
+            }
+            vertex_count = highest + 1;
+        }
+        const uint32_t components = attr.components;
+        const uint32_t stride = vp->streams[attr.stream].stride;
+        const uint32_t element = attr.format <= SCE_GXM_ATTRIBUTE_FORMAT_S8 || attr.format == SCE_GXM_ATTRIBUTE_FORMAT_U8N
+                || attr.format == SCE_GXM_ATTRIBUTE_FORMAT_S8N ? 1 : 2;
+        const uint8_t *source = Ptr<const uint8_t>(stream_base[attr.stream]).get(mem);
+        const uint32_t source_size = stream_size[attr.stream];
+        Converted &copy = converted[converted_count];
+        copy.size = vertex_count * components * 4;
+        float *dest = reinterpret_cast<float *>(out.reserve(copy.size, 4, copy.offset));
+        for (uint32_t v = 0; v < vertex_count; ++v) {
+            const uint64_t at = uint64_t(v) * stride + attr.offset;
+            for (uint32_t c = 0; c < components; ++c) {
+                float value = 0;
+                const uint64_t byte = at + uint64_t(c) * element;
+                if (byte + element <= source_size) {
+                    const uint8_t *e = source + byte;
+                    uint16_t h = 0;
+                    if (element == 2) std::memcpy(&h, e, 2);
+                    switch (attr.format) {
+                    case SCE_GXM_ATTRIBUTE_FORMAT_U8: value = float(e[0]); break;
+                    case SCE_GXM_ATTRIBUTE_FORMAT_S8: value = float(int8_t(e[0])); break;
+                    case SCE_GXM_ATTRIBUTE_FORMAT_U16: value = float(h); break;
+                    case SCE_GXM_ATTRIBUTE_FORMAT_S16: value = float(int16_t(h)); break;
+                    case SCE_GXM_ATTRIBUTE_FORMAT_U8N: value = e[0] / 255.0f; break;
+                    case SCE_GXM_ATTRIBUTE_FORMAT_S8N: value = std::max(int8_t(e[0]) / 127.0f, -1.0f); break;
+                    case SCE_GXM_ATTRIBUTE_FORMAT_U16N: value = h / 65535.0f; break;
+                    case SCE_GXM_ATTRIBUTE_FORMAT_S16N: value = std::max(int16_t(h) / 32767.0f, -1.0f); break;
+                    case SCE_GXM_ATTRIBUTE_FORMAT_F16: {
+                        // IEEE half to float (no Wasm half type here).
+                        const uint32_t sign = uint32_t(h & 0x8000) << 16, exponent = (h >> 10) & 31, mantissa = h & 1023;
+                        uint32_t bits;
+                        if (exponent == 31) bits = sign | 0x7f800000 | (mantissa << 13);
+                        else if (exponent) bits = sign | ((exponent + 112) << 23) | (mantissa << 13);
+                        else if (mantissa) {
+                            uint32_t m = mantissa, shift = 0;
+                            while (!(m & 1024)) { m <<= 1; ++shift; }
+                            bits = sign | ((113 - shift) << 23) | ((m & 1023) << 13);
+                        } else bits = sign;
+                        std::memcpy(&value, &bits, 4);
+                        break;
+                    }
+                    default: break;
+                    }
+                }
+                dest[v * components + c] = value;
+            }
+        }
+        attr.stream = uint32_t(stream_count + converted_count);
+        attr.offset = 0;
+        attr.format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+        ++converted_count;
+    }
     uint32_t index_offset = 0, index_count = count;
     if (primitive == SCE_GXM_PRIMITIVE_TRIANGLE_FAN) {
         if (count < 3)
@@ -1520,6 +1744,23 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
         ctx.record.front_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED ? 1.0f : 0.0f,
         ctx.record.writing_mask, 0.0f, float(ctx.internal_scale * ctx.samples), 0, 0, 0}; // [4] res_multiplier
     const uint32_t vs_info_offset = out.bytes(vs_info, sizeof(vs_info), scene::kUniformAlign);
+    if (gxm_tracing()) {
+        GXM_TRACE("  vs_info flip=%.2f,%.2f flag=%.0f screen=%.0fx%.0f z=%.3f+%.3f uniforms=%zu/%zu\n", vs_info[0], vs_info[1], vs_info[4],
+            vs_info[5], vs_info[6], vs_info[7], vs_info[8], ctx.uniforms[0].size(), ctx.uniforms[1].size());
+        for (uint32_t k = 0; k < attribute_count; ++k) {
+            const auto &attr = attributes[k];
+            if (attr.stream >= stream_count) {
+                GXM_TRACE("  attr loc=%u converted to float32 x%u\n", attr.location, attr.components);
+                continue;
+            }
+            const uint8_t *vertex = Ptr<const uint8_t>(stream_base[attr.stream] + attr.offset).get(mem);
+            float v[4] = {};
+            if (attr.format == SCE_GXM_ATTRIBUTE_FORMAT_F32)
+                std::memcpy(v, vertex, std::min<uint32_t>(attr.components, 4) * 4);
+            GXM_TRACE("  attr loc=%u fmt=%u x%u stride=%u v0=%g,%g,%g,%g\n", attr.location, attr.format, attr.components,
+                vp->streams[attr.stream].stride, v[0], v[1], v[2], v[3]);
+        }
+    }
     const uint32_t fs_info_offset = out.bytes(fs_info, sizeof(fs_info), scene::kUniformAlign);
     const uint32_t vs_uniforms = out.bytes(ctx.uniforms[0].data(), ctx.uniforms[0].size(), scene::kUniformAlign);
     const uint32_t fs_uniforms = out.bytes(ctx.uniforms[1].data(), ctx.uniforms[1].size(), scene::kUniformAlign);
@@ -1550,6 +1791,9 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
     }
     sx = std::clamp(sx, 0, render_width); sy = std::clamp(sy, 0, render_height);
     sw = std::clamp(sw, 0, render_width - sx); sh = std::clamp(sh, 0, render_height - sy);
+    GXM_TRACE("  clip mode=%d raw=%u,%u,%u,%u scissor=%d,%d %dx%d viewport=%.1f,%.1f %.1fx%.1f flat=%d render=%dx%d\n",
+        int(ctx.record.region_clip_mode), ctx.region_clip[0], ctx.region_clip[1], ctx.region_clip[2], ctx.region_clip[3],
+        sx, sy, sw, sh, vx, vy, vw, vh, int(ctx.record.viewport_flat), render_width, render_height);
 
     const auto *webgpu_fp = static_cast<const browser::WebGPUFragmentProgram *>(fp->renderer_data.get());
     const auto &blend = webgpu_fp->blend;
@@ -1580,11 +1824,16 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
     out.word(front_values.compare_mask);
     out.word(front_values.write_mask);
     out.word(front_values.ref);
-    out.word(uint32_t(stream_count));
+    out.word(uint32_t(stream_count + converted_count));
     for (size_t i = 0; i < stream_count; ++i) {
         out.word(vp->streams[i].stride);
         out.stream(stream_base[i], stream_size[i]);
         out.word(stream_size[i]);
+    }
+    for (uint32_t i = 0; i < converted_count; ++i) {
+        out.word(converted[i].size / std::max(vertex_count, 1u));
+        out.word(converted[i].offset);
+        out.word(converted[i].size);
     }
     out.word(attribute_count);
     for (uint32_t i = 0; i < attribute_count; ++i) {
@@ -2268,6 +2517,8 @@ bool gxm_present_gpu_target(Address base) {
     }
     if (result < 0)
         unsupported("GXM presentation failed (see browser log)");
+    GXM_TRACE("present %08x %s\n", base, result == 1 ? "gpu" : "guest memory");
+    ++trace_presents;
     return result == 1;
 }
 } // namespace browser

@@ -29,6 +29,7 @@ EXPORT int gxp_compile(const uint8_t *bytes, uint32_t size, const uint32_t *form
         if (program.magic != 0x00505847 || program.size != size)
             throw std::runtime_error("GXP header magic/size mismatch");
         FeatureState features{};
+        features.sampled_fragcolor = true;
         shader::Hints hints{};
         hints.color_format = SCE_GXM_COLOR_FORMAT_A8B8G8R8;
         for (size_t i = 0; i < SCE_GXM_MAX_TEXTURE_UNITS; ++i) {

@@ -750,6 +750,21 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
             b.setPrecision(source, precision);
 
             translation_state.last_frag_data_id = last_frag_data;
+        } else if (features.sampled_fragcolor) {
+            // WebGPU cannot read the color attachment it renders to, nor read
+            // and write an rgba8 storage image: the consumer copies the target
+            // into a snapshot before each draw that reads it, sampled here at
+            // this fragment (gl_FragCoord is in target texels).
+            const spv::Id image_type = b.makeImageType(f32, spv::Dim2D, false, false, false, 1, spv::ImageFormatUnknown);
+            const spv::Id snapshot = b.createVariable(spv::NoPrecision, spv::StorageClassUniformConstant, image_type, "fragColorSnapshot");
+            b.addDecoration(snapshot, spv::DecorationBinding, 0);
+            b.addDecoration(snapshot, spv::DecorationDescriptorSet, 1);
+            const spv::Id i32 = b.makeIntegerType(32, true);
+            spv::Id coord = b.createUnaryOp(spv::OpConvertFToS, b.makeVectorType(i32, 4), b.createLoad(current_coord, spv::NoPrecision));
+            coord = b.createOp(spv::OpVectorShuffle, b.makeVectorType(i32, 2), { { true, coord }, { true, coord }, { false, 0 }, { false, 1 } });
+            source = b.createOp(spv::OpImageFetch, v4, { { true, b.createLoad(snapshot, spv::NoPrecision) }, { true, coord },
+                                                          { false, spv::ImageOperandsLodMask }, { true, b.makeIntConstant(0) } });
+            b.setPrecision(source, precision);
         } else if (features.support_shader_interlock || features.support_texture_barrier) {
             // Create a global sampler, which is our color attachment
             spv::Id color_attachment = create_builtin_sampler(b, features, translation_state, "f_colorAttachment");
@@ -1648,6 +1663,15 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
         if (vertex_outputs & vo) {
             const auto vo_typed = static_cast<SceGxmVertexProgramOutputs>(vo);
             const VertexProgramOutputProperties &properties = vertex_properties_map.at(vo_typed);
+
+#ifdef VITA3K_SHADER_SPIRV_ONLY
+            // The browser's SPIR-V goes to WGSL, which has no point size
+            // (WebGPU always rasterizes points at one pixel): drop the output.
+            if (vo == SCE_GXM_VERTEX_PROGRAM_OUTPUT_PSIZE) {
+                o_op.num += properties.component_count;
+                continue;
+            }
+#endif
 
             // TODO: use real component_count, for now only force PSIZE to have a component count of 1 and other to 4
             const int32_t used_component_count = (vo == SCE_GXM_VERTEX_PROGRAM_OUTPUT_PSIZE) ? 1 : 4;
