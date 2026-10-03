@@ -19,6 +19,7 @@
 
 #include <codec/state.h>
 #include <kernel/state.h>
+#include <mem/functions.h>
 #include <util/lock_and_find.h>
 
 #include <util/tracy.h>
@@ -229,6 +230,10 @@ EXPORT(int, sceAvcdecDecode, SceAvcdecCtrl *decoder, const SceAvcdecAu *au, SceA
     const auto send = decoder_info->send(au->es.pBuf.cast<uint8_t>().get(emuenv.mem), au->es.size);
     decoder_info->set_res(pPicture->frame.frameWidth, pPicture->frame.frameHeight);
     if (send && decoder_info->receive(output)) {
+        // The picture is written from the host: renderers that cache textures by
+        // tracked guest writes must see the new frame (YUV 4:2:0 of the frame size).
+        mem_mark_written(emuenv.mem, pPicture->frame.pPicture[0].address(),
+            size_t(pPicture->frame.frameWidth) * pPicture->frame.frameHeight * 3 / 2);
         decoder_info->get_res(pPicture->frame.horizontalSize, pPicture->frame.verticalSize);
         decoder_info->get_pts(pPicture->info.pts.upper, pPicture->info.pts.lower);
         picture->numOfOutput++;
