@@ -76,9 +76,7 @@ struct GuestFiberScheduler::Impl {
     Task *active = nullptr;
     TaskId next_id = 1;
     unsigned cores = 1;
-    unsigned next_core = 0; // rotation position among cores with equal work
-    // Work charged per logical core (charge()); see take_next.
-    std::uint64_t core_work[max_cores] = {};
+    unsigned next_core = 0; // rotation position
     // One logical CPU stands in for the Vita's three cores: a task that keeps
     // exhausting slices loses effective priority step by step, so a busy-wait
     // cannot starve the lower-priority thread it is waiting for.
@@ -137,26 +135,10 @@ struct GuestFiberScheduler::Impl {
             if (place(task, visited, claimed))
                 ++filled;
         }
-        // Serve the claimed core that has done the least work (rotation order
-        // breaks ties). Serving cores in turn regardless of how long each turn
-        // ran let a thread spinning through whole slices take nearly all the
-        // time from threads on other cores that block or yield often: Persona
-        // 4 Golden's main thread busy-waits for its model threads, which got
-        // about 2% of the instructions. An idle core banks no credit: it is
-        // raised to the least-loaded claimed core first.
-        std::uint64_t least = UINT64_MAX;
-        for (unsigned core = 0; core < cores; ++core)
-            if (claimed[core])
-                least = std::min(least, core_work[core]);
-        if (least == UINT64_MAX)
-            return nullptr;
-        for (unsigned core = 0; core < cores; ++core)
-            if (!claimed[core])
-                core_work[core] = std::max(core_work[core], least);
         for (unsigned i = 0; i < cores; ++i) {
             const unsigned core = (next_core + i) % cores;
             Task *task = claimed[core];
-            if (!task || core_work[core] != least)
+            if (!task)
                 continue;
             next_core = (core + 1) % cores;
             task->last_core = core;
@@ -272,11 +254,6 @@ bool GuestFiberScheduler::should_yield() const noexcept {
     return self.active && self.ready && self.ready->effective() < self.active->effective();
 }
 bool GuestFiberScheduler::park() noexcept { return impl_->suspend(State::parked); }
-void GuestFiberScheduler::charge(std::uint64_t units) noexcept {
-    auto &self = *impl_;
-    if (self.active)
-        self.core_work[self.active->last_core] += units;
-}
 
 bool GuestFiberScheduler::set_priority(TaskId id, int priority) noexcept {
     auto &self = *impl_;

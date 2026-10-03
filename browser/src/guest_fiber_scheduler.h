@@ -56,11 +56,6 @@ public:
     // Active task only: a ready task has a strictly better effective priority,
     // so it should run now. Equal ones wait for the slice to run out.
     bool should_yield() const noexcept;
-    // Active task only: charge `units` of work (guest instructions) to the
-    // logical core it runs on. The next dispatch serves the claimed core that
-    // has done the least work, so a busy-waiting thread with long slices
-    // cannot crowd out threads on other cores whose turns are short.
-    void charge(std::uint64_t units) noexcept;
     // Only parked->runnable; append behind existing equals, never execute eagerly.
     bool wake(TaskId id) noexcept;
     // Guest priority change (sceKernelChangeThreadPriority): takes effect for
