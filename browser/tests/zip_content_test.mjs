@@ -237,6 +237,11 @@ assert.equal(await cache.cacheReadFile(key, 'ux0/app/TEST00001/nope.bin'), null)
 assert.equal(cache.cacheIndexFor(manifest.files, manifest.files).size, contents.files.length);
 assert.equal(cache.cacheIndexFor(manifest.files, [{ path: 'ux0/app/TEST00001/eboot.bin', size: 999 }]).size, 0);
 assert.equal(cache.cacheIndexFor(null, manifest.files).size, 0);
+// Server files carry a version: a stored copy needs the same one (restaged files refetch).
+assert.equal(cache.cacheIndexFor([{ path: 'a', size: 4, version: 7 }], [{ path: 'a', size: 4, version: 7 }]).size, 1);
+assert.equal(cache.cacheIndexFor([{ path: 'a', size: 4, version: 7 }], [{ path: 'a', size: 4, version: 8 }]).size, 0);
+assert.equal(cache.cacheIndexFor([{ path: 'a', size: 4 }], [{ path: 'a', size: 4, version: 8 }]).size, 0);
+assert.equal(cache.cacheIndexFor([{ path: 'a', size: 4, version: 7 }], [{ path: 'a', size: 4 }]).size, 1);
 // The bare layout unpacks under the title id from param.sfo (needs OPFS).
 assert.equal((await cache.unpackPackageToCache(new Blob([readFileSync(bareZip)]),
   cache.cacheKeyFor('BARE00001', 'BARE00001'), () => {})).files, 3);

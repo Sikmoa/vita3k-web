@@ -111,15 +111,23 @@ export async function listCachedTitles() {
   return out.sort((a, b) => a.title.localeCompare(b.title));
 }
 
-// Which needed paths does a stored manifest cover (path+size)? Returns a
-// Map<path, size>; anything absent is fetched (and then stored).
+// Which needed paths does a stored manifest cover (path, size and, for server
+// files, version)? Returns a Map<path, size>; anything absent is fetched (and
+// then stored).
 export function cacheIndexFor(manifestFiles, needed) {
   const index = new Map();
   if (!Array.isArray(manifestFiles) || !Array.isArray(needed)) return index;
-  const have = new Map(manifestFiles.map((f) => [f?.path, f?.size]));
+  const have = new Map(manifestFiles.map((f) => [f?.path, f]));
   for (const file of needed) {
-    if (typeof file?.path === 'string' && have.get(file.path) === file.size)
-      index.set(file.path, file.size);
+    const stored = typeof file?.path === 'string' ? have.get(file.path) : undefined;
+    if (!stored || stored.size !== file.size)
+      continue;
+    // A server file carries a version (its modification time): a stored copy
+    // of the same size but another (or no) version is stale, e.g. a title
+    // restaged on the server. Package files have no version.
+    if (file.version !== undefined && stored.version !== file.version)
+      continue;
+    index.set(file.path, file.size);
   }
   return index;
 }

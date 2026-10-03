@@ -616,14 +616,20 @@ async function run() {
           cacheNS = cache;
           const storedManifest = cache ? await cache.cacheReadManifest(cacheKey) : null;
           const serverPaths = new Set(serverFiles.map((file) => file.path));
-          const storedOnly = (storedManifest?.files ?? []).filter((file) => !serverPaths.has(file.path));
+          // When the server stages this title's app directory, that directory
+          // is the server's: a stored copy (an older staging) adds nothing to it.
+          const appPrefix = `ux0/app/${APP}/`;
+          const serverHasApp = serverFiles.some((file) => file.path.startsWith(appPrefix));
+          const storedOnly = (storedManifest?.files ?? []).filter((file) => !serverPaths.has(file.path)
+            && !(serverHasApp && file.path.startsWith(appPrefix)));
           const staged = [...serverFiles, ...storedOnly];
           // An empty manifest is allowed (a fixture, or a title with nothing
           // staged yet): say what to do, then let the launch report the rest.
           if (!staged.length)
             notice(`No content for ${TITLE}: upload its .zip package (or stage it on the server) first.`);
           stageTotals = { files: staged.length, bytes: staged.reduce((sum, file) => sum + (file.size || 0), 0) };
-          stageNeeded = staged.map((file) => ({ path: file.path, size: file.size }));
+          stageNeeded = staged.map((file) => ({ path: file.path, size: file.size,
+            ...(Number.isSafeInteger(file.version) ? { version: file.version } : {}) }));
           stageCacheActive = storageSupported() && !!cache;
           stageCacheIndex = stageCacheActive ? cache.cacheIndexFor(storedManifest?.files, stageNeeded) : null;
           const useContentCache = (stageCacheIndex?.size ?? 0) > 0;

@@ -63,14 +63,19 @@ export async function stageFiles(stage) {
       const full = resolve(directory, entry.name);
       const path = prefix + entry.name;
       if (entry.isDirectory()) await walk(full, path + '/');
-      else if (entry.isFile() && !files.has(path)) files.set(path, { path, size: statSync(full).size, source: full });
+      else if (entry.isFile() && !files.has(path)) {
+        const stat = statSync(full);
+        files.set(path, { path, size: stat.size, version: Math.floor(stat.mtimeMs), source: full });
+      }
     }
   };
   await walk(stage, '');
   if (existsSync(patchRoot)) await walk(patchRoot, 'patch/');
   return [...files.values()];
 }
-export const stageManifest = (files) => files.map(({ path, size }) => ({ path, size }));
+// `version` (modification time) lets a browser content cache tell a restaged
+// file from its stored copy of the same size.
+export const stageManifest = (files) => files.map(({ path, size, version }) => ({ path, size, version }));
 export async function readStageFile(files, path) {
   const entry = files.find((file) => file.path === path);
   if (!entry) throw Object.assign(new Error(`not staged: ${path}`), { code: 'ENOENT' });
