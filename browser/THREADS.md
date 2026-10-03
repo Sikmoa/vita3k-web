@@ -168,7 +168,7 @@ probe confirms shared Memory64; otherwise it loads the single-Worker build.
 Each phase ends with Limbo and Persona 4 Golden still running, compared against
 the single-Worker build.
 
-0. **Feasibility probe** (done in Chromium; see Phase 0 results): a tiny `-pthread -sMEMORY64` program with an 8 GiB
+0. **Feasibility probe** (done: Chromium, Firefox, Android Chrome; see Phase 0 results): a tiny `-pthread -sMEMORY64` program with an 8 GiB
    shared memory, nested Workers from a Worker and `Atomics.wait`, in Chrome and
    Firefox; COOP/COEP in `limbo_serve.mjs`; measure Worker start and pool warm-up.
 1. **Threaded target**: `vita3k_web_jit_mt` built beside the current target; the
@@ -190,16 +190,16 @@ the single-Worker build.
 response): the emulator's memory settings plus `-pthread`, a 24-Worker pool,
 run from a dedicated Worker like the coordinator.
 
-| | Chromium 153, Linux (Ryzen 5 5500U) | Firefox | Chrome, Android |
+| | Chromium 153, Linux (Ryzen 5 5500U) | Firefox 156, Linux (same) | Chrome 154, Android 10 (8 cores) |
 |---|---|---|---|
-| cross-origin isolated, 8 GiB shared Memory64 | yes | | |
-| store at 0x1ffffffff seen by another thread | yes | | |
-| module + 24 Workers ready | 179 ms | | |
-| thread start from the pool (median / max) | 0.06 / 0.36 ms | | |
-| futex wake/wait round trip | 9 µs | | |
-| CAS, 4 threads x 500k, 32 and 64 bit | exact, 337 ms | | |
-| 40 threads at once, pool of 24 (median / max) | 1.1 / 96 ms | | |
-| background top-up of 8 Workers | 63 ms | | |
+| cross-origin isolated, 8 GiB shared Memory64 | yes | yes | yes |
+| store at 0x1ffffffff seen by another thread | yes | yes | yes |
+| module + 24 Workers ready | 179 ms | 105 ms | 261 ms |
+| thread start from the pool (median / max) | 0.06 / 0.36 ms | 0.02 / 0.40 ms | 0.10 / 0.46 ms |
+| futex wake/wait round trip | 9 µs | 15 µs | 38 µs |
+| CAS, 4 threads x 500k, 32 and 64 bit | exact, 337 ms | exact, 289 ms | exact, 438 ms |
+| 40 threads at once, pool of 24 (median / max) | 1.1 / 96 ms | 0.4 / 45 ms | 1.5 / 221 ms |
+| background top-up of 8 Workers | 63 ms | 32 ms | 69 ms |
 
 The probe module is small; the emulator's Workers also instantiate the large
 runtime and AOT image, which phase 1 measures.
