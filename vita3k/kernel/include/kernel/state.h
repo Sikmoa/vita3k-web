@@ -214,6 +214,10 @@ struct KernelState {
     CorenumAllocator corenum_allocator;
     CallImportFunc call_import;
     KernelExecutionHost *execution_host = nullptr; // borrowed; opt-in only
+    // Host threads without an execution host (desktop paths): the CPU each new
+    // thread gets, on its allocated core. Unset, init_cpu picks the build's
+    // backend; the threaded browser build sets it to its Wasm JIT.
+    std::function<CPUStatePtr(SceUID, std::size_t core, MemState &)> make_cpu;
     // Program authority id (PAID) of the process: its main module's.
     uint64_t process_program_authority_id = 0;
     // ksceSblACMgrIsGameProgram (firmware 3.74 acmgr): a game has PAID class

@@ -289,7 +289,7 @@ void rewrite_retires_aot(uint32_t at, const std::array<uint8_t, 2> &code, bool b
         oracle = capture(cpu, fixture.mem, cpu.instructions_executed());
     }
     CHECK(oracle.regs[0] != run_interpreter().regs[0]); // the rewrite is observable
-    const uint64_t retired = g_aot.invalidated_functions;
+    const uint64_t retired = g_aot_invalidated;
     Fixture fixture;
     CHECK(mem_set_permissions(fixture.mem, kCode, 0x1000, MemPerm::ReadWrite));
     CHECK(mem_write(fixture.mem, at, code.data(), code.size()));
@@ -302,7 +302,7 @@ void rewrite_retires_aot(uint32_t at, const std::array<uint8_t, 2> &code, bool b
     cpu.set_region_mode(true);
     if (!before_cpu)
         cpu.invalidate_jit_cache(at, code.size());
-    CHECK(g_aot.invalidated_functions > retired);
+    CHECK(g_aot_invalidated > retired);
     reset(cpu, fixture.mem);
     run_to_svc(cpu, parent, 0);
     check_same(oracle, capture(cpu, fixture.mem, cpu.instructions_executed()));

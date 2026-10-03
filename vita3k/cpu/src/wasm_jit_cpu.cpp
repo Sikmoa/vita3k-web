@@ -32,12 +32,18 @@
 #include "mem/functions.h"
 #include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <unordered_set>
 #include <vector>
 
 namespace {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+template <typename T> using SharedCounter = std::atomic<T>;
+#else
+template <typename T> using SharedCounter = T;
+#endif
 // Address width of the linear memory an AOT image imports (32 or 64).
 constexpr uint32_t aot_memory_bits = vita3k::wasmjit::memory_address_type == vita3k::wasmjit::MemoryAddressType::I64 ? 64 : 32;
 using JitState = vita3k::wasmjit::JitState;
@@ -122,8 +128,15 @@ EM_JS(int, vita3k_jit_inline_mutex_option, (), {
     return String(v) === '0' ? 0 : 1;
 });
 bool inline_mutex_enabled() noexcept {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    // The fast paths update guest mutexes with plain loads and stores, correct
+    // only while one guest thread runs at a time (THREADS.md: off until they
+    // are rewritten on atomics).
+    return false;
+#else
     static const bool enabled = vita3k_jit_inline_mutex_option() != 0;
     return enabled;
+#endif
 }
 // Only ARM little-endian stubs can match. Include return/NID in cache
 // validation below so patching only the literal cannot retain an intrinsic.
@@ -174,7 +187,7 @@ struct Region {
 };
 
 // Wide reference counts: multiple CPUs and cached entries can share pages.
-std::array<uint32_t, 1 << 20> g_code_pages{};
+std::array<SharedCounter<uint32_t>, 1 << 20> g_code_pages{};
 // Per-page write generation, and a global generation that changes whenever any
 // page a cached region could cover is written through a TRACKED path. These
 // exist only to make the region-cache sweep affordable:
@@ -200,7 +213,7 @@ std::array<uint32_t, 1 << 20> g_code_pages{};
 // guest-memory mutation except memcpy through Ptr::get() in 13 places, all
 // targeting thread/mutex info, GXM program/uniform data or file buffers - not
 // loaded code - and module loading completes before any region exists.
-std::array<uint32_t, 1 << 20> g_code_page_versions{};
+std::array<SharedCounter<uint32_t>, 1 << 20> g_code_page_versions{};
 std::atomic<uint32_t> g_code_write_epoch{1};
 
 // AOT seeding: full location keys (Dynarmic UniqueHash) of every block the
@@ -210,6 +223,7 @@ bool aot_seed_recording() noexcept {
     return enabled;
 }
 std::unordered_set<uint64_t> g_aot_seed_keys;
+std::mutex g_aot_seed_mutex;
 
 // Record that pages [first_page, last_page] may have changed through a tracked
 // path. Only pages that actually carry compiled code bump a generation, so
@@ -232,7 +246,7 @@ void note_code_page_write(uint32_t first_page, uint32_t last_page) noexcept {
         any = true;
     }
     if (any)
-        g_code_write_epoch.fetch_add(1, std::memory_order_relaxed);
+        g_code_write_epoch.fetch_add(1, std::memory_order_release);
 }
 
 void note_code_range_write(Address address, size_t size) noexcept {
@@ -517,10 +531,10 @@ uint32_t memory_fault(JitState &state, uint32_t address, bool write) noexcept {
 // Profiling counters (worker is single-threaded; no atomics needed).
 // g_mem_* are process-lifetime totals; the fast-path per-call scratch lives
 // in JitState (REGION_ABI.md) and is accumulated here between calls.
-uint64_t g_mem_reads = 0, g_mem_writes = 0;
-uint64_t g_mem_fast_reads = 0, g_mem_fast_writes = 0;
+SharedCounter<uint64_t> g_mem_reads = 0, g_mem_writes = 0;
+SharedCounter<uint64_t> g_mem_fast_reads = 0, g_mem_fast_writes = 0;
 // Slow-fallback reasons (high byte of the helper `bytes` argument).
-uint64_t g_mem_slow_unmapped = 0, g_mem_slow_perms = 0, g_mem_slow_cross_page = 0,
+SharedCounter<uint64_t> g_mem_slow_unmapped = 0, g_mem_slow_perms = 0, g_mem_slow_cross_page = 0,
     g_mem_slow_code_page = 0, g_mem_slow_other = 0;
 
 void account_slow_reason(uint32_t bytes_arg) noexcept {
@@ -552,8 +566,26 @@ void account_fast_counters(JitState &state) noexcept {
 // compiled state, and a core can never chain into another core's code. Slices
 // are allocated on first dispatch, so a run pays only for the cores it uses.
 static uint32_t *dispatch_map_slices[MAX_CORE_COUNT] = {};
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+// A live guest thread exclusively owns its core number. Its map contains
+// slots in its own Worker's table, and eviction must only stale that map.
+static std::array<uint32_t, MAX_CORE_COUNT> dispatch_epochs = [] {
+    std::array<uint32_t, MAX_CORE_COUNT> epochs;
+    epochs.fill(1);
+    return epochs;
+}();
+static std::array<uint64_t, MAX_CORE_COUNT> dispatch_versions{};
+#else
 static uint32_t dispatch_epoch = 1;
 static uint64_t dispatch_global_version = 0;
+#endif
+static uint64_t dispatch_version(std::size_t core) {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    return dispatch_versions[core];
+#else
+    return dispatch_global_version;
+#endif
+}
 // Process-global eviction generation. Every dispatch_bump_epoch() (all region-
 // eviction paths funnel through it) advances this, so each CPU can tell whether
 // any map invalidation happened since its last pump entry without paying a
@@ -570,19 +602,31 @@ static uint32_t *dispatch_map_slice(std::size_t core) noexcept {
 static uintptr_t dispatch_map_base(std::size_t core) noexcept {
     return reinterpret_cast<uintptr_t>(dispatch_map_slice(core));
 }
-static uintptr_t dispatch_epoch_addr() {
+static uintptr_t dispatch_epoch_addr(std::size_t core = 0) {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    return reinterpret_cast<uintptr_t>(&dispatch_epochs[core]);
+#else
     return reinterpret_cast<uintptr_t>(&dispatch_epoch);
+#endif
 }
 // Every region-cache removal path must bump the epoch (stale entries can
 // never match afterwards); table slots are nulled on release as backup.
-static void dispatch_bump_epoch() noexcept {
-    ++dispatch_epoch;
+static void dispatch_bump_epoch(std::size_t core = 0) noexcept {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    auto &dispatch_epoch = dispatch_epochs[core];
+    auto &dispatch_global_version = dispatch_versions[core];
+#endif
     ++dispatch_global_version;
     ++dispatch_epoch;
     if (dispatch_epoch == 0) { // Never use the never-written marker.
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+        if (auto *slice = dispatch_map_slices[core])
+            std::memset(slice, 0, vita3k::wasmjit::kDispatchMapEntries * 4 * sizeof(uint32_t));
+#else
         for (uint32_t *slice : dispatch_map_slices)
             if (slice)
                 std::memset(slice, 0, vita3k::wasmjit::kDispatchMapEntries * 4 * sizeof(uint32_t));
+#endif
         dispatch_epoch = 1;
     }
 }
@@ -594,6 +638,9 @@ static bool dispatch_map_insert(std::size_t core, uint64_t key, uint32_t slot) n
     uint32_t *base = dispatch_map_slice(core);
     if (!base)
         return false;
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    const auto dispatch_epoch = dispatch_epochs[core];
+#endif
     const uint32_t lo = static_cast<uint32_t>(key);
     const uint32_t hi = static_cast<uint32_t>(key >> 32);
     uint32_t idx = dispatch_map_index(lo, hi);
@@ -630,10 +677,19 @@ EMSCRIPTEN_KEEPALIVE uint32_t checked_memory_read(JitState *state, uint32_t addr
     // be local until the region epilogue. Same rule applies to write below.
     ++g_mem_reads;
     account_slow_reason(bytes);
+    const bool exclusive = (bytes & vita3k::wasmjit::kExclusiveAccessFlag) != 0;
     bytes &= 0xffu; // Fast-path fallback reason rides in the high byte.
     if (!valid_memory_size(bytes) || !state->memory_cookie)
         return memory_fault(*state, address, false);
     const auto *mem = reinterpret_cast<const MemState *>(static_cast<uintptr_t>(state->memory_cookie));
+    if (exclusive) {
+        uint64_t value = 0;
+        if (!mem_read_exclusive(*mem, address, bytes, value))
+            return memory_fault(*state, address, false);
+        state->memory_value[0] = static_cast<uint32_t>(value);
+        state->memory_value[1] = static_cast<uint32_t>(value >> 32);
+        return 0;
+    }
     std::array<uint8_t, 16> value{};
     if (!mem_read(*mem, address, value.data(), bytes))
         return memory_fault(*state, address, false);
@@ -648,15 +704,29 @@ EMSCRIPTEN_KEEPALIVE uint32_t checked_memory_read(JitState *state, uint32_t addr
 EMSCRIPTEN_KEEPALIVE uint32_t checked_memory_write(JitState *state, uint32_t address, uint32_t bytes) noexcept {
     ++g_mem_writes;
     account_slow_reason(bytes);
+    const bool exclusive = (bytes & vita3k::wasmjit::kExclusiveAccessFlag) != 0;
     bytes &= 0xffu; // Fast-path fallback reason rides in the high byte.
     if (!valid_memory_size(bytes) || !state->memory_cookie)
         return memory_fault(*state, address, true);
     auto *mem = reinterpret_cast<MemState *>(static_cast<uintptr_t>(state->memory_cookie));
-    std::array<uint8_t, 16> value{};
-    for (uint32_t i = 0; i < bytes; ++i)
-        value[i] = static_cast<uint8_t>(state->memory_value[i / 4] >> ((i % 4) * 8));
-    if (!mem_write(*mem, address, value.data(), bytes))
-        return memory_fault(*state, address, true);
+    if (exclusive) {
+        // STREX with real concurrency: one atomic compare-and-swap against the
+        // value LDREX observed (emit_wasm.cpp, exclusive_write).
+        const uint64_t expected = state->exclusive_value | (uint64_t(state->exclusive_value_hi) << 32);
+        const uint64_t desired = state->memory_value[0] | (uint64_t(state->memory_value[1]) << 32);
+        bool swapped = false;
+        if (bytes > 8 || !mem_compare_exchange(*mem, address, bytes, expected, desired, swapped))
+            return memory_fault(*state, address, true);
+        state->memory_value[2] = swapped ? 0 : 1;
+        if (!swapped)
+            return 0;
+    } else {
+        std::array<uint8_t, 16> value{};
+        for (uint32_t i = 0; i < bytes; ++i)
+            value[i] = static_cast<uint8_t>(state->memory_value[i / 4] >> ((i % 4) * 8));
+        if (!mem_write(*mem, address, value.data(), bytes))
+            return memory_fault(*state, address, true);
+    }
     // Only successful writes dirty code. Widen before computing the range.
     const uint64_t end = uint64_t(address) + bytes;
     for (uint64_t page = address >> 12; page < (end + 4095) / 4096; ++page) {
@@ -706,19 +776,15 @@ uint32_t aot_hash(const uint8_t *data, size_t size) noexcept {
 // reads through its env.aot_lut global; the host uses it to choose AOT entry.
 using AotEntry = uint32_t (*)(JitState *, uint32_t);
 struct AotRuntime {
-    bool loaded = false;
-    AotEntry entry = nullptr;
-    bool disabled = false;
     std::vector<vita3k::wasmjit::AotRange> ranges;
     std::vector<uint64_t> offsets; // lookup-table word offset per range
     std::vector<uint32_t> lut;
     std::vector<std::pair<uint32_t, uint32_t>> spans; // per slot [begin, end)
-    uint64_t invalidated_functions = 0;
     uint32_t slot(uint32_t pc) const noexcept {
         for (size_t k = 0; k < ranges.size(); ++k) {
             const uint32_t offset = pc - ranges[k].base;
             if (offset < ranges[k].size)
-                return lut[offsets[k] + offset / 2];
+                return __atomic_load_n(&lut[offsets[k] + offset / 2], __ATOMIC_ACQUIRE);
         }
         return 0;
     }
@@ -727,7 +793,7 @@ struct AotRuntime {
     // g_code_pages on its behalf, so data later placed there stores freely.
     std::vector<uint8_t> retired_pages;
     bool covers_page(uint32_t page) const noexcept {
-        if (!retired_pages.empty() && retired_pages[page])
+        if (!retired_pages.empty() && __atomic_load_n(&retired_pages[page], __ATOMIC_ACQUIRE))
             return false;
         for (const auto &range : ranges)
             if (page >= (range.base >> 12) && page <= ((range.base + range.size - 1) >> 12))
@@ -737,12 +803,15 @@ struct AotRuntime {
     void retire_page(uint32_t page) noexcept {
         if (!covers_page(page))
             return;
-        if (retired_pages.empty())
-            retired_pages.resize(size_t(1) << 20);
-        retired_pages[page] = 1;
+        __atomic_store_n(&retired_pages[page], uint8_t(1), __ATOMIC_RELEASE);
         --g_code_pages[page];
     }
 } g_aot;
+std::atomic<bool> g_aot_loaded{false}, g_aot_disabled{false};
+SharedCounter<uint64_t> g_aot_invalidated{0}, g_aot_retired_pages{0};
+std::mutex g_aot_retire_mutex;
+// A function-table slot belongs to one runtime instance (one Worker).
+thread_local AotEntry g_aot_entry = nullptr;
 
 // VITA3K_AOT_DIFF=N (diagnostic): every Nth AOT call is also executed by the
 // lazy JIT from the same state and memory, and the results are compared.
@@ -756,6 +825,10 @@ AotDiffStats g_aot_diff;
 uint64_t aot_diff_every() {
     static const uint64_t every = [] {
         const char *value = std::getenv("VITA3K_AOT_DIFF");
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+        if (value) std::fputs("[wasmjit] AOT_DIFF requires the single-Worker build; disabled\n", stderr);
+        return 0ull;
+#endif
         return value ? std::strtoull(value, nullptr, 10) : 0ull;
     }();
     return every;
@@ -1498,6 +1571,7 @@ EM_JS(void, vita3k_aot_metadata_copy, (uint8_t *dest), {
 EM_JS(int, vita3k_aot_instantiate, (const uint32_t *lut, MemoryFunction read_memory,
     MemoryFunction write_memory, MemoryFunction arithmetic), {
     try {
+        if (Module['vita3kAotEntrySlot'] !== undefined) return Module['vita3kAotEntrySlot'];
         const instance = new WebAssembly.Instance(Module['vita3kAotModule'], {env: {
             memory: wasmMemory,
             mem_read: Module['vita3kNativeFunction'](read_memory),
@@ -1507,6 +1581,7 @@ EM_JS(int, vita3k_aot_instantiate, (const uint32_t *lut, MemoryFunction read_mem
         }});
         const slot = Number(wasmTable.grow(Module['vita3kMemory64'] ? 1n : 1));
         setWasmTableEntry(slot, instance.exports.entry);
+        Module['vita3kAotEntrySlot'] = slot;
         return slot;
     } catch (error) {
         err('[vita3k-web] AOT instantiation failed: ' + error);
@@ -1537,12 +1612,14 @@ struct WasmJitCPU::Impl {
     std::size_t core;
     State state{};
     std::atomic<bool> stopped{false};
+    std::atomic<bool> invalidate_pending{false};
     bool breakpoint = false, log_code = false, log_mem = false;
-    uint64_t budget = 1'000'000'000'000, executed = 0, compiled = 0, hits = 0, invalidated = 0;
+    uint64_t budget = 1'000'000'000'000;
+    SharedCounter<uint64_t> executed = 0, compiled = 0, hits = 0, invalidated = 0;
     // Phase profiling: milliseconds and counts for the JIT cost centers.
-    double emit_ms = 0, install_ms = 0, run_js_ms = 0;
-    uint64_t js_calls = 0, misses = 0, svc_exits = 0, budget_exits = 0;
-    uint64_t mutex_fast_take = 0, mutex_fast_release = 0, mutex_fast_fallback = 0;
+    SharedCounter<double> emit_ms = 0, install_ms = 0, run_js_ms = 0;
+    SharedCounter<uint64_t> js_calls = 0, misses = 0, svc_exits = 0, budget_exits = 0;
+    SharedCounter<uint64_t> mutex_fast_take = 0, mutex_fast_release = 0, mutex_fast_fallback = 0;
     // Dispatch-ownership telemetry (step-2 measurement, no behavior change).
     // host_entries: execute_regions host entries (region path only).
     // post_hle_entries: entries where svc_exits advanced since the previous
@@ -1555,24 +1632,25 @@ struct WasmJitCPU::Impl {
     //   vs regions dropped by the entry scan. select_checks/select_stale:
     //   loop-top selected-region validations vs stale drops.
     //   capacity_evictions: LRU victim removals.
-    uint64_t host_entries = 0, post_hle_entries = 0, last_svc_at_entry = 0;
-    uint64_t version_syncs = 0, version_bumps = 0;
-    uint64_t entry_scanned = 0, entry_evicted = 0;
+    SharedCounter<uint64_t> host_entries = 0, post_hle_entries = 0;
+    uint64_t last_svc_at_entry = 0;
+    SharedCounter<uint64_t> version_syncs = 0, version_bumps = 0;
+    SharedCounter<uint64_t> entry_scanned = 0, entry_evicted = 0;
     // Wall time spent in the whole-cache revalidation sweep above. Diagnostic
     // only: it attributes the Memory64 entry cost that entry_scanned counts.
-    double revalidate_ms = 0;
+    SharedCounter<double> revalidate_ms = 0;
     // g_code_write_epoch as of this core's last whole-cache sweep. Zero forces
     // the first sweep, so regions formed before tracking started are checked.
     uint32_t swept_code_epoch = 0;
-    uint64_t select_checks = 0, select_stale = 0, capacity_evictions = 0;
+    SharedCounter<uint64_t> select_checks = 0, select_stale = 0, capacity_evictions = 0;
     // Region-mode profiling.
-    uint64_t regions = 0, region_misses = 0, smc_exits = 0, dispatches = 0;
+    SharedCounter<uint64_t> regions = 0, region_misses = 0, smc_exits = 0, dispatches = 0;
     // M16 pump counters: in-Wasm chained transfers (tx_wasm) vs dispatcher
     // Miss returns to the host (host_miss; ~all resolve to compiled regions
     // at the loop top, true compiles are region_misses).
-    uint64_t tx_wasm = 0, host_miss = 0;
+    SharedCounter<uint64_t> tx_wasm = 0, host_miss = 0;
     // AOT entries (host -> AOT module) and entry misses (PC/mode not owned).
-    uint64_t aot_calls = 0, aot_entry_misses = 0;
+    SharedCounter<uint64_t> aot_calls = 0, aot_entry_misses = 0;
     uint32_t aot_skip_pc = 0xffffffffu;
     bool aot_enabled = true;    // per thread (VITA3K_AOT_EXCLUDE_THREADS)
     bool diff_reference = false; // running the lazy half of a VITA3K_AOT_DIFF sample
@@ -1607,6 +1685,7 @@ struct WasmJitCPU::Impl {
         state.mutex_fast_take = state.mutex_fast_release = state.mutex_fast_fallback = 0;
     }
     void clear_regions() {
+        if (region_cache.empty()) return;
         for (auto &[key, entry] : region_cache) {
             if (entry.table_index >= 0) {
                 vita3k_jit_release_region(entry.table_index);
@@ -1615,7 +1694,7 @@ struct WasmJitCPU::Impl {
         }
         invalidated += region_cache.size();
         region_cache.clear();
-        dispatch_bump_epoch();
+        dispatch_bump_epoch(core);
     }
     void clear_regions_for_page(uint32_t page) {
         bool erased = false;
@@ -1633,7 +1712,7 @@ struct WasmJitCPU::Impl {
             erased = true;
         }
         if (erased)
-            dispatch_bump_epoch();
+            dispatch_bump_epoch(core);
     }
     void clear() {
         for (const auto &[key, block] : cache) vita3k_jit_release(block.table_index);
@@ -1709,7 +1788,7 @@ struct WasmJitCPU::Impl {
             mark_code_pages(*victim->second.region, -1);
             region_cache.erase(victim);
             ++invalidated;
-                dispatch_bump_epoch();
+                dispatch_bump_epoch(core);
         }
         const double t0 = emscripten_get_now();
         ++region_misses;
@@ -1731,8 +1810,10 @@ struct WasmJitCPU::Impl {
         block_ptrs.reserve(region->blocks.size());
         meta.reserve(region->blocks.size());
         for (size_t i = 0; i < region->blocks.size(); ++i) {
-            if (aot_seed_recording())
+            if (aot_seed_recording()) {
+                const std::lock_guard<std::mutex> guard(g_aot_seed_mutex);
                 g_aot_seed_keys.insert(ir_blocks[i].Location().Value());
+            }
             block_ptrs.push_back(&ir_blocks[i]);
             meta.push_back({region->blocks[i].pc, region->blocks[i].psr_mask,
                 region->blocks[i].psr_value, region->blocks[i].ticks,
@@ -1777,13 +1858,13 @@ struct WasmJitCPU::Impl {
     // rewrote translated code: stop using the whole module (fail closed to
     // the lazy JIT, which revalidates bytes) and say so loudly.
     void note_aot_smc() {
-        if (!g_aot.loaded || g_aot.disabled)
+        if (!g_aot_loaded || g_aot_disabled)
             return;
         const uint32_t page = state.smc_page;
         if (page != std::numeric_limits<uint32_t>::max() && !g_aot.covers_page(page))
             return;
         if (page == std::numeric_limits<uint32_t>::max()) {
-            g_aot.disabled = true;
+            g_aot_disabled = true;
             std::fprintf(stderr, "[vita3k-web] AOT disabled: guest store into AOT code pages (pc %08x)\n",
                 state.regs[15]);
             return;
@@ -1841,7 +1922,7 @@ struct WasmJitCPU::Impl {
         const uint32_t svc0 = parent->svc;
         const bool svc_called0 = parent->svc_called;
         const uint64_t executed0 = executed;
-        const uint32_t aot_reason = g_aot.entry(&state, granted);
+        const uint32_t aot_reason = g_aot_entry(&state, granted);
         const vita3k::wasmjit::JitState after_aot = state;
         const uint32_t aot_ticks = counter_delta(initial.executed, after_aot.executed);
         const auto aot_pages = changed();
@@ -1949,6 +2030,11 @@ struct WasmJitCPU::Impl {
     }
 
     int execute_regions(uint64_t remaining_budget) {
+        if (g_aot_loaded && !g_aot_entry) {
+            const int slot = vita3k_aot_instantiate(g_aot.lut.data(), checked_memory_read, checked_memory_write, fp64_helper);
+            if (slot < 0) return fail("AOT instance unavailable on guest Worker");
+            g_aot_entry = reinterpret_cast<AotEntry>(static_cast<uintptr_t>(slot));
+        }
         ++host_entries;
         // HLE ran between this entry and the previous one (an SVC exit was
         // serviced, possibly with fiber suspension). Single-block SVC exits
@@ -1980,10 +2066,10 @@ struct WasmJitCPU::Impl {
             // (version_bumps tracks this ping-pong; host_miss stays flat
             // until real eviction churn stales chained targets).
             ++version_syncs;
-            if (dispatch_global_version != last_dispatch_version) {
+            if (dispatch_version(core) != last_dispatch_version) {
                 ++version_bumps;
-                dispatch_bump_epoch();
-                last_dispatch_version = dispatch_global_version;
+                dispatch_bump_epoch(core);
+                last_dispatch_version = dispatch_version(core);
             }
         }
         // Revalidate every cached region whose code a TRACKED path wrote since
@@ -2008,7 +2094,8 @@ struct WasmJitCPU::Impl {
             //      redundant, so it costs one integer compare.
             //   2. When it does move, region_unchanged() re-reads only the
             //      pages whose own generation changed.
-            if (g_code_write_epoch.load(std::memory_order_relaxed) != swept_code_epoch) {
+            const auto observed_epoch = g_code_write_epoch.load(std::memory_order_acquire);
+            if (observed_epoch != swept_code_epoch) {
                 const auto revalidate_started = std::chrono::steady_clock::now();
                 for (auto it = region_cache.begin(); it != region_cache.end();) {
                     ++entry_scanned;
@@ -2021,9 +2108,9 @@ struct WasmJitCPU::Impl {
                     mark_code_pages(*it->second.region, -1);
                     it = region_cache.erase(it);
                     ++invalidated;
-                dispatch_bump_epoch();
+                dispatch_bump_epoch(core);
                 }
-                swept_code_epoch = g_code_write_epoch.load(std::memory_order_relaxed);
+                swept_code_epoch = observed_epoch;
                 revalidate_ms += std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - revalidate_started)
                                      .count();
@@ -2064,10 +2151,10 @@ struct WasmJitCPU::Impl {
             const uint32_t pc = state.regs[15];
             // AOT first: the module owns this PC unless its entry already
             // reported a PC/mode mismatch here (then the lazy path runs once).
-            const bool via_aot = g_aot.loaded && !g_aot.disabled && aot_enabled && !diff_reference
+            const bool via_aot = g_aot_loaded && !g_aot_disabled && aot_enabled && !diff_reference
                 && pc != aot_skip_pc && g_aot.slot(pc) != 0;
             aot_skip_pc = 0xffffffffu;
-            if (g_aot.loaded && !via_aot && std::getenv("VITA3K_AOT_TRACE_MISSES")) {
+            if (g_aot_loaded && !via_aot && std::getenv("VITA3K_AOT_TRACE_MISSES")) {
                 static std::unordered_map<uint32_t, uint64_t> uncovered;
                 const uint64_t hits = ++uncovered[pc];
                 if (hits == 1 || hits == 1000 || hits == 100000)
@@ -2088,7 +2175,7 @@ struct WasmJitCPU::Impl {
                 mark_code_pages(*found->second.region, -1);
                 region_cache.erase(found);
                 ++invalidated;
-                    dispatch_bump_epoch();
+                    dispatch_bump_epoch(core);
                 found = region_cache.end();
                 }
             }
@@ -2129,7 +2216,7 @@ struct WasmJitCPU::Impl {
             state.page_perms_base = reinterpret_cast<uintptr_t>(mem_state->page_permissions.get());
             state.code_pages_base = reinterpret_cast<uintptr_t>(g_code_pages.data());
             state.write_epochs_base = reinterpret_cast<uintptr_t>(mem_state->write_epochs.get());
-            state.write_epoch = mem_state->write_epoch;
+            state.write_epoch = __atomic_load_n(&mem_state->write_epoch, __ATOMIC_RELAXED);
             state.smc_dirty = 0;
             state.smc_page = 0;
             // stop() owns an atomic request. Mirror it at entry and return
@@ -2168,8 +2255,8 @@ struct WasmJitCPU::Impl {
                 && emscripten_get_now() >= aot_diff_after_ms()
                 && ++g_aot_diff.calls % aot_diff_every() == 0;
             const uint32_t reason = diff_sample ? aot_differential(granted)
-                : via_aot ? g_aot.entry(&state, granted)
-                : vita3k_jit_run_dispatch(state_offset, granted, map_base, dispatch_epoch_addr());
+                : via_aot ? g_aot_entry(&state, granted)
+                : vita3k_jit_run_dispatch(state_offset, granted, map_base, dispatch_epoch_addr(core));
             aot_calls += via_aot;
             if (jit_timing())
                 run_js_ms += emscripten_get_now() - t2;
@@ -2376,7 +2463,7 @@ struct WasmJitCPU::Impl {
             state.page_perms_base = reinterpret_cast<uintptr_t>(mem_state->page_permissions.get());
             state.code_pages_base = reinterpret_cast<uintptr_t>(g_code_pages.data());
             state.write_epochs_base = reinterpret_cast<uintptr_t>(mem_state->write_epochs.get());
-            state.write_epoch = mem_state->write_epoch;
+            state.write_epoch = __atomic_load_n(&mem_state->write_epoch, __ATOMIC_RELAXED);
             // Fast-path tallies are per-call scratch (REGION_ABI.md): zero
             // them before the snapshot so the fault rollback below cannot
             // resurrect stale counts.
@@ -2525,7 +2612,7 @@ bool WasmJitCPU::build_aot(MemState &mem, const AotBuildSpec &spec, std::vector<
 }
 
 int WasmJitCPU::load_aot(MemState &mem, std::string &report) {
-    if (g_aot.loaded) {
+    if (g_aot_loaded) {
         report = "already loaded";
         return 1;
     }
@@ -2618,6 +2705,7 @@ int WasmJitCPU::load_aot(MemState &mem, std::string &report) {
             return -1;
         }
     }
+    runtime.retired_pages.resize(size_t(1) << 20);
     g_aot = std::move(runtime);
     const int entry_slot = vita3k_aot_instantiate(g_aot.lut.data(), checked_memory_read, checked_memory_write, fp64_helper);
     if (entry_slot < 0) {
@@ -2625,13 +2713,13 @@ int WasmJitCPU::load_aot(MemState &mem, std::string &report) {
         report = "AOT module instantiation failed";
         return -1;
     }
-    g_aot.entry = reinterpret_cast<AotEntry>(static_cast<uintptr_t>(entry_slot));
+    g_aot_entry = reinterpret_cast<AotEntry>(static_cast<uintptr_t>(entry_slot));
     // Stores into translated code must take the checked path so smc_dirty
     // reports them (the loaded module never revalidates its bytes).
     for (const auto &range : g_aot.ranges)
         for (uint32_t page = range.base >> 12; page <= (range.base + range.size - 1) >> 12; ++page)
             ++g_code_pages[page];
-    g_aot.loaded = true;
+    g_aot_loaded = true;
     char line[160];
     std::snprintf(line, sizeof(line), "AOT loaded: %u ranges, %u entries, %llu table words",
         range_count, pairs, static_cast<unsigned long long>(lut_words));
@@ -2642,6 +2730,7 @@ int WasmJitCPU::load_aot(MemState &mem, std::string &report) {
 bool WasmJitCPU::dump_aot_seeds(const char *path) {
     // Accumulate: seeds recorded by earlier runs (possibly with an AOT module
     // loaded, when only uncovered code reaches the lazy JIT) are kept.
+    const std::lock_guard<std::mutex> guard(g_aot_seed_mutex);
     std::unordered_set<uint64_t> all(g_aot_seed_keys.begin(), g_aot_seed_keys.end());
     if (FILE *previous = std::fopen(path, "r")) {
         unsigned long long value = 0;
@@ -2663,7 +2752,21 @@ int WasmJitCPU::run() {
     impl->stopped = false;
     impl->parent->svc_called = false;
     impl->error.clear();
-    const auto start = impl->executed;
+    if (impl->invalidate_pending.exchange(false))
+        impl->clear();
+    const uint64_t start = impl->executed;
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    // Bound host entries so a guest-only loop observes stop requests and
+    // foreign code writes. A slice return keeps the desktop run loop active.
+    if (impl->region_mode && impl->budget > 65536 && !impl->scheduler_slice) {
+        impl->scheduler_slice = true;
+        const int result = impl->execute_regions(65536);
+        impl->scheduler_slice = false;
+        // The fiber API exposes slice_yield, while the desktop run loop
+        // treats every positive result as a completed guest function.
+        return result == slice_yield ? 0 : result;
+    }
+#endif
     if (impl->region_mode)
         return impl->execute_regions(impl->budget);
     while (impl->executed - start < impl->budget) {
@@ -2687,6 +2790,8 @@ int WasmJitCPU::run_slice(uint64_t instructions) {
 int WasmJitCPU::step() {
     impl->parent->svc_called = false;
     impl->error.clear();
+    if (impl->invalidate_pending.exchange(false))
+        impl->clear();
     if (impl->breakpoint) return 1;
     return impl->execute(1);
 }
@@ -2729,6 +2834,14 @@ void WasmJitCPU::load_context(const CPUContext &c) {
 void WasmJitCPU::invalidate_jit_cache(Address start, size_t length) {
     if (!length) return;
     const uint64_t end = uint64_t(start) + std::min<uint64_t>(length, 0x100000000ULL - start);
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    // Kernel invalidation can arrive on another Worker. Only the executing
+    // Worker may remove slots from its JS tables or walk its region cache.
+    note_code_page_write(start / 4096, (end - 1) / 4096);
+    impl->invalidate_pending = true;
+    retire_aot(start, length);
+    return;
+#endif
     // Invalidate every block touching any page in the changed range.
     const uint64_t first_page = start / 4096, end_page = (end + 4095) / 4096;
     for (auto it = impl->cache.begin(); it != impl->cache.end();) {
@@ -2759,7 +2872,7 @@ void WasmJitCPU::invalidate_jit_cache(Address start, size_t length) {
     // Nulling a slot alone does not retire its map entries; slot reuse can
     // otherwise make an old key dispatch unrelated code after host invalidation.
     if (erased_region)
-        dispatch_bump_epoch();
+        dispatch_bump_epoch(impl->core);
     retire_aot(start, length);
 }
 // AOT functions overlapping the changed code become unreachable: every
@@ -2769,7 +2882,8 @@ void WasmJitCPU::invalidate_jit_cache(Address start, size_t length) {
 void WasmJitCPU::retire_aot(Address start, size_t length) {
     if (!length) return;
     const uint64_t end = uint64_t(start) + std::min<uint64_t>(length, 0x100000000ULL - start);
-    if (g_aot.loaded) {
+    const std::lock_guard<std::mutex> guard(g_aot_retire_mutex);
+    if (g_aot_loaded) {
         for (uint32_t slot = 0; slot < g_aot.spans.size(); ++slot) {
             const auto [begin, span_end] = g_aot.spans[slot];
             if (begin >= end || span_end <= start)
@@ -2781,20 +2895,23 @@ void WasmJitCPU::retire_aot(Address start, size_t length) {
                     if (offset >= g_aot.ranges[k].size)
                         continue;
                     uint32_t &entry = g_aot.lut[g_aot.offsets[k] + offset / 2];
-                    if (entry && (entry & vita3k::wasmjit::kAotMaxFunctions) == slot + 1) {
-                        entry = 0;
+                    const uint32_t current = __atomic_load_n(&entry, __ATOMIC_ACQUIRE);
+                    if (current && (current & vita3k::wasmjit::kAotMaxFunctions) == slot + 1) {
+                        __atomic_store_n(&entry, 0u, __ATOMIC_RELEASE);
                         cleared = true;
                     }
                     break;
                 }
             }
             if (cleared)
-                ++g_aot.invalidated_functions;
+                ++g_aot_invalidated;
         }
         // Every function overlapping the range is retired, so pages wholly
         // inside it hold no live AOT code (an unloaded module's segment).
-        for (uint64_t page = (uint64_t(start) + 4095) >> 12; (page + 1) << 12 <= end; ++page)
+        for (uint64_t page = (uint64_t(start) + 4095) >> 12; (page + 1) << 12 <= end; ++page) {
+            if (g_aot.covers_page(uint32_t(page))) ++g_aot_retired_pages;
             g_aot.retire_page(uint32_t(page));
+        }
     }
 }
 void WasmJitCPU::release_code_caches() {
@@ -2830,7 +2947,7 @@ bool WasmJitCPU::get_fault_write() const { return impl->state.fault_write != 0; 
 uint64_t WasmJitCPU::instructions_executed() const { return impl->executed; }
 double WasmJitCPU::run_ms() const { return impl->run_js_ms; }
 void WasmJitCPU::set_aot_enabled(bool enabled) { impl->aot_enabled = enabled; }
-void WasmJitCPU::disable_aot() { g_aot.disabled = true; }
+void WasmJitCPU::disable_aot() { g_aot_disabled = true; }
 uint64_t WasmJitCPU::compiled_blocks() const { return impl->compiled; }
 uint64_t WasmJitCPU::regions_formed() const { return impl->regions; }
 // AOT-1: install the entry closure before first execution. Mirrors the
@@ -2903,7 +3020,7 @@ std::string WasmJitCPU::get_profile() const {
         "entry_scanned=%llu entry_evicted=%llu select_checks=%llu select_stale=%llu "
         "capacity_evictions=%llu revalidate_ms=%.1f cache_limit=%zu "
         "aot=%d aot_calls=%llu aot_entry_misses=%llu aot_invalidated=%llu aot_retired_pages=%llu",
-        impl->emit_ms, impl->install_ms, impl->run_js_ms,
+        double(impl->emit_ms), double(impl->install_ms), double(impl->run_js_ms),
         (unsigned long long)impl->js_calls, (unsigned long long)impl->misses,
         (unsigned long long)impl->svc_exits, (unsigned long long)impl->compiled,
         (unsigned long long)g_mem_reads, (unsigned long long)g_mem_writes,
@@ -2922,12 +3039,12 @@ std::string WasmJitCPU::get_profile() const {
         (unsigned long long)impl->version_syncs, (unsigned long long)impl->version_bumps,
         (unsigned long long)impl->entry_scanned, (unsigned long long)impl->entry_evicted,
         (unsigned long long)impl->select_checks, (unsigned long long)impl->select_stale,
-        (unsigned long long)impl->capacity_evictions, impl->revalidate_ms,
+        (unsigned long long)impl->capacity_evictions, double(impl->revalidate_ms),
         region_cache_limit(),
-        g_aot.loaded ? (g_aot.disabled ? -1 : 1) : 0,
+        g_aot_loaded ? (g_aot_disabled ? -1 : 1) : 0,
         (unsigned long long)impl->aot_calls, (unsigned long long)impl->aot_entry_misses,
-        (unsigned long long)g_aot.invalidated_functions,
-        (unsigned long long)std::count(g_aot.retired_pages.begin(), g_aot.retired_pages.end(), uint8_t(1)));
+        (unsigned long long)g_aot_invalidated,
+        (unsigned long long)g_aot_retired_pages);
     return buffer;
 }
 

@@ -146,9 +146,15 @@ void constant64(Bytes &out, int64_t n) {
 
 void memory_type(Bytes &out) {
     if (memory64) {
-        // Unshared, maximum present, i64 address type. Import the ONE main
-        // runtime memory, whose fixed extent is 8 GiB = 131072 Wasm pages.
+        // Maximum present, i64 address type, shared in the threaded build
+        // (THREADS.md: a module importing a shared memory must say so). Import
+        // the ONE main runtime memory, whose fixed extent is 8 GiB = 131072
+        // Wasm pages.
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+        out.push_back(0x07);
+#else
         out.push_back(0x05);
+#endif
         uleb64(out, vita3k::memory::guest_window_end / vita3k::memory::wasm_page_size);
         uleb64(out, vita3k::memory::guest_window_end / vita3k::memory::wasm_page_size);
     } else {
@@ -199,6 +205,20 @@ void section(Bytes &module, uint8_t id, const Bytes &payload) {
 // Free byte helpers so the region dispatcher can share the exact emitter
 // encoding without an Emitter instance.
 void b_op(Bytes &c, uint8_t byte) { c.push_back(byte); }
+void b_shared_load32(Bytes &c) {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    b_op(c, 0xfe); uleb(c, 0x10); // i32.atomic.load
+#else
+    b_op(c, Load);
+#endif
+}
+void b_shared_store32(Bytes &c) {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    b_op(c, 0xfe); uleb(c, 0x17); // i32.atomic.store
+#else
+    b_op(c, Store);
+#endif
+}
 void b_imm(Bytes &c, uint32_t n) { constant(c, n); }
 void b_get(Bytes &c, uint32_t index) { b_op(c, Get); uleb(c, index); }
 void b_set(Bytes &c, uint32_t index) { b_op(c, Set); uleb(c, index); }
@@ -961,7 +981,7 @@ private:
     };
     // The checked-helper call, shared by the always-slow widths and every
     // fast-path fallback. `reason` rides in the `bytes` argument's high byte.
-    void memory_slow_call(const Inst &inst, bool write, unsigned bytes, uint32_t reason = 0) {
+    void memory_slow_call(const Inst &inst, bool write, unsigned bytes, uint32_t reason = 0, uint32_t flags = 0) {
         if (write) {
             const auto &value = inst.GetArg(2);
             get(0); value_word(value, 0);
@@ -972,7 +992,7 @@ private:
             }
         }
         state.before_checked_memory_helper();
-        get(0); value_word(inst.GetArg(1)); imm(bytes | (reason << 8)); op(Call); uleb(code, write ? 1 : 0);
+        get(0); value_word(inst.GetArg(1)); imm(bytes | (reason << 8) | flags); op(Call); uleb(code, write ? 1 : 0);
         checked_status();
         if (!write) {
             for (unsigned i = 0; i < (bytes + 3) / 4; ++i) { get(0); op(Load); uleb(code, 2); uleb(code, offsetof(JitState, memory_value) + i * 4); set(next_local + i); }
@@ -1000,7 +1020,7 @@ private:
         if (offset) { imm(offset); op(Add); }
         imm(12); op(ShrU); imm(2); op(Shl); address_add_i32(code);
         load(offsetof(JitState, write_epoch));
-        op(Store); uleb(code, 2); uleb(code, 0);
+        b_shared_store32(code); uleb(code, 2); uleb(code, 0);
     }
     void guest_effective_address(uint32_t address, uint32_t backing) {
         if (memory64) {
@@ -1074,7 +1094,7 @@ private:
         if (write) {
             memory_base(code_pages_local, offsetof(JitState, code_pages_base));
             get(page_local); imm(2); op(Shl); address_add_i32(code);
-            op(Load); uleb(code, 2); uleb(code, 0);
+            b_shared_load32(code); uleb(code, 2); uleb(code, 0);
             op(Eqz);
             op(And);
         }
@@ -1191,7 +1211,7 @@ private:
         if (write) {
             memory_base(code_pages_local, offsetof(JitState, code_pages_base));
             get(page_local); imm(2); op(Shl); address_add_i32(code);
-            op(Load); uleb(code, 2); uleb(code, 0);
+            b_shared_load32(code); uleb(code, 2); uleb(code, 0);
             op(Eqz); op(Eqz);
             begin_if();
             memory_slow_call(inst, write, bytes, kSlowCodePage);
@@ -1234,7 +1254,11 @@ private:
         if (!inst.GetArg(0).IsImmediate()) { reject("exclusive read arg0 not imm"); return; }
         value_word(inst.GetArg(1)); set(next_local + 5);
         pending_fault_location = inst.GetArg(0).GetImmediateAsU64();
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+        memory_slow_call(inst, false, bytes, 0, kExclusiveAccessFlag);
+#else
         memory_slow_call(inst, false, bytes);
+#endif
         get(0); get(next_local + 5); store(offsetof(JitState, exclusive_address));
         for (unsigned i = 0; i < (bytes + 3) / 4; ++i) {
             get(0); get(next_local + i);
@@ -1248,6 +1272,24 @@ private:
         if (inst.GetArg(1).GetType() != Type::U32) { reject("exclusive write arg1 not U32"); return; }
         if (!inst.GetArg(0).IsImmediate()) { reject("exclusive write arg0 not imm"); return; }
         value_word(inst.GetArg(1)); set(next_local + 5);
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+        // Threaded build: other guest threads store concurrently, so the
+        // re-read, compare and write below would race. The helper instead
+        // compares and swaps atomically against the reserved value
+        // (kExclusiveAccessFlag) when the reservation matches this store.
+        imm(1); set(next_local + 4); // STREX fails unless the swap stores
+        load(offsetof(JitState, exclusive_size)); imm(bytes); op(Eq);
+        load(offsetof(JitState, exclusive_address)); get(next_local + 5); op(Eq); op(And);
+        begin_if();
+        pending_fault_location = inst.GetArg(0).GetImmediateAsU64();
+        memory_slow_call(inst, true, bytes, 0, kExclusiveAccessFlag);
+        get(0); op(Load); uleb(code, 2); uleb(code, offsetof(JitState, memory_value) + 8); set(next_local + 4);
+        end_if();
+        // Success or failure, the store consumes the reservation.
+        store_constant(offsetof(JitState, exclusive_size), 0);
+        get(next_local + 4); set(next_local);
+        return;
+#endif
         pending_fault_location = inst.GetArg(0).GetImmediateAsU64();
         // Words 0..1 take the fresh read; the result is staged in word 4 and
         // published after the branch, because the write arm reads inst arg2.
@@ -3979,9 +4021,13 @@ private:
         case Op::A32DataMemoryBarrier:
         case Op::A32DataSynchronizationBarrier:
         case Op::A32InstructionSynchronizationBarrier:
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+            // WebAssembly atomic.fence has a required zero flags immediate.
+            op(0xfe); uleb(code, 0x03); op(0x00);
+#else
             // Single host thread: no other observer of guest memory exists,
             // and the JIT holds no stale translations needing an ISB flush.
-            // Revisit if guest threads ever run on parallel host threads.
+#endif
             return true;
         case Op::Identity: {
             const auto type = inst.GetType();
@@ -6427,7 +6473,7 @@ std::vector<uint8_t> assemble_aot_module(
         b_op(lookup, GlobalGet); uleb(lookup, 0);
         b_get(lookup, 1); b_imm(lookup, 1); b_op(lookup, ShrU); b_imm(lookup, 2); b_op(lookup, Shl);
         address_add_i32(lookup);
-        b_op(lookup, Load); memarg(lookup, 2, aot_lut_offset_words(ranges, k) * 4);
+        b_shared_load32(lookup); memarg(lookup, 2, aot_lut_offset_words(ranges, k) * 4);
         b_op(lookup, Return);
         b_op(lookup, End);
     }

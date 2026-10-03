@@ -19,6 +19,7 @@
 #include <kernel/state.h>
 
 #include <cstdint>
+#include <atomic>
 #include <limits>
 #include <mutex>
 #include <vector>
@@ -38,7 +39,7 @@ struct DisplayBridgeState {
     std::mutex mutex;
     std::vector<uint8_t> rgba; // tight RGBA scratch, resized on dimension change
     uint32_t posted_generation = 0;
-    uint64_t last_frame_instructions = 0; // cumulative guest instructions at the last presented frame
+    std::atomic<uint64_t> last_frame_instructions = 0; // cumulative guest instructions at the last presented frame
     bool hooked = false;
 };
 
@@ -50,7 +51,10 @@ DisplayBridgeState &bridge_state() {
 // Cumulative guest instructions of the main thread's CPU backend. Mirrors the
 // counter read the runtime itself performs after the run loop; 0 when the main
 // thread or its backend is absent (also before the first presented frame).
-static uint64_t guest_instructions_executed(const EmuEnvState &emuenv) {
+static uint64_t guest_instructions_executed(EmuEnvState &emuenv) {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    const std::lock_guard<std::mutex> guard(emuenv.kernel.mutex);
+#endif
     const auto thread = emuenv.kernel.threads.find(emuenv.main_thread_id);
     if (thread == emuenv.kernel.threads.end() || !thread->second || !thread->second->cpu)
         return 0;
@@ -68,6 +72,9 @@ static uint64_t guest_instructions_executed(const EmuEnvState &emuenv) {
 
 void vita3k_web_present_frame(EmuEnvState &emuenv) {
     DisplayBridgeState &bridge = bridge_state();
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    const std::lock_guard<std::mutex> guard(bridge.mutex);
+#endif
     DisplayFrameInfo info;
     {
         // SceDisplay updates sce_frame under display_info_mutex; match it.

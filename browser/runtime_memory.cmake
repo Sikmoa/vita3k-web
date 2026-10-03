@@ -38,8 +38,15 @@ function(vita3k_web_finalize_memory64 directory)
     foreach(_target IN LISTS _targets)
         get_target_property(_type "${_target}" TYPE)
         if(_type STREQUAL "EXECUTABLE")
-            target_sources("${_target}" PRIVATE $<TARGET_OBJECTS:vita3k_web_memory64_heap>)
-            add_dependencies("${_target}" vita3k_web_memory64_heap)
+            if(_target STREQUAL "vita3k_threads_probe")
+                # This target uses pthreads even in the single-Worker build.
+                # Compile the bounded heap with the probe's own atomics flags.
+                target_sources("${_target}" PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/src/memory64_heap.cpp")
+                target_include_directories("${_target}" PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../vita3k/mem/include")
+            else()
+                target_sources("${_target}" PRIVATE $<TARGET_OBJECTS:vita3k_web_memory64_heap>)
+                add_dependencies("${_target}" vita3k_web_memory64_heap)
+            endif()
         endif()
     endforeach()
     get_property(_children DIRECTORY "${directory}" PROPERTY SUBDIRECTORIES)
@@ -52,4 +59,15 @@ endfunction()
 # Do not add conflicting per-target growth/initial/max-memory settings.
 if(VITA3K_WEB_MEMORY64)
     add_link_options(${VITA3K_WEB_MEMORY_LINK_OPTIONS})
+endif()
+
+# Threaded build (THREADS.md): configured in its own build directory with
+# -DCMAKE_C_FLAGS=-pthread -DCMAKE_CXX_FLAGS=-pthread, because Wasm objects
+# built with and without shared-memory atomics cannot be linked together.
+if(CMAKE_CXX_FLAGS MATCHES "-pthread")
+    set(VITA3K_WEB_THREADS ON)
+    add_compile_definitions(VITA3K_WEB_THREADS=1)
+    add_link_options(-pthread)
+else()
+    set(VITA3K_WEB_THREADS OFF)
 endif()

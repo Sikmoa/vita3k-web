@@ -129,6 +129,8 @@ const staged = (await stageFiles(stage)).filter((file) => process.env.LIMBO_PATC
 const manifestBytes = new TextEncoder().encode(JSON.stringify(stageManifest(staged)));
 
 const server = createServer(async (req, res) => {
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
   try {
     const path = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
     const send = (content, type) => {
@@ -434,7 +436,7 @@ try {
       const finish = (error, value) => { clearTimeout(starter); worker.terminate();
         error ? rejectRun(error) : resolveRun(value); };
       finishRun = () => finish(null, state);
-      worker.onerror = (event) => finish(rejectRun, new Error(`worker error: ${event.message}`));
+      worker.onerror = (event) => finish(new Error(`worker error: ${event.message} at ${event.filename}:${event.lineno}:${event.colno}; last logs: ${state.logs.slice(-15).join(" | ")}`));
       worker.onmessage = ({ data }) => {
         if (!data || typeof data !== 'object') return;
         switch (data.type) {

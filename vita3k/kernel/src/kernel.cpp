@@ -26,6 +26,7 @@
 #include <kernel/thread/thread_state.h>
 
 #include <cpu/functions.h>
+#include <cpu/impl/interface.h>
 #include <mem/ptr.h>
 #include <util/lock_and_find.h>
 #include <util/log.h>
@@ -73,6 +74,7 @@ static int SDLCALL thread_function(void *data) {
 
     thread->run_loop();
     const uint32_t r0 = read_reg(*thread->cpu, 0);
+    thread->cpu->cpu->release_code_caches();
 
     {
         std::lock_guard<std::mutex> lock(params.kernel->mutex);

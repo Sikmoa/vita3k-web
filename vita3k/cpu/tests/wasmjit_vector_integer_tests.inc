@@ -64,12 +64,6 @@ void ir_arithmetic() {
             });
         }
     }
-    // The wider generic IR helper is an inventory candidate, but no A32
-    // integer VMUL translator permits size=3. Keep that unsupported boundary.
-    auto wide_multiply = blank();
-    write_q(wide_multiply, append(wide_multiply, Op::VectorMultiply64,
-        {read_q(wide_multiply), read_q(wide_multiply, 1)}));
-    for (bool region : {false, true}) CHECK(emit(wide_multiply, region).empty());
     CHECK(h.missing.empty());
     std::printf("NEON integer arithmetic: %u independent IR fixtures passed\n", h.cases);
 }

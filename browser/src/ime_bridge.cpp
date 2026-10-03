@@ -7,6 +7,8 @@
 // posts 'vita-ime'; 'ime-input' queues page input for web_ime_take.
 #include "ime_bridge.h"
 #include "page_json.h"
+#include "thread_bridge.h"
+#include <atomic>
 
 #include <emuenv/state.h>
 #include <ime/state.h>
@@ -19,6 +21,14 @@
 #include <mutex>
 #include <string>
 
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+static void web_ime_post(const char *json, uint32_t size) {
+    browser::coordinator_call("ime", {reinterpret_cast<uintptr_t>(json), size});
+}
+static uint32_t web_ime_take(uint32_t *header, uint16_t *text, uint32_t capacity) {
+    return browser::coordinator_call("ime-take", {reinterpret_cast<uintptr_t>(header), reinterpret_cast<uintptr_t>(text), capacity}) > 0;
+}
+#else
 EM_JS(void, web_ime_post, (const char *json, uint32_t size), {
     if (typeof globalThis.vita3kWebOnIme !== 'function') return;
     globalThis.vita3kWebOnIme(JSON.parse(new TextDecoder().decode(Module['vita3kHostBytes'](json, size).slice())));
@@ -44,10 +54,13 @@ EM_JS(uint32_t, web_ime_take, (uint32_t *header, uint16_t *text, uint32_t capaci
     return 1;
 });
 
+#endif
+
 namespace {
 struct PageIme {
     uint32_t shown = 0, next = 1; // id of the IME the page shows (0 = none)
-    bool pending = false; // the Worker queued input since the last take
+    std::atomic<bool> pending = false; // the Worker queued input since the last take
+    std::recursive_mutex mutex;
     std::deque<browser::ImeInput> inputs;
 };
 PageIme &page() {
@@ -110,10 +123,15 @@ namespace browser {
 uint32_t sync_ime(EmuEnvState &env) {
     auto &state = page();
     auto &ime = env.ime;
+    // Idle fast path: this runs after every import. Rechecked under the locks.
     if (!state.shown && !ime.state && !state.pending)
         return 0;
-    if (state.pending) {
-        state.pending = false;
+    const std::unique_lock<std::mutex> lock(ime.mutex, std::try_to_lock);
+    if (!lock) return 0;
+    const std::lock_guard<std::recursive_mutex> page_lock(state.mutex);
+    if (!state.shown && !ime.state && !state.pending)
+        return 0;
+    if (state.pending.exchange(false)) {
         take_page_inputs();
     }
     if (!ime.state) {
@@ -137,7 +155,6 @@ uint32_t sync_ime(EmuEnvState &env) {
         return state.shown;
     // sceImeUpdate holds the mutex while the guest handler runs, which may
     // make imports; this sync then retries after a later one.
-    const std::unique_lock<std::mutex> lock(ime.mutex, std::try_to_lock);
     // One event at a time: the next input waits until sceImeUpdate has
     // delivered the previous one (and reset event_id to OPEN).
     if (lock && ime.event_id == SCE_IME_EVENT_OPEN) {
@@ -148,6 +165,7 @@ uint32_t sync_ime(EmuEnvState &env) {
 }
 
 void ime_page_input(ImeInput input) {
+    const std::lock_guard<std::recursive_mutex> guard(page().mutex);
     page().inputs.push_back(std::move(input));
 }
 } // namespace browser

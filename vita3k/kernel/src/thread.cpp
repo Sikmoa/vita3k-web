@@ -76,7 +76,8 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
     last_vblank_waited = 0;
 
     cpu = kernel.execution_host ? kernel.execution_host->make_cpu(id, mem)
-                                : init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem);
+        : kernel.make_cpu      ? kernel.make_cpu(id, static_cast<std::size_t>(core_num), mem)
+                               : init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem);
     if (!cpu) {
         return SCE_KERNEL_ERROR_ERROR;
     }

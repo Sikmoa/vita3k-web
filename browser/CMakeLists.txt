@@ -64,19 +64,31 @@ if(EMSCRIPTEN)
     target_link_libraries(vita3k_web_app_bench PRIVATE vita3k_web_runtime_hle)
     if(TARGET vita3k_wasm_jit)
         target_compile_definitions(vita3k_web_app_bench PRIVATE VITA3K_WEB=1 VITA3K_USE_WASM_JIT=1)
-        target_link_libraries(vita3k_web_app_bench PRIVATE vita3k_guest_thread_runtime)
+        if(TARGET vita3k_guest_thread_runtime)
+            target_link_libraries(vita3k_web_app_bench PRIVATE vita3k_guest_thread_runtime)
+        else()
+            # Threaded build: main() on a pthread keeps Node's main thread
+            # free to start the Workers guest threads run on.
+            target_link_libraries(vita3k_web_app_bench PRIVATE vita3k_wasm_jit)
+            target_link_options(vita3k_web_app_bench PRIVATE -sPROXY_TO_PTHREAD=1 -sEXIT_RUNTIME=1)
+        endif()
     else()
         message(FATAL_ERROR "vita3k_web_app_bench requires VITA3K_WEB_JIT_TESTS=ON")
     endif()
-    add_executable(vita3k_guest_thread_tests
-        tests/guest_thread_lifecycle_test.cpp
-    )
-    target_link_libraries(vita3k_guest_thread_tests PRIVATE vita3k_guest_thread_runtime vita3k_web_mspace)
-    target_link_options(vita3k_guest_thread_tests PRIVATE
-        ${VITA3K_WEB_GROWTH_LINK_OPTION} "SHELL:-sSTACK_SIZE=1048576")
+    if(TARGET vita3k_guest_thread_runtime)
+        add_executable(vita3k_guest_thread_tests
+            tests/guest_thread_lifecycle_test.cpp
+        )
+        target_link_libraries(vita3k_guest_thread_tests PRIVATE vita3k_guest_thread_runtime vita3k_web_mspace)
+        target_link_options(vita3k_guest_thread_tests PRIVATE
+            ${VITA3K_WEB_GROWTH_LINK_OPTION} "SHELL:-sSTACK_SIZE=1048576")
+    endif()
     # Desktop-path sync tests need concurrent host threads, so they exist only
     # in a build compiled with -pthread (CMAKE_C_FLAGS and CMAKE_CXX_FLAGS).
     if(CMAKE_CXX_FLAGS MATCHES "-pthread")
+        add_executable(vita3k_threaded_jit_tests tests/threaded_jit_test.cpp)
+        target_link_libraries(vita3k_threaded_jit_tests PRIVATE vita3k_web_runtime_hle vita3k_wasm_jit)
+        target_link_options(vita3k_threaded_jit_tests PRIVATE -sPROXY_TO_PTHREAD=1 -sPTHREAD_POOL_SIZE=8 -sEXIT_RUNTIME=1)
         add_executable(vita3k_host_thread_sync_tests tests/host_thread_sync_test.cpp)
         target_link_libraries(vita3k_host_thread_sync_tests PRIVATE vita3k_web_runtime_hle vita3k_web_mspace)
         target_link_options(vita3k_host_thread_sync_tests PRIVATE
@@ -215,7 +227,7 @@ set_target_properties(vita3k_web PROPERTIES
 # Deployable web root, built by vita3k_web_dist. Every file in it is the
 # output of a rule that depends on its source (web asset, module link,
 # fixture), so a deleted or stale dist is rebuilt by the next build.
-set(VITA3K_WEB_DIST "${CMAKE_BINARY_DIR}/dist")
+set(VITA3K_WEB_DIST "${CMAKE_BINARY_DIR}/dist" CACHE PATH "Web assets destination (may be shared by runtime variants)")
 set(_dist_outputs "")
 # vita3k_web_dist_copy(<path in dist> <source file>)
 function(vita3k_web_dist_copy destination source)
@@ -362,16 +374,29 @@ if(VITA3K_WEB_MEMORY64)
         -sENVIRONMENT=web,worker -sNO_EXIT_RUNTIME=1
         "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=['$PThread']")
     set_target_properties(vita3k_threads_probe PROPERTIES SUFFIX ".js")
-    foreach(_file vita3k_threads_probe.js vita3k_threads_probe.wasm)
-        vita3k_web_dist_copy("threads-probe/${_file}" "$<TARGET_FILE_DIR:vita3k_threads_probe>/${_file}")
-    endforeach()
+    # Depend on the target, not its files: ninja has no rule for the .wasm, so
+    # a fresh build tree would refuse to plan a file-level copy of it.
+    set(_probe_dir "${VITA3K_WEB_DIST}/threads-probe")
+    add_custom_command(
+        OUTPUT "${_probe_dir}/vita3k_threads_probe.js" "${_probe_dir}/vita3k_threads_probe.wasm"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_probe_dir}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE_DIR:vita3k_threads_probe>/vita3k_threads_probe.js"
+            "$<TARGET_FILE_DIR:vita3k_threads_probe>/vita3k_threads_probe.wasm" "${_probe_dir}"
+        DEPENDS vita3k_threads_probe
+        COMMENT "Staging the threads probe into dist"
+        VERBATIM
+    )
+    list(APPEND _dist_outputs "${_probe_dir}/vita3k_threads_probe.js" "${_probe_dir}/vita3k_threads_probe.wasm")
     foreach(_file index.html probe_worker.js)
         vita3k_web_dist_copy("threads-probe/${_file}" "${CMAKE_CURRENT_SOURCE_DIR}/threads_probe/${_file}")
     endforeach()
 endif()
-vita3k_web_dist_module(vita3k_web)
-if(TARGET vita3k_web_jit)
-    vita3k_web_dist_module(vita3k_web_jit)
+if(NOT VITA3K_WEB_THREADS)
+    vita3k_web_dist_module(vita3k_web)
+endif()
+if(VITA3K_WEB_JIT_TARGET)
+    vita3k_web_dist_module(${VITA3K_WEB_JIT_TARGET})
 endif()
 add_custom_target(vita3k_web_dist ALL DEPENDS ${_dist_outputs})
 add_dependencies(vita3k_web_dist vita3k_gxp_compiler)

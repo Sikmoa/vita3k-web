@@ -52,6 +52,12 @@ enum class ExitReason : uint32_t {
 // in their address space; whoever runs it must supply the table.
 HostAddress scratch_write_epochs();
 
+// Checked-memory size flag (threaded build): an atomic exclusive load/store.
+// The write helper compares and swaps atomically against the
+// reserved value (exclusive_value, exclusive_value_hi) and leaves 0 in
+// memory_value[2] when it stored, 1 when memory no longer held that value.
+inline constexpr uint32_t kExclusiveAccessFlag = 1u << 30;
+
 struct JitState {
     uint32_t regs[16];
     uint32_t cpsr;

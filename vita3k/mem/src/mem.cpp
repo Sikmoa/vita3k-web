@@ -383,12 +383,17 @@ void (*g_mem_write_observer)(Address addr, size_t size) = nullptr;
 bool mem_write(MemState &state, Address addr, const void *source, size_t size) {
     if ((!source && size) || !check_range(state, addr, size, MemPerm::WriteOnly))
         return false;
-    if (g_mem_write_observer)
-        g_mem_write_observer(addr, size);
-    mem_mark_written(state, addr, size);
+    const auto written = [&state, addr, size] {
+        // Publish generations after the bytes. Other host threads must never
+        // validate old bytes against the new generation and cache them.
+        if (g_mem_write_observer)
+            g_mem_write_observer(addr, size);
+        mem_mark_written(state, addr, size);
+    };
     if (state.direct_host_memory) {
         if (size)
             std::memcpy(vita3k::memory::direct_pointer(addr), source, size);
+        written();
         return true;
     }
     auto *input = static_cast<const uint8_t *>(source);
@@ -399,6 +404,61 @@ bool mem_write(MemState &state, Address addr, const void *source, size_t size) {
         addr += static_cast<Address>(count);
         size -= count;
     }
+    written();
+    return true;
+}
+
+bool mem_read_exclusive(const MemState &state, Address addr, size_t size, uint64_t &value) {
+    if ((size != 1 && size != 2 && size != 4 && size != 8) || addr % size != 0
+        || !check_range(state, addr, size, MemPerm::ReadOnly))
+        return false;
+    const uint8_t *host = state.direct_host_memory ? vita3k::memory::direct_pointer(addr) : page_pointer(state, addr);
+    switch (size) {
+    case 1: value = __atomic_load_n(host, __ATOMIC_SEQ_CST); break;
+    case 2: value = __atomic_load_n(reinterpret_cast<const uint16_t *>(host), __ATOMIC_SEQ_CST); break;
+    case 4: value = __atomic_load_n(reinterpret_cast<const uint32_t *>(host), __ATOMIC_SEQ_CST); break;
+    case 8: value = __atomic_load_n(reinterpret_cast<const uint64_t *>(host), __ATOMIC_SEQ_CST); break;
+    }
+    return true;
+}
+
+bool mem_compare_exchange(MemState &state, Address addr, size_t size, uint64_t expected, uint64_t desired, bool &swapped) {
+    swapped = false;
+    if ((size != 1 && size != 2 && size != 4 && size != 8) || addr % size != 0
+        || !check_range(state, addr, size, MemPerm::ReadWrite))
+        return false;
+    // Naturally aligned, so the bytes lie in one page.
+    uint8_t *host = state.direct_host_memory ? vita3k::memory::direct_pointer(addr) : page_pointer(state, addr);
+    switch (size) {
+    case 1: {
+        auto old = static_cast<uint8_t>(expected);
+        swapped = __atomic_compare_exchange_n(host, &old, static_cast<uint8_t>(desired), false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        break;
+    }
+    case 2: {
+        auto old = static_cast<uint16_t>(expected);
+        swapped = __atomic_compare_exchange_n(reinterpret_cast<uint16_t *>(host), &old, static_cast<uint16_t>(desired), false,
+            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        break;
+    }
+    case 4: {
+        auto old = static_cast<uint32_t>(expected);
+        swapped = __atomic_compare_exchange_n(reinterpret_cast<uint32_t *>(host), &old, static_cast<uint32_t>(desired), false,
+            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        break;
+    }
+    default: {
+        auto old = expected;
+        swapped = __atomic_compare_exchange_n(reinterpret_cast<uint64_t *>(host), &old, desired, false,
+            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        break;
+    }
+    }
+    if (swapped) {
+        if (g_mem_write_observer)
+            g_mem_write_observer(addr, size);
+        mem_mark_written(state, addr, size);
+    }
     return true;
 }
 
@@ -407,7 +467,7 @@ void mem_mark_written(MemState &state, Address addr, size_t size) {
         return;
     const uint64_t end = std::min<uint64_t>(uint64_t(addr) + size, TOTAL_MEM_SIZE);
     for (uint64_t page = addr / STANDARD_PAGE_SIZE; page * STANDARD_PAGE_SIZE < end; ++page)
-        state.write_epochs[page] = state.write_epoch;
+        __atomic_store_n(&state.write_epochs[page], __atomic_load_n(&state.write_epoch, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
 }
 
 void mem_mark_written_host(MemState &state, const void *pointer, size_t size) {
@@ -417,7 +477,7 @@ void mem_mark_written_host(MemState &state, const void *pointer, size_t size) {
 }
 
 uint32_t mem_next_write_epoch(MemState &state) {
-    return ++state.write_epoch;
+    return __atomic_add_fetch(&state.write_epoch, 1, __ATOMIC_RELAXED);
 }
 
 uint32_t mem_written_epoch(const MemState &state, Address addr, size_t size) {
@@ -426,7 +486,7 @@ uint32_t mem_written_epoch(const MemState &state, Address addr, size_t size) {
     uint32_t latest = 0;
     const uint64_t end = std::min<uint64_t>(uint64_t(addr) + size, TOTAL_MEM_SIZE);
     for (uint64_t page = addr / STANDARD_PAGE_SIZE; page * STANDARD_PAGE_SIZE < end; ++page)
-        latest = std::max(latest, state.write_epochs[page]);
+        latest = std::max(latest, __atomic_load_n(&state.write_epochs[page], __ATOMIC_RELAXED));
     return latest;
 }
 

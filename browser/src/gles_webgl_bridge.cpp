@@ -90,6 +90,15 @@ uint32_t vita3k_web_gles_alloc(uint32_t length) {
     return alloc(state.env->mem, length, "GLES guest return data");
 }
 
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+// Threaded build (THREADS.md): WebGL lives on the coordinator; the adapter is
+// not proxied there yet.
+EM_JS(int, web_gles_init, (), {
+    err("[gles-webgl] the threaded build has no GLES adapter yet (THREADS.md)");
+    return -1;
+});
+EM_JS(int, web_gles_swap, (), { return 0; });
+#else
 EM_ASYNC_JS(int, web_gles_init, (), {
     try {
         const { createGlesBridge } = await import(new URL('gles_webgl.js', globalThis.location.href).href);
@@ -133,6 +142,7 @@ EM_ASYNC_JS(int, web_gles_init, (), {
         return -1;
     }
 });
+#endif
 EM_JS(int, web_gles_supports, (const char *name), {
     return Module['vita3kGles']?.supports(UTF8ToString(Module['vita3kHostOffset'](name))) ? 1 : 0;
 });
@@ -151,6 +161,7 @@ EM_JS(int, web_gles_call, (const char *name, const double *args, uint32_t count,
         return -1;
     }
 });
+#ifndef __EMSCRIPTEN_SHARED_MEMORY__
 EM_ASYNC_JS(int, web_gles_swap, (), {
     try {
         await Module['vita3kGles'].swapBuffers();
@@ -160,6 +171,7 @@ EM_ASYNC_JS(int, web_gles_swap, (), {
         return 0;
     }
 });
+#endif
 
 namespace {
 void ensure_bridge() {

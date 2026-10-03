@@ -55,6 +55,10 @@ struct CPUInterface {
     virtual CPUContext save_context() = 0;
     virtual void load_context(const CPUContext &ctx) = 0;
     virtual void invalidate_jit_cache(Address start, size_t length) = 0;
+    // Called on the executing host thread before it exits. Backends with
+    // thread-local code tables must release entries here, even if another
+    // owner keeps the CPUState alive after the host thread is gone.
+    virtual void release_code_caches() {}
 
     virtual bool is_thumb_mode() = 0;
     virtual int step() = 0;

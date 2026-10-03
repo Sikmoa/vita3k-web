@@ -19,48 +19,67 @@ target_link_options(vita3k_wasm_jit INTERFACE
 
 # Opt-in lifecycle host for parent-owned app/tests. Keep this separate from the
 # CPU library so JIT-only probes need not pull in HLE or Asyncify fibers.
-add_library(vita3k_guest_thread_runtime STATIC
-    src/guest_fiber_scheduler.cpp
-    src/guest_thread_runtime.cpp)
-target_include_directories(vita3k_guest_thread_runtime PUBLIC "${CMAKE_CURRENT_LIST_DIR}/src")
-target_link_libraries(vita3k_guest_thread_runtime PUBLIC vita3k_web_runtime_hle vita3k_wasm_jit)
-target_compile_options(vita3k_guest_thread_runtime PUBLIC -fexceptions)
-target_link_options(vita3k_guest_thread_runtime INTERFACE -fexceptions -sASYNCIFY=1
-    -lexports.js "SHELL:--post-js ${CMAKE_CURRENT_LIST_DIR}/src/asyncify_post.js")
-set_property(TARGET vita3k_guest_thread_runtime PROPERTY INTERFACE_LINK_DEPENDS
-    "${CMAKE_CURRENT_LIST_DIR}/src/asyncify_post.js")
+# Single-threaded builds only: the threaded build (THREADS.md) runs guest
+# threads on host threads through the desktop kernel paths instead.
+if(NOT VITA3K_WEB_THREADS)
+    add_library(vita3k_guest_thread_runtime STATIC
+        src/guest_fiber_scheduler.cpp
+        src/guest_thread_runtime.cpp)
+    target_include_directories(vita3k_guest_thread_runtime PUBLIC "${CMAKE_CURRENT_LIST_DIR}/src")
+    target_link_libraries(vita3k_guest_thread_runtime PUBLIC vita3k_web_runtime_hle vita3k_wasm_jit)
+    target_compile_options(vita3k_guest_thread_runtime PUBLIC -fexceptions)
+    target_link_options(vita3k_guest_thread_runtime INTERFACE -fexceptions -sASYNCIFY=1
+        -lexports.js "SHELL:--post-js ${CMAKE_CURRENT_LIST_DIR}/src/asyncify_post.js")
+    set_property(TARGET vita3k_guest_thread_runtime PROPERTY INTERFACE_LINK_DEPENDS
+        "${CMAKE_CURRENT_LIST_DIR}/src/asyncify_post.js")
+endif()
 
 # Separate fixture-launch targets: opting into tests does not switch the
 # already-working interpreter application. The Worker selects this module only
 # when created with ?backend=jit.
-add_executable(vita3k_web_jit
+if(VITA3K_WEB_THREADS)
+    set(VITA3K_WEB_JIT_TARGET vita3k_web_jit_mt)
+else()
+    set(VITA3K_WEB_JIT_TARGET vita3k_web_jit)
+endif()
+add_executable(${VITA3K_WEB_JIT_TARGET}
     src/main.cpp src/vita_runtime.cpp src/vita_display_bridge.cpp
     src/memory.cpp src/interpreter.cpp src/guest.cpp
     src/vita_aot.cpp src/vita_app.cpp)
-target_compile_definitions(vita3k_web_jit PRIVATE VITA3K_WEB=1 VITA3K_USE_WASM_JIT=1)
-target_link_libraries(vita3k_web_jit PRIVATE vita3k_web_runtime_hle vita3k_wasm_jit
-    vita3k_guest_thread_runtime)
+target_compile_definitions(${VITA3K_WEB_JIT_TARGET} PRIVATE VITA3K_WEB=1 VITA3K_USE_WASM_JIT=1)
+target_link_libraries(${VITA3K_WEB_JIT_TARGET} PRIVATE vita3k_web_runtime_hle vita3k_wasm_jit)
+if(TARGET vita3k_guest_thread_runtime)
+    target_link_libraries(${VITA3K_WEB_JIT_TARGET} PRIVATE vita3k_guest_thread_runtime)
+endif()
 # The retail-app entry points are exported for the Worker, and the FS runtime is
 # exported so staged content can be uploaded into MEMFS before vita3k_web_run_app
 # (the browser build has no NODERAWFS). FORCE_FILESYSTEM keeps the FS library in
 # the link even when only the harness (not the guest) touches it.
-target_link_options(vita3k_web_jit PRIVATE
+target_link_options(${VITA3K_WEB_JIT_TARGET} PRIVATE
     -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=Vita3KWebJit
-    -sENVIRONMENT=web,worker -sNO_EXIT_RUNTIME=1 -sASYNCIFY=1
+    -sENVIRONMENT=web,worker -sNO_EXIT_RUNTIME=1 $<$<NOT:$<BOOL:${VITA3K_WEB_THREADS}>>:-sASYNCIFY=1>
     -sFORCE_FILESYSTEM=1
     ${VITA3K_WEB_INITIAL_MEMORY_LINK_OPTION}
     "-sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_vita3k_web_set_app_paths','_vita3k_web_set_license_key','_vita3k_web_run_app']"
     "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','cwrap','HEAPU8']")
 
+if(VITA3K_WEB_THREADS)
+    target_link_options(${VITA3K_WEB_JIT_TARGET} PRIVATE -sPTHREAD_POOL_SIZE=24
+        "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=['$PThread','$setWasmTableEntry','$getWasmTableEntry']")
+endif()
+
 # The guest hot path must not call through invoke_* exception wrappers. The
 # symbol map names functions for the check without shipping a name section.
-target_link_options(vita3k_web_jit PRIVATE --emit-symbol-map)
+# The threaded build has no fiber scheduler, so the functions checked do not exist there.
+if(NOT VITA3K_WEB_THREADS)
+target_link_options(${VITA3K_WEB_JIT_TARGET} PRIVATE --emit-symbol-map)
 find_program(VITA3K_WASM_OBJDUMP wasm-objdump REQUIRED)
-add_custom_command(TARGET vita3k_web_jit POST_BUILD
+add_custom_command(TARGET ${VITA3K_WEB_JIT_TARGET} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E env "WASM_OBJDUMP=${VITA3K_WASM_OBJDUMP}"
         ${CMAKE_CROSSCOMPILING_EMULATOR} "${CMAKE_CURRENT_LIST_DIR}/tests/hot_path_invokes.mjs"
-        "$<TARGET_FILE_DIR:vita3k_web_jit>/vita3k_web_jit.wasm"
+        "$<TARGET_FILE_DIR:${VITA3K_WEB_JIT_TARGET}>/${VITA3K_WEB_JIT_TARGET}.wasm"
     VERBATIM)
+endif()
 
 add_executable(vita3k_jit_fixture_node
     src/vita_runtime.cpp src/vita_display_bridge.cpp src/vita_aot.cpp tests/vita_bench_main.cpp)

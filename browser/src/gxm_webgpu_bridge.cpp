@@ -13,6 +13,7 @@
 // desktop's disable-surface-sync=false) also reads each rendered target back
 // into guest memory first, suspending the guest until the copy arrives.
 #include "gxm_webgpu_bridge.h"
+#include "thread_bridge.h"
 #include "gxm_webgpu_program.h"
 #include <display/state.h>
 #include <emuenv/state.h>
@@ -32,6 +33,7 @@
 #include <memory>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <exception>
@@ -39,9 +41,24 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+static int web_gxm_init() { return browser::coordinator_call("gxm-init"); }
+static int web_gxm_register_program(uint32_t id, const void *gxp, uint32_t size, int fragment) {
+    return browser::coordinator_call("gxm-program", {id, reinterpret_cast<uintptr_t>(gxp), size, uint64_t(fragment)});
+}
+static int web_gxm_wait_capacity() { return browser::coordinator_call("gxm-capacity"); }
+static int web_gxm_sync_surface(uint32_t address, uint8_t *dest, uint32_t width, uint32_t height, uint32_t pixel_bytes) {
+    return browser::coordinator_call("gxm-read", {address, reinterpret_cast<uintptr_t>(dest), width, height, pixel_bytes});
+}
+static int web_gxm_submit(const uint32_t *words, uint32_t count, const uint8_t *data, uint32_t size) {
+    return browser::coordinator_call("gxm-submit", {reinterpret_cast<uintptr_t>(words), count, reinterpret_cast<uintptr_t>(data), size});
+}
+static int web_gxm_present(uint32_t address) { return browser::coordinator_call("gxm-present", {address}); }
+#else
 // Device and GXP compiler: once, at sceGxmInitialize (the calling guest thread
 // may suspend). Benchmark-only VITA3K_NULL_GPU (see host_abi.js) keeps every
 // scene call a no-op so the CPU path runs under Node.
@@ -146,6 +163,8 @@ EM_JS(int, web_gxm_present, (uint32_t address), {
     }
 });
 
+#endif
+
 // Benchmark survey (VITA3K_GXM_SURVEY=1 with VITA3K_NULL_GPU=1): a command the
 // consumer cannot represent is counted and skipped instead of failing the
 // guest thread, so one Node run lists every GXM feature a title needs.
@@ -155,6 +174,12 @@ EM_JS(int, web_gxm_survey_enabled, (), {
 });
 
 namespace {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+std::recursive_mutex gxm_mutex;
+#define GXM_GUARD const std::lock_guard<std::recursive_mutex> gxm_guard(gxm_mutex)
+#else
+#define GXM_GUARD
+#endif
 // Host milliseconds per stage, reported with the run progress.
 struct Timing {
     double build = 0, decode = 0, submit = 0, sync = 0, queue_wait = 0;
@@ -352,6 +377,7 @@ struct WebState final : renderer::State {
 
 namespace browser {
 void gxm_timing_report() {
+    GXM_GUARD;
     const auto &t = timing();
     std::printf("[gxm] scene_ms=%.0f (decode_ms=%.0f decodes=%u hashes=%u clean=%u untracked=%u js_submit_ms=%.0f) gpu_wait_ms=%.0f",
         t.build, t.decode, t.decodes, t.hashes, t.clean, t.untracked, t.submit, t.queue_wait);
@@ -360,11 +386,13 @@ void gxm_timing_report() {
     std::printf("\n");
 }
 void gxm_survey_report() {
+    GXM_GUARD;
     for (const auto &[reason, count] : survey_counts())
         std::printf("[gxm-%s] %8llu %s\n", survey_mode() ? "survey" : "skip",
             static_cast<unsigned long long>(count), reason.c_str());
 }
 int gxm_initialize(EmuEnvState &env) {
+    GXM_GUARD;
     if (env.renderer) return SCE_GXM_ERROR_ALREADY_INITIALIZED;
     if (web_gxm_init() != 0) return SCE_GXM_ERROR_DRIVER;
     env.renderer = std::make_unique<WebState>(env.mem);
@@ -397,6 +425,7 @@ int gxm_initialize(EmuEnvState &env) {
     return 0;
 }
 int gxm_terminate(EmuEnvState &env) {
+    GXM_GUARD;
     if (!env.renderer) return SCE_GXM_ERROR_UNINITIALIZED;
     // Every queued entry was drained inline before its AddEntry returned, so
     // only the guest thread is left; release it the way desktop terminate does.
@@ -430,7 +459,11 @@ SyncWaitResult wishlist(SceGxmSyncObject *sync, uint32_t timestamp, int32_t time
             std::printf("[gxm-wait] sync current=%u target=%u not ready\n",
                 sync->timestamp_current.load(), timestamp);
         }
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+        std::this_thread::sleep_for(std::chrono::milliseconds(1)); // a host thread may block
+#else
         emscripten_sleep(1);
+#endif
     }
     return sync->being_deleted ? SyncWaitResult::Shutdown : SyncWaitResult::Ready;
 }
@@ -2534,6 +2567,7 @@ static void consume_commands(State &state, Context *ctx, Command *&cursor, MemSt
 }
 
 void submit_command_list(State &state, Context *ctx, CommandList &list) {
+    GXM_GUARD;
     const double started = emscripten_get_now();
     auto &web_state = static_cast<WebState &>(state);
     auto &mem = web_state.mem;
@@ -2593,6 +2627,7 @@ namespace browser {
 // render target is shown from the GPU; otherwise the caller presents guest
 // memory.
 bool gxm_present_gpu_target(Address base) {
+    GXM_GUARD;
     int result;
     while ((result = web_gxm_present(base)) == 2) {
         if (!renderer::wait_for_gpu_capacity())

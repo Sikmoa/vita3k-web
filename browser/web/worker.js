@@ -15,6 +15,7 @@ const moduleDirectories = { w64: 'wasm64/', w32: '' };
 const storage = createWebStorage('./');
 const post = (message, transfer) => self.postMessage({ ...message, timestamp: performance.now() }, transfer || []);
 let module = null;
+let threaded = false;
 let lifecycle = 'starting';
 
 // Host hooks called from Wasm (see browser/src/vita_runtime.cpp). With
@@ -26,7 +27,7 @@ globalThis.vita3kWebOnExit = (code) => {
 // The view is only valid synchronously; copy it before yielding. The data is
 // TIGHT RGBA produced in Wasm from the real sceDisplaySetFrameBuf state.
 globalThis.vita3kWebOnFrame = (generation, width, height, view) => {
-  const data = view.slice().buffer;
+  const data = new Uint8Array(view).buffer;
   post({ type: 'vita-frame', generation, width, height, pixelFormat: 'A8B8G8R8', data }, [data]);
 };
 // GXM frames presented from the GPU (browser/web/gxm_scene.js). Pixels are
@@ -73,7 +74,7 @@ globalThis.vita3kWebOnGxmThrottle = (detail) => {
 // sceAudioOutOutput call. Transfer the copy; the Wasm scratch is reused by
 // the next call, so the page must not retain the view.
 globalThis.vita3kWebOnAudio = (freq, channels, frames, view, port = 0) => {
-  const data = view.slice().buffer;
+  const data = new Uint8Array(view).buffer;
   post({ type: 'vita-audio', freq, channels, frames, data, port }, [data]);
 };
 
@@ -86,7 +87,7 @@ try {
   transition('loading');
   const workerParams = new URL(self.location.href).searchParams;
   const jit = workerParams.get('backend') === 'jit';
-  const moduleName = jit ? 'vita3k_web_jit' : 'vita3k_web';
+  let moduleName = jit ? 'vita3k_web_jit' : 'vita3k_web';
   // Memory-model selection: Memory64 is the preferred configuration, wasm32
   // the fallback. ?memory=w64 forces the direct build (fails loudly when
   // unsupported); ?memory=w32 forces the sparse reference; default (auto)
@@ -107,9 +108,17 @@ try {
     }
   };
   const attempts = forceW64 ? ['w64'] : forceW32 ? ['w32'] : (probeMemory64() ? ['w64', 'w32'] : ['w32']);
+  // Opt-in while validation continues; keep the single-Worker fallback.
+  const threadsRequested = workerParams.get('threads') === '1';
+  if (threadsRequested && jit && !forceW32 && workerParams.get('gles') !== '1'
+      && globalThis.crossOriginIsolated && typeof SharedArrayBuffer === 'function' && probeMemory64())
+    attempts.unshift('mt');
+  else if (threadsRequested)
+    post({type: 'log', message: 'threaded runtime unavailable; using the single-Worker runtime'});
   let memoryFallback = false;
   for (const attempt of attempts) {
-    const base = `./${moduleDirectories[attempt]}`;
+    moduleName = attempt === 'mt' ? 'vita3k_web_jit_mt' : jit ? 'vita3k_web_jit' : 'vita3k_web';
+    const base = `./${moduleDirectories[attempt === 'mt' ? 'w64' : attempt]}`;
     const moduleUrl = new URL(`${base}${moduleName}.js`, self.location.href).href;
     try {
       const { default: createModule } = await import(moduleUrl);
@@ -180,6 +189,12 @@ try {
         // Print every guest thread's PC each N dispatches (vita_app.cpp).
         VITA3K_BENCH_PC_SAMPLE: workerParams.get('pcSample') ?? undefined,
       });
+      threaded = attempt === 'mt';
+      if (threaded) {
+        const { installThreadBridge } = await import('./thread_bridge.js');
+        installThreadBridge(module, message => post({ type: 'log', message }));
+        module.vita3kStartPoolRefill?.();
+      }
       break;
     } catch (error) {
       if (attempt === attempts[attempts.length - 1]) throw error;
@@ -189,7 +204,7 @@ try {
   }
   transition('ready');
   post({ type: 'ready', diagnostics: { module: moduleName, backend: jit ? 'jit' : 'interpreter',
-    memoryRequested: memoryParam, memoryFallback, inlineMutex: jit && workerParams.get('inlineMutex') !== '0',
+    memoryRequested: memoryParam, memoryFallback, threaded, inlineMutex: jit && !threaded && workerParams.get('inlineMutex') !== '0',
     memoryModel: module['vita3kMemoryModel'], hostPointerBits: module['vita3kHostPointerBits'], wasm: true, worker: true } });
 } catch (error) {
   lifecycle = 'error';
@@ -535,7 +550,12 @@ self.onmessage = async ({ data }) => {
       } else {
         module._vita3k_web_set_license_key(hostPointer(0));
       }
-      module._vita3k_web_run_app();
+      if (threaded) {
+        module.vita3kConfigureWorkers();
+        if (module._vita3k_web_start_app() !== 0) throw new Error('application already started');
+      } else {
+        module._vita3k_web_run_app();
+      }
     } catch (error) {
       post({ type: 'vita-exit', exitCode: -1, ok: false, message: String(error.stack || error) });
     }

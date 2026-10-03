@@ -21,14 +21,23 @@
 // production paths shared with run_vita(), so this works under both
 // InterpreterCPU and WasmJitCPU.
 #include <patch/patch.h>
+#include <cpu/disasm/functions.h>
 #include <cpu/functions.h>
 #include <cpu/impl/interpreter_cpu.h>
+// Guest threads: Asyncify fibers on one Worker (GuestThreadRuntime), or host
+// threads on the desktop kernel paths in the threaded build (THREADS.md).
+#if defined(VITA3K_USE_WASM_JIT) && !defined(VITA3K_WEB_THREADS)
+#define VITA3K_WEB_FIBERS 1
+#endif
 #ifdef VITA3K_USE_WASM_JIT
 #include <cpu/impl/wasm_jit_cpu.h>
+#ifdef VITA3K_WEB_FIBERS
 #include "guest_thread_runtime.h"
+#endif
 #include "gxm_webgpu_bridge.h"
 #endif
 #include <ctrl/state.h>
+#include <display/functions.h>
 #include <display/state.h>
 #include <emuenv/state.h>
 #include <io/functions.h>
@@ -51,6 +60,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstdio>
@@ -58,14 +68,17 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 // Null audio sink (hle_audio_null.cpp): no device in the web runtime.
 void vita3k_web_install_null_audio(struct AudioState &audio);
 
+#ifdef VITA3K_WEB_FIBERS
 // One event-loop turn without setTimeout's clamping: a Worker only commits its
 // OffscreenCanvas frame and resolves GPU map requests between tasks.
 EM_ASYNC_JS(void, web_yield_to_event_loop, (), {
@@ -75,13 +88,15 @@ EM_ASYNC_JS(void, web_yield_to_event_loop, (), {
         channel.port2.postMessage(0);
     });
 });
+#endif
 
 // Host input (worker.js 'input'): SCE_CTRL_* button mask and stick axes in
 // [-1, 1] (lx, ly, rx, ry), set between event-loop turns and applied to the
 // guest pad by the run loop.
 static std::uint32_t g_host_buttons = 0;
 static std::array<float, 4> g_host_axes{};
-static bool g_host_input_changed = false;
+static std::atomic<bool> g_host_input_changed = false;
+static std::mutex g_host_input_mutex;
 
 namespace {
 
@@ -135,6 +150,19 @@ bool needs_module_start(const char *path) {
 std::uint32_t run_module_entry(EmuEnvState &env, const SceKernelModuleInfo &info,
     Ptr<const void> entry, SceSize args, Ptr<const void> argp) {
     if (browser::gles::replace_module(env, info)) return 0;
+#ifdef VITA3K_WEB_THREADS
+    // The desktop run loop stays alive after a guest return so its host thread
+    // can be reused. Run the entry on that host thread and wait for dormancy;
+    // calling run_loop(false) here would park the loader itself forever.
+    auto module_thread = env.kernel.create_thread(env.mem, info.module_name, entry,
+        SCE_KERNEL_DEFAULT_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT,
+        SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
+    if (!module_thread)
+        return 0xDEADDEAD;
+    const auto result = module_thread->run_guest_function(entry.address(), args, argp.cast<void>());
+    module_thread->exit_delete(false);
+    return result;
+#else
     auto module_thread = std::make_shared<ThreadState>(
         env.kernel.get_next_uid(), env.kernel, env.mem);
     if (module_thread->init(info.module_name, entry,
@@ -169,6 +197,7 @@ std::uint32_t run_module_entry(EmuEnvState &env, const SceKernelModuleInfo &info
     env.kernel.threads.erase(module_thread->id);
     module_thread.reset();
     return result;
+#endif
 }
 
 } // namespace
@@ -405,7 +434,12 @@ static int run_app_impl() {
         std::fprintf(stderr, "[vita3k-web] run_app: no title staged (call vita3k_web_set_app_paths first)\n");
         return -1;
     }
+#ifdef VITA3K_WEB_THREADS
+    // Never freed: guest host threads may outlive this function.
+    EmuEnvState *env = new EmuEnvState();
+#else
     auto env = std::make_unique<EmuEnvState>();
+#endif
     if (!init(env->mem, true)) return -2;
     // Desktop late_init: the NGS voice definitions live in guest memory and
     // sceNgsVoiceDefGet* hands their addresses to the guest.
@@ -422,7 +456,7 @@ static int run_app_impl() {
     if (config.has_klic) std::memcpy(license.key, config.klic, sizeof(license.key));
 
     ThreadStatePtr thread;
-#ifdef VITA3K_USE_WASM_JIT
+#ifdef VITA3K_WEB_FIBERS
     // The Vita gives applications three CPU cores. VITA3K_GUEST_CORES=1
     // restores the single-core scheduler (A/B measurement).
     unsigned guest_cores = 3;
@@ -437,14 +471,23 @@ static int run_app_impl() {
     // so titles that pace at 30 FPS through the display API present at 60.
     if (const char *fps_hack = std::getenv("VITA3K_FPS_HACK"))
         env->display.fps_hack = std::strcmp(fps_hack, "1") == 0;
-    bool exited = false;
-    int exit_code = 0;
-    unsigned imports = 0;
+    // Atomic: in the threaded build every guest thread runs the import callback.
+    std::atomic<bool> exited = false;
+    std::atomic<int> exit_code = 0;
+    std::atomic<unsigned> imports = 0;
     // Wall time charged to the HLE callback (import dispatch + module body).
     // Subtracting it, the JIT phase counters and the wall clock separates
     // "import handling" from "JIT compile" and "JIT dispatch".
     double hle_ms = 0.0;
-    unsigned frames_presented = 0;
+    std::atomic<unsigned> frames_presented = 0;
+    // The progress report clock and the HLE profile, shared by guest threads.
+#ifdef VITA3K_WEB_THREADS
+    using ReportMutex = std::mutex;
+#else
+    // One guest thread runs at a time; the import callback must stay cheap.
+    struct ReportMutex { void lock() {} void unlock() {} };
+#endif
+    ReportMutex report_mutex;
     std::unordered_map<std::uint32_t, std::pair<unsigned, double>> hle_nids;
     // Last import (NID, PC) per thread under VITA3K_HLE_PROFILE: where a parked thread waits.
     std::unordered_map<SceUID, std::pair<std::uint32_t, Address>> last_import;
@@ -467,8 +510,17 @@ static int run_app_impl() {
     // slow-path memory breakdown in the per-CPU profile.
     const auto jit_started = std::chrono::steady_clock::now();
     const auto jit_report = [&](const char *tag, bool verbose) {
+#ifdef VITA3K_WEB_THREADS
+        // Guest host threads are created and erased concurrently.
+        const auto report_threads = [&] {
+            const std::lock_guard<std::mutex> threads_guard(env->kernel.mutex);
+            return env->kernel.threads;
+        }();
+#else
+        const auto &report_threads = env->kernel.threads;
+#endif
         std::uint64_t total = 0, hottest = 0;
-        for (const auto &[id, active] : env->kernel.threads) {
+        for (const auto &[id, active] : report_threads) {
             if (!active || !active->cpu || !active->cpu->cpu) continue;
             const auto count = static_cast<WasmJitCPU &>(*active->cpu->cpu).instructions_executed();
             total += count;
@@ -477,13 +529,13 @@ static int run_app_impl() {
         const double seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - jit_started).count();
         double guest_ms = 0;
-        for (const auto &[id, active] : env->kernel.threads)
+        for (const auto &[id, active] : report_threads)
             if (active && active->cpu && active->cpu->cpu)
                 guest_ms += static_cast<WasmJitCPU &>(*active->cpu->cpu).run_ms();
         std::printf("[vita3k-web] jit[%s] elapsed=%.1fs insns=%llu rate_mips=%.2f imports=%u threads=%zu hle_ms=%.1f frames=%u guest_ms=%.0f idle_ms=%.0f yield_ms=%.0f\n",
             tag, seconds, static_cast<unsigned long long>(total),
             seconds > 0.0 ? static_cast<double>(total) / seconds / 1e6 : 0.0,
-            imports, env->kernel.threads.size(), hle_ms, frames_presented, guest_ms, idle_ms, yield_ms);
+            imports.load(), report_threads.size(), hle_ms, frames_presented.load(), guest_ms, idle_ms, yield_ms);
         browser::gxm_timing_report();
         if (!verbose) return;
         // Which import owns the wall clock, and is it many cheap calls (spin) or
@@ -510,7 +562,7 @@ static int run_app_impl() {
                 nid, app_import_name(nid), stats.first, stats.second,
                 stats.first ? stats.second * 1000.0 / stats.first : 0.0);
         }
-        for (const auto &[id, active] : env->kernel.threads) {
+        for (const auto &[id, active] : report_threads) {
             if (!active || !active->cpu || !active->cpu->cpu) continue;
             auto &jit = static_cast<WasmJitCPU &>(*active->cpu->cpu);
             if (jit.instructions_executed() == 0) continue;
@@ -524,9 +576,12 @@ static int run_app_impl() {
             if (jit.instructions_executed() == hottest)
                 std::printf("[vita3k-web] jit profile %d: %s\n", id, jit.get_profile().c_str());
         }
-        for (const auto &[id, active] : env->kernel.threads) {
+        for (const auto &[id, active] : report_threads) {
             const auto last = last_import.find(id);
             if (!active || last == last_import.end()) continue;
+#ifdef VITA3K_WEB_THREADS
+            const std::lock_guard<std::mutex> status_guard(active->mutex);
+#endif
             std::printf("[vita3k-web] thread=%d %s status=%d last_import=%s PC=%08x\n", id,
                 active->name.c_str(), static_cast<int>(active->status),
                 app_import_name(last->second.first), last->second.second);
@@ -536,27 +591,42 @@ static int run_app_impl() {
     struct Cleanup {
         EmuEnvState &env;
         ThreadStatePtr &thread;
-#ifdef VITA3K_USE_WASM_JIT
+#ifdef VITA3K_WEB_FIBERS
         vita3k::web::GuestThreadRuntime &runtime;
 #endif
         ~Cleanup() {
-#ifdef VITA3K_USE_WASM_JIT
+#ifdef VITA3K_WEB_THREADS
+            // The import callbacks capture this function's stack. Stop and
+            // reap every host thread before those captures go out of scope.
+            env.kernel.process_exit();
+            env.display.abort = true;
+            if (env.display.vblank_thread && env.display.vblank_thread->joinable())
+                env.display.vblank_thread->join();
+#else
+#ifdef VITA3K_WEB_FIBERS
             // Never release guest memory while a suspended HLE frame refers to it.
             if (!runtime.shutdown()) std::terminate();
 #endif
             if (thread) { env.kernel.threads.erase(thread->id); thread.reset(); }
             env.kernel.deinit(env.mem);
             deinit_mem(env.mem);
+#endif
         }
     } cleanup{*env, thread
-#ifdef VITA3K_USE_WASM_JIT
+#ifdef VITA3K_WEB_FIBERS
         , runtime
 #endif
     };
     try {
         if (!env->kernel.init(env->mem, [&](CPUState &cpu, uint32_t nid, SceUID tid) {
                 const unsigned import_sequence = ++imports;
-                recent_imports[import_sequence % recent_imports.size()] = { import_sequence, tid, nid, read_pc(cpu), read_lr(cpu) };
+                {
+                    const std::lock_guard<ReportMutex> guard(report_mutex);
+                    recent_imports[import_sequence % recent_imports.size()] = { import_sequence, tid, nid, read_pc(cpu), read_lr(cpu) };
+#ifdef VITA3K_WEB_THREADS
+                    last_import[tid] = { nid, read_pc(cpu) };
+#endif
+                }
                 if (trace_hle) {
                     std::fprintf(stderr, "[vita3k-web] HLE enter #%u tid=%d NID=%08x PC=%08x name=%s args=%08x,%08x,%08x,%08x LR=%08x\n",
                         import_sequence, tid, nid, read_pc(cpu), app_import_name(nid),
@@ -566,28 +636,33 @@ static int run_app_impl() {
                 // Boot imports are traced one by one; afterwards progress is
                 // reported on a wall-clock period, not per import (retail
                 // titles make 100k+ imports per second).
-                bool report = imports < 400;
-                if (!report && (imports & 1023) == 0) {
+                if (import_sequence < 400 || (import_sequence & 1023) == 0) {
+                    const std::lock_guard<ReportMutex> guard(report_mutex);
+                    bool report = import_sequence < 400;
                     const auto now = std::chrono::steady_clock::now();
-                    if (now - last_report >= std::chrono::seconds(5)) {
+                    if (!report && now - last_report >= std::chrono::seconds(5)) {
                         last_report = now;
                         report = true;
                     }
-                }
-                if (report) {
-                    std::printf("[vita3k-web] Vita import #%u: %s NID=%08x PC=%08x\n",
-                        imports, app_import_name(nid), nid, read_pc(cpu));
+                    if (report) {
+                        std::printf("[vita3k-web] Vita import #%u: %s NID=%08x PC=%08x\n",
+                            import_sequence, app_import_name(nid), nid, read_pc(cpu));
 #ifdef VITA3K_USE_WASM_JIT
-                    jit_report("progress", true);
+                        jit_report("progress", true);
 #endif
+                    }
                 }
                 if (hle_profile) {
-                    last_import[tid] = { nid, read_pc(cpu) };
+                    {
+                        const std::lock_guard<ReportMutex> guard(report_mutex);
+                        last_import[tid] = { nid, read_pc(cpu) };
+                    }
                     const auto hle_started = std::chrono::steady_clock::now();
                     if (!browser::gles::call_import(*env, cpu, nid))
                         ::call_import(*env, cpu, nid, tid);
                     const double hle_cost = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - hle_started).count();
+                    const std::lock_guard<ReportMutex> guard(report_mutex);
                     hle_ms += hle_cost;
                     auto &hle_slot = hle_nids[nid];
                     ++hle_slot.first;
@@ -619,6 +694,7 @@ static int run_app_impl() {
         env->kernel.process_exit_callback = [&](int status, std::optional<AppLaunchRequest>) {
             exited = true;
             exit_code = status;
+            const std::lock_guard<std::mutex> guard(env->kernel.mutex);
             for (auto &[id, active] : env->kernel.threads)
                 active->exit_delete(false);
         };
@@ -626,8 +702,22 @@ static int run_app_impl() {
             Ptr<const void> entry, SceSize args, Ptr<const void> argp) {
             return run_module_entry(*env, info, entry, args, argp);
         };
-#ifdef VITA3K_USE_WASM_JIT
+#ifdef VITA3K_WEB_FIBERS
         if (!runtime.attach(*env)) return -11;
+#elif defined(VITA3K_WEB_THREADS)
+        // Host threads (desktop kernel paths), each with its own Wasm JIT CPU;
+        // the core number keeps every live thread on its own dispatch slice.
+        env->kernel.make_cpu = [](SceUID id, std::size_t core, MemState &mem) -> CPUStatePtr {
+            CPUStatePtr cpu(new CPUState(), [](CPUState *p) { delete p; });
+            cpu->mem = &mem;
+            cpu->thread_id = id;
+            cpu->svc_called = false;
+            cpu->svc = 0;
+            if (!init(cpu->disasm))
+                return {};
+            cpu->cpu = std::make_unique<WasmJitCPU>(cpu.get(), core);
+            return cpu;
+        };
 #endif
         init_device_paths(env->io);
         // Desktop io::init() creates the standard device tree (ux0:/data,
@@ -669,7 +759,7 @@ static int run_app_impl() {
                             std::printf("[vita3k-web] missing NID=%08x (%s)\n", nid, app_import_name(nid));
                         return -8;
                     }
-                    if (exited) return exit_code;
+                    if (exited) return exit_code.load();
                     if (result == 0xDEADDEAD || static_cast<std::int32_t>(result) < 0)
                         return -10;
                 }
@@ -722,10 +812,18 @@ static int run_app_impl() {
             if (param->main_thread_cpu_affinity_mask) affinity = *Ptr<SceInt32>(param->main_thread_cpu_affinity_mask).get(env->mem);
         }
 #ifdef VITA3K_USE_WASM_JIT
+#ifdef VITA3K_WEB_THREADS
+        // Desktop vblank thread: the emulated display clock runs on its own.
+        start_sync_thread(*env);
+#endif
         thread = env->kernel.create_thread(env->mem, config.title_id.c_str(), module.start_entry,
             priority, affinity, stack_size, nullptr);
         if (!thread) return -6;
+#ifdef VITA3K_WEB_THREADS
+        std::puts("[vita3k-web] CPU backend: WasmJitCPU on host threads (threaded build)");
+#else
         std::puts("[vita3k-web] CPU backend: WasmJitCPU with guest fibers (single logical CPU)");
+#endif
 #else
         thread = std::make_shared<ThreadState>(env->kernel.get_next_uid(), env->kernel, env->mem);
         if (thread->init(config.title_id.c_str(), module.start_entry, priority, affinity, stack_size, nullptr) < 0) return -6;
@@ -742,7 +840,15 @@ static int run_app_impl() {
             return -7;
         }
 #ifdef VITA3K_USE_WASM_JIT
+#ifdef VITA3K_WEB_FIBERS
         vita3k::web::GuestThreadRuntime::Progress progress;
+#else
+        // Threaded build: no scheduler to ask; the loop below only watches.
+        struct {
+            std::size_t dispatches = 0, runnable = 0, waiting = 0, dormant = 0, failed = 0;
+            bool idle = false;
+        } progress;
+#endif
         std::size_t dispatched = 0;
         std::size_t pc_sample_every = 0;
         if (const char *sample_env = std::getenv("VITA3K_BENCH_PC_SAMPLE")) {
@@ -831,6 +937,7 @@ static int run_app_impl() {
                 break;
             }
             if (g_host_input_changed) {
+                const std::lock_guard<std::mutex> input_guard(g_host_input_mutex);
                 g_host_input_changed = false;
                 const std::lock_guard<std::mutex> guard(env->ctrl.mutex);
                 auto &pad = env->ctrl.keyboard_state;
@@ -842,6 +949,26 @@ static int run_app_impl() {
                 std::printf("[vita3k-web] AOT disabled after %.0fs (VITA3K_AOT_UNTIL)\n", aot_until);
                 aot_until = 0;
             }
+#ifdef VITA3K_WEB_THREADS
+            // Guest threads run on their own host threads; this thread only
+            // feeds input and watches for the end of the run. Every 5 s it
+            // names where each guest thread is (a stall shows as a fixed PC).
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            if (const double now_ms = emscripten_get_now(); now_ms - last_yield_ms >= 5000.0) {
+                last_yield_ms = now_ms;
+                const std::lock_guard<ReportMutex> report_guard(report_mutex);
+                const std::lock_guard<std::mutex> threads_guard(env->kernel.mutex);
+                std::fprintf(stderr, "[vita3k-web] threads imports=%u (last HLE PC):", imports.load());
+                for (const auto &[tid, t] : env->kernel.threads) {
+                    const std::lock_guard<std::mutex> thread_guard(t->mutex);
+                    const auto last = last_import.find(tid);
+                    std::fprintf(stderr, " %d:%s:%08x:%d", tid, t->name.c_str(),
+                        last == last_import.end() ? 0 : last->second.second, static_cast<int>(t->status));
+                }
+                std::fprintf(stderr, "\n");
+            }
+            continue;
+#else
             progress = runtime.resume(256);
             dispatched += progress.dispatches;
             // Page messages (pad input, dialog answers) arrive only in event
@@ -874,6 +1001,7 @@ static int run_app_impl() {
                 }
                 progress.idle = false;
             }
+#endif
         // Unsupported imports remain fatal. A return-zero missing-import stub
         // is not an implementation (PVRSRVConnect must provide a connection).
         // The opt-in GLES adapter handles its APIs explicitly before this point.
@@ -892,7 +1020,10 @@ static int run_app_impl() {
         thread->run_loop(true);
 #endif
 #ifdef VITA3K_USE_WASM_JIT
-        jit_report("final", true);
+        {
+            const std::lock_guard<ReportMutex> guard(report_mutex);
+            jit_report("final", true);
+        }
         browser::gxm_survey_report();
         if (bench_expired)
             std::printf("[vita3k-web] benchmark deadline reached after %.1fs\n", bench_seconds);
@@ -901,10 +1032,10 @@ static int run_app_impl() {
                 WasmJitCPU::dump_aot_seeds(seeds) ? "ok" : "FAILED");
 #endif
         std::printf("[vita3k-web] Vita result: process_exit=%d code=%d imports=%u missing_nids=%zu PC=%08x\n",
-            exited, exit_code, imports, env->missing_nids.size(), read_pc(*thread->cpu));
+            exited.load(), exit_code.load(), imports.load(), env->missing_nids.size(), read_pc(*thread->cpu));
         for (const auto nid : env->missing_nids)
             std::printf("[vita3k-web] missing NID=%08x (%s)\n", nid, app_import_name(nid));
-        return exited && env->missing_nids.empty() ? exit_code : -8;
+        return exited && env->missing_nids.empty() ? exit_code.load() : -8;
     } catch (const std::exception &error) {
         std::fprintf(stderr, "[vita3k-web] Vita app runtime error: %s\n", error.what());
         return -9;
@@ -913,6 +1044,7 @@ static int run_app_impl() {
 
 extern "C" EMSCRIPTEN_KEEPALIVE
 void vita3k_web_set_pad(std::uint32_t buttons, float lx, float ly, float rx, float ry) {
+    const std::lock_guard<std::mutex> guard(g_host_input_mutex);
     g_host_buttons = buttons;
     g_host_axes = { lx, ly, rx, ry };
     g_host_input_changed = true;
@@ -929,3 +1061,12 @@ int vita3k_web_run_app() {
     vita3k_web_notify_exit(code);
     return code;
 }
+
+#ifdef VITA3K_WEB_THREADS
+extern "C" EMSCRIPTEN_KEEPALIVE int vita3k_web_start_app() {
+    static std::atomic<bool> started = false;
+    if (started.exchange(true)) return -1;
+    std::thread([] { vita3k_web_run_app(); }).detach();
+    return 0;
+}
+#endif

@@ -263,5 +263,10 @@ void backend(MemState &mem) {
     }
     std::puts("Inline mutex: real stubs, NID/return patching, 1000-pair single-phase loop and bounded slices passed");
 }
-void run(MemState &mem) { emitted_matrix(mem); backend(mem); }
+void run(MemState &mem) {
+    emitted_matrix(mem);
+#ifndef __EMSCRIPTEN_SHARED_MEMORY__
+    backend(mem); // The shared build never takes the fast paths (inline_mutex_enabled).
+#endif
+}
 } // namespace inline_mutex_tests

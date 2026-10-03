@@ -5,6 +5,7 @@
 // vita3kWebOnDialog posts 'vita-dialog', 'dialog-press' calls the export below.
 #include "msg_dialog_bridge.h"
 #include "page_json.h"
+#include "thread_bridge.h"
 
 #include <config/state.h>
 #include <ctrl/ctrl.h>
@@ -19,10 +20,17 @@
 #include <mutex>
 #include <string>
 
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+static void web_msg_dialog_post(const char *json, uint32_t size) {
+    browser::coordinator_call("dialog", {reinterpret_cast<uintptr_t>(json), size});
+}
+#else
 EM_JS(void, web_msg_dialog_post, (const char *json, uint32_t size), {
     if (typeof globalThis.vita3kWebOnDialog !== 'function') return;
     globalThis.vita3kWebOnDialog(JSON.parse(new TextDecoder().decode(Module['vita3kHostBytes'](json, size).slice())));
 });
+
+#endif
 
 namespace {
 struct Press {
@@ -33,6 +41,7 @@ struct PageDialog {
     std::string message;
     uint32_t percent = 0;
     Press press;
+    std::mutex press_mutex;
 };
 PageDialog &page() {
     static PageDialog state;
@@ -83,16 +92,24 @@ namespace browser {
 uint32_t sync_message_dialog(EmuEnvState &env) {
     auto &state = page();
     auto &dialog = env.common_dialog;
+    // Idle fast path: this runs after every import. Rechecked under the lock.
     if (!state.shown && dialog.type != MESSAGE_DIALOG)
         return 0;
     const std::lock_guard<std::recursive_mutex> lock(dialog.mutex);
+    if (!state.shown && dialog.type != MESSAGE_DIALOG)
+        return 0;
+    Press press;
+    {
+        const std::lock_guard<std::mutex> guard(state.press_mutex);
+        press = state.press;
+        state.press = {};
+    }
     const auto running = [&] {
         return dialog.type == MESSAGE_DIALOG && dialog.status == SCE_COMMON_DIALOG_STATUS_RUNNING;
     };
     // A press names the dialog it answers; one for a dialog that is gone is dropped.
-    if (state.press.id && state.press.id == state.shown && running())
-        apply(dialog, state.press, env.cfg.sys_button);
-    state.press = {};
+    if (press.id && press.id == state.shown && running())
+        apply(dialog, press, env.cfg.sys_button);
     if (!running()) {
         if (state.shown) {
             // Closed by a press, or by the guest (Close, Abort, Term).
@@ -119,6 +136,7 @@ uint32_t sync_message_dialog(EmuEnvState &env) {
 }
 
 void press_message_dialog(uint32_t id, uint32_t button, uint32_t selected) {
+    const std::lock_guard<std::mutex> guard(page().press_mutex);
     page().press = { id, button, selected };
 }
 } // namespace browser

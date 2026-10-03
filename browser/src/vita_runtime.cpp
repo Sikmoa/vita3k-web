@@ -1,3 +1,4 @@
+#include "thread_bridge.h"
 // Browser byte transport into Vita3K's production loader, thread and HLE paths.
 // This is a synchronous, non-graphical launch entrypoint, not another kernel.
 #include <cpu/functions.h>
@@ -34,6 +35,12 @@ static_assert(sizeof(SceSize) == 4 && sizeof(SceUIntPtr) == 4 && sizeof(SceIntPt
 // delivered to the original JS call site, so the runtime reports its final
 // exit code through this host hook instead. Hosts that receive the return
 // value directly (non-suspending Node builds) may ignore it.
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+extern "C" void vita3k_web_notify_exit(int code) { browser::coordinator_call("exit", {uint64_t(uint32_t(code))}); }
+extern "C" void vita3k_web_post_frame_hook(int generation, int width, int height, const uint8_t *ptr) {
+    browser::coordinator_call("frame", {uint64_t(generation), uint64_t(width), uint64_t(height), reinterpret_cast<uintptr_t>(ptr)});
+}
+#else
 EM_JS(void, vita3k_web_notify_exit, (int code), {
     if (typeof vita3kWebOnExit === 'function') vita3kWebOnExit(code);
 });
@@ -48,6 +55,8 @@ EM_JS(void, vita3k_web_post_frame_hook, (int generation, int width, int height, 
     if (typeof vita3kWebOnFrame === 'function')
         vita3kWebOnFrame(generation, width, height, Module['vita3kHostBytes'](ptr, width * height * 4));
 });
+
+#endif
 
 // Fixed-width input length, native host pointer. Dedicated exports avoid the
 // special Number wrappers Emscripten may apply to its built-in malloc/free.

@@ -12,9 +12,6 @@
 #ifndef VITA3K_WEB_MEMORY64
 #error This object belongs only to the Memory64 browser build
 #endif
-#ifdef __EMSCRIPTEN_SHARED_MEMORY__
-#error The current cooperative Vita3K browser runtime requires unshared memory
-#endif
 
 extern "C" {
 extern unsigned char __heap_base;
@@ -25,11 +22,14 @@ extern unsigned char __heap_base;
 // the link rather than silently restore an unbounded break (see MEMORY64.md).
 // Lazy initialization is deliberate: morecore may be needed before C++ global
 // constructors. Do not depend on a pointer-to-integer dynamic initializer.
+// The break moves by compare-and-swap: in the threaded build (THREADS.md)
+// several threads may grow the heap at once.
 static uintptr_t runtime_break = 0;
 
 uintptr_t *emscripten_get_sbrk_ptr() {
-    if (!runtime_break)
-        runtime_break = reinterpret_cast<uintptr_t>(&__heap_base);
+    uintptr_t unset = 0;
+    __atomic_compare_exchange_n(&runtime_break, &unset, reinterpret_cast<uintptr_t>(&__heap_base), false,
+        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     return &runtime_break;
 }
 
@@ -37,38 +37,41 @@ void *_sbrk64(int64_t increment) {
     using namespace vita3k::memory;
     constexpr uint64_t alignment = alignof(std::max_align_t);
     const uintptr_t floor = reinterpret_cast<uintptr_t>(&__heap_base);
-    const uintptr_t old = *emscripten_get_sbrk_ptr();
-    if (floor >= guest_window_base || old < floor || old > guest_window_base) {
-        errno = ENOMEM;
-        return reinterpret_cast<void *>(UINTPTR_MAX);
+    uintptr_t *pointer = emscripten_get_sbrk_ptr();
+    uintptr_t old = __atomic_load_n(pointer, __ATOMIC_SEQ_CST);
+    while (true) {
+        if (floor >= guest_window_base || old < floor || old > guest_window_base) {
+            errno = ENOMEM;
+            return reinterpret_cast<void *>(UINTPTR_MAX);
+        }
+        uintptr_t next;
+        if (increment >= 0) {
+            const uint64_t amount = static_cast<uint64_t>(increment);
+            // Reject before rounding; no signed overflow or wrap at INT64_MAX.
+            if (amount > guest_window_base - old) {
+                errno = ENOMEM;
+                return reinterpret_cast<void *>(UINTPTR_MAX);
+            }
+            const uint64_t rounded = (amount + alignment - 1) & ~(alignment - 1);
+            if (rounded > guest_window_base - old) {
+                errno = ENOMEM;
+                return reinterpret_cast<void *>(UINTPTR_MAX);
+            }
+            next = old + rounded;
+        } else {
+            // Unsigned magnitude also handles INT64_MIN. Match libc's rounding
+            // toward zero when trimming. Memory.size is never reduced.
+            const uint64_t amount = (uint64_t{0} - static_cast<uint64_t>(increment)) & ~(alignment - 1);
+            if (amount > old - floor) {
+                errno = ENOMEM;
+                return reinterpret_cast<void *>(UINTPTR_MAX);
+            }
+            next = old - amount;
+        }
+        // Memory is created at its final size; no memory.grow call is needed.
+        if (__atomic_compare_exchange_n(pointer, &old, next, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            return reinterpret_cast<void *>(old);
     }
-    uintptr_t next;
-    if (increment >= 0) {
-        const uint64_t amount = static_cast<uint64_t>(increment);
-        // Reject before rounding; no signed overflow or wrap at INT64_MAX.
-        if (amount > guest_window_base - old) {
-            errno = ENOMEM;
-            return reinterpret_cast<void *>(UINTPTR_MAX);
-        }
-        const uint64_t rounded = (amount + alignment - 1) & ~(alignment - 1);
-        if (rounded > guest_window_base - old) {
-            errno = ENOMEM;
-            return reinterpret_cast<void *>(UINTPTR_MAX);
-        }
-        next = old + rounded;
-    } else {
-        // Unsigned magnitude also handles INT64_MIN. Match libc's rounding
-        // toward zero when trimming. Memory.size is never reduced.
-        const uint64_t amount = (uint64_t{0} - static_cast<uint64_t>(increment)) & ~(alignment - 1);
-        if (amount > old - floor) {
-            errno = ENOMEM;
-            return reinterpret_cast<void *>(UINTPTR_MAX);
-        }
-        next = old - amount;
-    }
-    // Memory is created at its final size; no memory.grow call is needed.
-    runtime_break = next;
-    return reinterpret_cast<void *>(old);
 }
 
 void *sbrk(intptr_t increment) {
@@ -82,13 +85,13 @@ int brk(void *pointer) {
         errno = ENOMEM;
         return -1;
     }
-    *emscripten_get_sbrk_ptr() = target;
+    __atomic_store_n(emscripten_get_sbrk_ptr(), target, __ATOMIC_SEQ_CST);
     return 0;
 }
 
 bool vita3k_web_memory64_ready() {
     using namespace vita3k::memory;
-    const uintptr_t current = *emscripten_get_sbrk_ptr();
+    const uintptr_t current = __atomic_load_n(emscripten_get_sbrk_ptr(), __ATOMIC_SEQ_CST);
     // Called before the guest window can be used. Raw Wasm size, not malloc's
     // break: the distinction is the whole purpose of this backend.
     return __builtin_wasm_memory_size(0) == guest_window_end / wasm_page_size

@@ -54,6 +54,12 @@ constexpr MemPerm most_restrictive_perm(MemPerm a, MemPerm b) {
 bool mem_read(const MemState &state, Address addr, void *destination, size_t size);
 bool mem_write(MemState &state, Address addr, const void *source, size_t size);
 bool mem_fetch(const MemState &state, Address addr, void *destination, size_t size);
+// Atomic compare-and-swap of 1, 2, 4 or 8 naturally aligned bytes (the store
+// half of LDREX/STREX). Checks like mem_write, and needs read permission too;
+// false means the access is not allowed. `swapped` reports whether memory
+// held `expected` and now holds `desired`.
+bool mem_compare_exchange(MemState &state, Address addr, size_t size, uint64_t expected, uint64_t desired, bool &swapped);
+bool mem_read_exclusive(const MemState &state, Address addr, size_t size, uint64_t &value);
 // Optional observer for successful mem_write() ranges. The Wasm region JIT
 // installs this so code written through mem_write bumps its per-page write
 // generations (see wasm_jit_cpu.cpp: g_code_page_versions). Null in builds

@@ -38,7 +38,7 @@ public:
     void invalidate_jit_cache(Address, size_t) override;
     // Releases this CPU's lazy code caches without implying a code change
     // (the loaded AOT module is unaffected). Used when a guest thread exits.
-    void release_code_caches();
+    void release_code_caches() override;
 
     void set_instruction_budget(uint64_t value);
     // Explicit scheduler boundary, distinct from halt (1), SVC (0), and

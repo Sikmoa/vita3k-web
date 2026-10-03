@@ -191,7 +191,8 @@ void wait_vblank(EmuEnvState &emuenv, const ThreadStatePtr &wait_thread, const u
             display.vblank_wait_infos.push_back({ wait_thread, target_vcount });
         }
 
-#ifdef __EMSCRIPTEN__
+        // The threaded browser build (shared memory) has the desktop vblank thread.
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_SHARED_MEMORY__)
         // Browser Worker path: there is no host vblank thread, so nothing would
         // ever wake status_cond. Two shapes, one clock service:
         //

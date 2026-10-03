@@ -7,11 +7,14 @@
 // Production SceAudio bodies (validation, port registry, volumes) run
 // unchanged; only the device layer is a sink.
 #include <audio/state.h>
+#include "thread_bridge.h"
 
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #ifdef __EMSCRIPTEN__
@@ -23,13 +26,25 @@
 // never passed to JS directly. The page must copy the view synchronously.
 // `port` tells concurrently open ports apart: each is its own stream, which
 // the page mixes (a movie's port plays alongside the game's mixer port).
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+static void vita3k_web_post_audio_hook(int freq, int channels, int frames, const uint8_t *ptr, int bytes, int port) {
+    browser::coordinator_call("audio", {uint64_t(freq), uint64_t(channels), uint64_t(frames), reinterpret_cast<uintptr_t>(ptr), uint64_t(bytes), uint64_t(port)});
+}
+#else
 EM_JS(void, vita3k_web_post_audio_hook, (int freq, int channels, int frames, const uint8_t *ptr, int bytes, int port), {
     if (typeof vita3kWebOnAudio === 'function')
         vita3kWebOnAudio(freq, channels, frames, Module['vita3kHostBytes'](ptr, bytes), port);
 });
+#endif
 #else
 static void vita3k_web_post_audio_hook(int, int, int, const uint8_t *, int, int) {}
 #endif
+
+struct NullAudioPort : AudioOutPort {
+    std::mutex mutex;
+    std::vector<uint8_t> pcm;
+    std::chrono::steady_clock::time_point next_output{};
+};
 
 struct NullAudioAdapter : AudioAdapter {
     explicit NullAudioAdapter(AudioState &audio_state)
@@ -38,13 +53,26 @@ struct NullAudioAdapter : AudioAdapter {
     bool init() override { return true; }
 
     AudioOutPortPtr open_port(int nb_channels, int freq, int nb_sample) override {
-        auto port = std::make_shared<AudioOutPort>();
+        auto port = std::make_shared<NullAudioPort>();
         port->len_bytes = nb_sample * nb_channels * static_cast<int>(sizeof(int16_t));
         port->len_microseconds = (static_cast<uint64_t>(nb_sample) * 1000000) / static_cast<uint64_t>(freq);
         return port;
     }
 
     void audio_output(AudioOutPort &out_port, const void *buffer) override {
+        auto &port = static_cast<NullAudioPort &>(out_port);
+        const std::lock_guard<std::mutex> guard(port.mutex);
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+        // There is no physical device to pace a pthread. Match the fiber
+        // sink's buffer clock, independently for every open audio port.
+        const auto duration = std::chrono::microseconds(out_port.len_microseconds);
+        const auto now = std::chrono::steady_clock::now();
+        if (port.next_output.time_since_epoch().count() == 0 || now > port.next_output + 4 * duration)
+            port.next_output = now + duration;
+        std::this_thread::sleep_until(port.next_output);
+        port.next_output += duration;
+#endif
+        auto &pcm = port.pcm;
         // Sink + Web Audio tap: copy the PCM out for the page, never block
         // the guest audio thread. buffer holds out_port.len_bytes of int16
         // interleaved samples (readable host memory, as the SDL backend
@@ -69,7 +97,6 @@ struct NullAudioAdapter : AudioAdapter {
         return 0;
     }
 
-    std::vector<uint8_t> pcm; // PCM scratch for the synchronous JS copy-out
 };
 
 void vita3k_web_install_null_audio(AudioState &audio) {

@@ -784,6 +784,7 @@ add_custom_command(
 
 add_library(vita3k_web_runtime_hle STATIC
     ${VITA3K_WEB_CODEC_SOURCES}
+    $<$<BOOL:${VITA3K_WEB_THREADS}>:${_HLE_BROWSER_ROOT}/src/thread_bridge.cpp>
     # decrypt_fself for module_parent.cpp's module loader.
     "${_HLE_BROWSER_ROOT}/src/vita_self_decrypt.cpp"
     "${_HLE_BROWSER_ROOT}/src/gxm_webgpu_bridge.cpp"
@@ -870,6 +871,9 @@ if(NOT TARGET SDL3::SDL3-static)
     set(SDL_SHARED OFF CACHE BOOL "" FORCE)
     set(SDL_STATIC ON CACHE BOOL "" FORCE)
     set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    # The threaded build creates guest host threads through SDL (kernel.cpp).
+    set(SDL_PTHREADS ${VITA3K_WEB_THREADS} CACHE BOOL "" FORCE)
+    set(SDL_PTHREADS_SEM ${VITA3K_WEB_THREADS} CACHE BOOL "" FORCE)
     foreach(_sub AUDIO VIDEO RENDER CAMERA JOYSTICK HAPTIC SENSOR POWER DIALOG)
         set(SDL_${_sub} OFF CACHE BOOL "" FORCE)
     endforeach()
