@@ -57,6 +57,8 @@
 //   LIMBO_AOT_DIR       per-title AOT images (<TITLE>.aot.wasm), served as
 //                       /aot/<TITLE>.wasm; AOT is on by default for every
 //                       title that has an image (preferred over LIMBO_AOT)
+//   LIMBO_AOT_MT_DIR    shared-memory AOT images for the threaded runtime
+//                       (?threads=1, THREADS.md), served as /aot-mt/<TITLE>.wasm
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { networkInterfaces } from 'node:os';
@@ -71,6 +73,12 @@ const title = process.env.LIMBO_TITLE || 'PCSE00268';
 const app = process.env.LIMBO_APP || title;
 const aotPath = process.env.LIMBO_AOT ? resolve(process.env.LIMBO_AOT) : '';
 const aotDir = process.env.LIMBO_AOT_DIR ? resolve(process.env.LIMBO_AOT_DIR) : '';
+const aotMtDir = process.env.LIMBO_AOT_MT_DIR ? resolve(process.env.LIMBO_AOT_MT_DIR) : '';
+const aotMtFileFor = (wantedTitle) => {
+  if (!aotMtDir || !titleIdOk(wantedTitle)) return '';
+  const candidate = resolve(aotMtDir, `${wantedTitle}.aot.wasm`);
+  return existsSync(candidate) ? candidate : '';
+};
 // The AOT image belongs to the title it was built for (its code hashes).
 // Prefer the per-title image; fall back to the legacy single file for the
 // default app only.
@@ -146,8 +154,10 @@ const server = createServer(async (req, res) => {
       const isStaged = stagedTitles.includes(wanted);
       const wantedTitle = requestUrl.searchParams.get('title') || (wanted === app ? title : wanted);
       const aotFile = isStaged ? aotFileFor(wantedTitle, wanted) : '';
+      const aotMtFile = isStaged ? aotMtFileFor(wantedTitle) : '';
       return body(Buffer.from(JSON.stringify({ title: wantedTitle, app: wanted, staged: isStaged,
         aot: Boolean(aotFile), aotUrl: aotFile ? `/aot/${wantedTitle}.wasm` : null,
+        aotMtUrl: aotMtFile ? `/aot-mt/${wantedTitle}.wasm` : null,
         titles: stagedTitles })), 'application/json');
     }
     if (path === '/manifest.json') {
@@ -175,6 +185,12 @@ const server = createServer(async (req, res) => {
       return res.end(await readFile(file));
     };
     if (path === '/aot.wasm' && aotPath) return sendAot(aotPath);
+    if (path.startsWith('/aot-mt/') && path.endsWith('.wasm')) {
+      const id = path.slice('/aot-mt/'.length, -'.wasm'.length);
+      const file = aotMtFileFor(id);
+      if (!file) { res.writeHead(404); return res.end('no threaded AOT image for ' + id); }
+      return sendAot(file);
+    }
     if (path.startsWith('/aot/') && path.endsWith('.wasm')) {
       const id = path.slice('/aot/'.length, -'.wasm'.length);
       if (!titleIdOk(id)) { res.writeHead(400, { 'Content-Type': 'text/plain' }); return res.end('bad title id'); }
@@ -201,6 +217,7 @@ server.listen(port, host, () => {
       ? readdirSync(aotDir).filter((file) => file.endsWith('.aot.wasm')).sort() : [];
     console.log(`  AOT dir     ${aotDir} (${images.join(', ') || 'no images'})`);
   }
+  if (aotMtDir) console.log(`  AOT dir (threaded) ${aotMtDir}`);
   // Name every address the server actually answers on, so a browser on another
   // host does not have to guess which one to open.
   const addresses = host === '0.0.0.0' || host === '::'

@@ -47,7 +47,7 @@ try {
   warning.textContent = error.message; warning.style.display = 'block';
   throw error;
 }
-const { title: TITLE, app: APP, aot: AOT, aotUrl: AOT_URL } = config;
+const { title: TITLE, app: APP, aot: AOT, aotUrl: AOT_URL, aotMtUrl: AOT_MT_URL } = config;
 const aotUrl = typeof AOT_URL === 'string' && AOT_URL ? AOT_URL : (AOT ? '/aot.wasm' : null);
 // Uploaded games need no server-built image or recorded execution seeds:
 // build from their loaded code at launch. An explicit query overrides this.
@@ -582,7 +582,7 @@ async function run() {
   const workerParams = new URLSearchParams({ backend, memory, inlineMutex: params.get('inlineMutex') === '0' ? '0' : '1' });
   if (buildAot !== null) workerParams.set('buildAot', buildAot);
   for (const name of ['fpsHack', 'scale', 'surfaceSync', 'maxInFlight', 'cores', 'hleProfile', 'gles',
-    'readback', 'stampLru', 'writeObserver', 'regionCache', 'textureVerify']) {
+    'readback', 'stampLru', 'writeObserver', 'regionCache', 'textureVerify', 'threads']) {
     if (params.has(name)) workerParams.set(name, params.get(name));
   }
   const currentWorker = worker = new Worker(`./worker.js?${workerParams}`, { type: 'module' });
@@ -729,7 +729,8 @@ async function run() {
           cacheNS.cacheWriteManifest(cacheKey, stageNeeded).catch(() => {});
         log(`staged ${data.files} files (${(data.bytes / 1048576).toFixed(1)} MiB) — launching`);
         worker.postMessage({ type: 'run-app', vitaFs: data.root, title: TITLE, app: APP, fastVblank,
-          ...(aotUrl ? { aotUrl } : {}) });
+          ...(aotUrl ? { aotUrl } : {}),
+          ...(AOT_MT_URL ? { aotMtUrl: AOT_MT_URL } : {}) });
         running = true;
         sendPad();
         break;

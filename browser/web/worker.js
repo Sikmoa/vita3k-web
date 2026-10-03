@@ -517,6 +517,12 @@ self.onmessage = async ({ data }) => {
         post({ type: 'log', message: '[vita3k-web] buildAot=only: skipping AOT download, building on this device' });
         data.aotUrl = null;
       }
+      // The threaded runtime imports shared memory: only its own image links.
+      if (typeof module._vita3k_web_start_app === 'function') {
+        if (data.aotUrl && !data.aotMtUrl)
+          post({ type: 'log', message: '[vita3k-web] no threaded AOT image for this title; using the lazy JIT' });
+        data.aotUrl = data.aotMtUrl ?? null;
+      }
       if (data.aotUrl) {
         const started = performance.now();
         // Buffer with progress instead of compileStreaming: the download

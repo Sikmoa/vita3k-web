@@ -480,7 +480,9 @@ try {
           state.staged = { files: data.files, bytes: data.bytes, root: data.root };
           state.runStartedAt = performance.now();
           worker.postMessage({ type: 'run-app', vitaFs: data.root, title, app,
-            fastVblank, ...(useAot && aotUrl ? { aotUrl } : {}) });
+            fastVblank, ...(useAot && aotUrl ? { aotUrl } : {}),
+            // LIMBO_AOT_DIR names the image for the runtime asked for (aot-mt with threads=1).
+            ...(useAot && aotUrl && /(^|&)threads=1/.test(workerParams) ? { aotMtUrl: aotUrl } : {}) });
           // At every press/release boundary send the combined state of all
           // inputs held then, so releasing one input keeps the others held.
           const boundaries = [...new Set(inputScript.flatMap(({ at, hold }) => [at, at + hold]))];
