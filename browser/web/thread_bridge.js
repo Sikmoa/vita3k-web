@@ -3,7 +3,20 @@
 export function installThreadBridge(module, logger = console.error) {
   const bytes = (pointer, length) => module.vita3kHostBytes(pointer, length);
   const text = (pointer, length) => new TextDecoder().decode(new Uint8Array(bytes(pointer, length)));
+  // Calls still in flight after 2 s are logged: a guest thread waits on each.
+  const inFlight = new Map();
+  let nextCall = 0;
+  setInterval(() => {
+    const now = performance.now();
+    for (const [id, { operation, started, args }] of inFlight)
+      if (now - started > 2000) logger(`[thread-bridge] ${operation} pending ${((now - started) / 1000).toFixed(1)}s args=${args.slice(0, 4).join(",")} (call ${id})`);
+  }, 5000);
   module.vita3kThreadCall = async (operation, a) => {
+    const id = ++nextCall;
+    inFlight.set(id, { operation, started: performance.now(), args: a });
+    try { return await dispatch(operation, a); } finally { inFlight.delete(id); }
+  };
+  const dispatch = async (operation, a) => {
     switch (operation) {
       case 'gxm-init': {
         if (module.vita3kNullGpu) return 0;
