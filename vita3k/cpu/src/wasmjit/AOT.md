@@ -30,6 +30,28 @@ VITA3K_NULL_GPU=1 VITA3K_AOT_BUILD=limbo.aot.wasm [VITA3K_AOT_SEEDS=seeds.txt] \
   fixed-address executable such as Limbo has none), and optional seeds. Seeds
   are full location keys of blocks the lazy JIT executed
   (`VITA3K_AOT_SEEDS_OUT=<file>` records them in any JIT run).
+* Discovery beyond the roots, so a title needs no seeds:
+  * Calls and returns are followed; call targets become roots.
+  * Switches: a block ending in Thumb `TBB`/`TBH [pc, Rm]` adds its cases as
+    members. The table length comes from the `CMP Rm, #imm` before it or,
+    without one in reach, from the table itself (it ends where its first case
+    begins). Cases that fall inside the table are refused.
+  * Gap sweep: after discovery, an uncovered spot that starts with a push of
+    LR right after a function-ending instruction (return, unconditional
+    branch, padding) becomes a root, until a pass adds none. ARM prologues
+    count only in ranges that already have ARM functions.
+  * System modules loaded later: `run_app` preloads, right after the fixed
+    preload chain and before the image is built or loaded, the auto-LLE
+    sysmodules whose libraries the loaded modules import
+    (`preload_imported_sysmodules`, `KernelState::imported_libraries`). They
+    land at the same addresses in the build and in every run, so the image
+    covers them, and the title's own `sceSysmoduleLoadModule` finds them
+    loaded. Persona 4 Golden: `libscemp4` (movies) and `adhoc_matching`.
+
+  Persona 4 Golden, scripted 100 s session, lazy-JIT block starts: 9022 with
+  the roots alone, 1113 with the above (most of the rest is module_start code
+  that runs before the image is loaded). An image built before the preload
+  existed no longer matches and is rejected; rebuild it.
 * The build also reports untranslatable blocks by first rejected IR op, and
   imported NIDs this build has no HLE body for.
 

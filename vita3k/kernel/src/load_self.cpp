@@ -228,6 +228,8 @@ static bool load_imports(const sce_module_info_raw &module, Ptr<const void> segm
             var_entry_table = long_imports->var_entry_table;
         }
 
+        if (!is_unload && library_name)
+            kernel.imported_libraries.insert(Ptr<const char>(library_name).get(mem));
         std::string lib_name;
         if (kernel.debugger.log_imports) {
             lib_name = Ptr<const char>(library_name).get(mem);

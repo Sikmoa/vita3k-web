@@ -816,6 +816,10 @@ public:
                 add_root(location);
         }
         drain();
+        // Functions no root, call, switch or seed reaches (only called
+        // through pointers built at run time): sweep what is left.
+        for (int pass = 0; pass < 8 && sweep(); ++pass)
+            drain();
         return assemble(out, report);
     }
 
@@ -935,6 +939,8 @@ private:
         result->location = key;
         result->end_pc = Dynarmic::A32::LocationDescriptor(ir->EndLocation()).PC();
         collect_targets(ir->GetTerminal(), result->targets);
+        if (location.TFlag())
+            thumb_jump_table_targets(location, result->end_pc, result->targets);
         for (const Dynarmic::IR::Inst &inst : *ir) {
             if (inst.GetOpcode() != Dynarmic::IR::Opcode::PushRSB)
                 continue;
@@ -948,6 +954,160 @@ private:
         auto *pointer = result.get();
         translated.emplace(key, std::move(result));
         return pointer;
+    }
+
+    // A block ending in a Thumb TBB/TBH [pc, Rm] is a switch: the jump is
+    // indirect to the IR, so its cases (and all code only they reach) would
+    // be found only at run time. Compilers bound Rm with a CMP Rm, #imm just
+    // before (and a BHI to the default case), so the table has imm + 1 entries
+    // right after the instruction; each entry is a forward halfword offset.
+    void thumb_jump_table_targets(const Dynarmic::A32::LocationDescriptor &location, uint32_t end_pc,
+        std::vector<Dynarmic::A32::LocationDescriptor> &out) {
+        const auto halfword = [&](uint32_t address, uint16_t &value) {
+            return in_code(address) && mem_read(mem, address, &value, sizeof(value));
+        };
+        uint16_t first = 0, second = 0;
+        if (!halfword(end_pc - 4, first) || !halfword(end_pc - 2, second))
+            return;
+        if ((first & 0xFFF0) != 0xE8D0 || (second & 0xFFE0) != 0xF000 || (first & 0xF) != 15)
+            return;
+        const bool half = second & 0x10;
+        const uint32_t index = second & 0xF;
+        // The bound: CMP (T1, low register) or CMP.W with a plain 8-bit
+        // immediate, within the four instructions before the TBB/TBH.
+        std::optional<uint32_t> bound;
+        for (uint32_t back = 2; back <= 20 && !bound; back += 2) {
+            uint16_t h = 0, h2 = 0;
+            if (!halfword(end_pc - 4 - back, h))
+                break;
+            if ((h & 0xF800) == 0x2800 && ((h >> 8) & 7) == index)
+                bound = h & 0xFF;
+            else if (halfword(end_pc - 4 - back + 2, h2) && (h & 0xFBF0) == 0xF1B0 && (h & 0xF) == index
+                && (h2 & 0x8F00) == 0x0F00 && !(h & 0x400) && !(h2 & 0x7000))
+                bound = h2 & 0xFF;
+        }
+        if (!bound) {
+            // No bound in reach (scheduled earlier, or the index is offset after
+            // a range check elsewhere): the table ends where its first case
+            // begins, so read entries until the nearest target seen so far.
+            uint32_t nearest = 0xFFFF;
+            uint32_t k = 0;
+            for (; k < 1024 && (half ? 2 * k : k) < 2 * nearest; ++k) {
+                uint16_t offset = 0;
+                if (half) {
+                    if (!halfword(end_pc + 2 * k, offset))
+                        return;
+                } else {
+                    uint8_t byte = 0;
+                    if (!in_code(end_pc + k) || !mem_read(mem, end_pc + k, &byte, 1))
+                        return;
+                    offset = byte;
+                }
+                if (!offset || !in_code(end_pc + 2 * uint32_t(offset)))
+                    return; // not a table this decoder understands
+                nearest = std::min<uint32_t>(nearest, offset);
+            }
+            if (!k || k == 1024)
+                return;
+            bound = k - 1;
+        }
+        const uint32_t entries = *bound + 1;
+        // The cases follow the table: a target inside it means the bound was not
+        // this table's (decoding table bytes as code can trip translator asserts).
+        const uint32_t table_end = end_pc + ((half ? 2 * entries : entries) + 1) / 2 * 2;
+        for (uint32_t k = 0; k < entries; ++k) {
+            uint16_t offset = 0;
+            if (half) {
+                if (!halfword(end_pc + 2 * k, offset))
+                    return;
+            } else {
+                uint8_t byte = 0;
+                if (!in_code(end_pc + k) || !mem_read(mem, end_pc + k, &byte, 1))
+                    return;
+                offset = byte;
+            }
+            const uint32_t target = end_pc + 2 * uint32_t(offset);
+            if (target < table_end)
+                return;
+            if (in_code(target))
+                out.push_back(location.SetPC(target).SetIT({}));
+        }
+    }
+
+    // Gap sweep: an uncovered spot of a code range that starts with a
+    // function prologue (a push that saves LR) right after an instruction that
+    // ends a function (return, unconditional branch or padding) becomes a
+    // root. Both conditions together keep literal pools and tables out. ARM
+    // prologues count only in ranges that already have ARM functions, so the
+    // bytes of a Thumb module are never translated as ARM. Returns the number
+    // of roots added.
+    size_t sweep() {
+        std::vector<std::pair<uint32_t, uint32_t>> spans;
+        for (const auto &function : functions)
+            for (const auto *member : function.members)
+                spans.emplace_back(member->block.pc, member->end_pc);
+        std::sort(spans.begin(), spans.end());
+        const auto read16 = [&](uint32_t address) {
+            uint16_t value = 0;
+            if (!in_code(address) || !mem_read(mem, address, &value, sizeof(value)))
+                return uint32_t(0xFFFFFFFF);
+            return uint32_t(value);
+        };
+        const auto read32 = [&](uint32_t address) {
+            uint32_t value = 0;
+            if (!in_code(address) || !in_code(address + 3) || !mem_read(mem, address, &value, sizeof(value)))
+                return uint32_t(0xFFFFFFFF);
+            return value;
+        };
+        const auto thumb_end = [&](uint32_t p) {
+            const uint32_t h = read16(p - 2), h2 = read16(p - 4);
+            return h == 0x4770 || (h & 0xFF00) == 0xBD00 || h == 0xBF00 || h == 0 || (h & 0xF800) == 0xE000
+                || (h2 == 0xE8BD && (h & 0x8000)) || ((h2 & 0xF800) == 0xF000 && (h & 0xD000) == 0x9000);
+        };
+        const auto arm_end = [&](uint32_t p) {
+            const uint32_t w = read32(p - 4);
+            return w == 0xE12FFF1E || (w & 0xFFFF8000) == 0xE8BD8000 || w == 0xE320F000 || w == 0
+                || (w & 0xFF000000) == 0xEA000000;
+        };
+        size_t added = 0;
+        auto span = spans.begin();
+        for (const auto &range : ranges) {
+            bool arm_range = false;
+            for (const uint64_t value : spec.function_roots) {
+                const Dynarmic::A32::LocationDescriptor root{Dynarmic::IR::LocationDescriptor{value}};
+                if (!root.TFlag() && root.PC() - range.base < range.size) {
+                    arm_range = true;
+                    break;
+                }
+            }
+            for (uint32_t p = range.base + 4; p + 4 <= range.base + range.size; p += 2) {
+                while (span != spans.end() && span->second <= p)
+                    ++span;
+                if (span != spans.end() && span->first <= p) {
+                    p = span->second - 2; // resumes at the end of the covered block
+                    continue;
+                }
+                const uint32_t h = read16(p);
+                const bool thumb_push = (h & 0xFF00) == 0xB500 || (h == 0xE92D && (read16(p + 2) & 0x4000));
+                if (thumb_push && thumb_end(p)) {
+                    const auto location = WasmJitCPU::aot_location(p | 1);
+                    if (!owned(Dynarmic::A32::LocationDescriptor{Dynarmic::IR::LocationDescriptor{location}})
+                        && !roots.contains(location)) {
+                        add_root(Dynarmic::A32::LocationDescriptor{Dynarmic::IR::LocationDescriptor{location}});
+                        ++added;
+                    }
+                } else if (arm_range && !(p & 3) && (read32(p) & 0xFFFF4000) == 0xE92D4000 && arm_end(p)) {
+                    const auto location = WasmJitCPU::aot_location(p);
+                    if (!owned(Dynarmic::A32::LocationDescriptor{Dynarmic::IR::LocationDescriptor{location}})
+                        && !roots.contains(location)) {
+                        add_root(Dynarmic::A32::LocationDescriptor{Dynarmic::IR::LocationDescriptor{location}});
+                        ++added;
+                    }
+                }
+            }
+        }
+        std::fprintf(stderr, "[aot] gap sweep: %zu new roots\n", added);
+        return added;
     }
 
     void drain() {

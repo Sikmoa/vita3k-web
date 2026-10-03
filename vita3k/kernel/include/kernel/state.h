@@ -38,6 +38,7 @@
 #include <condition_variable>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -195,6 +196,9 @@ struct KernelState {
 
     SceKernelModuleInfoPtrs loaded_modules;
     LoadedSysmodules loaded_sysmodules;
+    // Names of the libraries loaded modules import (load_imports), e.g. so a
+    // host can preload the system modules that provide them.
+    std::set<std::string> imported_libraries;
     LoadedInternalSysmodules loaded_internal_sysmodules;
 
     // the variables in this block must be accessed by first locking export_nids_mutex

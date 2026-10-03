@@ -36,6 +36,7 @@
 #include <kernel/state.h>
 #include <kernel/thread/thread_state.h>
 #include <mem/functions.h>
+#include <module/load_module.h>
 #include <modules/module_parent.h>
 #include <nids/functions.h>
 #include <ngs/state.h>
@@ -194,6 +195,30 @@ void vita3k_web_set_license_key(const std::uint8_t *key16) {
     std::memcpy(config.klic, key16, sizeof(config.klic));
     config.has_klic = true;
     std::puts("[vita3k-web] license klic staged");
+}
+
+// Firmware LLE modules a title loads itself later (sceSysmoduleLoadModule)
+// whose libraries it imports statically, loaded at boot in this fixed order
+// instead. The AOT build runs after this point too, so the image covers them
+// at the addresses they get here, and the title's own load finds them loaded.
+// Loaded later, after the title's allocations, they would land elsewhere and
+// run on the lazy JIT (Persona 4 Golden's movie player, libscemp4).
+static void preload_imported_sysmodules(EmuEnvState &env) {
+    static constexpr std::pair<const char *, SceSysmoduleModuleId> libraries[] = {
+        { "SceMp4", SCE_SYSMODULE_MP4 }, { "SceAvPlayer", SCE_SYSMODULE_AVPLAYER },
+        { "SceAtrac", SCE_SYSMODULE_ATRAC }, { "SceFiber", SCE_SYSMODULE_FIBER }, { "SceUlt", SCE_SYSMODULE_ULT },
+        { "SceSas", SCE_SYSMODULE_SAS }, { "ScePgf", SCE_SYSMODULE_PGF }, { "SceXml", SCE_SYSMODULE_XML },
+        { "SceSqlite", SCE_SYSMODULE_SQLITE }, { "SceRudp", SCE_SYSMODULE_RUDP },
+        { "SceNetAdhocMatching", SCE_SYSMODULE_NET_ADHOC_MATCHING }, { "SceJson", SCE_SYSMODULE_JSON },
+        { "SceSystemGesture", SCE_SYSMODULE_SYSTEM_GESTURE },
+    };
+    for (const auto &[library, id] : libraries) {
+        if (!env.kernel.imported_libraries.contains(library) || is_module_loaded(env.kernel, id) || !is_lle_module(id, env))
+            continue;
+        const bool loaded = load_sys_module(env, id);
+        std::printf("[vita3k-web] preload sysmodule %#x (imported %s): %s\n", unsigned(id), library,
+            loaded ? "loaded" : "failed");
+    }
 }
 
 #ifdef VITA3K_USE_WASM_JIT
@@ -650,6 +675,9 @@ static int run_app_impl() {
                 }
             }
         }
+        // Before the AOT image is built or loaded: the system modules the title
+        // imports load here, at the same addresses on every run (vita_aot.h).
+        preload_imported_sysmodules(*env);
         const auto &module = env->kernel.loaded_modules.at(eboot_uid)->info;
         std::printf("[vita3k-web] Vita module: %.28s entry=%08x\n", module.module_name, module.start_entry.address());
 #ifdef VITA3K_USE_WASM_JIT
