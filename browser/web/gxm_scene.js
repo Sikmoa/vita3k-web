@@ -383,6 +383,10 @@ function createPipeline(d, target, depth) {
     if (!format) throw new Error(`unsupported vertex attribute ${a.format}x${a.components}`);
     buffers[a.stream].attributes.push({ shaderLocation: a.location, offset: a.offset, format });
   }
+  // Conversion can move every attribute out of an original stream. Keep
+  // its slot number for the other streams, but require no fetch from it.
+  for (let i = 0; i < buffers.length; ++i)
+    if (buffers[i].attributes.length === 0) buffers[i] = null;
   const colorMask = d.blend[0];
   const writeMask = (colorMask & 2 ? 1 : 0) | (colorMask & 4 ? 2 : 0) | (colorMask & 8 ? 4 : 0) | (colorMask & 1 ? 8 : 0);
   const [, colorFunc, alphaFunc, colorSrc, colorDst, alphaSrc, alphaDst] = d.blend;

@@ -54,5 +54,8 @@ its command list. Nothing is rendered implicitly.
 `browser/tests/gxm_surface_chromium.mjs` runs the VitaSDK fixture
 `vita_gxm_surface_fixture` (tiled, swizzled, downscaled and multisampled
 surfaces, textures over them, transfers) with and without surface sync.
+It also checks indexed draws with 10/14/18/22-byte vertex strides, including
+normalized integers, unaligned F32 data and an aligned stream alongside a
+fully converted one.
 
 Not covered by a test: viewport sub-rects and negative viewport x scale.

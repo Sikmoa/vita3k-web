@@ -3,7 +3,7 @@
 // twice their size and box-filtered), multisampled render targets, textures
 // over rendered surfaces (whole surfaces and rectangles inside them), and
 // transfers into and out of rendered surfaces; plus sceCommonDialogUpdate's
-// checks with a message dialog open.
+// checks with a message dialog open, and packed vertex streams.
 //
 // Every surface gets the same pattern (red, a green top-left strip, a blue
 // bottom-right block), drawn with the repository's color GXP. Results are
@@ -513,6 +513,58 @@ int main(void) {
     begin(rt164, &s_quarter); color_rect(16, 4, 0, 0, 16, 4, GREEN, 0); end();
     read_surface(halves, SCE_GXM_TRANSFER_LINEAR, 0, 0, 32, 4, 32);
     if (check(32, 4, halves_then_green, 93)) return failed;
+
+    // Packed 10/14/18/22-byte streams, as used by P4G room meshes. Draw an
+    // indexed cyan quad over red, checking every pixel. The 10-byte case
+    // keeps color in a second, aligned stream; 22 bytes includes F32 data
+    // whose later vertices are only two-byte aligned. Padding is nonzero
+    // so using the wrong stride or component size cannot silently pass.
+    for (unsigned stride = 10; stride <= 22; stride += 4) {
+        static unsigned char packed[4 * 22] __attribute__((aligned(16)));
+        static const float colors[4][4] = {{0, 1, 1, 1}, {0, 1, 1, 1}, {0, 1, 1, 1}, {0, 1, 1, 1}};
+        static const float positions[4][4] = {{-1, 1, 0, 1}, {-1, -1, 0, 1}, {1, -1, 0, 1}, {1, 1, 0, 1}};
+        const unsigned position_size = stride == 22 ? 16 : 8;
+        memset(packed, 0xa5, sizeof(packed));
+        for (unsigned v = 0; v < 4; ++v) {
+            unsigned char *p = packed + v * stride;
+            if (stride == 22) memcpy(p, positions[v], 16);
+            else {
+                short pos[4];
+                for (unsigned c = 0; c < 4; ++c) pos[c] = (short)(positions[v][c] * 32767);
+                memcpy(p, pos, sizeof(pos));
+            }
+            if (stride == 18) {
+                const short color[4] = {0, 32767, 32767, 32767};
+                memcpy(p + position_size, color, sizeof(color));
+            } else if (stride != 10) {
+                const unsigned char color[4] = {0, 255, 255, 255};
+                memcpy(p + position_size, color, sizeof(color));
+            }
+        }
+        memset(attrs, 0, sizeof(attrs));
+        attrs[0].regIndex = sceGxmProgramParameterGetResourceIndex(sceGxmProgramFindParameterByName(cvp, "aPosition"));
+        attrs[1].regIndex = sceGxmProgramParameterGetResourceIndex(sceGxmProgramFindParameterByName(cvp, "aColor"));
+        attrs[0].componentCount = attrs[1].componentCount = 4;
+        attrs[0].format = stride == 22 ? SCE_GXM_ATTRIBUTE_FORMAT_F32 : SCE_GXM_ATTRIBUTE_FORMAT_S16N;
+        attrs[1].format = stride == 10 ? SCE_GXM_ATTRIBUTE_FORMAT_F32
+            : stride == 18 ? SCE_GXM_ATTRIBUTE_FORMAT_S16N : SCE_GXM_ATTRIBUTE_FORMAT_U8N;
+        attrs[1].streamIndex = stride == 10 ? 1 : 0;
+        attrs[1].offset = stride == 10 ? 0 : position_size;
+        SceGxmVertexStream streams[2] = {{stride, SCE_GXM_INDEX_SOURCE_INDEX_16BIT},
+            {sizeof(colors[0]), SCE_GXM_INDEX_SOURCE_INDEX_16BIT}};
+        SceGxmVertexProgram *packed_vp;
+        if (sceGxmShaderPatcherCreateVertexProgram(patcher, cv, attrs, 2, streams, stride == 10 ? 2 : 1, &packed_vp)) return 130;
+        begin(rt64, &s_linear64);
+        color_rect(64, 64, 0, 0, 64, 64, RED, 0);
+        sceGxmSetVertexProgram(context, packed_vp);
+        sceGxmSetVertexStream(context, 0, packed);
+        if (stride == 10) sceGxmSetVertexStream(context, 1, colors);
+        if (sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, quad, 6)) return 131;
+        end();
+        read_surface(linear64, SCE_GXM_TRANSFER_LINEAR, 0, 0, 64, 64, 64);
+        if (check(64, 64, all_cyan, 132 + (stride - 10) / 4)) return failed;
+        sceGxmShaderPatcherReleaseVertexProgram(patcher, packed_vp);
+    }
 
     // 7. sceCommonDialogUpdate (firmware 3.74 libcdlg). Without a dialog the
     // parameter is not read; with one, the render target is checked and the

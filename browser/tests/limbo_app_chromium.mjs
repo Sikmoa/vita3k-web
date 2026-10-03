@@ -44,6 +44,8 @@
 //   LIMBO_AOT_DIR           per-title images (<TITLE>.aot.wasm); preferred,
 //                           on by default for the run's title when present
 //   LIMBO_LOG_OUT           write the retained worker log tail (4000 lines) to this file
+//                           (and translated programs, with LIMBO_GXM_TRACE, to <file>.programs)
+//   LIMBO_WORKER_PARAMS     extra raw query parameters appended to the worker URL
 import { createServer } from 'node:http';
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
@@ -286,8 +288,8 @@ const { chromium } = await import(process.env.PLAYWRIGHT_MODULE_URL || 'playwrig
 let browser;
 try {
   browser = await chromium.launch({
-    // Headless Chrome only offers SwiftShader WebGPU; LIMBO_HEADED=1 opens a
-    // window so the hardware adapter is used.
+    // --enable-gpu permits the hardware adapter in headless Chrome too;
+    // LIMBO_HEADED=1 opens a window for interactive debugging.
     headless: process.env.LIMBO_HEADED !== '1',
     args: process.env.LIMBO_GPU === '1' ? ['--enable-unsafe-webgpu', '--enable-gpu', '--enable-features=Vulkan']
       : ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--enable-features=Vulkan',
@@ -362,9 +364,9 @@ try {
     });
   }
 
-  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot, aotUrl, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale, surfaceSync, gxmTrace, gxmTraceLines, pcSample, dialogAnswer, ctrlButtons, imeAnswer }) => {
-    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}${textureVerify ? '&textureVerify=1' : ''}${scale ? '&scale=' + scale : ''}${surfaceSync ? '&surfaceSync=1' : ''}${gxmTrace ? '&gxmTrace=' + gxmTrace : ''}${gxmTraceLines ? '&gxmTraceLines=' + gxmTraceLines : ''}${pcSample ? '&pcSample=' + pcSample : ''}`, { type: 'module' });
-    const state = { logs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
+  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot, aotUrl, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale, surfaceSync, gxmTrace, gxmTraceLines, pcSample, workerParams, dialogAnswer, ctrlButtons, imeAnswer }) => {
+    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}${textureVerify ? '&textureVerify=1' : ''}${scale ? '&scale=' + scale : ''}${surfaceSync ? '&surfaceSync=1' : ''}${gxmTrace ? '&gxmTrace=' + gxmTrace : ''}${gxmTraceLines ? '&gxmTraceLines=' + gxmTraceLines : ''}${pcSample ? '&pcSample=' + pcSample : ''}${workerParams ? '&' + workerParams : ''}`, { type: 'module' });
+    const state = { logs: [], programs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
       backend: null, memory: null, workerErrors: [], ready: false, timedOut: false,
       gxmSceneStats: null, gxmFailures: [], gxmSkips: [],
       latestProgress: null, profiles: {}, jitThreads: {}, runStartedAt: null, dialogs: [], imes: [],
@@ -439,11 +441,13 @@ try {
         case 'log': {
           const message = String(data.message);
           state.logs.push(message);
+          // Translated programs and pipelines (?gxmTrace) arrive long before the traced frames.
+          if (/^\[gxm-trace\] (program|pipeline) /.test(message)) state.programs.push(message);
           state.logCount += 1;
           // Renderer diagnostics are tracked here: the log keeps only its tail.
           if (message.startsWith('[gxm-scene] stats '))
             state.gxmSceneStats = JSON.parse(message.slice('[gxm-scene] stats '.length));
-          if (/^\[vita3k-web\] GX[MP] .* failed/.test(message))
+          if (/^\[vita3k-web\] GX[MP] .* failed|^\[gxm-scene\] WebGPU validation:/.test(message))
             state.gxmFailures = [...state.gxmFailures.slice(-2), message];
           if (message.startsWith('[gxm-skip]')) state.gxmSkips.push(message);
           if (message.includes('[gxm] scene_ms')) state.latestScene = message;
@@ -584,7 +588,7 @@ try {
       };
     });
     return result;
-  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot: Boolean(aotProbePath), aotUrl: aotProbeUrl, fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '', surfaceSync: process.env.LIMBO_SURFACE_SYNC === '1', gxmTrace: process.env.LIMBO_GXM_TRACE || '', gxmTraceLines: process.env.LIMBO_GXM_TRACE_LINES || '', pcSample: process.env.LIMBO_PC_SAMPLE || '', dialogAnswer, ctrlButtons, imeAnswer });
+  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot: Boolean(aotProbePath), aotUrl: aotProbeUrl, fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '', surfaceSync: process.env.LIMBO_SURFACE_SYNC === '1', gxmTrace: process.env.LIMBO_GXM_TRACE || '', gxmTraceLines: process.env.LIMBO_GXM_TRACE_LINES || '', pcSample: process.env.LIMBO_PC_SAMPLE || '', workerParams: process.env.LIMBO_WORKER_PARAMS || '', dialogAnswer, ctrlButtons, imeAnswer });
 
   const saved = [];
   for (const frame of outcome.saved) {
@@ -628,6 +632,8 @@ try {
   };
   if (process.env.LIMBO_LOG_OUT)
     await writeFile(process.env.LIMBO_LOG_OUT, outcome.logs.join('\n') + '\n');
+  if (process.env.LIMBO_LOG_OUT && outcome.programs.length)
+    await writeFile(process.env.LIMBO_LOG_OUT + '.programs', outcome.programs.join('\n') + '\n');
   console.log(JSON.stringify(diagnostics, null, 2));
 
   assert.equal(outcome.workerErrors.length, 0, 'worker must not post errors');

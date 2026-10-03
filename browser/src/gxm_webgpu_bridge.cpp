@@ -1707,16 +1707,18 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
     // Attributes WebGPU cannot fetch as the shader reads them become float32
     // copies in extra streams: GXM converts non-normalized integers to float
     // (desktop uses USCALED/SSCALED formats, which WebGPU lacks), and WebGPU
-    // has no one- or three-component 8/16-bit formats. A mismatched format
-    // invalidates the pipeline and with it the whole scene's command buffer.
-    struct Converted { uint32_t offset, size; };
+    // has no one- or three-component 8/16-bit formats. It also requires
+    // four-byte-aligned stream strides, so every attribute in a packed
+    // stream must move. An invalid layout rejects the whole command buffer.
+    struct Converted { uint32_t offset, size, format; float first[3]; };
     std::array<Converted, SCE_GXM_MAX_VERTEX_STREAMS> converted;
     uint32_t converted_count = 0, vertex_count = 0;
     for (uint32_t k = 0; k < attribute_count; ++k) {
         auto &attr = attributes[k];
         const bool scaled = attr.format <= SCE_GXM_ATTRIBUTE_FORMAT_S16;
         const bool odd = attr.format <= SCE_GXM_ATTRIBUTE_FORMAT_F16 && attr.components != 2 && attr.components != 4;
-        if (!scaled && !odd)
+        const bool packed = vp->streams[attr.stream].stride % 4 != 0;
+        if (!scaled && !odd && !packed)
             continue;
         if (stream_count + converted_count == SCE_GXM_MAX_VERTEX_STREAMS)
             return skip_draw("too many converted vertex attributes");
@@ -1733,8 +1735,7 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
         }
         const uint32_t components = attr.components;
         const uint32_t stride = vp->streams[attr.stream].stride;
-        const uint32_t element = attr.format <= SCE_GXM_ATTRIBUTE_FORMAT_S8 || attr.format == SCE_GXM_ATTRIBUTE_FORMAT_U8N
-                || attr.format == SCE_GXM_ATTRIBUTE_FORMAT_S8N ? 1 : 2;
+        const uint32_t element = gxm::attribute_format_size(static_cast<SceGxmAttributeFormat>(attr.format));
         const uint8_t *source = Ptr<const uint8_t>(stream_base[attr.stream]).get(mem);
         const uint32_t source_size = stream_size[attr.stream];
         Converted &copy = converted[converted_count];
@@ -1758,6 +1759,7 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
                     case SCE_GXM_ATTRIBUTE_FORMAT_S8N: value = std::max(int8_t(e[0]) / 127.0f, -1.0f); break;
                     case SCE_GXM_ATTRIBUTE_FORMAT_U16N: value = h / 65535.0f; break;
                     case SCE_GXM_ATTRIBUTE_FORMAT_S16N: value = std::max(int16_t(h) / 32767.0f, -1.0f); break;
+                    case SCE_GXM_ATTRIBUTE_FORMAT_F32: std::memcpy(&value, e, sizeof(value)); break;
                     case SCE_GXM_ATTRIBUTE_FORMAT_F16: {
                         // IEEE half to float (no Wasm half type here).
                         const uint32_t sign = uint32_t(h & 0x8000) << 16, exponent = (h >> 10) & 31, mantissa = h & 1023;
@@ -1780,6 +1782,8 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
         }
         attr.stream = uint32_t(stream_count + converted_count);
         attr.offset = 0;
+        copy.format = attr.format;
+        for (uint32_t c = 0; c < 3; ++c) copy.first[c] = vertex_count && c < components ? dest[c] : 0.0f;
         attr.format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
         ++converted_count;
     }
@@ -1816,10 +1820,18 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
     if (gxm_tracing()) {
         GXM_TRACE("  vs_info flip=%.2f,%.2f flag=%.0f screen=%.0fx%.0f z=%.3f+%.3f uniforms=%zu/%zu\n", vs_info[0], vs_info[1], vs_info[4],
             vs_info[5], vs_info[6], vs_info[7], vs_info[8], ctx.uniforms[0].size(), ctx.uniforms[1].size());
+        if (const size_t floats = std::min<size_t>(ctx.uniforms[0].size() / 4, 16)) {
+            float u[16] = {};
+            std::memcpy(u, ctx.uniforms[0].data(), floats * 4);
+            GXM_TRACE("  vs_uniforms %g,%g,%g,%g | %g,%g,%g,%g | %g,%g,%g,%g | %g,%g,%g,%g\n", u[0], u[1], u[2], u[3], u[4], u[5],
+                u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+        }
         for (uint32_t k = 0; k < attribute_count; ++k) {
             const auto &attr = attributes[k];
             if (attr.stream >= stream_count) {
-                GXM_TRACE("  attr loc=%u converted to float32 x%u\n", attr.location, attr.components);
+                const Converted &copy = converted[attr.stream - stream_count];
+                GXM_TRACE("  attr loc=%u converted from fmt=%u to float32 x%u v0=%g,%g,%g\n", attr.location, copy.format, attr.components,
+                    copy.first[0], attr.components > 1 ? copy.first[1] : 0.0f, attr.components > 2 ? copy.first[2] : 0.0f);
                 continue;
             }
             const uint8_t *vertex = Ptr<const uint8_t>(stream_base[attr.stream] + attr.offset).get(mem);
@@ -1895,7 +1907,9 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
     out.word(front_values.ref);
     out.word(uint32_t(stream_count + converted_count));
     for (size_t i = 0; i < stream_count; ++i) {
-        out.word(vp->streams[i].stride);
+        // Packed streams have no remaining attributes; keep their unused
+        // slots valid without changing the stride used to read guest data.
+        out.word(align(vp->streams[i].stride, 4));
         out.stream(stream_base[i], stream_size[i]);
         out.word(stream_size[i]);
     }
