@@ -31,7 +31,21 @@
 #include <renderer/state.h>
 
 #include <chrono>
+#include <cstdint>
 #include <vector>
+
+// The vblank clock is read on every guest thread switch in the browser. There,
+// libc++ reaches the same monotonic clock (performance.now()) through a
+// clock_gettime call that JS exceptions wrap in an allocating invoke_*
+// thunk; read it directly instead.
+static std::chrono::steady_clock::time_point vblank_clock_now() noexcept {
+#ifdef __EMSCRIPTEN__
+    return std::chrono::steady_clock::time_point(std::chrono::nanoseconds(
+        static_cast<std::int64_t>(emscripten_get_now() * 1e6)));
+#else
+    return std::chrono::steady_clock::now();
+#endif
+}
 
 // Code heavily influenced by PPSSSPP's SceDisplay.cpp
 
@@ -132,10 +146,10 @@ bool service_vblank(EmuEnvState &emuenv) {
         // next_vblank_time tracks now so leaving fast mode (or concurrent
         // readers) never sees a stale deadline.
         advance_vblank(emuenv);
-        display.next_vblank_time = std::chrono::steady_clock::now();
+        display.next_vblank_time = vblank_clock_now();
         return display.vblank_count.load() != before;
     }
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = vblank_clock_now();
     if (display.next_vblank_time.time_since_epoch().count() == 0) {
         // First wait: seed the cadence so the first vblank lands one full
         // period from now, like arriving just after a vblank start on native.

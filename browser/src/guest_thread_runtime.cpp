@@ -9,6 +9,8 @@
 #include <display/state.h>
 #include <emuenv/state.h>
 #include <kernel/state.h>
+
+#include <emscripten.h>
 #include <kernel/sync_primitives.h>
 #include <kernel/thread/thread_state.h>
 #include <nids/functions.h>
@@ -307,8 +309,11 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
     }
     // Called after every run_cpu return (slice end or serviced SVC). Switch
     // only when the slice is used up (aging the thread) or a ready thread is
-    // at least as urgent, e.g. one this HLE call just woke. Otherwise keep
-    // running: each needless switch costs two Asyncify stack unwinds.
+    // more urgent, e.g. one this HLE call just woke. Otherwise keep running:
+    // each needless switch costs two Asyncify stack unwinds, and equal
+    // priority threads switching on every import (Persona 4 Golden's model
+    // threads call GXM getters every ~80 instructions) spent most of the time
+    // switching. Equal priorities take turns when the slice runs out.
     // The kernel changes ThreadState::priority in place; mirror it into the
     // scheduler before any dispatch decision.
     // SCE_KERNEL_CPU_MASK_USER_0..2 are bits 16..18; 0 (default) allows any core.
@@ -530,9 +535,11 @@ GuestThreadRuntime::~GuestThreadRuntime() {
     if (!shutdown())
         std::terminate();
 }
+// The steady clock read directly: libc++ reaches it (performance.now()) through
+// clock_gettime, which JS exceptions wrap in an allocating invoke_* thunk, and
+// service() asks on every guest thread switch.
 uint64_t GuestThreadRuntime::now_us() noexcept {
-    return std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+    return static_cast<uint64_t>(emscripten_get_now() * 1000.0);
 }
 bool GuestThreadRuntime::attached() const noexcept { return impl_->kernel != nullptr; }
 bool GuestThreadRuntime::attach(EmuEnvState &env) {

@@ -269,7 +269,7 @@ std::size_t GuestFiberScheduler::resume(std::size_t max_swaps) noexcept {
 bool GuestFiberScheduler::yield(bool aged) noexcept { return impl_->suspend(State::runnable, aged); }
 bool GuestFiberScheduler::should_yield() const noexcept {
     const auto &self = *impl_;
-    return self.active && self.ready && self.ready->effective() <= self.active->effective();
+    return self.active && self.ready && self.ready->effective() < self.active->effective();
 }
 bool GuestFiberScheduler::park() noexcept { return impl_->suspend(State::parked); }
 void GuestFiberScheduler::charge(std::uint64_t units) noexcept {
