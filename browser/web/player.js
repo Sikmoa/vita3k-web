@@ -207,6 +207,31 @@ function playAudioPCM(freq, channels, frameCount, buffer, port = 0) {
   src.start(next);
   audioNext.set(port, next + audio.duration);
 }
+// Threaded runtime: one AudioWorklet node per guest port plays the port's PCM
+// ring straight from shared memory (browser/web/audio_ring_worklet.js). Its
+// consumption is what paces the guest audio thread.
+const audioRings = new Map();
+let audioWorkletReady = null;
+async function playAudioRing(ring) {
+  ensureAudio();
+  if (!audioCtx?.audioWorklet) { log('audio: no AudioWorklet in this browser; threaded audio is silent'); return; }
+  audioWorkletReady ??= audioCtx.audioWorklet.addModule('./audio_ring_worklet.js');
+  try { await audioWorkletReady; } catch (error) { log('audio: ring worklet failed: ' + error.message); return; }
+  stopAudioRing(ring.port);
+  const node = new AudioWorkletNode(audioCtx, 'vita3k-audio-ring', { numberOfInputs: 0, outputChannelCount: [2],
+    processorOptions: { buffer: ring.buffer, offset: ring.offset, generation: ring.generation } });
+  node.connect(audioGain);
+  audioRings.set(ring.port, node);
+  node.port.onmessage = ({ data }) => log(`audio: ring port=${ring.port} played=${data.played} frames underruns=${data.underruns} peak=${data.peak}/32768`);
+  log(`audio: ring port=${ring.port} ${ring.channels}ch ${ring.freq} Hz capacity=${ring.capacity} frames ctx=${audioCtx.state}`);
+}
+function stopAudioRing(port) {
+  const node = audioRings.get(port);
+  if (!node) return;
+  node.port.postMessage('stop');
+  node.disconnect();
+  audioRings.delete(port);
+}
 const logLines = [];
 let logDirty = false;
 const log = (text) => {
@@ -541,6 +566,7 @@ function stop(keepsStatus) {
   worker?.terminate(); worker = null; running = false;
   for (const source of audioSources) { source.stop(); source.disconnect(); }
   audioSources.clear(); audioNext.clear();
+  for (const port of [...audioRings.keys()]) stopAudioRing(port);
   dialog = null; dialogBox.hidden = true;
   ime = null; imeBox.hidden = true;
   runButton.disabled = false; stopButton.disabled = true;
@@ -755,6 +781,7 @@ async function run() {
       case 'vita-audio':
         playAudioPCM(data.freq, data.channels, data.frames, data.data, data.port ?? 0);
         break;
+      case 'vita-audio-ring': playAudioRing(data); break;
       case 'vita-dialog': onDialog(data.dialog); break;
       case 'vita-ime': onIme(data.ime); break;
       case 'vita-gxm-throttle': {

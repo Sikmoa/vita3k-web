@@ -78,6 +78,10 @@ globalThis.vita3kWebOnAudio = (freq, channels, frames, view, port = 0) => {
   post({ type: 'vita-audio', freq, channels, frames, data, port }, [data]);
 };
 
+// Threaded runtime: a port's PCM ring in shared memory (hle_audio_null.cpp).
+// The page plays it with audio_ring_worklet.js; nothing is copied per chunk.
+globalThis.vita3kWebOnAudioRing = (ring) => post({ type: 'vita-audio-ring', ...ring });
+
 const transition = (state) => {
   lifecycle = state;
   post({ type: 'lifecycle', state });

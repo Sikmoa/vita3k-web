@@ -53,6 +53,13 @@ export function installThreadBridge(module, logger = console.error) {
       case 'audio':
         globalThis.vita3kWebOnAudio?.(a[0], a[1], a[2], bytes(a[3], a[4]), a[5]);
         return 0;
+      case 'audio-ring': {
+        // The page plays the ring straight from shared memory (audio_ring_worklet.js).
+        const header = bytes(a[0], 32);
+        globalThis.vita3kWebOnAudioRing?.({ buffer: header.buffer, offset: header.byteOffset, capacity: a[1],
+          channels: a[2], freq: a[3], generation: a[4], port: a[5] });
+        return 0;
+      }
       case 'frame':
         globalThis.vita3kWebOnFrame?.(a[0], a[1], a[2], bytes(a[3], a[1] * a[2] * 4));
         return 0;
