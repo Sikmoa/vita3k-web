@@ -75,7 +75,7 @@ try {
 
   await page.goto(base);
   await page.waitForFunction(() => !document.querySelector('#run').disabled);
-  assert.equal(await page.locator('#title-row').isVisible(), false, 'one title: no picker yet');
+  assert.equal(await page.locator('#title-row').isVisible(), true, 'the picker stays visible with one title');
 
   // The package names its own title and is stored under it.
   await page.locator('#upload-file').setInputFiles(zipPath);
@@ -87,7 +87,7 @@ try {
   assert.match(stored, /PACK00001/);
 
   // The picker now offers both titles (server-staged and uploaded).
-  await page.waitForFunction(() => !document.querySelector('#title-row').hidden);
+  await page.waitForFunction(() => document.querySelector('#title-picker option[value="PACK00001"]'));
   const options = await page.locator('#title-picker option').allTextContents();
   console.log('picker:', options);
   assert.ok(options.some((text) => text.includes('PACK00001') && text.includes('package')));

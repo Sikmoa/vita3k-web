@@ -37,7 +37,7 @@ let browser;
 const errors = [];
 try {
   browser = await chromium.launch({ headless: true,
-    args: ['--no-sandbox', '--enable-unsafe-webgpu', '--use-angle=swiftshader'],
+    args: ['--no-sandbox', '--enable-gpu', '--enable-unsafe-webgpu', '--use-angle=swiftshader'],
     ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}),
   });
   async function open(options) {
@@ -71,6 +71,7 @@ try {
     }
   }
   const desktop = await open({ viewport: { width: 1280, height: 900 } });
+  assert.equal(await desktop.locator('#title-picker').isVisible(), true, 'one title still has a visible picker');
   assert.equal(await desktop.locator('#touch-controls').isVisible(), false);
   assert.equal(await desktop.locator('#diagnostics').getAttribute('open'), null);
   await desktop.locator('#run').click();
@@ -89,6 +90,8 @@ try {
   assert.equal(await desktop.locator('#run').isEnabled(), true);
 
   const phone = await open({ viewport: { width: 844, height: 390 }, hasTouch: true, isMobile: true });
+  assert.equal(await phone.locator('#title-picker').isVisible(), true, 'landscape keeps title selection accessible');
+  assert.equal(await phone.locator('#upload').isVisible(), true, 'landscape keeps package upload accessible');
   assert.equal(await phone.locator('#touch-controls').isVisible(), true);
   await phone.locator('#run').click();
   await expectPad(phone, 0, [0, 0, 0, 0]);

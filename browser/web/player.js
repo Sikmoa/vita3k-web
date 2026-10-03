@@ -49,6 +49,9 @@ try {
 }
 const { title: TITLE, app: APP, aot: AOT, aotUrl: AOT_URL } = config;
 const aotUrl = typeof AOT_URL === 'string' && AOT_URL ? AOT_URL : (AOT ? '/aot.wasm' : null);
+// Uploaded games need no server-built image or recorded execution seeds:
+// build from their loaded code at launch. An explicit query overrides this.
+const buildAot = params.get('buildAot') ?? (backend === 'jit' && config.staged === false ? '1' : null);
 // Persistent content cache (OPFS) namespace for this title: staging reads
 // through it, and the package upload below fills it.
 const cacheKey = `${sanitizeSegment(TITLE)}/${sanitizeSegment(APP)}`;
@@ -104,7 +107,8 @@ function stagingDetail(index, bytes) {
 document.querySelector('#game-title').textContent = TITLE === 'PCSE00268' ? 'Limbo' : TITLE;
 document.title = 'Vita3K Web — ' + document.querySelector('#game-title').textContent;
 document.querySelector('#runtime-info').textContent = TITLE + ' · ' + backend.toUpperCase() + ' · ' + memory +
-  (aotUrl ? ' · AOT' : '') + (config.staged === false ? ' · package' : '');
+  (aotUrl ? ' · AOT' : buildAot === '1' || buildAot === 'only' ? ' · AOT at launch' : '') +
+  (config.staged === false ? ' · package' : '');
 function notice(message) {
   const element = document.querySelector('#player-notice');
   element.textContent = message; element.hidden = !message;
@@ -498,25 +502,30 @@ if (!storageSupported()) {
 // Title picker: everything bootable — the server's staged titles plus the
 // packages this browser holds in persistent storage (uploaded, no server
 // work). Switching reloads with ?title=<id>, which is also the shareable link.
-const titleRow = document.querySelector('#title-row');
 const titlePicker = document.querySelector('#title-picker');
 async function refreshTitlePicker() {
   const stagedTitles = Array.isArray(config.titles) ? config.titles : [];
+  const showTitles = (uploaded) => {
+    const counts = new Map(uploaded.map((entry) => [entry.title, entry.files]));
+    const ids = [...new Set([...stagedTitles, ...counts.keys(), TITLE])].sort();
+    titlePicker.replaceChildren(...ids.map((id) => {
+      const option = document.createElement('option');
+      option.value = id;
+      option.textContent = stagedTitles.includes(id)
+        ? `${id} · server`
+        : `${id} · package${counts.has(id) ? ` (${counts.get(id)})` : ''}`;
+      return option;
+    }));
+    titlePicker.value = TITLE;
+    titlePicker.disabled = false;
+  };
+  // Keep the picker visible even with one title, and make the server's
+  // titles available while persistent storage is being read.
+  showTitles([]);
   const cache = storageSupported() ? await cacheAPI() : null;
   let uploaded = [];
   try { uploaded = cache?.listCachedTitles ? await cache.listCachedTitles() : []; } catch { uploaded = []; }
-  const counts = new Map(uploaded.map((entry) => [entry.title, entry.files]));
-  const ids = [...new Set([...stagedTitles, ...counts.keys(), TITLE])].sort();
-  titlePicker.replaceChildren(...ids.map((id) => {
-    const option = document.createElement('option');
-    option.value = id;
-    option.textContent = stagedTitles.includes(id)
-      ? `${id} · server`
-      : `${id} · package${counts.has(id) ? ` (${counts.get(id)})` : ''}`;
-    return option;
-  }));
-  titlePicker.value = TITLE;
-  titleRow.hidden = ids.length < 2;
+  showTitles(uploaded);
 }
 titlePicker.onchange = () => {
   const next = new URLSearchParams(location.search.replace(/^\?/, ''));
@@ -571,8 +580,9 @@ async function run() {
   runButton.disabled = true; stopButton.disabled = false;
   ensureAudio();
   const workerParams = new URLSearchParams({ backend, memory, inlineMutex: params.get('inlineMutex') === '0' ? '0' : '1' });
+  if (buildAot !== null) workerParams.set('buildAot', buildAot);
   for (const name of ['fpsHack', 'scale', 'surfaceSync', 'maxInFlight', 'cores', 'hleProfile', 'gles',
-    'readback', 'stampLru', 'writeObserver', 'regionCache', 'textureVerify', 'buildAot']) {
+    'readback', 'stampLru', 'writeObserver', 'regionCache', 'textureVerify']) {
     if (params.has(name)) workerParams.set(name, params.get(name));
   }
   const currentWorker = worker = new Worker(`./worker.js?${workerParams}`, { type: 'module' });

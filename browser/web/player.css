@@ -114,7 +114,9 @@ body.player-expanded { overflow: hidden; }
   .system-buttons { gap: 8px; }.system-buttons button { width: 58px; }
 }
 @media (orientation: landscape) and (max-height: 600px) {
-  .site-header, .game-heading, .below-player { display: none; } main { max-width: none; padding: 0; }
+  .site-header, .game-heading { display: none; } main { max-width: none; padding: 0; }
+  .below-player { flex-direction: row; flex-wrap: wrap; margin: 12px 16px; }
+  .below-player .play-hint, .below-player .rotate-hint { display: none; }
   #player-shell { border: 0; border-radius: 0; }.toolbar { min-height: 52px; padding: 5px max(12px, env(safe-area-inset-right)) 5px max(12px, env(safe-area-inset-left)); }
   #display, #display.touch-visible { width: 100%; height: calc(100dvh - 52px); min-height: 0; max-height: none; aspect-ratio: auto; }
   #display.touch-visible > canvas { object-position: center; }

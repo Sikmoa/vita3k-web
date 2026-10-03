@@ -64,10 +64,17 @@ Two ways a title becomes bootable:
   package names its own title (see below). No server-side staging, no
   restart.
 
-The **Title** picker lists both, tagging them `· server` or `· package`;
+The **Title** picker stays visible below the game screen and lists both,
+tagging them `· server` or `· package`;
 switching titles reloads with `?title=<id>`, which is also the link to share.
 Each title keeps its own persistent cache, and the AOT image is used only for
 the title it was built for.
+
+Uploaded packages use seedless AOT by default with the JIT backend: the
+runtime builds an image from the loaded game and firmware code at launch.
+This adds startup time, and the generated image is currently rebuilt on each
+launch. Code outside the image uses the JIT fallback. `?buildAot=0` disables
+building at launch; `?buildAot=1` also enables it for server-staged titles.
 
 ## Game packages & offline content
 
