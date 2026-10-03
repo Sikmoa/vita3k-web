@@ -250,7 +250,15 @@ EXPORT(int, sceAudioOutOutput, int port, const void *buf) {
             emuenv.kernel.execution_host->wait_sync(*thread,
                 static_cast<uint32_t>(wait > UINT32_MAX ? UINT32_MAX : wait));
         }
-        next = (audio_wall_us() > next ? audio_wall_us() : next) + buffer_us;
+        // Keep the schedule: a wake that came late is made up by the next
+        // buffers (a device keeps consuming at its rate), so the samples
+        // submitted track the wall clock. Movie players time video by this
+        // audio clock; restarting from "now" after every late wake made it
+        // run slow and video frames missed their display frames. Only a stall
+        // of several buffers resynchronizes instead of bursting.
+        next += buffer_us;
+        if (audio_wall_us() > next + 4 * buffer_us)
+            next = audio_wall_us() + buffer_us;
     }
     emuenv.audio.audio_output(*prt, buf);
     thread->update_status(ThreadStatus::run);

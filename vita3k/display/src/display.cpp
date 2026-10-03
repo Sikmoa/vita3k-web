@@ -122,11 +122,12 @@ void start_sync_thread(EmuEnvState &emuenv) {
 // legacy self-driven wait below. See display/functions.h for the contract.
 bool service_vblank(EmuEnvState &emuenv) {
     DisplayState &display = emuenv.display;
-    if (display.vblank_wait_infos.empty())
-        return false;
-
     const auto before = display.vblank_count.load();
     if (display.fast_vblank) {
+        // Headroom mode has no wall clock to follow: vblanks happen only for
+        // threads that wait for one.
+        if (display.vblank_wait_infos.empty())
+            return false;
         // Headroom mode: one vblank per service pass, no wall-clock gating.
         // next_vblank_time tracks now so leaving fast mode (or concurrent
         // readers) never sees a stale deadline.
@@ -142,12 +143,18 @@ bool service_vblank(EmuEnvState &emuenv) {
     }
     // Advance by every fully elapsed period, mirroring the native vblank
     // thread's steady wall-clock cadence (a slow guest sees its vcount jump by
-    // the number of missed vblanks, as on native).
+    // the number of missed vblanks, as on native). This runs with no thread
+    // waiting too: games also poll sceDisplayGetVcount (Persona 4 Golden's
+    // display callback spins on it), and a clock that only moved for waiters
+    // left that poll, and every thread spinning on its result, stuck.
+    // Only a waiter or a vblank callback can be woken, so a tick without them
+    // does not count as a wake for the scheduler (it would spin when idle).
+    const bool wakes = !display.vblank_wait_infos.empty() || !display.vblank_callbacks.empty();
     while (now >= display.next_vblank_time) {
         advance_vblank(emuenv);
         display.next_vblank_time += std::chrono::microseconds(TARGET_MICRO_PER_FRAME);
     }
-    return display.vblank_count.load() != before;
+    return wakes && display.vblank_count.load() != before;
 }
 
 void wait_vblank(EmuEnvState &emuenv, const ThreadStatePtr &wait_thread, const uint64_t target_vcount, const bool is_cb) {

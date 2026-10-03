@@ -296,7 +296,9 @@ struct GuestThreadRuntime::Impl final : KernelExecutionHost {
         jit.set_inline_mutex_table(kernel->inline_mutex_table.get());
         const uint64_t before = jit.instructions_executed();
         const int result = single_step ? jit.step() : jit.run_slice(slice);
-        active->since_yield += jit.instructions_executed() - before + kHleCharge;
+        const uint64_t charged = jit.instructions_executed() - before + kHleCharge;
+        active->since_yield += charged;
+        scheduler.charge(charged);
         mutex_inline_commit(*kernel, active->thread);
         if (result < 0 && !active->faulted) {
             active->faulted = true;
