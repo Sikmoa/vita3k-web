@@ -928,6 +928,12 @@ private:
         auto result = std::make_unique<AotTranslated>();
         std::optional<Dynarmic::IR::Block> ir;
         last_rejection.clear();
+        if (trace) { // a Dynarmic assertion aborts the build: name the block first
+            std::array<uint8_t, 8> bytes{};
+            mem_fetch(mem, location.PC(), bytes.data(), bytes.size());
+            std::fprintf(stderr, "[aot] translate %08x%s bytes=%02x%02x %02x%02x %02x%02x %02x%02x\n", location.PC(),
+                location.TFlag() ? "T" : "A", bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]);
+        }
         for (const auto [limit, continue_stores] : {std::pair{REGION_BLOCK_INSTR_LIMIT, true},
                  std::pair{REGION_BLOCK_INSTR_LIMIT, false}, std::pair{1u, false}}) {
             ir = translate_ir(location, limit, continue_stores, result->block);

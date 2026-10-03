@@ -72,6 +72,27 @@ endforeach()
 set(_dynarmic_portable_three_regs "${CMAKE_CURRENT_BINARY_DIR}/dynarmic-frontend/asimd_three_regs.cpp")
 file(GENERATE OUTPUT "${_dynarmic_portable_three_regs}" CONTENT "${_dynarmic_three_regs_text}")
 
+# Some UNPREDICTABLE encodings with base writeback to PC (LDC2 [pc]!, ...)
+# reach SetRegister(PC), which upstream asserts on and so aborts the whole
+# process. Real code never contains them, but the AOT builder's seedless
+# discovery can translate data: the build-local copy throws instead, which
+# the builder and the lazy JIT already treat as an untranslatable block.
+set(_dynarmic_a32_emitter "${_dynarmic_src}/frontend/A32/a32_ir_emitter.cpp")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_dynarmic_a32_emitter}")
+file(READ "${_dynarmic_a32_emitter}" _dynarmic_a32_emitter_text)
+set(_set_register_assert "void IREmitter::SetRegister(const Reg reg, const IR::U32& value) {
+    ASSERT(reg != A32::Reg::PC);")
+string(FIND "${_dynarmic_a32_emitter_text}" "${_set_register_assert}" _set_register_at)
+if(_set_register_at EQUAL -1)
+    message(FATAL_ERROR "Dynarmic A32 SetRegister changed; review the PC write adaptation")
+endif()
+string(REPLACE "${_set_register_assert}" "void IREmitter::SetRegister(const Reg reg, const IR::U32& value) {
+    if (reg == A32::Reg::PC)
+        throw std::invalid_argument(\"A32 SetRegister(PC): unpredictable PC writeback\");"
+    _dynarmic_a32_emitter_text "${_dynarmic_a32_emitter_text}")
+set(_dynarmic_portable_a32_emitter "${CMAKE_CURRENT_BINARY_DIR}/dynarmic-frontend/a32_ir_emitter.cpp")
+file(GENERATE OUTPUT "${_dynarmic_portable_a32_emitter}" CONTENT "#include <stdexcept>\n${_dynarmic_a32_emitter_text}")
+
 # Exact FMA cancellation must keep the low product limb's binary point.
 set(DYNARMIC_ROOT "${_dynarmic_root}")
 set(FUSED_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/dynarmic-frontend/fused.cpp")
@@ -90,7 +111,7 @@ add_library(vita3k_dynarmic_frontend STATIC
     "${_dynarmic_src}/frontend/A32/translate/translate_arm.cpp"
     "${_dynarmic_src}/frontend/A32/translate/translate_thumb.cpp"
     "${_dynarmic_src}/frontend/A32/translate/conditional_state.cpp"
-    "${_dynarmic_src}/frontend/A32/a32_ir_emitter.cpp"
+    "${_dynarmic_portable_a32_emitter}"
     "${_dynarmic_src}/frontend/A32/a32_location_descriptor.cpp"
     "${_dynarmic_src}/frontend/A32/a32_types.cpp"
     # Core IR diagnostics use A64 register/condition names, not A64 translation.
