@@ -176,6 +176,9 @@ try {
         // Trace passes, draws, texture binds and presents after N frames
         // (gxm_webgpu_bridge.cpp VITA3K_GXM_TRACE).
         VITA3K_GXM_TRACE: workerParams.get('gxmTrace') ?? undefined,
+        VITA3K_GXM_TRACE_LINES: workerParams.get('gxmTraceLines') ?? undefined,
+        // Print every guest thread's PC each N dispatches (vita_app.cpp).
+        VITA3K_BENCH_PC_SAMPLE: workerParams.get('pcSample') ?? undefined,
       });
       break;
     } catch (error) {
@@ -235,6 +238,7 @@ async function readStagedFile(response, onProgress) {
   const LAZY_STAGE_BYTES = 8 << 20;
   const LAZY_CHUNK = 4 << 20;
   const LAZY_CACHE_CHUNKS = 96; // per file, least recently used evicted
+  const lazyStats = { chunks: 0, ms: 0 };
   // A MEMFS file node whose reads fetch LAZY_CHUNK-aligned byte ranges of
   // `url` with synchronous XHR (allowed in workers; the emulator's file reads
   // are synchronous) and copy them out in bulk. Emscripten's createLazyFile
@@ -252,6 +256,7 @@ async function readStagedFile(response, onProgress) {
       }
       const from = index * LAZY_CHUNK;
       const to = Math.min(from + LAZY_CHUNK, size) - 1;
+      const fetchStarted = performance.now();
       const xhr = new XMLHttpRequest();
       xhr.open('GET', url, false);
       xhr.responseType = 'arraybuffer';
@@ -260,6 +265,9 @@ async function readStagedFile(response, onProgress) {
       if (xhr.status !== 206 && !(xhr.status === 200 && from === 0 && to === size - 1))
         throw new Error(`lazy read of ${url} [${from}, ${to}] failed: HTTP ${xhr.status}`);
       bytes = new Uint8Array(xhr.response);
+      lazyStats.chunks += 1; lazyStats.ms += performance.now() - fetchStarted;
+      if (lazyStats.chunks % 25 === 0)
+        post({ type: 'log', message: `[vita3k-web] lazy reads: ${lazyStats.chunks} chunks of ${LAZY_CHUNK >> 20} MiB, ${Math.round(lazyStats.ms)} ms` });
       if (bytes.byteLength !== to - from + 1)
         throw new Error(`lazy read of ${url} [${from}, ${to}] returned ${bytes.byteLength} bytes`);
       chunks.set(index, bytes);

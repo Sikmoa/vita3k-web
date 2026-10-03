@@ -33,6 +33,8 @@
 //   LIMBO_SCALE=N           internal resolution multiplier (default 2)
 //   LIMBO_SURFACE_SYNC=1    read rendered surfaces back into guest memory
 //   LIMBO_GXM_TRACE=N       trace passes, draws, textures and presents after N frames
+//   LIMBO_GXM_TRACE_LINES=N trace line budget (default 600)
+//   LIMBO_CPU_PROFILE=S:D   Worker CPU profile from S ms for D ms (LIMBO_PROFILE_OUT.cpu.cpuprofile)
 //   LIMBO_DIALOG            answer to every guest message dialog (sceMsgDialog):
 //                           cross (default; the highlighted first button), circle
 //                           (the last of several buttons) or none (leave it open)
@@ -65,6 +67,9 @@ const hleProfile = process.env.LIMBO_HLE_PROFILE === '1';
 // presses cross every 5 s after the loading window and holds the left stick
 // right once gameplay starts. The run ends after the gameplay window.
 const measure = process.env.LIMBO_MEASURE === '1';
+// LIMBO_CPU_PROFILE=<start ms>:<duration ms>: one Worker CPU profile of that
+// window after the page loads, written to LIMBO_PROFILE_OUT.cpu.cpuprofile.
+const cpuWindow = (process.env.LIMBO_CPU_PROFILE || '').split(':').map(Number);
 // LIMBO_PROFILE=0 keeps the measurement windows but skips the CPU profiler,
 // which itself costs guest throughput.
 const profileWindows = process.env.LIMBO_PROFILE !== '0';
@@ -284,7 +289,7 @@ try {
     // Headless Chrome only offers SwiftShader WebGPU; LIMBO_HEADED=1 opens a
     // window so the hardware adapter is used.
     headless: process.env.LIMBO_HEADED !== '1',
-    args: process.env.LIMBO_GPU === '1' ? ['--enable-unsafe-webgpu', '--enable-features=Vulkan']
+    args: process.env.LIMBO_GPU === '1' ? ['--enable-unsafe-webgpu', '--enable-gpu', '--enable-features=Vulkan']
       : ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--enable-features=Vulkan',
         '--disable-vulkan-surface'],
     ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
@@ -295,7 +300,7 @@ try {
   page.on('pageerror', (error) => pageErrors.push(String(error)));
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   const measurements = {};
-  if (measure) {
+  if (measure || cpuWindow.length === 2) {
     // Playwright has no CDP session for a Worker: use the page session's
     // legacy (non-flat) auto-attach and message relay to reach it.
     const cdp = await page.context().newCDPSession(page);
@@ -317,7 +322,20 @@ try {
       cdp.send('Target.sendMessageToTarget', { sessionId: workerSession, message: JSON.stringify({ id, method, params }) })
         .catch(rejectCall);
     });
-    await page.exposeFunction('limboMeasure', async ({ kind, name }) => {
+    if (cpuWindow.length === 2) {
+      setTimeout(async () => {
+        try {
+          await workerCall('Profiler.enable');
+          await workerCall('Profiler.setSamplingInterval', { interval: 500 });
+          await workerCall('Profiler.start');
+          setTimeout(async () => {
+            const { profile } = await workerCall('Profiler.stop');
+            await writeFile(`${process.env.LIMBO_PROFILE_OUT || 'limbo'}.cpu.cpuprofile`, JSON.stringify(profile));
+          }, cpuWindow[1]);
+        } catch (error) { console.error('cpu profile:', error); }
+      }, cpuWindow[0]);
+    }
+    if (measure) await page.exposeFunction('limboMeasure', async ({ kind, name }) => {
       if (!profileWindows) return;
       if (allocationProfile) {
         if (kind === 'start') {
@@ -344,8 +362,8 @@ try {
     });
   }
 
-  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot, aotUrl, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale, surfaceSync, gxmTrace, dialogAnswer, ctrlButtons, imeAnswer }) => {
-    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}${textureVerify ? '&textureVerify=1' : ''}${scale ? '&scale=' + scale : ''}${surfaceSync ? '&surfaceSync=1' : ''}${gxmTrace ? '&gxmTrace=' + gxmTrace : ''}`, { type: 'module' });
+  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot, aotUrl, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale, surfaceSync, gxmTrace, gxmTraceLines, pcSample, dialogAnswer, ctrlButtons, imeAnswer }) => {
+    const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}${textureVerify ? '&textureVerify=1' : ''}${scale ? '&scale=' + scale : ''}${surfaceSync ? '&surfaceSync=1' : ''}${gxmTrace ? '&gxmTrace=' + gxmTrace : ''}${gxmTraceLines ? '&gxmTraceLines=' + gxmTraceLines : ''}${pcSample ? '&pcSample=' + pcSample : ''}`, { type: 'module' });
     const state = { logs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
       backend: null, memory: null, workerErrors: [], ready: false, timedOut: false,
       gxmSceneStats: null, gxmFailures: [], gxmSkips: [],
@@ -566,7 +584,7 @@ try {
       };
     });
     return result;
-  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot: Boolean(aotProbePath), aotUrl: aotProbeUrl, fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '', surfaceSync: process.env.LIMBO_SURFACE_SYNC === '1', gxmTrace: process.env.LIMBO_GXM_TRACE || '', dialogAnswer, ctrlButtons, imeAnswer });
+  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot: Boolean(aotProbePath), aotUrl: aotProbeUrl, fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '', surfaceSync: process.env.LIMBO_SURFACE_SYNC === '1', gxmTrace: process.env.LIMBO_GXM_TRACE || '', gxmTraceLines: process.env.LIMBO_GXM_TRACE_LINES || '', pcSample: process.env.LIMBO_PC_SAMPLE || '', dialogAnswer, ctrlButtons, imeAnswer });
 
   const saved = [];
   for (const frame of outcome.saved) {

@@ -200,7 +200,7 @@ bool surface_sync() {
 // the next passes, draws, texture binds and presents (a few hundred lines)
 // to see where a frame's pixels come from.
 static uint32_t trace_presents = 0;
-static int trace_budget = 600;
+static int trace_budget = [] { const char *v = std::getenv("VITA3K_GXM_TRACE_LINES"); return v ? std::atoi(v) : 600; }();
 static bool gxm_tracing() {
     static const long after = [] {
         const char *value = std::getenv("VITA3K_GXM_TRACE");

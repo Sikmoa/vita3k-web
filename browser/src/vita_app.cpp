@@ -471,6 +471,14 @@ static int run_app_impl() {
         // Ascending on purpose: the log tail keeps the end of the block, so the
         // largest consumer is the last line printed.
         const std::size_t shown = ranked.size() < 8 ? ranked.size() : 8;
+        // The most frequent imports too: a guest polling loop shows here, not by time.
+        std::vector<std::pair<std::uint32_t, std::pair<unsigned, double>>> frequent(ranked);
+        std::sort(frequent.begin(), frequent.end(), [](const auto &x, const auto &y) {
+            return x.second.first > y.second.first;
+        });
+        for (std::size_t i = std::min<std::size_t>(frequent.size(), 8); i > 0; --i)
+            std::printf("[vita3k-web] jit hle frequent NID=%08x %-28s calls=%u\n",
+                frequent[i - 1].first, app_import_name(frequent[i - 1].first), frequent[i - 1].second.first);
         for (std::size_t i = shown; i > 0; --i) {
             const auto &[nid, stats] = ranked[i - 1];
             std::printf("[vita3k-web] jit hle NID=%08x %-28s calls=%u ms=%.1f avg_us=%.0f\n",
