@@ -722,11 +722,25 @@ struct AotRuntime {
         }
         return 0;
     }
+    // Pages whose AOT functions were all retired (module unloaded, code
+    // rewritten): they no longer hold live AOT code and no longer mark
+    // g_code_pages on its behalf, so data later placed there stores freely.
+    std::vector<uint8_t> retired_pages;
     bool covers_page(uint32_t page) const noexcept {
+        if (!retired_pages.empty() && retired_pages[page])
+            return false;
         for (const auto &range : ranges)
             if (page >= (range.base >> 12) && page <= ((range.base + range.size - 1) >> 12))
                 return true;
         return false;
+    }
+    void retire_page(uint32_t page) noexcept {
+        if (!covers_page(page))
+            return;
+        if (retired_pages.empty())
+            retired_pages.resize(size_t(1) << 20);
+        retired_pages[page] = 1;
+        --g_code_pages[page];
     }
 } g_aot;
 
@@ -1762,8 +1776,16 @@ struct WasmJitCPU::Impl {
         const uint32_t page = state.smc_page;
         if (page != std::numeric_limits<uint32_t>::max() && !g_aot.covers_page(page))
             return;
-        g_aot.disabled = true;
-        std::fprintf(stderr, "[vita3k-web] AOT disabled: guest store into AOT code page %08x (pc %08x)\n",
+        if (page == std::numeric_limits<uint32_t>::max()) {
+            g_aot.disabled = true;
+            std::fprintf(stderr, "[vita3k-web] AOT disabled: guest store into AOT code pages (pc %08x)\n",
+                state.regs[15]);
+            return;
+        }
+        // Retire only the functions on the rewritten page; the rest of the
+        // module stays in use.
+        WasmJitCPU::retire_aot(page << 12, 4096);
+        std::fprintf(stderr, "[vita3k-web] AOT retired code page %08x: guest store (pc %08x)\n",
             page << 12, state.regs[15]);
     }
     // One VITA3K_AOT_DIFF sample: run the AOT call, then the lazy JIT from the
@@ -2763,6 +2785,10 @@ void WasmJitCPU::retire_aot(Address start, size_t length) {
             if (cleared)
                 ++g_aot.invalidated_functions;
         }
+        // Every function overlapping the range is retired, so pages wholly
+        // inside it hold no live AOT code (an unloaded module's segment).
+        for (uint64_t page = (uint64_t(start) + 4095) >> 12; (page + 1) << 12 <= end; ++page)
+            g_aot.retire_page(uint32_t(page));
     }
 }
 void WasmJitCPU::release_code_caches() {
@@ -2870,7 +2896,7 @@ std::string WasmJitCPU::get_profile() const {
         "host_entries=%llu post_hle_entries=%llu version_syncs=%llu version_bumps=%llu "
         "entry_scanned=%llu entry_evicted=%llu select_checks=%llu select_stale=%llu "
         "capacity_evictions=%llu revalidate_ms=%.1f cache_limit=%zu "
-        "aot=%d aot_calls=%llu aot_entry_misses=%llu aot_invalidated=%llu",
+        "aot=%d aot_calls=%llu aot_entry_misses=%llu aot_invalidated=%llu aot_retired_pages=%llu",
         impl->emit_ms, impl->install_ms, impl->run_js_ms,
         (unsigned long long)impl->js_calls, (unsigned long long)impl->misses,
         (unsigned long long)impl->svc_exits, (unsigned long long)impl->compiled,
@@ -2894,7 +2920,8 @@ std::string WasmJitCPU::get_profile() const {
         region_cache_limit(),
         g_aot.loaded ? (g_aot.disabled ? -1 : 1) : 0,
         (unsigned long long)impl->aot_calls, (unsigned long long)impl->aot_entry_misses,
-        (unsigned long long)g_aot.invalidated_functions);
+        (unsigned long long)g_aot.invalidated_functions,
+        (unsigned long long)std::count(g_aot.retired_pages.begin(), g_aot.retired_pages.end(), uint8_t(1)));
     return buffer;
 }
 

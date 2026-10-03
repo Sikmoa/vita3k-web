@@ -94,8 +94,11 @@ then one region-shaped `run(state, budget)` per AOT function, in table order.
 * `unchecked_memory` (Memory64 only): guest accesses are plain window loads and
   stores. Guest faults are not reported and stores do not raise `smc_dirty`.
   AOT text is read-execute; a store into a covered page that does reach the
-  checked path disables the whole module. `VITA3K_AOT_CHECKED_MEMORY=1` keeps
-  the probes for diagnosis.
+  checked path retires the functions on that page (the whole module only when
+  the store spans pages that cannot be told apart). Invalidating a range, as
+  unloading a module does, also retires its whole pages, so data later placed
+  there stores without SMC checks (Persona 4 Golden unloads `libscemp4` after
+  the movies). `VITA3K_AOT_CHECKED_MEMORY=1` keeps the probes for diagnosis.
 * `fast_fp`: FP add/sub/mul/div/sqrt lower to native Wasm arithmetic without
   cumulative FPSCR flags; NaN payloads and NEON denormal flushing may differ.
   `VITA3K_AOT_EXACT_FP=1` restores the exact lowering.
