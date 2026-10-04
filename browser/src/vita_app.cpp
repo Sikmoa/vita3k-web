@@ -491,6 +491,15 @@ static int run_app_impl() {
     std::unordered_map<std::uint32_t, std::pair<unsigned, double>> hle_nids;
     // Last import (NID, PC) per thread under VITA3K_HLE_PROFILE: where a parked thread waits.
     std::unordered_map<SceUID, std::pair<std::uint32_t, Address>> last_import;
+#ifdef VITA3K_WEB_THREADS
+    // Where each guest thread is in the import callback (threaded diagnostics):
+    // 0 guest code, 1 import, 2 dialog/IME sync, 3 frame present.
+    std::unordered_map<SceUID, int> import_phase;
+    const auto set_phase = [&](SceUID tid, int phase) {
+        const std::lock_guard<ReportMutex> guard(report_mutex);
+        import_phase[tid] = phase;
+    };
+#endif
     // The last imports of every thread, printed when a guest thread fails.
     struct ImportRecord { unsigned sequence; SceUID tid; std::uint32_t nid; Address pc, lr; };
     std::array<ImportRecord, 128> recent_imports{};
@@ -580,7 +589,7 @@ static int run_app_impl() {
             const auto last = last_import.find(id);
             if (!active || last == last_import.end()) continue;
 #ifdef VITA3K_WEB_THREADS
-            const std::lock_guard<std::mutex> status_guard(active->mutex);
+            const std::unique_lock<std::mutex> status_guard(active->mutex, std::try_to_lock);
 #endif
             std::printf("[vita3k-web] thread=%d %s status=%d last_import=%s PC=%08x\n", id,
                 active->name.c_str(), static_cast<int>(active->status),
@@ -625,6 +634,7 @@ static int run_app_impl() {
                     recent_imports[import_sequence % recent_imports.size()] = { import_sequence, tid, nid, read_pc(cpu), read_lr(cpu) };
 #ifdef VITA3K_WEB_THREADS
                     last_import[tid] = { nid, read_pc(cpu) };
+                    import_phase[tid] = 1;
 #endif
                 }
                 if (trace_hle) {
@@ -670,6 +680,9 @@ static int run_app_impl() {
                 } else if (!browser::gles::call_import(*env, cpu, nid)) {
                     ::call_import(*env, cpu, nid, tid);
                 }
+#ifdef VITA3K_WEB_THREADS
+                set_phase(tid, 2);
+#endif
                 browser::sync_message_dialog(*env);
                 browser::sync_ime(*env);
                 if (trace_hle) {
@@ -679,11 +692,17 @@ static int run_app_impl() {
                 }
                 if (nid == 0x7A410B64 /* sceDisplaySetFrameBuf */
                     || nid == 0xF51523CB /* _sceDisplaySetFrameBuf */) {
+#ifdef VITA3K_WEB_THREADS
+                    set_phase(tid, 3);
+#endif
                     vita3k_web_present_frame(*env);
                     ++frames_presented;
                 } else if (nid == 0x02AB000E /* eglSwapBuffers */) {
                     ++frames_presented;
                 }
+#ifdef VITA3K_WEB_THREADS
+                set_phase(tid, 0);
+#endif
                 // Module-start imports run before the main thread exists.
                 // Stop the importing thread, not a possibly-null main thread.
                 if (!env->missing_nids.empty()) {
@@ -958,12 +977,16 @@ static int run_app_impl() {
                 last_yield_ms = now_ms;
                 const std::lock_guard<ReportMutex> report_guard(report_mutex);
                 const std::lock_guard<std::mutex> threads_guard(env->kernel.mutex);
-                std::fprintf(stderr, "[vita3k-web] threads imports=%u (last HLE PC):", imports.load());
+                std::fprintf(stderr, "[vita3k-web] threads imports=%u vblank=%llu (tid:name:last HLE PC:status:phase):", imports.load(),
+                    static_cast<unsigned long long>(env->display.vblank_count.load()));
                 for (const auto &[tid, t] : env->kernel.threads) {
-                    const std::lock_guard<std::mutex> thread_guard(t->mutex);
+                    // Never wait here: a stuck thread may hold its own lock.
+                    const std::unique_lock<std::mutex> thread_guard(t->mutex, std::try_to_lock);
                     const auto last = last_import.find(tid);
-                    std::fprintf(stderr, " %d:%s:%08x:%d", tid, t->name.c_str(),
-                        last == last_import.end() ? 0 : last->second.second, static_cast<int>(t->status));
+                    const auto phase = import_phase.find(tid);
+                    std::fprintf(stderr, " %d:%s:%08x:%d:%d", tid, t->name.c_str(),
+                        last == last_import.end() ? 0 : last->second.second, static_cast<int>(t->status),
+                        phase == import_phase.end() ? -1 : phase->second);
                 }
                 std::fprintf(stderr, "\n");
             }

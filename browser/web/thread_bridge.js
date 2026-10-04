@@ -10,6 +10,8 @@ export function installThreadBridge(module, logger = console.error) {
     const now = performance.now();
     for (const [id, { operation, started, args }] of inFlight)
       if (now - started > 2000) logger(`[thread-bridge] ${operation} pending ${((now - started) / 1000).toFixed(1)}s args=${args.slice(0, 4).join(",")} (call ${id})`);
+    const pool = module.vita3kPoolStats?.();
+    if (pool) logger(`[thread-bridge] pool idle=${pool.idle} busy=${pool.busy} misses=${pool.misses} calls in flight=${inFlight.size}`);
   }, 5000);
   module.vita3kThreadCall = async (operation, a) => {
     const id = ++nextCall;
