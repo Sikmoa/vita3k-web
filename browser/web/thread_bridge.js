@@ -13,10 +13,40 @@ export function installThreadBridge(module, logger = console.error) {
     const pool = module.vita3kPoolStats?.();
     if (pool) logger(`[thread-bridge] pool idle=${pool.idle} busy=${pool.busy} misses=${pool.misses} calls in flight=${inFlight.size}`);
   }, 5000);
+  // GXM operations run one after another, in the order guest threads issued
+  // them: a posted scene may still wait for GPU capacity when the next
+  // present or readback arrives.
+  let gxmChain = Promise.resolve();
+  const inOrder = (work) => {
+    const result = gxmChain.then(work);
+    gxmChain = result.catch(() => {});
+    return result;
+  };
+  // Posted scene (gxm_webgpu_bridge.cpp, post_scene): copy it out of shared
+  // memory now and free its slot, so the guest thread builds the next scene
+  // while this one waits its turn and for GPU capacity.
+  const submitPosted = (a) => {
+    const view = bytes(a[2], a[3]);
+    const data = new Uint8Array(view);
+    const words = new Uint32Array(new Uint32Array(view.buffer, Number(module.vita3kHostOffset(a[0], a[1] * 4)), a[1]));
+    const flag = bytes(a[4], 4);
+    const busy = new Int32Array(flag.buffer, flag.byteOffset, 1);
+    Atomics.store(busy, 0, 0);
+    Atomics.notify(busy, 0);
+    return inOrder(async () => {
+      const gxm = module.vita3kGxm;
+      if (!gxm) return 0;
+      while (!gxm.trySubmitScene(words, data)) await gxm.waitForCapacity();
+      return 0;
+    }).catch((error) => { logger(`[thread-bridge] posted scene rejected: ${error?.stack || error}`); return -1; });
+  };
   module.vita3kThreadCall = async (operation, a) => {
     const id = ++nextCall;
     inFlight.set(id, { operation, started: performance.now(), args: a });
-    try { return await dispatch(operation, a); } finally { inFlight.delete(id); }
+    try {
+      if (operation === 'gxm-submit-async') return await submitPosted(a);
+      return await (operation.startsWith('gxm-') ? inOrder(() => dispatch(operation, a)) : dispatch(operation, a));
+    } finally { inFlight.delete(id); }
   };
   const dispatch = async (operation, a) => {
     switch (operation) {

@@ -26,12 +26,16 @@
 #include <renderer/state.h>
 #include <util/align.h>
 #include <emscripten.h>
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+#include <emscripten/threading.h>
+#endif
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 #include <fmt/format.h>
 #include <algorithm>
 #include <memory>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -1984,10 +1988,45 @@ static bool wait_for_gpu_capacity() {
     return result == 0;
 }
 
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+// Threaded build: a finished scene moves into one of two slots and is posted
+// to the coordinator, which copies it out at once, frees the slot and encodes
+// it afterwards (in order with every other GXM operation). The guest thread
+// builds the next scene meanwhile and waits only for a slot still unread.
+struct PendingScene {
+    std::vector<uint32_t> words;
+    scene::Writer::Bytes data;
+    std::atomic<uint32_t> busy{0}; // 1 until the coordinator has copied it
+};
+static std::array<PendingScene, 2> pending_scenes;
+static unsigned next_pending_scene = 0;
+static bool post_scene(scene::Writer &out) {
+    PendingScene &slot = pending_scenes[next_pending_scene++ % pending_scenes.size()];
+    const double started = emscripten_get_now();
+    while (slot.busy.load(std::memory_order_acquire))
+        emscripten_futex_wait(reinterpret_cast<volatile void *>(&slot.busy), 1, 100.0);
+    timing().submit += emscripten_get_now() - started;
+    std::swap(slot.words, out.words);
+    std::swap(slot.data, out.data);
+    slot.busy.store(1, std::memory_order_release);
+    if (!browser::coordinator_post("gxm-submit-async", {reinterpret_cast<uintptr_t>(slot.words.data()),
+            slot.words.size(), reinterpret_cast<uintptr_t>(slot.data.data()), slot.data.size(),
+            reinterpret_cast<uintptr_t>(&slot.busy)}))
+        slot.busy.store(0, std::memory_order_release);
+    return true;
+}
+#endif
+
 // False when gxm_scene.js rejected the stream (its error is logged).
 static bool submit_scene(scene::Writer &out, MemState &mem) {
     end_pass(out);
     out.copy_streams(mem);
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    // A rejected stream is logged by the coordinator; it cannot answer here.
+    const bool posted = out.words.size() <= 1 || post_scene(out);
+    out.reset();
+    return posted;
+#endif
     int result = 0;
     if (out.words.size() > 1) {
         for (;;) {
