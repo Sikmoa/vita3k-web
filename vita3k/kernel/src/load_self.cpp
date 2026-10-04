@@ -151,6 +151,8 @@ static bool load_func_imports(const uint32_t *nids, const Ptr<uint32_t> *entries
             stub[0] = 0xef000000; // svc #0 - Call our interrupt hook.
             stub[1] = 0xe1a0f00e; // mov pc, lr - Return to the caller.
             stub[2] = nid; // Our interrupt hook will read this.
+            if (kernel.patch_hle_stub)
+                kernel.patch_hle_stub(nid, stub);
         } else {
             stub[0] = encode_arm_inst(INSTRUCTION_MOVW, (uint16_t)func_address, 12);
             stub[1] = encode_arm_inst(INSTRUCTION_MOVT, (uint16_t)(func_address >> 16), 12);
@@ -357,6 +359,8 @@ static bool unload_func_exports(const uint32_t *nids, const Ptr<uint32_t> *entri
             stub[0] = 0xef000000; // svc #0 - Call our interrupt hook.
             stub[1] = 0xe1a0f00e; // mov pc, lr - Return to the caller.
             stub[2] = nid; // Our interrupt hook will read this.
+            if (kernel.patch_hle_stub)
+                kernel.patch_hle_stub(nid, stub);
             kernel.invalidate_jit_cache(entry, 3 * sizeof(uint32_t));
         }
     }

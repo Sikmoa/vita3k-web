@@ -35,6 +35,9 @@
 #include "guest_thread_runtime.h"
 #endif
 #include "gxm_webgpu_bridge.h"
+#ifdef VITA3K_WEB_THREADS
+#include "thread_bridge.h"
+#endif
 #endif
 #include <ctrl/state.h>
 #include <display/functions.h>
@@ -54,6 +57,7 @@
 #include <emscripten/emscripten.h>
 
 #include "gles_webgl_bridge.h"
+#include "hle_stub_intrinsics.h"
 #include "ime_bridge.h"
 #include "msg_dialog_bridge.h"
 #include "vita_runtime.h"
@@ -492,12 +496,31 @@ static int run_app_impl() {
     // Last import (NID, PC) per thread under VITA3K_HLE_PROFILE: where a parked thread waits.
     std::unordered_map<SceUID, std::pair<std::uint32_t, Address>> last_import;
 #ifdef VITA3K_WEB_THREADS
-    // Where each guest thread is in the import callback (threaded diagnostics):
-    // 0 guest code, 1 import, 2 dialog/IME sync, 3 frame present.
-    std::unordered_map<SceUID, int> import_phase;
-    const auto set_phase = [&](SceUID tid, int phase) {
+    // Per guest thread: its last import and where it is in the import callback
+    // (0 guest code, 1 import, 2 dialog/IME sync, 3 frame present). The owning
+    // thread writes with relaxed stores and diagnostics read them; the map only
+    // changes under report_mutex, the first time a thread imports. Hundreds of
+    // thousands of imports per second must not share a lock.
+    struct ThreadTrace {
+        std::atomic<std::uint32_t> nid{0};
+        std::atomic<Address> pc{0};
+        std::atomic<int> phase{-1};
+    };
+    std::unordered_map<SceUID, std::unique_ptr<ThreadTrace>> traces;
+    const auto trace_for = [&](SceUID tid) -> ThreadTrace & {
+        thread_local SceUID cached_tid = -1;
+        thread_local ThreadTrace *cached = nullptr;
+        thread_local const void *cached_owner = nullptr;
+        if (cached && cached_tid == tid && cached_owner == &traces)
+            return *cached;
         const std::lock_guard<ReportMutex> guard(report_mutex);
-        import_phase[tid] = phase;
+        auto &slot = traces[tid];
+        if (!slot)
+            slot = std::make_unique<ThreadTrace>();
+        cached_tid = tid;
+        cached = slot.get();
+        cached_owner = &traces;
+        return *cached;
     };
 #endif
     // The last imports of every thread, printed when a guest thread fails.
@@ -586,14 +609,22 @@ static int run_app_impl() {
                 std::printf("[vita3k-web] jit profile %d: %s\n", id, jit.get_profile().c_str());
         }
         for (const auto &[id, active] : report_threads) {
+#ifdef VITA3K_WEB_THREADS
+            // Caller holds report_mutex, which guards the trace map.
+            const auto trace = traces.find(id);
+            if (!active || trace == traces.end()) continue;
+            const std::uint32_t last_nid = trace->second->nid.load(std::memory_order_relaxed);
+            const Address last_pc = trace->second->pc.load(std::memory_order_relaxed);
+            const std::unique_lock<std::mutex> status_guard(active->mutex, std::try_to_lock);
+#else
             const auto last = last_import.find(id);
             if (!active || last == last_import.end()) continue;
-#ifdef VITA3K_WEB_THREADS
-            const std::unique_lock<std::mutex> status_guard(active->mutex, std::try_to_lock);
+            const std::uint32_t last_nid = last->second.first;
+            const Address last_pc = last->second.second;
 #endif
             std::printf("[vita3k-web] thread=%d %s status=%d last_import=%s PC=%08x\n", id,
                 active->name.c_str(), static_cast<int>(active->status),
-                app_import_name(last->second.first), last->second.second);
+                app_import_name(last_nid), last_pc);
         }
     };
 #endif
@@ -629,14 +660,14 @@ static int run_app_impl() {
     try {
         if (!env->kernel.init(env->mem, [&](CPUState &cpu, uint32_t nid, SceUID tid) {
                 const unsigned import_sequence = ++imports;
-                {
-                    const std::lock_guard<ReportMutex> guard(report_mutex);
-                    recent_imports[import_sequence % recent_imports.size()] = { import_sequence, tid, nid, read_pc(cpu), read_lr(cpu) };
 #ifdef VITA3K_WEB_THREADS
-                    last_import[tid] = { nid, read_pc(cpu) };
-                    import_phase[tid] = 1;
+                ThreadTrace &trace = trace_for(tid);
+                trace.nid.store(nid, std::memory_order_relaxed);
+                trace.pc.store(read_pc(cpu), std::memory_order_relaxed);
+                trace.phase.store(1, std::memory_order_relaxed);
+#else
+                recent_imports[import_sequence % recent_imports.size()] = { import_sequence, tid, nid, read_pc(cpu), read_lr(cpu) };
 #endif
-                }
                 if (trace_hle) {
                     std::fprintf(stderr, "[vita3k-web] HLE enter #%u tid=%d NID=%08x PC=%08x name=%s args=%08x,%08x,%08x,%08x LR=%08x\n",
                         import_sequence, tid, nid, read_pc(cpu), app_import_name(nid),
@@ -663,10 +694,9 @@ static int run_app_impl() {
                     }
                 }
                 if (hle_profile) {
-                    {
-                        const std::lock_guard<ReportMutex> guard(report_mutex);
-                        last_import[tid] = { nid, read_pc(cpu) };
-                    }
+#ifndef VITA3K_WEB_THREADS // the thread trace above records it there
+                    last_import[tid] = { nid, read_pc(cpu) };
+#endif
                     const auto hle_started = std::chrono::steady_clock::now();
                     if (!browser::gles::call_import(*env, cpu, nid))
                         ::call_import(*env, cpu, nid, tid);
@@ -681,7 +711,7 @@ static int run_app_impl() {
                     ::call_import(*env, cpu, nid, tid);
                 }
 #ifdef VITA3K_WEB_THREADS
-                set_phase(tid, 2);
+                trace.phase.store(2, std::memory_order_relaxed);
 #endif
                 browser::sync_message_dialog(*env);
                 browser::sync_ime(*env);
@@ -693,7 +723,7 @@ static int run_app_impl() {
                 if (nid == 0x7A410B64 /* sceDisplaySetFrameBuf */
                     || nid == 0xF51523CB /* _sceDisplaySetFrameBuf */) {
 #ifdef VITA3K_WEB_THREADS
-                    set_phase(tid, 3);
+                    trace.phase.store(3, std::memory_order_relaxed);
 #endif
                     vita3k_web_present_frame(*env);
                     ++frames_presented;
@@ -701,7 +731,7 @@ static int run_app_impl() {
                     ++frames_presented;
                 }
 #ifdef VITA3K_WEB_THREADS
-                set_phase(tid, 0);
+                trace.phase.store(0, std::memory_order_relaxed);
 #endif
                 // Module-start imports run before the main thread exists.
                 // Stop the importing thread, not a possibly-null main thread.
@@ -738,6 +768,8 @@ static int run_app_impl() {
             return cpu;
         };
 #endif
+        // Pure GXM field getters become guest code as their stubs are written.
+        browser::install_hle_stub_intrinsics(env->kernel);
         init_device_paths(env->io);
         // Desktop io::init() creates the standard device tree (ux0:/data,
         // ux0:/user, ...); the browser stages files but never creates empty
@@ -982,13 +1014,14 @@ static int run_app_impl() {
                 for (const auto &[tid, t] : env->kernel.threads) {
                     // Never wait here: a stuck thread may hold its own lock.
                     const std::unique_lock<std::mutex> thread_guard(t->mutex, std::try_to_lock);
-                    const auto last = last_import.find(tid);
-                    const auto phase = import_phase.find(tid);
+                    const auto trace = traces.find(tid);
+                    const bool traced = trace != traces.end();
                     std::fprintf(stderr, " %d:%s:%08x:%d:%d", tid, t->name.c_str(),
-                        last == last_import.end() ? 0 : last->second.second, static_cast<int>(t->status),
-                        phase == import_phase.end() ? -1 : phase->second);
+                        traced ? trace->second->pc.load(std::memory_order_relaxed) : 0, static_cast<int>(t->status),
+                        traced ? trace->second->phase.load(std::memory_order_relaxed) : -1);
                 }
                 std::fprintf(stderr, "\n");
+                std::fprintf(stderr, "[vita3k-web] coordinator waits (5 s):%s\n", browser::coordinator_report().c_str());
             }
             continue;
 #else

@@ -218,6 +218,10 @@ struct KernelState {
     // thread gets, on its allocated core. Unset, init_cpu picks the build's
     // backend; the threaded browser build sets it to its Wasm JIT.
     std::function<CPUStatePtr(SceUID, std::size_t core, MemState &)> make_cpu;
+    // Called right after the loader writes an HLE import stub (svc #0; mov pc,
+    // lr; NID) at `stub`. A host may replace a pure function's stub with guest
+    // code; stub[3] belongs to the loader and must be kept. Unset on desktop.
+    std::function<void(uint32_t nid, uint32_t *stub)> patch_hle_stub;
     // Program authority id (PAID) of the process: its main module's.
     uint64_t process_program_authority_id = 0;
     // ksceSblACMgrIsGameProgram (firmware 3.74 acmgr): a game has PAID class
