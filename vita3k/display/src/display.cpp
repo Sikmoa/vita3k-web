@@ -98,12 +98,11 @@ void advance_vblank(EmuEnvState &emuenv) {
         notified.push_back(cb->get_owner_thread_id());
     }
 
+    std::vector<ThreadStatePtr> woken;
     for (std::size_t i = 0; i < display.vblank_wait_infos.size();) {
         auto &vblank_wait_info = display.vblank_wait_infos[i];
         if (vblank_wait_info.target_vcount <= display.vblank_count) {
-            ThreadStatePtr target_wait = vblank_wait_info.target_thread;
-
-            target_wait->update_status(ThreadStatus::run);
+            woken.push_back(vblank_wait_info.target_thread);
             display.vblank_wait_infos.erase(display.vblank_wait_infos.begin() + i);
         } else {
             i++;
@@ -112,6 +111,16 @@ void advance_vblank(EmuEnvState &emuenv) {
     // Waking takes the thread's lock, which wait_vblank holds while it takes
     // display.mutex.
     guard.unlock();
+    for (const ThreadStatePtr &target_wait : woken) {
+#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_SHARED_MEMORY__)
+        // With host threads the waiter checks its status under its own lock
+        // before it sleeps. Setting it without that lock can land between the
+        // check and the sleep, and the wakeup is lost for good (the thread is
+        // no longer in vblank_wait_infos).
+        const std::lock_guard<std::mutex> thread_guard(target_wait->mutex);
+#endif
+        target_wait->update_status(ThreadStatus::run);
+    }
     for (const SceUID owner : notified)
         wake_callback_wait(emuenv.kernel, owner);
 }
