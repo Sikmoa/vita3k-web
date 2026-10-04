@@ -293,3 +293,43 @@ export async function unpackPackageToCache(blob, key, onProgress) {
   await cacheWriteManifest(key, stored);
   return { title: contents.title, app: contents.app, files: stored.length, bytes };
 }
+
+// Game saves per title (save_sync.js), apart from staged content: clearing a
+// title's cached files never touches its saves. Paths are relative to the
+// title's ux0:user/00/savedata/<title>/ directory.
+const saveParts = (title) => ['vita3k-saves', sanitize(title)];
+
+export async function readSaves(title) {
+  const out = [];
+  const walk = async (dir, prefix) => {
+    for await (const [name, handle] of dir.entries()) {
+      const path = prefix ? `${prefix}/${name}` : name;
+      if (handle.kind === 'directory') await walk(handle, path);
+      else out.push({ path, bytes: new Uint8Array(await (await handle.getFile()).arrayBuffer()) });
+    }
+  };
+  try {
+    await walk(await openDir(false, ...saveParts(title)), '');
+  } catch {}
+  return out;
+}
+
+export async function writeSave(title, relPath, bytes) {
+  const segments = relPath.split('/');
+  const dir = await openDir(true, ...saveParts(title), ...segments.slice(0, -1));
+  const handle = await dir.getFileHandle(segments[segments.length - 1], { create: true });
+  const writable = await handle.createWritable();
+  try {
+    await writable.write(bytes);
+  } finally {
+    await writable.close();
+  }
+}
+
+export async function removeSave(title, relPath) {
+  const segments = relPath.split('/');
+  try {
+    const dir = await openDir(false, ...saveParts(title), ...segments.slice(0, -1));
+    await dir.removeEntry(segments[segments.length - 1]);
+  } catch {}
+}

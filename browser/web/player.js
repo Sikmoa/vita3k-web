@@ -22,6 +22,8 @@ function cacheAPI() {
 // Namespace of the current run's staging session, resolved in the ready
 // handler and shared by the stage-need/store/staged handlers below.
 let cacheNS = null;
+// Save batches from the worker are stored one after another (vita-saves).
+let saveChain = Promise.resolve();
 
 const params = new URLSearchParams(location.search);
 const backend = params.get('backend') === 'interp' ? 'interp' : 'jit';
@@ -754,9 +756,14 @@ async function run() {
         if (stageCacheActive && stageNeeded && cacheNS)
           cacheNS.cacheWriteManifest(cacheKey, stageNeeded).catch(() => {});
         log(`staged ${data.files} files (${(data.bytes / 1048576).toFixed(1)} MiB) — launching`);
-        worker.postMessage({ type: 'run-app', vitaFs: data.root, title: TITLE, app: APP, fastVblank,
+        // Saves this browser kept for the title replace the staged ones.
+        const saveAPI = storageSupported() ? await cacheAPI() : null;
+        const saves = saveAPI ? await saveAPI.readSaves(TITLE).catch(() => []) : [];
+        if (worker !== currentWorker) return;
+        if (saves.length) log(`restoring ${saves.length} saved file(s) from this browser`);
+        worker.postMessage({ type: 'run-app', vitaFs: data.root, title: TITLE, app: APP, fastVblank, saves,
           ...(aotUrl ? { aotUrl } : {}),
-          ...(AOT_MT_URL ? { aotMtUrl: AOT_MT_URL } : {}) });
+          ...(AOT_MT_URL ? { aotMtUrl: AOT_MT_URL } : {}) }, saves.map((file) => file.bytes.buffer));
         running = true;
         sendPad();
         break;
@@ -782,6 +789,25 @@ async function run() {
         playAudioPCM(data.freq, data.channels, data.frames, data.data, data.port ?? 0);
         break;
       case 'vita-audio-ring': playAudioRing(data); break;
+      case 'vita-saves': {
+        // The game saved: keep the files in this browser (save_sync.js), one
+        // batch after another.
+        const batch = data;
+        saveChain = saveChain.then(async () => {
+          const saveAPI = storageSupported() ? await cacheAPI() : null;
+          if (!saveAPI) { log('saves: no persistent storage in this browser; the save lasts until reload'); return; }
+          const data = batch;
+          try {
+            for (const file of data.files) await saveAPI.writeSave(data.title, file.path, new Uint8Array(file.bytes));
+            for (const path of data.removed) await saveAPI.removeSave(data.title, path);
+            log(`saves: stored ${data.files.length} file(s)${data.removed.length ? `, removed ${data.removed.length}` : ''} for ${data.title}`);
+          } catch (error) {
+            log('saves: storing failed: ' + (error?.message || error));
+            notice('Could not store the save in this browser: ' + (error?.message || error));
+          }
+        });
+        break;
+      }
       case 'vita-dialog': onDialog(data.dialog); break;
       case 'vita-ime': onIme(data.ime); break;
       case 'vita-gxm-throttle': {

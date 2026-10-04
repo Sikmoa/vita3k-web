@@ -560,6 +560,17 @@ self.onmessage = async ({ data }) => {
       } else {
         module._vita3k_web_set_license_key(hostPointer(0));
       }
+      // Saves the page kept from earlier sessions replace the staged ones;
+      // changed saves go back to the page (save_sync.js).
+      if (module.FS && data.title) {
+        const { applySaves, watchSaves } = await import('./save_sync.js');
+        const saveDir = `${data.vitaFs || '/vita'}/ux0/user/00/savedata/${data.title}`;
+        const restored = applySaves(module.FS, saveDir, data.saves);
+        if (restored) post({ type: 'log', message: `[vita3k-web] restored ${restored} saved file(s) from this browser` });
+        watchSaves(module.FS, saveDir, ({ files, removed }) => {
+          post({ type: 'vita-saves', title: data.title, files, removed }, files.map((file) => file.bytes.buffer));
+        });
+      }
       if (threaded) {
         module.vita3kConfigureWorkers();
         if (module._vita3k_web_start_app() !== 0) throw new Error('application already started');
