@@ -35,6 +35,7 @@
 //   LIMBO_GXM_TRACE=N       trace passes, draws, textures and presents after N frames
 //   LIMBO_GXM_TRACE_LINES=N trace line budget (default 600)
 //   LIMBO_CPU_PROFILE=S:D   Worker CPU profile from S ms for D ms (LIMBO_PROFILE_OUT.cpu.cpuprofile)
+//   LIMBO_THREAD_PROFILE=S:D  same for every Worker incl. pthreads (LIMBO_PROFILE_OUT.thread<N>.cpuprofile)
 //   LIMBO_DIALOG            answer to every guest message dialog (sceMsgDialog):
 //                           cross (default; the highlighted first button), circle
 //                           (the last of several buttons) or none (leave it open)
@@ -286,6 +287,54 @@ function png(width, height, rgba) {
     chunk('IEND', Buffer.alloc(0))]);
 }
 
+// LIMBO_THREAD_PROFILE=<start ms>:<duration ms>: CPU profiles of every Worker,
+// including the threaded runtime's nested pthread Workers, which Playwright
+// cannot reach. A raw DevTools-protocol connection auto-attaches recursively
+// (flat sessions) and writes LIMBO_PROFILE_OUT.thread<N>.cpuprofile per Worker.
+const threadWindow = (process.env.LIMBO_THREAD_PROFILE || '').split(':').filter(Boolean).map(Number);
+const threadProfilePort = 9333;
+async function profileAllThreads(startMs, durationMs, outPrefix) {
+  const { webSocketDebuggerUrl } = await (await fetch(`http://127.0.0.1:${threadProfilePort}/json/version`)).json();
+  const ws = new WebSocket(webSocketDebuggerUrl);
+  await new Promise((ready, fail) => { ws.onopen = ready; ws.onerror = fail; });
+  let nextId = 0;
+  const pending = new Map(), workers = new Map();
+  const send = (method, params = {}, sessionId) => new Promise((done, fail) => {
+    const id = ++nextId;
+    pending.set(id, (message) => message.error ? fail(new Error(`${method}: ${message.error.message}`)) : done(message.result));
+    ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+  });
+  const autoAttach = (sessionId) => send('Target.setAutoAttach',
+    { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, sessionId).catch(() => {});
+  ws.onmessage = ({ data }) => {
+    const message = JSON.parse(data);
+    if (message.id) { pending.get(message.id)?.(message); pending.delete(message.id); return; }
+    if (message.method === 'Target.attachedToTarget') {
+      const { sessionId, targetInfo } = message.params;
+      if (targetInfo.type === 'worker') workers.set(sessionId, targetInfo);
+      autoAttach(sessionId);
+    }
+  };
+  await autoAttach();
+  await new Promise((wait) => setTimeout(wait, startMs));
+  const profiled = [...workers.keys()];
+  await Promise.all(profiled.map(async (sessionId) => {
+    await send('Profiler.enable', {}, sessionId);
+    await send('Profiler.setSamplingInterval', { interval: 500 }, sessionId);
+    await send('Profiler.start', {}, sessionId);
+  }).map((started) => started.catch(() => {})));
+  await new Promise((wait) => setTimeout(wait, durationMs));
+  let index = 0;
+  for (const sessionId of profiled) {
+    try {
+      const { profile } = await send('Profiler.stop', {}, sessionId);
+      await writeFile(`${outPrefix}.thread${index++}.cpuprofile`, JSON.stringify(profile));
+    } catch {}
+  }
+  console.error(`thread profiles: ${index} of ${workers.size} Workers`);
+  ws.close();
+}
+
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE_URL || 'playwright');
 let browser;
 try {
@@ -293,13 +342,17 @@ try {
     // --enable-gpu permits the hardware adapter in headless Chrome too;
     // LIMBO_HEADED=1 opens a window for interactive debugging.
     headless: process.env.LIMBO_HEADED !== '1',
-    args: process.env.LIMBO_GPU === '1' ? ['--enable-unsafe-webgpu', '--enable-gpu', '--enable-features=Vulkan']
+    args: [...(process.env.LIMBO_GPU === '1' ? ['--enable-unsafe-webgpu', '--enable-gpu', '--enable-features=Vulkan']
       : ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--enable-features=Vulkan',
-        '--disable-vulkan-surface'],
+        '--disable-vulkan-surface']),
+      ...(threadWindow.length === 2 ? [`--remote-debugging-port=${threadProfilePort}`] : [])],
     ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
       ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}),
   });
   const page = await browser.newPage();
+  if (threadWindow.length === 2)
+    profileAllThreads(threadWindow[0], threadWindow[1], process.env.LIMBO_PROFILE_OUT || "limbo")
+      .catch((error) => console.error("thread profile:", error));
   const pageErrors = [];
   page.on('pageerror', (error) => pageErrors.push(String(error)));
   await page.goto(`http://127.0.0.1:${server.address().port}/`);

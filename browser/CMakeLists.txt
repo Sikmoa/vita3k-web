@@ -70,7 +70,9 @@ if(EMSCRIPTEN)
             # Threaded build: main() on a pthread keeps Node's main thread
             # free to start the Workers guest threads run on.
             target_link_libraries(vita3k_web_app_bench PRIVATE vita3k_wasm_jit)
-            target_link_options(vita3k_web_app_bench PRIVATE -sPROXY_TO_PTHREAD=1 -sEXIT_RUNTIME=1)
+            # --profiling-funcs: guest-thread CPU profiles (node --cpu-prof) name
+            # Wasm functions; it keeps the name section and changes no code.
+            target_link_options(vita3k_web_app_bench PRIVATE -sPROXY_TO_PTHREAD=1 -sEXIT_RUNTIME=1 --profiling-funcs)
         endif()
     else()
         message(FATAL_ERROR "vita3k_web_app_bench requires VITA3K_WEB_JIT_TESTS=ON")

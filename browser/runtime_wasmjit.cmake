@@ -70,9 +70,9 @@ endif()
 
 # The guest hot path must not call through invoke_* exception wrappers. The
 # symbol map names functions for the check without shipping a name section.
+target_link_options(${VITA3K_WEB_JIT_TARGET} PRIVATE --emit-symbol-map)
 # The threaded build has no fiber scheduler, so the functions checked do not exist there.
 if(NOT VITA3K_WEB_THREADS)
-target_link_options(${VITA3K_WEB_JIT_TARGET} PRIVATE --emit-symbol-map)
 find_program(VITA3K_WASM_OBJDUMP wasm-objdump REQUIRED)
 add_custom_command(TARGET ${VITA3K_WEB_JIT_TARGET} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E env "WASM_OBJDUMP=${VITA3K_WASM_OBJDUMP}"
