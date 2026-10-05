@@ -790,7 +790,9 @@ function encodeScene(words, data) {
       ++stats.textureUploads;
       break;
     }
-    case 6: { // REGION: id, target address, x, y, width, height (outside any pass)
+    case 6: // REGION: id, target address, x, y, width, height (outside any pass)
+    case 8: { // REGION_OPAQUE: the same, with alpha read as 1 (a 1BGR texture over RGBA8)
+      const opaque = command === 8;
       const id = word(), address = word(), x = word(), y = word(), width = word(), height = word();
       const source = targets.get(address);
       if (!source) { warnOnce('region of a render target that was never rendered'); break; }
@@ -800,7 +802,7 @@ function encodeScene(words, data) {
       if (!entry || entry.width !== w || entry.height !== h || entry.format !== source.gpuFormat) {
         entry?.texture.destroy();
         const texture = device.createTexture({ size: [w, h], format: source.gpuFormat,
-          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT });
         entry = { texture, view: texture.createView(), width: w, height: h, levels: 1, format: source.gpuFormat };
         textures.set(id, entry);
         textureGroups.clear();
@@ -811,6 +813,7 @@ function encodeScene(words, data) {
       if (cw > 0 && ch > 0)
         encoder.copyTextureToTexture({ texture: sampled(source).texture, origin: { x: x * scale, y: y * scale } },
           { texture: entry.texture }, [cw, ch]);
+      if (opaque) forceOpaque(encoder, entry);
       break;
     }
     case 4: // END_PASS
@@ -840,6 +843,28 @@ function encodeScene(words, data) {
 
 export function hasTarget(address) { return targets.has(address); }
 
+// Sets a texture's alpha to 1 and keeps its color (REGION_OPAQUE): one draw
+// whose pipeline writes only the alpha channel.
+const opaquePipelines = new Map();
+function forceOpaque(encoder, entry) {
+  let pipeline = opaquePipelines.get(entry.format);
+  if (!pipeline) {
+    const module = device.createShaderModule({ code: `
+      @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+        let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+        return vec4f(uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0), 0.0, 1.0);
+      }
+      @fragment fn fs() -> @location(0) vec4f { return vec4f(0.0, 0.0, 0.0, 1.0); }` });
+    pipeline = device.createRenderPipeline({ layout: 'auto', vertex: { module, entryPoint: 'vs' },
+      fragment: { module, entryPoint: 'fs', targets: [{ format: entry.format, writeMask: GPUColorWrite.ALPHA }] },
+      primitive: { topology: 'triangle-list' } });
+    opaquePipelines.set(entry.format, pipeline);
+  }
+  const pass = encoder.beginRenderPass({ colorAttachments: [{ view: entry.view, loadOp: 'load', storeOp: 'store' }] });
+  pass.setPipeline(pipeline);
+  pass.draw(3);
+  pass.end();
+}
 function blit(encoder, target, viewTarget, format) {
   if (!blitPipeline || blitPipeline.format !== format) {
     const module = device.createShaderModule({ code: `

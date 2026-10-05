@@ -690,7 +690,8 @@ static void require_guest(MemState &mem, Address address, size_t size) {
 // --- GXS1 scene stream (browser/web/gxm_scene.js is the only consumer) -------
 namespace scene {
 constexpr uint32_t kMagic = 0x31535847; // "GXS1"
-enum Command : uint32_t { BeginPass = 1, Draw = 2, Texture = 3, EndPass = 4, Region = 6, WriteTexels = 7 };
+// RegionOpaque: a Region whose copy reads alpha as 1 (a 1BGR texture over an RGBA8 target).
+enum Command : uint32_t { BeginPass = 1, Draw = 2, Texture = 3, EndPass = 4, Region = 6, WriteTexels = 7, RegionOpaque = 8 };
 // Dynamic uniform/storage offsets must honour WebGPU's 256-byte minimum.
 constexpr size_t kUniformAlign = 256;
 
@@ -1326,6 +1327,7 @@ struct TargetTexels {
     Address base = 0;
     uint32_t x = 0, y = 0;
     bool whole = false;
+    bool alpha_one = false; // the texture reads the target's alpha as 1
 };
 enum class TargetMatch { None, Mismatch, Written, Texels };
 static TargetMatch match_target(const MemState &mem, const SceGxmTexture &t, Address base, const RenderedTarget &target,
@@ -1347,7 +1349,12 @@ static TargetMatch match_target(const MemState &mem, const SceGxmTexture &t, Add
     case SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16: expected = SCE_GXM_TEXTURE_BASE_FORMAT_F16F16F16F16; break;
     default: return TargetMatch::Mismatch;
     }
-    if (gxm::get_base_format(format) != expected || (format & SCE_GXM_TEXTURE_SWIZZLE_MASK) != 0)
+    // The identity order, or for RGBA8 the same order with alpha read as 1
+    // (1BGR: Persona 4 Golden draws the previous final frame under each field
+    // scene). The latter always takes an opaque region copy.
+    const uint32_t swizzle = format & SCE_GXM_TEXTURE_SWIZZLE_MASK;
+    const bool alpha_one = expected == SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8 && swizzle == SCE_GXM_TEXTURE_SWIZZLE4_1BGR;
+    if (gxm::get_base_format(format) != expected || (swizzle != 0 && !alpha_one))
         return TargetMatch::Mismatch;
     // Layout: the texture's texel (u, v) must be the surface's texel
     // (x + u, y + v) for every texel.
@@ -1391,7 +1398,8 @@ static TargetMatch match_target(const MemState &mem, const SceGxmTexture &t, Add
                                     : uint64_t(width) * height * g.pixel_bytes;
     if (mem_written_epoch(mem, address, span) >= target.rendered_epoch)
         return TargetMatch::Written;
-    at = {base, x, y, x == 0 && y == 0 && width == g.width && height == g.height};
+    // Alpha-one texels need a copy, so they never bind the target itself.
+    at = {base, x, y, !alpha_one && x == 0 && y == 0 && width == g.width && height == g.height, alpha_one};
     return TargetMatch::Texels;
 }
 // Targets are never forgotten, so memory rendered long ago may lie under
@@ -1469,13 +1477,13 @@ static void bind_target_texels(const SceGxmTexture &t, const TargetTexels &at, s
     const Address address = t.data_addr << 2;
     const uint32_t width = gxm::get_width(t), height = gxm::get_height(t);
     auto &cache = texture_cache();
-    const uint32_t identity[4] = {address, width, height, 0x52474e52u /* region */};
+    const uint32_t identity[4] = {address, width, height, at.alpha_one ? 0x5247314fu /* opaque region */ : 0x52474e52u /* region */};
     auto &entry = cache.entries[XXH3_64bits(identity, sizeof(identity))];
     if (!entry.id)
         entry.id = cache.next_id++;
     if (std::find(out.pass_regions.begin(), out.pass_regions.end(), entry.id) == out.pass_regions.end()) {
         out.pass_regions.push_back(entry.id);
-        out.insert_before_pass({scene::Region, entry.id, at.base, at.x, at.y, width, height});
+        out.insert_before_pass({at.alpha_one ? scene::RegionOpaque : scene::Region, entry.id, at.base, at.x, at.y, width, height});
     }
     bound.id = entry.id;
 }
