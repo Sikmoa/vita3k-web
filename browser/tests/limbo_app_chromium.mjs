@@ -565,6 +565,10 @@ try {
             sinceRunMs: Math.round(performance.now() - state.runStartedAt),
             at: Math.round(performance.now()), byteLength: pixels.byteLength, head: hex(pixels),
             checksum: [...pixels].reduce((h, v) => ((h * 33) ^ v) >>> 0, 5381) };
+          // Mean RGB brightness over a sparse sample: white flashes stand out (LIMBO_FRAME_STATS).
+          let lit = 0, samples = 0;
+          for (let i = 0; i + 2 < pixels.length; i += 4 * 97, ++samples) lit += pixels[i] + pixels[i + 1] + pixels[i + 2];
+          record.mean = samples ? Math.round(lit / samples / 3) : 0;
           if (data.generation % frameEvery === 1 && state.saved.length < maxFrames) {
             let binary = '';
             for (let i = 0; i < pixels.length; i += 0x8000)
@@ -668,6 +672,11 @@ try {
     staged: outcome.staged,
     manifestFiles: staged.length,
     framesPresented: outcome.frames.length,
+    // Read-back frames by mean brightness: [sinceRunMs, generation, mean] for
+    // near-white ones (>= 245) and a 10 s histogram of how many there were.
+    whiteFrames: outcome.frames.filter((f) => f.mean >= 245).slice(0, 40).map((f) => [f.sinceRunMs, f.generation, f.mean]),
+    whiteFramesPer10s: Object.entries(outcome.frames.reduce((bins, f) => { if (f.mean >= 245) { const k = Math.floor(f.sinceRunMs / 10000) * 10; bins[k] = (bins[k] || 0) + 1; } return bins; }, {})),
+    readbackFrames: outcome.frames.length,
     firstFrame: outcome.frames[0] || null,
     lastFrame: outcome.frames[outcome.frames.length - 1] || null,
     framesSaved: saved,

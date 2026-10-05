@@ -328,6 +328,14 @@ Persona 4 Golden 3D scenes 20 fps after phase 5, against 22–24 and 14–16 fps
 single Worker.
 After phase 6 (user report, Firefox 156): Persona 4 Golden 3D scenes 30 fps,
 and the boot animation 40 fps instead of 25.
+Limbo threaded in Firefox: 28–32 fps, against 58.8–59.8 headless Chromium,
+which never puts frames on screen; take the Firefox figures as the real ones.
+
+Until its fix ("fix(display): 60 Hz vblank clock"), the threaded build's vblank
+clock ran at 116–143 Hz: Emscripten sleeps can wake early, and desktop's modulo schedule
+then ticked twice per period. Movies asked for frames faster than they
+decode and flashed white. With a deadline schedule it runs at 60 Hz; the
+Persona 4 Golden field still holds 30 fps and Limbo 59.8 headless.
 
 Node, null GPU, 45 s with AOT (boot checks, not a speed comparison): Limbo
 127 MIPS on 11 threads; Persona 4 Golden 1,875 frames on 17 threads, no missing

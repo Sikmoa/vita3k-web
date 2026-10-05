@@ -128,6 +128,27 @@ void advance_vblank(EmuEnvState &emuenv) {
 static void vblank_sync_thread(EmuEnvState &emuenv) {
     DisplayState &display = emuenv.display;
 
+#ifdef __EMSCRIPTEN__
+    // Threaded browser build. Emscripten's sleeps may return a little early;
+    // the wall-clock modulo schedule below then lands just before the same
+    // period boundary and ticks twice per period (measured: 116-143 vblanks
+    // per second, so movies asked for frames faster than they decode). Keep
+    // a deadline instead and only tick once it has passed.
+    const auto period = std::chrono::microseconds(TARGET_MICRO_PER_FRAME);
+    auto next = std::chrono::steady_clock::now() + period;
+    while (!display.abort.load()) {
+        std::this_thread::sleep_until(next);
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next)
+            continue;
+        advance_vblank(emuenv);
+        next += period;
+        // After a long stall, resume the cadence instead of bursting ticks.
+        if (now > next + 4 * period)
+            next = now + period;
+    }
+    return;
+#endif
     while (!display.abort.load()) {
         advance_vblank(emuenv);
 
