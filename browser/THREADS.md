@@ -326,6 +326,8 @@ sceGxmDisplayQueueAddEntry) and the scene thread (24 to 30; it took about
 Firefox 156 on the same machine (user reports): Limbo threaded 27–30 fps and
 Persona 4 Golden 3D scenes 20 fps after phase 5, against 22–24 and 14–16 fps
 single Worker.
+After phase 6 (user report, Firefox 156): Persona 4 Golden 3D scenes 30 fps,
+and the boot animation 40 fps instead of 25.
 
 Node, null GPU, 45 s with AOT (boot checks, not a speed comparison): Limbo
 127 MIPS on 11 threads; Persona 4 Golden 1,875 frames on 17 threads, no missing
