@@ -449,6 +449,19 @@ int gxm_terminate(EmuEnvState &env) {
 
 namespace renderer {
 SyncWaitResult wishlist(SceGxmSyncObject *sync, uint32_t timestamp, int32_t timeout_micros) {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    // Host threads: desktop sync.cpp. subject_done signals under the same lock,
+    // so the predicate check and the sleep cannot miss it.
+    {
+        std::unique_lock<std::mutex> lock(sync->lock);
+        const auto ready = [&] { return sync->being_deleted || sync->timestamp_current >= timestamp; };
+        if (timeout_micros < 0)
+            sync->cond.wait(lock, ready);
+        else if (!sync->cond.wait_for(lock, std::chrono::microseconds(timeout_micros), ready))
+            return SyncWaitResult::TimedOut;
+    }
+    return sync->being_deleted ? SyncWaitResult::Shutdown : SyncWaitResult::Ready;
+#endif
     const double start = emscripten_get_now();
     unsigned spins = 0;
     while (sync->timestamp_current < timestamp) {
@@ -473,7 +486,12 @@ SyncWaitResult wishlist(SceGxmSyncObject *sync, uint32_t timestamp, int32_t time
 }
 void subject_done(SceGxmSyncObject *sync, uint32_t timestamp) {
     assert(timestamp <= sync->timestamp_ahead);
-    sync->timestamp_current = std::max(sync->timestamp_current.load(), timestamp);
+    {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+        const std::lock_guard<std::mutex> lock(sync->lock);
+#endif
+        sync->timestamp_current = std::max(sync->timestamp_current.load(), timestamp);
+    }
     sync->cond.notify_all();
 }
 Command *generic_command_allocate() { return new Command{}; }
