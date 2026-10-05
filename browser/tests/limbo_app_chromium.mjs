@@ -34,6 +34,7 @@
 //   LIMBO_SURFACE_SYNC=1    read rendered surfaces back into guest memory
 //   LIMBO_GXM_TRACE=N       trace passes, draws, textures and presents after N frames
 //   LIMBO_GXM_TRACE_LINES=N trace line budget (default 600)
+//   LIMBO_LOG_KEEP=N        log lines kept for LIMBO_LOG_OUT (default the last 4000)
 //   LIMBO_CPU_PROFILE=S:D   Worker CPU profile from S ms for D ms (LIMBO_PROFILE_OUT.cpu.cpuprofile)
 //   LIMBO_THREAD_PROFILE=S:D  same for every Worker incl. pthreads (LIMBO_PROFILE_OUT.thread<N>.cpuprofile)
 //   LIMBO_DIALOG            answer to every guest message dialog (sceMsgDialog):
@@ -419,7 +420,7 @@ try {
     });
   }
 
-  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot, aotUrl, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale, surfaceSync, gxmTrace, gxmTraceLines, pcSample, workerParams, dialogAnswer, ctrlButtons, imeAnswer }) => {
+  const outcome = await page.evaluate(async ({ title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot, aotUrl, fastVblank, hleProfile, inputScript, measure, guestCores, fpsHack, textureVerify, scale, surfaceSync, gxmTrace, gxmTraceLines, logKeep, pcSample, workerParams, dialogAnswer, ctrlButtons, imeAnswer }) => {
     const worker = new Worker(`./worker.js?backend=jit&memory=w64&inlineMutex=${inlineMutex ? '1' : '0'}&regionCache=${encodeURIComponent(regionCache)}&writeObserver=${writeObserver ? '1' : '0'}&readback=${frameEvery}${hleProfile ? '&hleProfile=1' : ''}${guestCores ? `&cores=${guestCores}` : ''}${fpsHack ? '&fpsHack=1' : ''}${textureVerify ? '&textureVerify=1' : ''}${scale ? '&scale=' + scale : ''}${surfaceSync ? '&surfaceSync=1' : ''}${gxmTrace ? '&gxmTrace=' + gxmTrace : ''}${gxmTraceLines ? '&gxmTraceLines=' + gxmTraceLines : ''}${pcSample ? '&pcSample=' + pcSample : ''}${workerParams ? '&' + workerParams : ''}`, { type: 'module' });
     const state = { logs: [], programs: [], logCount: 0, frames: [], saved: [], staged: null, exit: null,
       backend: null, memory: null, workerErrors: [], ready: false, timedOut: false,
@@ -517,7 +518,7 @@ try {
           if (profile) state.profiles[profile[1]] = message;
           const thread = message.match(/jit thread=(\d+) /);
           if (thread) state.jitThreads[thread[1]] = message;
-          if (state.logs.length > 4000) state.logs.splice(0, state.logs.length - 4000);
+          if (state.logs.length > logKeep) state.logs.splice(0, state.logs.length - logKeep);
           break;
         }
         case 'ready':
@@ -649,7 +650,7 @@ try {
       };
     });
     return result;
-  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot: Boolean(aotProbePath), aotUrl: aotProbeUrl, fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '', surfaceSync: process.env.LIMBO_SURFACE_SYNC === '1', gxmTrace: process.env.LIMBO_GXM_TRACE || '', gxmTraceLines: process.env.LIMBO_GXM_TRACE_LINES || '', pcSample: process.env.LIMBO_PC_SAMPLE || '', workerParams: process.env.LIMBO_WORKER_PARAMS || '', dialogAnswer, ctrlButtons, imeAnswer });
+  }, { title, app, frameEvery, maxFrames, deadlineMs, inlineMutex, regionCache, writeObserver, useAot: Boolean(aotProbePath), aotUrl: aotProbeUrl, fastVblank, hleProfile, inputScript, measure, guestCores: process.env.LIMBO_GUEST_CORES || '', fpsHack: process.env.LIMBO_FPS_HACK === '1', textureVerify: process.env.LIMBO_TEXTURE_VERIFY === '1', scale: process.env.LIMBO_SCALE || '', surfaceSync: process.env.LIMBO_SURFACE_SYNC === '1', gxmTrace: process.env.LIMBO_GXM_TRACE || '', gxmTraceLines: process.env.LIMBO_GXM_TRACE_LINES || '', logKeep: Number(process.env.LIMBO_LOG_KEEP) || 4000, pcSample: process.env.LIMBO_PC_SAMPLE || '', workerParams: process.env.LIMBO_WORKER_PARAMS || '', dialogAnswer, ctrlButtons, imeAnswer });
 
   const saved = [];
   for (const frame of outcome.saved) {

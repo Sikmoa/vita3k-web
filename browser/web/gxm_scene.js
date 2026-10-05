@@ -67,7 +67,7 @@ function record(ev, detail) {
   if (flight.length > 256) flight.splice(0, flight.length - 256);
 }
 const stagingBuffers = [], transientTextures = []; // per-submission texel writes, destroyed after submit
-const stats = { scenes: 0, draws: 0, pipelines: 0, textureUploads: 0, presents: 0, bindGroups: 0, submitMs: 0, uploadMs: 0, sceneBytes: 0, surfaceSyncs: 0, droppedScenes: 0, presentFailures: 0, stateSkips: 0, throttledScenes: 0, throttledPresents: 0, colorSnapshots: 0 };
+const stats = { scenes: 0, draws: 0, pipelines: 0, textureUploads: 0, presents: 0, bindGroups: 0, submitMs: 0, uploadMs: 0, sceneBytes: 0, surfaceSyncs: 0, droppedScenes: 0, presentFailures: 0, stateSkips: 0, throttledScenes: 0, throttledPresents: 0, colorSnapshots: 0, drawParts: 0 };
 // Redundant state-change filter (reset per pass): every WebGPU call from a
 // worker crosses into the browser/GPU process, so re-emitting unchanged
 // bindings, buffers, viewport, scissor or stencil reference each draw costs
@@ -611,6 +611,105 @@ export function trySubmitScene(words, data) {
   }
 }
 
+// Splits a draw whose fragment program reads the current color (see DRAW)
+// into parts whose triangles do not overlap one another, in draw order.
+// Returns the part count; part k is triangles partStarts[k] up to
+// partStarts[k + 1]. Positions: the lowest-location float attribute with two
+// or more components, read from the scene payload. Only flat draws (one z for
+// every vertex) split: any projection maps a plane to the screen keeping
+// which triangles overlap, which a 3D mesh's x, y do not tell. Persona 4
+// Golden's menus layer translucent quads in one draw.
+const partStarts = new Uint32Array(65);
+const partTriangles = new Float32Array(6 * 256);
+const kMaxPartTriangles = 4096;
+function drawParts(data, indexOffset, indexSize, indexCount, streamOffsets) {
+  const w = pipelineWords;
+  const topology = w[3], cull = w[2];
+  // Strip parts must begin at even triangles to keep their winding.
+  if (topology > 1 || (topology === 1 && cull !== 0)) return 1;
+  const triangles = topology === 0 ? Math.floor(indexCount / 3) : indexCount - 2;
+  if (triangles < 2 || triangles > kMaxPartTriangles) return 1;
+  let i = 24;
+  const streamCount = w[i++], strides = i;
+  i += streamCount;
+  let position = -1, location = Infinity;
+  for (let n = w[i++]; n > 0; --n, i += 5)
+    if (w[i + 3] === 9 /* F32 */ && w[i + 4] >= 2 && w[i] < location) { location = w[i]; position = i; }
+  if (position < 0) return 1;
+  const stream = w[position + 1], stride = w[strides + stream], base = streamOffsets[stream] + w[position + 2];
+  const flat = w[position + 4] < 3;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const index = k => indexSize === 2 ? view.getUint16(indexOffset + k * 2, true) : view.getUint32(indexOffset + k * 4, true);
+  let parts = 0, inPart = 0, z = NaN;
+  partStarts[0] = 0;
+  for (let t = 0; t < triangles; ++t) {
+    const k = topology === 0 ? t * 3 : t;
+    if (inPart === partTriangles.length / 6) {
+      // A full part ends here (strips: at an even triangle).
+      if (parts + 1 >= partStarts.length - 1) return 1;
+      const keep = topology === 1 && (t & 1) ? 1 : 0;
+      partStarts[++parts] = t - keep;
+      partTriangles.copyWithin(0, (inPart - keep) * 6, inPart * 6);
+      inPart = keep;
+    }
+    const at = inPart * 6;
+    for (let v = 0; v < 3; ++v) {
+      const offset = base + index(k + v) * stride;
+      partTriangles[at + v * 2] = view.getFloat32(offset, true);
+      partTriangles[at + v * 2 + 1] = view.getFloat32(offset + 4, true);
+      if (flat) continue;
+      const vz = view.getFloat32(offset + 8, true);
+      if (t === 0 && v === 0) z = vz;
+      else if (vz !== z) return 1;
+    }
+    let overlaps = false;
+    for (let other = 0; other < inPart && !overlaps; ++other)
+      overlaps = trianglesOverlap(partTriangles, at, other * 6);
+    if (overlaps && topology === 1 && (t & 1)) {
+      // An odd strip triangle starts no part: the new part begins one
+      // triangle early, so that triangle must not overlap this one.
+      if (inPart < 2 || trianglesOverlap(partTriangles, at - 6, at)) return 1;
+      if (parts + 1 >= partStarts.length - 1) return 1;
+      partStarts[++parts] = t - 1;
+      partTriangles.copyWithin(0, at - 6, at + 6);
+      inPart = 2;
+      continue;
+    }
+    if (overlaps) {
+      if (parts + 1 >= partStarts.length - 1) return 1;
+      partStarts[++parts] = t;
+      partTriangles.copyWithin(0, at, at + 6);
+      inPart = 0;
+    }
+    ++inPart;
+  }
+  partStarts[++parts] = triangles;
+  return parts;
+}
+// Whether two triangles (x, y triples at a and b) share interior area:
+// separating axis test on their six edge normals. Shared edges, degenerate
+// triangles and anything not finite do not overlap.
+function trianglesOverlap(t, a, b) {
+  for (let side = 0; side < 2; ++side) {
+    const s = side ? b : a;
+    for (let e = 0; e < 3; ++e) {
+      const x0 = t[s + e * 2], y0 = t[s + e * 2 + 1];
+      const x1 = t[s + ((e + 1) % 3) * 2], y1 = t[s + ((e + 1) % 3) * 2 + 1];
+      const nx = y0 - y1, ny = x1 - x0;
+      const length = Math.hypot(nx, ny);
+      if (!(length > 1e-6)) return false;
+      let minA = Infinity, maxA = -Infinity, minB = Infinity, maxB = -Infinity;
+      for (let v = 0; v < 3; ++v) {
+        const pa = t[a + v * 2] * nx + t[a + v * 2 + 1] * ny, pb = t[b + v * 2] * nx + t[b + v * 2 + 1] * ny;
+        minA = Math.min(minA, pa); maxA = Math.max(maxA, pa); minB = Math.min(minB, pb); maxB = Math.max(maxB, pb);
+      }
+      const epsilon = 1e-3 * length; // a thousandth of a unit along the normal
+      if (!(maxA > minB + epsilon && maxB > minA + epsilon)) return false;
+    }
+  }
+  return true;
+}
+
 function encodeScene(words, data) {
   ensureSceneBuffer(data.byteLength + 4096);
   const uploadStart = performance.now();
@@ -709,7 +808,12 @@ function encodeScene(words, data) {
       // Programmable blending: a fragment program that reads the current
       // color samples a copy of the target taken here, so the pass ends,
       // the target is copied and the pass resumes with everything loaded.
+      // Where the draw's own triangles overlap, it is drawn in parts, each
+      // with a new copy: a later triangle blends over an earlier one.
       const readsColor = programs.get(pipelineWords[1])?.readsColor;
+      const strip = pipelineWords[3] === 1;
+      const parts = readsColor ? drawParts(data, indexOffset, indexSize, indexCount, streamOffsets) : 1;
+      for (let part = 0; part < parts; ++part) {
       if (readsColor) {
         pass.end();
         if (!target.fragColor) {
@@ -762,7 +866,14 @@ function encodeScene(words, data) {
       } else ++stats.stateSkips;
       if (lastStencil !== stencilRef) { pass.setStencilReference(stencilRef); lastStencil = stencilRef; }
       else ++stats.stateSkips;
-      pass.drawIndexed(indexCount);
+      if (parts === 1) pass.drawIndexed(indexCount);
+      else {
+        const first = partStarts[part], end = partStarts[part + 1];
+        if (strip) pass.drawIndexed(end - first + 2, 1, first);
+        else pass.drawIndexed((end - first) * 3, 1, first * 3);
+      }
+      }
+      if (parts > 1) stats.drawParts += parts;
       ++stats.draws;
       break;
     }
