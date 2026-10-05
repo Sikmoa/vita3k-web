@@ -178,6 +178,10 @@ try {
         VITA3K_GUEST_CORES: workerParams.get('cores') ?? undefined,
         // Vita3K's fps-hack: display waits use one vblank (vita_app.cpp).
         VITA3K_FPS_HACK: workerParams.get('fpsHack') === '1' ? '1' : undefined,
+        // ?asyncScene=0: consume GXM command lists on the submitting guest thread
+        // (threaded runtime; THREADS.md). ?hleIntrinsics=0: plain HLE stubs.
+        VITA3K_ASYNC_SCENES: workerParams.get('asyncScene') === '0' ? '0' : undefined,
+        VITA3K_HLE_INTRINSICS: workerParams.get('hleIntrinsics') === '0' ? '0' : undefined,
         // Internal render resolution multiplier (gxm_webgpu_bridge.cpp); unset = 2.
         VITA3K_RESOLUTION_SCALE: workerParams.get('scale') ?? undefined,
         // Check cached textures and vertex streams against guest memory and

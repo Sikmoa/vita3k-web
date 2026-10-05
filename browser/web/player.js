@@ -610,7 +610,7 @@ async function run() {
   const workerParams = new URLSearchParams({ backend, memory, inlineMutex: params.get('inlineMutex') === '0' ? '0' : '1' });
   if (buildAot !== null) workerParams.set('buildAot', buildAot);
   for (const name of ['fpsHack', 'scale', 'surfaceSync', 'maxInFlight', 'cores', 'hleProfile', 'gles',
-    'readback', 'stampLru', 'writeObserver', 'regionCache', 'textureVerify', 'threads']) {
+    'readback', 'stampLru', 'writeObserver', 'regionCache', 'textureVerify', 'threads', 'asyncScene', 'hleIntrinsics']) {
     if (params.has(name)) workerParams.set(name, params.get(name));
   }
   const currentWorker = worker = new Worker(`./worker.js?${workerParams}`, { type: 'module' });

@@ -29,6 +29,13 @@
 #ifdef __EMSCRIPTEN_SHARED_MEMORY__
 #include <emscripten/threading.h>
 #endif
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+namespace renderer {
+// Waits until every queued command list has been consumed (scene thread).
+// Never call it while holding GXM_GUARD: the scene thread takes it per list.
+void drain_scene_queue();
+}
+#endif
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 #include <fmt/format.h>
@@ -46,6 +53,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <condition_variable>
+#include <deque>
 #include <unordered_map>
 #include <vector>
 
@@ -181,6 +190,27 @@ namespace {
 #ifdef __EMSCRIPTEN_SHARED_MEMORY__
 std::recursive_mutex gxm_mutex;
 #define GXM_GUARD const std::lock_guard<std::recursive_mutex> gxm_guard(gxm_mutex)
+// Scene thread (threaded build): submit_command_list queues the list and a
+// renderer thread consumes it, as desktop Vita3K does. VITA3K_ASYNC_SCENES=0
+// consumes inline on the submitting thread instead.
+bool async_scenes() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("VITA3K_ASYNC_SCENES");
+        return !(value && std::strcmp(value, "0") == 0);
+    }();
+    return enabled;
+}
+// Command statuses (send_single_command with wait, finish) are written by the
+// scene thread under this lock; wait_for_status sleeps on it.
+std::mutex status_mutex;
+std::condition_variable status_changed;
+void set_status(int *status, int value) {
+    {
+        const std::lock_guard<std::mutex> lock(status_mutex);
+        *status = value;
+    }
+    status_changed.notify_all();
+}
 #else
 #define GXM_GUARD
 #endif
@@ -429,6 +459,9 @@ int gxm_initialize(EmuEnvState &env) {
     return 0;
 }
 int gxm_terminate(EmuEnvState &env) {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    renderer::drain_scene_queue(); // before the lock, which the scene thread takes
+#endif
     GXM_GUARD;
     if (!env.renderer) return SCE_GXM_ERROR_UNINITIALIZED;
     // Every queued entry was drained inline before its AddEntry returned, so
@@ -523,7 +556,12 @@ bool create_context(State &s, std::unique_ptr<Context> &ctx) {
     return true;
 }
 void destroy_context_during_shutdown(State &s, std::unique_ptr<Context> &ctx) { if (s.context == ctx.get()) s.context = nullptr; ctx.reset(); }
-void destroy_context(State &s, std::unique_ptr<Context> &ctx) { destroy_context_during_shutdown(s, ctx); }
+void destroy_context(State &s, std::unique_ptr<Context> &ctx) {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    drain_scene_queue(); // queued lists still point at this context
+#endif
+    destroy_context_during_shutdown(s, ctx);
+}
 // Multisampled targets render one pixel per sample (see WebContext::samples),
 // as the desktop renderers do.
 bool create_render_target(State &, std::unique_ptr<RenderTarget> &rt, const SceGxmRenderTargetParams *p) {
@@ -532,7 +570,12 @@ bool create_render_target(State &, std::unique_ptr<RenderTarget> &rt, const SceG
     return true;
 }
 void destroy_render_target_during_shutdown(State &, std::unique_ptr<RenderTarget> &rt) { rt.reset(); }
-void destroy_render_target(State &s, std::unique_ptr<RenderTarget> &rt) { destroy_render_target_during_shutdown(s, rt); }
+void destroy_render_target(State &s, std::unique_ptr<RenderTarget> &rt) {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    drain_scene_queue(); // queued SetContext commands still point at this target
+#endif
+    destroy_render_target_during_shutdown(s, rt);
+}
 // Bounded diagnostic for rejected scenes. Decode the same ABI as the
 // production command producers without executing or acknowledging the batch.
 static void trace_scene(CommandList &list, MemState &mem) {
@@ -2473,8 +2516,13 @@ struct Submission {
     for (const auto &c : sub.completions) {
         if (c.kind == Completion::SyncSignal)
             subject_done(Ptr<SceGxmSyncObject>(c.address).get(mem), c.value);
-        else if (c.kind == Completion::Status)
+        else if (c.kind == Completion::Status) {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+            set_status(c.status, static_cast<int>(c.value));
+#else
             *c.status = static_cast<int>(c.value);
+#endif
+        }
     }
     sub.completions.clear();
     if (notified)
@@ -2623,20 +2671,18 @@ static void consume_commands(State &state, Context *ctx, Command *&cursor, MemSt
     }
 }
 
-void submit_command_list(State &state, Context *ctx, CommandList &list) {
+// Consumes one command list from `first`. `epoch` is the write epoch taken
+// when the list was submitted: guest writes after the submission belong to a
+// newer epoch, which the texture checks see even if the list is consumed later.
+static void consume_list(State &state, Context *ctx, Command *first, uint32_t epoch) {
     GXM_GUARD;
     const double started = emscripten_get_now();
-    auto &web_state = static_cast<WebState &>(state);
-    auto &mem = web_state.mem;
-    if (!list.first) return;
-    // Writes after this point (the guest's next scene, stream-ordered
-    // transfer fills) belong to a new epoch the next check will see.
-    texture_cache().epoch = mem_next_write_epoch(mem);
+    auto &mem = static_cast<WebState &>(state).mem;
+    texture_cache().epoch = epoch;
     auto &out = scene::writer();
     out.reset();
     Submission sub;
-    Command *cursor = list.first;
-    reset_command_list(list);
+    Command *cursor = first;
     std::exception_ptr failure;
     while (cursor) {
         try {
@@ -2655,6 +2701,12 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
             }
             // No later notification/status may acknowledge a failed batch.
             failure = std::current_exception();
+            // A thread waiting for a status in this batch must still wake.
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+            for (Command *dead = failed; dead; dead = dead->next)
+                if (dead->status && *dead->status == CommandErrorCodePending)
+                    set_status(dead->status, -1);
+#endif
             release_command(ctx, failed);
             while (cursor) {
                 Command *next = cursor->next;
@@ -2670,9 +2722,97 @@ void submit_command_list(State &state, Context *ctx, CommandList &list) {
     if (sub.result != 0 && !survey_mode())
         unsupported("GXM command failed (see browser log)");
 }
+
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+// The scene thread: one host thread consumes submitted lists in order.
+// Submitters wait only while two lists are already queued, which keeps the
+// consumer at most about a frame behind the guest (its uniform rings).
+namespace {
+struct QueuedList {
+    Context *ctx;
+    Command *first;
+    uint32_t epoch;
+};
+struct SceneQueue {
+    std::mutex mutex;
+    std::condition_variable work, room, idle;
+    std::deque<QueuedList> lists;
+    bool busy = false;
+    bool started = false; // the thread is detached, so not joinable
+    State *state = nullptr;
+};
+SceneQueue &scene_queue() {
+    static SceneQueue queue;
+    return queue;
+}
+constexpr size_t kMaxQueuedLists = 2;
+void scene_thread_main(SceneQueue &queue) {
+    std::unique_lock<std::mutex> lock(queue.mutex);
+    for (;;) {
+        queue.work.wait(lock, [&] { return !queue.lists.empty(); });
+        const QueuedList item = queue.lists.front();
+        queue.lists.pop_front();
+        queue.busy = true;
+        lock.unlock();
+        queue.room.notify_all();
+        try {
+            consume_list(*queue.state, item.ctx, item.first, item.epoch);
+        } catch (const std::exception &error) {
+            // Nobody waits for this list's result; report it like the inline
+            // path would have through the guest thread.
+            std::fprintf(stderr, "[vita3k-web] GXM scene failed: %s\n", error.what());
+        }
+        lock.lock();
+        queue.busy = false;
+        if (queue.lists.empty())
+            queue.idle.notify_all();
+    }
+}
+} // namespace
+
+void drain_scene_queue() {
+    auto &queue = scene_queue();
+    std::unique_lock<std::mutex> lock(queue.mutex);
+    queue.idle.wait(lock, [&] { return queue.lists.empty() && !queue.busy; });
+}
+#endif
+
+void submit_command_list(State &state, Context *ctx, CommandList &list) {
+    if (!list.first) return;
+    // Writes after this point (the guest's next scene, stream-ordered
+    // transfer fills) belong to a new epoch the next check will see.
+    const uint32_t epoch = mem_next_write_epoch(static_cast<WebState &>(state).mem);
+    Command *first = list.first;
+    reset_command_list(list);
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    if (async_scenes()) {
+        auto &queue = scene_queue();
+        {
+            std::unique_lock<std::mutex> lock(queue.mutex);
+            if (!queue.started) {
+                queue.started = true;
+                queue.state = &state;
+                std::thread(scene_thread_main, std::ref(queue)).detach();
+            }
+            queue.room.wait(lock, [&] { return queue.lists.size() < kMaxQueuedLists; });
+            queue.lists.push_back({ctx, first, epoch});
+        }
+        queue.work.notify_one();
+        return;
+    }
+#endif
+    consume_list(state, ctx, first, epoch);
+}
 int wait_for_status(State &, int *status, int signal, bool equal) {
+#ifdef __EMSCRIPTEN_SHARED_MEMORY__
+    // The scene thread completes the command later (set_status).
+    std::unique_lock<std::mutex> lock(status_mutex);
+    status_changed.wait(lock, [&] { return (*status == signal) == equal; });
+    return *status;
+#else
     if ((*status == signal) != equal) unsupported("uncompleted command");
     return *status;
+#endif
 }
 void finish(State &s, Context *ctx) {
     send_single_command(s, ctx, CommandOpcode::Nop, true, 1);
