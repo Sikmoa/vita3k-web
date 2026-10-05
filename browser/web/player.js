@@ -60,14 +60,31 @@ if (config.static) {
   const title = titleParam || stored[0]?.title || '';
   config = { ...config, title, app: appParam || title, staged: false, aot: false, aotUrl: null, aotMtUrl: null, titles: [] };
 }
+// ?source=package boots this browser's package of a title the server also
+// stages: only firmware and patches come from the server then.
+const stagedTitles = Array.isArray(config.titles) ? config.titles : [];
+if (params.get('source') === 'package' && config.staged)
+  config = { ...config, staged: false, aot: false, aotUrl: null, aotMtUrl: null };
+const fromServer = config.staged !== false;
 const { title: TITLE, app: APP, aot: AOT, aotUrl: AOT_URL, aotMtUrl: AOT_MT_URL } = config;
 const aotUrl = typeof AOT_URL === 'string' && AOT_URL ? AOT_URL : (AOT ? '/aot.wasm' : null);
 // Uploaded games need no server-built image or recorded execution seeds:
 // build from their loaded code at launch. An explicit query overrides this.
 const buildAot = params.get('buildAot') ?? (backend === 'jit' && config.staged === false ? '1' : null);
-// Persistent content cache (OPFS) namespace for this title: staging reads
-// through it, and the package upload below fills it.
-const cacheKey = `${sanitizeSegment(TITLE)}/${sanitizeSegment(APP)}`;
+// Persistent content (OPFS) namespaces: an uploaded package at
+// <title>/<app>, the server's copy of a staged title at <title>/<app>.server
+// (content_cache.js) so that neither overwrites the other. Staging reads
+// through cacheKey and stores what it downloads there. A server copy stored
+// at the package key before the split stays in use there.
+const packageKey = `${sanitizeSegment(TITLE)}/${sanitizeSegment(APP)}`;
+const cacheKey = await (async () => {
+  if (!fromServer) return packageKey;
+  const cache = storageSupported() ? await cacheAPI() : null;
+  if (!cache) return packageKey + '.server';
+  const serverKey = packageKey + cache.SERVER_SUFFIX;
+  if (await cache.cacheReadManifest(serverKey)) return serverKey;
+  return cache.isServerManifest(await cache.cacheReadManifest(packageKey)) ? packageKey : serverKey;
+})();
 // Page-side content cache state: the page owns all OPFS I/O (the worker
 // only asks and hands back). stageCacheActive gates reads and write-back;
 // stageNeeded is the manifest the worker is currently staging.
@@ -591,8 +608,8 @@ async function uploadPackage(file, firmware) {
     // A static host's first game: reload into it.
     if (!TITLE) { location.search = new URLSearchParams({ ...Object.fromEntries(params), title: result.title }).toString(); return; }
     await refreshTitlePicker();
-    titlePicker.value = result.title;
-    notice(result.title === TITLE
+    titlePicker.value = `package:${result.title}`;
+    notice(result.title === TITLE && !fromServer
       ? `Package ready: ${result.files} files · ${mib(result.bytes)} MiB. Press Play.`
       : `Package ready: ${result.title} — ${result.files} files · ${mib(result.bytes)} MiB. Pick it in Title, then Play.`);
   } catch (error) {
@@ -635,20 +652,23 @@ refreshFirmwareStatus();
 // packages this browser holds in persistent storage (uploaded, no server
 // work). Switching reloads with ?title=<id>, which is also the shareable link.
 const titlePicker = document.querySelector('#title-picker');
+// A title both staged and uploaded is listed twice (value <source>:<id>).
+const currentChoice = `${fromServer ? 'server' : 'package'}:${TITLE}`;
 async function refreshTitlePicker() {
-  const stagedTitles = Array.isArray(config.titles) ? config.titles : [];
   const showTitles = (uploaded) => {
     const counts = new Map(uploaded.map((entry) => [entry.title, entry.files]));
-    const ids = [...new Set([...stagedTitles, ...counts.keys(), TITLE])].filter(Boolean).sort();
-    titlePicker.replaceChildren(...ids.map((id) => {
+    const choices = new Map();
+    for (const id of stagedTitles) choices.set(`server:${id}`, `${id} · server`);
+    for (const [id, files] of counts) choices.set(`package:${id}`, `${id} · package (${files})`);
+    if (TITLE && !choices.has(currentChoice)) choices.set(currentChoice, `${TITLE} · ${fromServer ? 'server' : 'package'}`);
+    titlePicker.replaceChildren(...[...choices].sort(([a], [b]) =>
+      a.slice(a.indexOf(':') + 1).localeCompare(b.slice(b.indexOf(':') + 1)) || b.localeCompare(a)).map(([value, label]) => {
       const option = document.createElement('option');
-      option.value = id;
-      option.textContent = stagedTitles.includes(id)
-        ? `${id} · server`
-        : `${id} · package${counts.has(id) ? ` (${counts.get(id)})` : ''}`;
+      option.value = value;
+      option.textContent = label;
       return option;
     }));
-    titlePicker.value = TITLE;
+    titlePicker.value = currentChoice;
     titlePicker.disabled = false;
   };
   // Keep the picker visible even with one title, and make the server's
@@ -661,8 +681,11 @@ async function refreshTitlePicker() {
 }
 titlePicker.onchange = () => {
   const next = new URLSearchParams(location.search.replace(/^\?/, ''));
-  next.set('title', titlePicker.value);
+  const [source, id] = titlePicker.value.split(':');
+  next.set('title', id);
   next.delete('app');
+  if (source === 'package' && stagedTitles.includes(id)) next.set('source', 'package');
+  else next.delete('source');
   location.search = next.toString();
 };
 refreshTitlePicker();
@@ -742,8 +765,12 @@ async function run() {
           // marked storage-only: a miss there is an error, not a doomed fetch.
           const response = await fetch('./manifest.json' + configQuery);
           if (!response.ok) throw new Error('HTTP ' + response.status);
+          // A package boot of a server-staged title takes firmware and
+          // patches from the server, not its copy of the game.
+          const appPrefix = `ux0/app/${APP}/`;
           const serverFiles = (await response.json())
-            .filter((file) => params.get('patches') !== '0' || !file.path.startsWith('patch/'));
+            .filter((file) => params.get('patches') !== '0' || !file.path.startsWith('patch/'))
+            .filter((file) => fromServer || !(file.path.startsWith(appPrefix) || file.path.startsWith('ux0/user/')));
           if (worker !== currentWorker) return;
           const cache = await cacheAPI();
           // Shared with the stage-need/stage-store handlers below.
@@ -752,9 +779,8 @@ async function run() {
           const serverPaths = new Set(serverFiles.map((file) => file.path));
           // When the server stages this title's app directory, that directory
           // is the server's: a stored copy (an older staging) adds nothing to it.
-          const appPrefix = `ux0/app/${APP}/`;
           const serverHasApp = serverFiles.some((file) => file.path.startsWith(appPrefix));
-          const storedOnly = (storedManifest?.files ?? []).filter((file) => !serverPaths.has(file.path)
+          const storedOnly = fromServer ? [] : (storedManifest?.files ?? []).filter((file) => !serverPaths.has(file.path)
             && !(serverHasApp && file.path.startsWith(appPrefix)));
           // Firmware uploaded on its own fills what neither the server nor
           // the package has (os0/vs0), read from its shared key.

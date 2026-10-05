@@ -124,7 +124,18 @@ export async function cacheClear(key) {
   }
 }
 
-// Titles this browser has content for: [{ title, app, files, bytes }].
+// A server-staged title's downloaded copy lives under <title>/<app>.server,
+// apart from an uploaded package of the same title at <title>/<app>.
+export const SERVER_SUFFIX = '.server';
+// Whether a manifest is a server copy stored before that split: every file
+// carries the server's version (package files never do).
+export function isServerManifest(manifest) {
+  return Array.isArray(manifest?.files) && manifest.files.length > 0
+    && manifest.files.every((file) => file.version !== undefined);
+}
+
+// Packages this browser holds: [{ title, app, files, bytes }]. Server copies
+// (see SERVER_SUFFIX) are a cache, not packages.
 export async function listCachedTitles() {
   const out = [];
   try {
@@ -132,10 +143,11 @@ export async function listCachedTitles() {
     for await (const [title, handle] of root.entries()) {
       if (handle.kind !== 'directory' || title === FIRMWARE_TITLE) continue;
       for await (const [app, appHandle] of handle.entries()) {
-        if (appHandle.kind !== 'directory') continue;
+        if (appHandle.kind !== 'directory' || app.endsWith(SERVER_SUFFIX)) continue;
         let files = 0, bytes = 0;
         try {
           const manifest = JSON.parse(await (await (await appHandle.getFileHandle('manifest.json')).getFile()).text());
+          if (isServerManifest(manifest)) continue;
           files = manifest.files.length;
           bytes = manifest.files.reduce((sum, file) => sum + file.size, 0);
         } catch {}

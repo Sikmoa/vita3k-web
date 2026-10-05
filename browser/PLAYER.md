@@ -69,6 +69,13 @@ Two ways a title becomes bootable:
 The **Title** picker stays visible below the game screen and lists both,
 tagging them `· server` or `· package`;
 switching titles reloads with `?title=<id>`, which is also the link to share.
+A title the server stages and this browser also holds as a package is listed
+twice; the package boots with `?source=package` (firmware and patches still
+come from the server). The two are stored apart — the package under
+`<title>/<app>`, the server's copy under `<title>/<app>.server` — so booting
+one never rewrites the other. A server copy cached before that split (every
+file carrying a server version) keeps serving from the package key and is
+not listed as a package.
 Each title keeps its own persistent cache, and the AOT image is used only for
 the title it was built for.
 
