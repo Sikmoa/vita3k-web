@@ -45,6 +45,19 @@ try {
     await context.addInitScript(() => {
       const NativeWorker = Worker;
       window.sent = []; window.testWorkers = []; window.workerUrls = [];
+      // Fake gamepads: tests fill window.fakePads and announce them.
+      window.fakePads = [];
+      navigator.getGamepads = () => window.fakePads;
+      window.connectPad = (pad) => {
+        window.fakePads[pad.index] = pad;
+        const event = new Event('gamepadconnected'); event.gamepad = pad; dispatchEvent(event);
+      };
+      window.disconnectPad = (index) => {
+        const pad = window.fakePads[index]; pad.connected = false; window.fakePads[index] = null;
+        const event = new Event('gamepaddisconnected'); event.gamepad = pad; dispatchEvent(event);
+      };
+      window.fakePad = (pressed = [], axes = [0, 0, 0, 0]) => ({ index: 0, id: 'Fixture pad', mapping: 'standard', connected: true,
+        axes, buttons: Array.from({ length: 17 }, (_, i) => ({ pressed: pressed.includes(i), value: pressed.includes(i) ? 1 : 0 })) });
       window.Worker = class extends NativeWorker {
         constructor(...args) { super(...args); window.testWorkers.push(this); window.workerUrls.push(String(args[0])); }
         postMessage(message, ...args) {
@@ -86,6 +99,43 @@ try {
   await desktop.evaluate(() => dispatchEvent(new Event('blur')));
   await expectPad(desktop, 0, [0, 0, 0, 0]);
   await desktop.keyboard.up('KeyX');
+
+  // Gamepads: A is cross, the right bumper R, sticks past a dead zone.
+  await desktop.evaluate(() => window.connectPad(window.fakePad([0, 5], [1, 0, 0, .1])));
+  await expectPad(desktop, 0x4200, [1, 0, 0, 0]);
+  await desktop.evaluate(() => { window.fakePads[0] = window.fakePad([13]); });
+  await expectPad(desktop, 0x40, [0, 0, 0, 0]);
+  await desktop.keyboard.down('KeyC');
+  await expectPad(desktop, 0x2040, [0, 0, 0, 0]);
+  await desktop.evaluate(() => window.disconnectPad(0));
+  await expectPad(desktop, 0x2000, [0, 0, 0, 0]);
+  await desktop.keyboard.up('KeyC');
+  await expectPad(desktop, 0, [0, 0, 0, 0]);
+  // A guest dialog takes the pad: D-pad right selects, A presses.
+  await desktop.evaluate(() => window.connectPad(window.fakePad()));
+  await desktop.evaluate(() => window.testWorkers.at(-1).postMessage({ type: 'fixture-message', message: {
+    type: 'vita-dialog', dialog: { id: 9, state: 'open', message: 'Pad dialog', buttons: ['Yes', 'No'], progress: null, enterButton: 'cross' },
+  } }));
+  await desktop.locator('#dialog').waitFor({ state: 'visible' });
+  await desktop.evaluate(() => { window.fakePads[0] = window.fakePad([15]); });
+  await desktop.waitForFunction(() => document.querySelector('#dialog-buttons button.selected')?.textContent === 'No');
+  await desktop.evaluate(() => { window.fakePads[0] = window.fakePad([]); });
+  await desktop.waitForTimeout(100);
+  await desktop.evaluate(() => { window.fakePads[0] = window.fakePad([0]); });
+  await desktop.waitForFunction(() => window.sent.some((m) => m.type === 'dialog-press' && m.id === 9));
+  assert.deepEqual(await desktop.evaluate(() => window.sent.filter((m) => m.type === 'dialog-press').at(-1)),
+    { type: 'dialog-press', id: 9, button: 0x4000, selected: 1 });
+  assert.equal((await lastInput(desktop)).buttons, 0, 'a dialog keeps pad buttons from the guest');
+  await desktop.evaluate(() => window.testWorkers.at(-1).postMessage({ type: 'fixture-message', message: { type: 'vita-dialog', dialog: { id: 9, state: 'close' } } }));
+  await desktop.locator('#dialog').waitFor({ state: 'hidden' });
+  await desktop.waitForTimeout(100);
+  assert.equal((await lastInput(desktop)).buttons, 0, 'the A that answered the dialog stays away from the guest');
+  await desktop.evaluate(() => { window.fakePads[0] = window.fakePad([]); });
+  await desktop.waitForTimeout(100);
+  await desktop.evaluate(() => { window.fakePads[0] = window.fakePad([0]); });
+  await expectPad(desktop, 0x4000, [0, 0, 0, 0]);
+  await desktop.evaluate(() => window.disconnectPad(0));
+  await expectPad(desktop, 0, [0, 0, 0, 0]);
   await desktop.locator('#stop').click();
   assert.equal(await desktop.locator('#run').isEnabled(), true);
 
@@ -217,7 +267,7 @@ try {
     }
   }
   assert.deepEqual(errors, []);
-  console.log('PASS: keyboard, multitouch sticks/buttons, D-pad diagonals, cancellation, dialogs/IME, restart, fullscreen fallback, and five phone layouts at three control sizes; zero page errors.');
+  console.log('PASS: keyboard, gamepads, multitouch sticks/buttons, D-pad diagonals, cancellation, dialogs/IME, restart, fullscreen fallback, and five phone layouts at three control sizes; zero page errors.');
 } finally {
   await browser?.close();
   await new Promise((done) => server.close(done));

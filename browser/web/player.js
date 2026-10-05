@@ -1,4 +1,4 @@
-import { SCE_CTRL, keyMap, createPadState, createTouchControls } from './pad_input.js';
+import { SCE_CTRL, keyMap, createPadState, createTouchControls, createGamepadInput } from './pad_input.js';
 // Persistent content helpers live in content_cache.js but are imported
 // lazily at each use site (never statically): late dynamic imports resolve
 // completely and a missing file (old server) disables the feature cleanly.
@@ -349,6 +349,9 @@ function onDialog(message) {
 function dialogKey(event) {
   const { buttons: button = 0 } = keyMap[event.code];
   if (event.type !== 'keydown' || event.repeat) return;
+  dialogButton(button);
+}
+function dialogButton(button) {
   if (button === SCE_CTRL.left || button === SCE_CTRL.right) {
     const last = Math.max(0, dialog.buttons.length - 1);
     dialog.selected = Math.max(0, Math.min(last, dialog.selected + (button === SCE_CTRL.right ? 1 : -1)));
@@ -397,7 +400,16 @@ const touch = createTouchControls(touchRoot, pad, {
   enabled: () => running && !dialog && !ime,
   onGesture: ensureAudio,
 });
-function clearInputs() { touch.clear(); pad.clear(); }
+const gamepads = createGamepadInput(pad, {
+  enabled: () => running && !dialog && !ime,
+  onPress: (button) => { if (running && dialog && !ime) dialogButton(button); },
+  onGesture: ensureAudio,
+  onConnect: (gamepad, connected) => {
+    log(`gamepad ${connected ? 'connected' : 'disconnected'}: ${gamepad.id} (${gamepad.mapping || 'no standard mapping'})`);
+    updateTouchVisibility();
+  },
+});
+function clearInputs() { touch.clear(); gamepads.clear(); pad.clear(); }
 function sendPad() { pad.flush(true); }
 function onKey(event) {
   if (event.type === 'keyup') pad.release('key:' + event.code);
@@ -433,7 +445,8 @@ function writePreference(key, value) {
 }
 touchMode.value = readPreference('touch', 'auto');
 if (!touchMode.value) touchMode.value = 'auto';
-function wantsTouch() { return touchMode.value === 'on' || (touchMode.value === 'auto' && (coarsePointer.matches || navigator.maxTouchPoints > 0)); }
+// auto: touch screens show the controls, unless a gamepad is connected.
+function wantsTouch() { return touchMode.value === 'on' || (touchMode.value === 'auto' && !gamepads.connected() && (coarsePointer.matches || navigator.maxTouchPoints > 0)); }
 function updateTouchVisibility() {
   touch.clear();
   const visible = wantsTouch() && !dialog && !ime;
