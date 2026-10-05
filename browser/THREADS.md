@@ -1,6 +1,6 @@
 # Multithreaded guest execution
 
-Status: phases 0–5 implemented, phase 6 partly. The threaded runtime is
+Status: phases 0–6 implemented (pool sizing not tuned). The threaded runtime is
 opt-in: the player loads it with `?threads=1` on a cross-origin isolated page.
 The single-Worker build stays the default and the fallback. The design
 sections below are the original plan; each ends with an "As built" note where
@@ -293,23 +293,39 @@ the single-Worker build.
    user reports no problems in Firefox.
 5. **Audio and input** (done): shared PCM rings read by an AudioWorklet; input
    through shared state.
-6. **Performance** (partly): `-fwasm-exceptions` is done (no `invoke_*`
-   wrappers remain in the threaded module). Pool sizing and field profiles
-   are not done yet.
+6. **Performance** (mostly done): `-fwasm-exceptions` (no `invoke_*`
+   wrappers remain); lock-free per-import bookkeeping; scenes posted to the
+   coordinator without waiting; four hot GXM getters as guest code
+   (hle_stub_intrinsics.cpp); desktop's display host thread; a scene thread
+   that consumes GXM command lists like desktop's renderer thread
+   (`?asyncScene=0` consumes them inline). Profiled with
+   `LIMBO_THREAD_PROFILE`, which samples every pthread Worker. Pool sizing is
+   not tuned.
 
 ## Results
 
 Headless Chromium 153 on the real GPU (Ryzen 5 5500U, Vega 7), Limbo with its
 AOT image, frames per second once gameplay starts (`LIMBO_MEASURE=1`):
 
-| | single Worker | threaded |
-|---|---|---|
-| Limbo gameplay | 16.4 fps | 29.8 fps |
-| Limbo loading screen | ~1 fps | ~1 fps |
+| | single Worker | threaded (phases 1–5) | threaded (phase 6) |
+|---|---|---|---|
+| Limbo gameplay | 16.4 fps | 29.8 fps | 58.8 fps |
+| Limbo loading screen | ~1 fps | ~1 fps | 24 fps |
+| Persona 4 Golden, gas-station field | — | 20 fps | 30–31 fps |
 
-The same machine in Firefox 156 (user report): Limbo threaded 27–30 fps,
-against 22–24 fps single Worker the day before. Limbo's loading phase is bound
-by one thread and does not speed up.
+The field figure is the scripted run's last 30 s
+(`.limbo_work/tools/field_mt_input.txt`). Persona 4 Golden targets 30 fps
+there with two vblanks per frame, so a frame over 33.3 ms of main-thread work
+showed as 20. The steps that mattered, in order: lock-free import
+bookkeeping (18 to 20 fps), the display host thread (20 to 24: the main
+thread no longer waited for the display callback's vblank inside
+sceGxmDisplayQueueAddEntry) and the scene thread (24 to 30; it took about
+6.6 ms of scene building per frame off the main thread). Limbo was capped at
+30 fps by the same vblank lock-step, not by its own pacing.
+
+Firefox 156 on the same machine (user reports): Limbo threaded 27–30 fps and
+Persona 4 Golden 3D scenes 20 fps after phase 5, against 22–24 and 14–16 fps
+single Worker.
 
 Node, null GPU, 45 s with AOT (boot checks, not a speed comparison): Limbo
 127 MIPS on 11 threads; Persona 4 Golden 1,875 frames on 17 threads, no missing
@@ -317,11 +333,14 @@ imports.
 
 ## Known issues
 
-* Headless scripted Persona 4 Golden runs hang threaded when an in-game movie
-  (`P4CTOP3.mp4`) plays during the input script: the main thread waits in
-  `sceGxmDisplayQueueAddEntry` and the display queue thread never returns from
-  `sceDisplayWaitVblankStart`, with no coordinator call pending. Not seen in
-  Firefox; not diagnosed.
+* Fixed (404115d4): Persona 4 Golden sometimes hung threaded past its intro
+  movie. advance_vblank set a waiter's status without the waiter's lock, so a
+  wakeup between the check and the sleep in wait_vblank was lost and the
+  display queue thread slept forever.
+* Each pooled Worker holds its own copy of the runtime, so every pthread costs
+  real memory: never start threads in a loop (a detached std::thread is not
+  joinable, which once made the scene thread start per command list). Run
+  experiments under a memory cap (`systemd-run --user --scope -p MemoryMax=8G`).
 * Stale staged files in browser storage show up as
   `sceGxmShaderPatcherCreateVertexProgram`/`CreateFragmentProgram` returning
   `INVALID_POINTER` near the end of Limbo's loading screen; the threaded build
