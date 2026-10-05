@@ -37,6 +37,8 @@ drives the left stick, matching the existing arrow-key behavior. Keyboard
 bindings are unchanged and listed in the preferences panel. Keyboard and touch
 holds are independent, so releasing one does not release the other.
 
+Touch controls and gamepads take presses while the game loads; whatever is
+held when it starts reaches it at once.
 Input is released on pointer cancellation/lost capture, blur, backgrounding,
 viewport changes, Stop, and opening a guest dialog or text-entry field. Hiding
 the touch overlay releases its touches. Guest dialogs have tappable response
@@ -86,9 +88,13 @@ never seen. Accepted layouts: `ux0/…`, `app/<id>/…` and either of those unde
 wrapper folders; anything outside the title's own directory (firmware the
 package happens to carry, for instance) is kept at its device root.
 
-**Firmware is the one thing that must come from the server** (`os0`/`vs0`, a
-few MiB): it is console system software, not part of any package. It
-downloads on a title's first boot and is cached like everything else. Each
+**Firmware comes from the server or its own upload** (`os0`/`vs0`): it is
+console system software, not part of any game package. From the server it
+downloads on a title's first boot and is cached like everything else. The
+**Firmware** upload takes a `.zip` holding the `os0` and `vs0` folders of
+an installed firmware (desktop Vita3K keeps them in its data directory),
+stores it once and lends it to every title; the server's or a package's own
+copy of a file wins over it. Each
 boot merges two sources — the server's manifest and the stored files for that
 title — and the staging line says which is which (`Reading <path> from
 storage` vs `Downloading <path>`, with read/download counters). A file the
@@ -102,6 +108,36 @@ keeps the toolbar and controls with the display; browsers without element
 fullscreen support use an expanded in-page player. **Exit full** leaves either
 mode. Debug and the sound test are collapsed by default. Runtime logs
 retain their last 200 messages and update in batches.
+
+## Static hosting (GitHub Pages)
+
+`.github/workflows/pages.yml` builds both runtimes with
+`browser/pages/build.sh` (in the flake's dev shell) and publishes the site
+`browser/pages/assemble.sh` makes from the dist: the player as `index.html`,
+a `player-config.json` of `{"static": true}` and an empty `manifest.json`.
+Enable it under Settings → Pages → Source: GitHub Actions.
+
+A static site ships no game, firmware or AOT image. Visitors upload the
+firmware and then a game; the first game reloads the page into
+`?title=<id>`, and later visits open the first stored title. Content must be
+decrypted already (the browser has no PUP/PKG/NoNpDrm decryption): a
+firmware installed by desktop Vita3K and a decrypted dump or a game folder
+installed by it. Uploaded games build their AOT image at launch.
+
+GitHub Pages sends no headers, so `coi.js` registers `coi_sw.js`, a service
+worker that adds the cross-origin isolation headers to every same-origin
+response, and reloads once: `SharedArrayBuffer`, and with it `?threads=1`,
+then works. A page already isolated (the dev server) skips it.
+
+```sh
+nix develop --command browser/pages/build.sh   # build/pages
+PAGES_DIR=build/pages PAGES_FIRMWARE_ZIP=firmware.zip PAGES_GAME_ZIP=game.zip \
+  node browser/tests/pages_static_chromium.mjs
+```
+
+The test serves the site under `/vita3k-web/` with no special headers,
+uploads both archives through the page and boots until frames present
+(`?threads=1` by default, `PAGES_PARAMS=` for the single-threaded build).
 
 ## Frozen frames (phone)
 

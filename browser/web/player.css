@@ -139,3 +139,4 @@ body.player-expanded { overflow: hidden; }
 @media (max-width: 400px) and (orientation: portrait) {
   #touch-controls { --control-scale: min(var(--preferred-control-scale, 1), .95); }
 }
+#firmware-state { color: #858f9d; }

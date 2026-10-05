@@ -20,6 +20,11 @@ const sanitize = (value) =>
 export function cacheKeyFor(title, app) {
   return `${sanitize(title)}/${sanitize(app)}`;
 }
+// Firmware (os0/vs0) uploaded on its own is stored once under this key and
+// shared by every title; it is not a title (no title id has a leading _).
+export const FIRMWARE_TITLE = '_firmware';
+export const FIRMWARE_KEY = cacheKeyFor(FIRMWARE_TITLE, FIRMWARE_TITLE);
+const FIRMWARE_ROOTS = new Set(['os0', 'vs0']);
 
 const contentParts = (key) => ['vita3k-content', ...key.split('/')];
 const metaParts = (key) => ['vita3k-meta', ...key.split('/')];
@@ -95,7 +100,7 @@ export async function listCachedTitles() {
   try {
     const root = await openDir(false, 'vita3k-meta');
     for await (const [title, handle] of root.entries()) {
-      if (handle.kind !== 'directory') continue;
+      if (handle.kind !== 'directory' || title === FIRMWARE_TITLE) continue;
       for await (const [app, appHandle] of handle.entries()) {
         if (appHandle.kind !== 'directory') continue;
         let files = 0, bytes = 0;
@@ -163,6 +168,8 @@ export async function packageContents(blob) {
     const segments = file.path.split('/');
     const appAt = segments.indexOf('app');
     if (appAt < 0 || appAt + 1 >= segments.length) continue;
+    // vs0/app/<id> are the firmware's own system apps, not a game.
+    if (appAt >= 1 && FIRMWARE_ROOTS.has(segments[appAt - 1])) continue;
     const id = segments[appAt + 1];
     if (!/^[A-Za-z0-9_-]{3,24}$/.test(id)) continue;
     const depth = appAt >= 1 && segments[appAt - 1] === 'ux0' ? appAt - 1 : appAt;
@@ -176,7 +183,7 @@ export async function packageContents(blob) {
     const [title, hits] = [...candidate.ids.entries()].sort((a, b) => b[1] - a[1])[0];
     if (!best || hits > best.hits) best = { ...candidate, title, hits };
   }
-  if (!best) return barePackageContents(blob, files);
+  if (!best) return firmwareContents(files) ?? barePackageContents(blob, files);
   const shipped = [];
   for (const file of files) {
     const segments = file.path.split('/');
@@ -195,6 +202,27 @@ export async function packageContents(blob) {
   }
   if (!shipped.length) throw new Error(`package has no files for ${best.title}`);
   return { title: best.title, app: best.title, files: shipped };
+}
+
+// An archive of firmware alone: os0/ and vs0/ (an installed firmware's
+// folders, e.g. from desktop Vita3K's data directory), optionally under
+// wrapper folders. Returns null when it holds no firmware.
+function firmwareContents(files) {
+  let depth = -1;
+  for (const file of files) {
+    const at = file.path.split('/').findIndex((segment) => FIRMWARE_ROOTS.has(segment));
+    if (at >= 0 && (depth < 0 || at < depth)) depth = at;
+  }
+  if (depth < 0) return null;
+  const shipped = [];
+  for (const file of files) {
+    const segments = file.path.split('/');
+    if (segments.length <= depth + 1 || !FIRMWARE_ROOTS.has(segments[depth])) continue;
+    shipped.push({ path: segments.slice(depth).join('/'), size: file.entry.size, entry: file.entry });
+  }
+  if (!shipped.some((file) => file.path.startsWith('vs0/')) || !shipped.some((file) => file.path.startsWith('os0/')))
+    throw new Error('firmware needs both its os0/ and vs0/ folders');
+  return { title: FIRMWARE_TITLE, app: FIRMWARE_TITLE, firmware: true, files: shipped };
 }
 
 // Vita param.sfo: {'magic': 'PSF\0', ...}. Reads the TITLE_ID for archives

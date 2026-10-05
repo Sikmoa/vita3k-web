@@ -1,0 +1,62 @@
+name: Web player (GitHub Pages)
+
+# Builds both browser runtimes (single-threaded and threaded) and publishes
+# the static player site. The site holds no game or firmware: visitors upload
+# their own (browser/PLAYER.md, "Static hosting"). Pages must be set to deploy
+# from GitHub Actions (Settings → Pages → Source).
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build the player site
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # The flake pins the toolchain (Emscripten, Node, CMake) the runtime is
+      # developed with.
+      - uses: cachix/install-nix-action@v31
+
+      # Emscripten's system libraries for Memory64 and pthreads take minutes
+      # to build; the flake's shell keeps them in .cache/emscripten.
+      - uses: actions/cache@v4
+        with:
+          path: .cache/emscripten
+          key: emscripten-${{ hashFiles('flake.lock') }}
+
+      - name: Build
+        run: nix develop --command browser/pages/build.sh
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/pages
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -13,7 +13,8 @@ const web = fileURLToPath(new URL('../web/', import.meta.url));
 const fixture = `
   postMessage({ type: 'ready', diagnostics: { backend: 'fixture', memoryModel: 'fixture' } });
   onmessage = ({ data }) => {
-    if (data.type === 'stage-files') postMessage({ type: 'staged', files: 0, bytes: 0, root: '/vita' });
+    // Staging takes a moment, as a real launch does.
+    if (data.type === 'stage-files') setTimeout(() => postMessage({ type: 'staged', files: 0, bytes: 0, root: '/vita' }), 400);
     if (data.type === 'run-app') postMessage({ type: 'vita-present' });
     if (data.type === 'fixture-message') postMessage(data.message);
   };
@@ -143,8 +144,6 @@ try {
   assert.equal(await phone.locator('#title-picker').isVisible(), true, 'landscape keeps title selection accessible');
   assert.equal(await phone.locator('#upload').isVisible(), true, 'landscape keeps package upload accessible');
   assert.equal(await phone.locator('#touch-controls').isVisible(), true);
-  await phone.locator('#run').click();
-  await expectPad(phone, 0, [0, 0, 0, 0]);
   const cdp = await phone.context().newCDPSession(phone);
   async function point(selector, id, dx = 0, dy = 0) {
     const b = await phone.locator(selector).boundingBox();
@@ -154,6 +153,14 @@ try {
   const touch = (type, touchPoints) => cdp.send('Input.dispatchTouchEvent', { type, touchPoints });
   const stick = await point('[data-stick="0"]', 1, .4);
   const cross = await point('[data-button="cross"]', 2);
+  // Controls take presses while the game loads; a held one reaches it at launch.
+  await phone.locator('#run').click();
+  await touch('touchStart', [cross]);
+  assert.equal(await phone.locator('[data-button="cross"]').evaluate((e) => e.classList.contains('pressed')), true);
+  assert.equal(await lastInput(phone), undefined, 'nothing reaches a game that is not running');
+  await expectPad(phone, 0x4000, [0, 0, 0, 0]);
+  await touch('touchEnd', []);
+  await expectPad(phone, 0, [0, 0, 0, 0]);
   await touch('touchStart', [stick]);
   await expectPad(phone, 0, [1, 0, 0, 0]);
   await touch('touchStart', [stick, cross]);

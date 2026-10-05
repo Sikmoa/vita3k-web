@@ -49,6 +49,17 @@ try {
   warning.textContent = error.message; warning.style.display = 'block';
   throw error;
 }
+// A static host (GitHub Pages, browser/pages/assemble.sh) has no game or firmware of its
+// own: its player-config.json says {"static": true}, and everything boots
+// from what this browser holds — the title from ?title= or the first stored
+// package, firmware from its own upload.
+if (config.static) {
+  const cache = storageSupported() ? await cacheAPI() : null;
+  let stored = [];
+  try { stored = cache ? await cache.listCachedTitles() : []; } catch {}
+  const title = titleParam || stored[0]?.title || '';
+  config = { ...config, title, app: appParam || title, staged: false, aot: false, aotUrl: null, aotMtUrl: null, titles: [] };
+}
 const { title: TITLE, app: APP, aot: AOT, aotUrl: AOT_URL, aotMtUrl: AOT_MT_URL } = config;
 const aotUrl = typeof AOT_URL === 'string' && AOT_URL ? AOT_URL : (AOT ? '/aot.wasm' : null);
 // Uploaded games need no server-built image or recorded execution seeds:
@@ -63,6 +74,8 @@ const cacheKey = `${sanitizeSegment(TITLE)}/${sanitizeSegment(APP)}`;
 let stageCacheActive = false;
 let stageNeeded = null;
 let stageCacheIndex = null;
+// Storage key of each staged file read from another title's key (firmware).
+let stageKeys = new Map();
 const stageSources = { storage: 0, downloaded: 0 };
 // A transferred canvas can no longer be drawn or read from this page, so GPU
 // frames get their own element and pixel frames the 2D canvas over it.
@@ -122,7 +135,7 @@ function stagingDetail(index, bytes) {
   parts.push(elapsed());
   return parts.join(' · ');
 }
-document.querySelector('#game-title').textContent = TITLE === 'PCSE00268' ? 'Limbo' : TITLE;
+document.querySelector('#game-title').textContent = TITLE === 'PCSE00268' ? 'Limbo' : TITLE || 'No game yet';
 document.title = 'Vita3K Web — ' + document.querySelector('#game-title').textContent;
 document.querySelector('#runtime-info').textContent = TITLE + ' · ' + backend.toUpperCase() + ' · ' + memory +
   (aotUrl ? ' · AOT' : buildAot === '1' || buildAot === 'only' ? ' · AOT at launch' : '') +
@@ -396,12 +409,14 @@ const pad = createPadState((state) => {
   if (running && worker) worker.postMessage({ type: 'input', ...state });
 });
 const touchRoot = document.querySelector('#touch-controls');
+// Touch controls take presses while the game loads too: what is held when
+// it starts reaches it at once (sendPad on launch).
 const touch = createTouchControls(touchRoot, pad, {
-  enabled: () => running && !dialog && !ime,
+  enabled: () => !dialog && !ime,
   onGesture: ensureAudio,
 });
 const gamepads = createGamepadInput(pad, {
-  enabled: () => running && !dialog && !ime,
+  enabled: () => !dialog && !ime,
   onPress: (button) => { if (running && dialog && !ime) dialogButton(button); },
   onGesture: ensureAudio,
   onConnect: (gamepad, connected) => {
@@ -502,59 +517,87 @@ addEventListener('keydown', (event) => {
 // storage (OPFS) once, and later boots stage from there instead of
 // re-downloading. Uploads are serialized against runs via the Stop button:
 // a run is active exactly while Stop is enabled.
+// The firmware button takes a .zip of os0/ and vs0/ (stored once for every
+// title); the package button takes a game, which may carry firmware too.
 const uploadRow = document.querySelector('#upload-row');
+const firmwareRow = document.querySelector('#firmware-row');
 const uploadButton = document.querySelector('#upload');
 const uploadInput = document.querySelector('#upload-file');
+const firmwareButton = document.querySelector('#upload-firmware');
+const firmwareInput = document.querySelector('#firmware-file');
 if (!storageSupported()) {
-  uploadRow.hidden = true;
+  uploadRow.hidden = true; firmwareRow.hidden = true;
 } else {
-  uploadButton.onclick = () => {
-    if (running || !stopButton.disabled) { notice('Stop the game before uploading a package.'); return; }
-    uploadInput.click();
-  };
-  uploadInput.onchange = async () => {
-    const file = uploadInput.files?.[0];
-    uploadInput.value = '';
-    if (!file) return;
-    const wasDisabled = runButton.disabled;
-    runButton.disabled = true; uploadButton.disabled = true;
-    const started = performance.now();
-    try {
-      // A .vpk is a zip under another name; the reader only cares about the container.
-      if (!/\.(zip|vpk)$/i.test(file.name)) throw new Error('only .zip/.vpk packages are supported');
-      const cache = await cacheAPI();
-      if (!cache) throw new Error('content cache module unavailable');
-      // The package names its own title (its ux0/app/<id> directory), so an
-      // upload is all a game needs to become bootable — the server only has
-      // to supply firmware. Files are stored under that title's own cache.
-      const contents = await cache.packageContents(file);
-      const packageKey = `${sanitizeSegment(contents.title)}/${sanitizeSegment(contents.app)}`;
-      const totalBytes = contents.files.reduce((sum, entry) => sum + entry.size, 0);
-      let lastNotice = 0;
-      const result = await cache.unpackPackageToCache(file, packageKey,
-        (done, total, path, doneBytes) => {
-          const now = performance.now();
-          if (now - lastNotice < 200 && done < total) return;
-          lastNotice = now;
-          notice(`Unpacking ${path} — ${done}/${total} files · ${mib(doneBytes)}/${mib(totalBytes)} MiB`);
-        });
-      try { await navigator.storage.persist?.(); } catch {}
-      const secs = Math.round((performance.now() - started) / 1000);
-      log(`package stored: ${result.title} — ${result.files} files · ${mib(result.bytes)} MiB` +
-        ` in ${secs}s (persistent storage, key ${packageKey})`);
-      await refreshTitlePicker();
-      titlePicker.value = result.title;
-      notice(result.title === TITLE
-        ? `Package ready: ${result.files} files · ${mib(result.bytes)} MiB. Press Play.`
-        : `Package ready: ${result.title} — ${result.files} files · ${mib(result.bytes)} MiB. Pick it in Title, then Play.`);
-    } catch (error) {
-      log('package upload failed: ' + (error?.message ?? error));
-      notice('Upload failed: ' + (error?.message ?? error));
-    } finally {
-      runButton.disabled = wasDisabled; uploadButton.disabled = false;
-    }
-  };
+  for (const [button, input] of [[uploadButton, uploadInput], [firmwareButton, firmwareInput]]) {
+    button.onclick = () => {
+      if (running || !stopButton.disabled) { notice('Stop the game before uploading.'); return; }
+      input.click();
+    };
+    input.onchange = () => {
+      const file = input.files?.[0];
+      input.value = '';
+      if (file) uploadPackage(file, input === firmwareInput);
+    };
+  }
 }
+async function uploadPackage(file, firmware) {
+  const wasDisabled = runButton.disabled;
+  runButton.disabled = true; uploadButton.disabled = true; firmwareButton.disabled = true;
+  const started = performance.now();
+  try {
+    // A .vpk is a zip under another name; the reader only cares about the container.
+    if (!/\.(zip|vpk)$/i.test(file.name)) throw new Error('only .zip/.vpk packages are supported');
+    const cache = await cacheAPI();
+    if (!cache) throw new Error('content cache module unavailable');
+    // The package names its own title (its ux0/app/<id> directory), so an
+    // upload is all a game needs to become bootable besides firmware (the
+    // server's or its own upload). Files are stored under that title's own cache.
+    const contents = await cache.packageContents(file);
+    if (firmware && !contents.firmware)
+      throw new Error(`this is a game package (${contents.title}), not firmware: use the game Upload button`);
+    if (!firmware && contents.firmware)
+      throw new Error('this archive holds firmware only: use the Firmware Upload button');
+    const packageKey = `${sanitizeSegment(contents.title)}/${sanitizeSegment(contents.app)}`;
+    const totalBytes = contents.files.reduce((sum, entry) => sum + entry.size, 0);
+    let lastNotice = 0;
+    const result = await cache.unpackPackageToCache(file, packageKey,
+      (done, total, path, doneBytes) => {
+        const now = performance.now();
+        if (now - lastNotice < 200 && done < total) return;
+        lastNotice = now;
+        notice(`Unpacking ${path} — ${done}/${total} files · ${mib(doneBytes)}/${mib(totalBytes)} MiB`);
+      });
+    try { await navigator.storage.persist?.(); } catch {}
+    const secs = Math.round((performance.now() - started) / 1000);
+    log(`package stored: ${result.title} — ${result.files} files · ${mib(result.bytes)} MiB` +
+      ` in ${secs}s (persistent storage, key ${packageKey})`);
+    if (contents.firmware) {
+      notice(`Firmware ready: ${result.files} files · ${mib(result.bytes)} MiB.` + (TITLE ? ' Press Play.' : ' Now upload a game.'));
+      await refreshFirmwareStatus();
+      return;
+    }
+    // A static host's first game: reload into it.
+    if (!TITLE) { location.search = new URLSearchParams({ ...Object.fromEntries(params), title: result.title }).toString(); return; }
+    await refreshTitlePicker();
+    titlePicker.value = result.title;
+    notice(result.title === TITLE
+      ? `Package ready: ${result.files} files · ${mib(result.bytes)} MiB. Press Play.`
+      : `Package ready: ${result.title} — ${result.files} files · ${mib(result.bytes)} MiB. Pick it in Title, then Play.`);
+  } catch (error) {
+    log('package upload failed: ' + (error?.message ?? error));
+    notice('Upload failed: ' + (error?.message ?? error));
+  } finally {
+    runButton.disabled = wasDisabled; uploadButton.disabled = false; firmwareButton.disabled = false;
+  }
+}
+// Whether this browser holds firmware: shown next to its upload button.
+async function refreshFirmwareStatus() {
+  const cache = storageSupported() ? await cacheAPI() : null;
+  const manifest = cache ? await cache.cacheReadManifest(cache.FIRMWARE_KEY) : null;
+  document.querySelector('#firmware-state').textContent = manifest?.files?.length
+    ? `stored (${manifest.files.length} files)` : config.static ? 'needed' : 'from the server';
+}
+refreshFirmwareStatus();
 // Title picker: everything bootable — the server's staged titles plus the
 // packages this browser holds in persistent storage (uploaded, no server
 // work). Switching reloads with ?title=<id>, which is also the shareable link.
@@ -563,7 +606,7 @@ async function refreshTitlePicker() {
   const stagedTitles = Array.isArray(config.titles) ? config.titles : [];
   const showTitles = (uploaded) => {
     const counts = new Map(uploaded.map((entry) => [entry.title, entry.files]));
-    const ids = [...new Set([...stagedTitles, ...counts.keys(), TITLE])].sort();
+    const ids = [...new Set([...stagedTitles, ...counts.keys(), TITLE])].filter(Boolean).sort();
     titlePicker.replaceChildren(...ids.map((id) => {
       const option = document.createElement('option');
       option.value = id;
@@ -619,6 +662,7 @@ beepButton.onclick = () => {
   osc.start(); osc.stop(audioCtx.currentTime + 0.25);
 };
 async function run() {
+  if (!TITLE) { notice('Upload the firmware and a game package first (below the player).'); return; }
   stop(); notice('');
   frames = 0; gpuFrames = 0; pixelFrames = 0; fps = 0; firstFrameAt = 0; logBox.textContent = ''; logLines.length = 0; logDirty = false; startedAt = performance.now();
   lastPresentAt = 0; presentedOnce = false; watchdogWarned = false;
@@ -679,7 +723,15 @@ async function run() {
           const serverHasApp = serverFiles.some((file) => file.path.startsWith(appPrefix));
           const storedOnly = (storedManifest?.files ?? []).filter((file) => !serverPaths.has(file.path)
             && !(serverHasApp && file.path.startsWith(appPrefix)));
-          const staged = [...serverFiles, ...storedOnly];
+          // Firmware uploaded on its own fills what neither the server nor
+          // the package has (os0/vs0), read from its shared key.
+          const firmwareManifest = cache ? await cache.cacheReadManifest(cache.FIRMWARE_KEY) : null;
+          const known = new Set([...serverPaths, ...storedOnly.map((file) => file.path)]);
+          const firmwareOnly = (firmwareManifest?.files ?? []).filter((file) => !known.has(file.path));
+          stageKeys = new Map(firmwareOnly.map((file) => [file.path, cache.FIRMWARE_KEY]));
+          const staged = [...serverFiles, ...storedOnly, ...firmwareOnly];
+          if (!staged.some((file) => file.path.startsWith('os0/')))
+            notice('No firmware: upload it (a .zip of its os0 and vs0 folders) below the player.');
           // An empty manifest is allowed (a fixture, or a title with nothing
           // staged yet): say what to do, then let the launch report the rest.
           if (!staged.length)
@@ -689,6 +741,7 @@ async function run() {
             ...(Number.isSafeInteger(file.version) ? { version: file.version } : {}) }));
           stageCacheActive = storageSupported() && !!cache;
           stageCacheIndex = stageCacheActive ? cache.cacheIndexFor(storedManifest?.files, stageNeeded) : null;
+          if (stageCacheIndex) for (const [path, size] of cache.cacheIndexFor(firmwareOnly, stageNeeded)) stageCacheIndex.set(path, size);
           const useContentCache = (stageCacheIndex?.size ?? 0) > 0;
           document.body.dataset.cacheVerdict = stageCacheActive
             ? `${stageCacheIndex.size} of ${stageNeeded.length} files in storage`
@@ -706,7 +759,7 @@ async function run() {
             stageTotals.bytes ? 0 : undefined);
           worker.postMessage({ type: 'stage-files', root: '/vita', useContentCache,
             files: staged.map((file) => ({ ...file,
-              url: serverPaths.has(file.path) ? `/stage/${file.path}` : null })) });
+              url: serverPaths.has(file.path) ? `stage/${file.path}` : null })) });
         } catch (error) { if (worker !== currentWorker) return; log('manifest failed: ' + error); status.textContent = 'Staging failed'; notice(error.message); stop(true); }
         break;
       case 'stage-progress':
@@ -750,7 +803,7 @@ async function run() {
         if (stageCacheActive && cacheNS && stageCacheIndex?.get(data.path) === data.size
             && Number.isSafeInteger(data.size) && data.size >= 0 && typeof data.path === 'string') {
           try {
-            const hit = await cacheNS.cacheReadFile(cacheKey, data.path);
+            const hit = await cacheNS.cacheReadFile(stageKeys.get(data.path) ?? cacheKey, data.path);
             if (hit && hit.byteLength === data.size) bytes = hit;
           } catch { bytes = null; }
         }
