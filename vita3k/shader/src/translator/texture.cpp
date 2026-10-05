@@ -40,6 +40,12 @@ static spv::Id get_uv_coeffs(spv::Builder &b, const spv::Id std_builtins, spv::I
     const spv::Id i32 = b.makeIntType(32);
     const spv::Id v2i32 = b.makeVectorType(i32, 2);
 
+#ifdef __EMSCRIPTEN__
+    // WGSL (Naga) has no level-of-detail query; the browser's gather
+    // emulation samples level 0, so its weights come from level 0 too.
+    if (lod == spv::NoResult)
+        lod = b.makeFloatConstant(0.0f);
+#endif
     if (lod == spv::NoResult) {
         // compute the lod here
         const spv::Id query_lod = b.createOp(spv::OpImageQueryLod, v2f32, { sampled_image, coords });
@@ -118,6 +124,36 @@ spv::Id shader::usse::USSETranslatorVisitor::do_fetch_texture(const spv::Id tex,
     spv::Id image_sample = spv::NoResult;
     spv::Op op;
     std::vector<spv::Id> params = { tex, coord_id };
+#ifdef __EMSCRIPTEN__
+    if (gather4_comp != -1) {
+        // The browser converts SPIR-V to WGSL with Naga, which cannot read
+        // OpImageGather (the draw would be dropped: Persona 4 Golden's outdoor
+        // ground). Gather the 2x2 footprint by hand: sampling at each texel's
+        // center at LOD 0 returns that texel under any filter.
+        const spv::Id int_v2 = m_b.makeVectorType(m_b.makeIntType(32), 2);
+        const spv::Id image = m_b.createUnaryOp(spv::OpImage, m_b.getImageType(tex), tex);
+        const spv::Id size = m_b.createUnaryOp(spv::OpConvertSToF, type_f32_v[2],
+            m_b.createBinOp(spv::OpImageQuerySizeLod, int_v2, image, m_b.makeIntConstant(0)));
+        spv::Id uv = coord_id;
+        if (m_b.getNumComponents(uv) > 2)
+            uv = m_b.createOp(spv::OpVectorShuffle, type_f32_v[2], { { true, uv }, { true, uv }, { false, 0 }, { false, 1 } });
+        const auto vec2 = [&](float x, float y) {
+            return m_b.makeCompositeConstant(type_f32_v[2], { m_b.makeFloatConstant(x), m_b.makeFloatConstant(y) });
+        };
+        // The footprint's top-left texel: floor(uv * size - 0.5).
+        const spv::Id base = m_b.createBuiltinCall(type_f32_v[2], std_builtins, GLSLstd450Floor,
+            { m_b.createBinOp(spv::OpFSub, type_f32_v[2], m_b.createBinOp(spv::OpFMul, type_f32_v[2], uv, size), vec2(0.5f, 0.5f)) });
+        const auto texel = [&](float dx, float dy) {
+            const spv::Id center = m_b.createBinOp(spv::OpFDiv, type_f32_v[2],
+                m_b.createBinOp(spv::OpFAdd, type_f32_v[2], base, vec2(dx + 0.5f, dy + 0.5f)), size);
+            const spv::Id sample = m_b.createOp(spv::OpImageSampleExplicitLod, type_f32_v[4],
+                { tex, center, spv::ImageOperandsLodMask, m_b.makeFloatConstant(0.0f) });
+            return m_b.createBinOp(spv::OpVectorExtractDynamic, type_f32, sample, m_b.makeIntConstant(gather4_comp));
+        };
+        // OpImageGather's order: (0,1) (1,1) (1,0) (0,0).
+        image_sample = m_b.createCompositeConstruct(type_f32_v[4], { texel(0, 1), texel(1, 1), texel(1, 0), texel(0, 0) });
+    } else
+#endif
     if (gather4_comp != -1) {
         // The gpx support gather with a grad but I don't think this is possible with spirV
         op = spv::OpImageGather;
@@ -149,7 +185,8 @@ spv::Id shader::usse::USSETranslatorVisitor::do_fetch_texture(const spv::Id tex,
         }
     }
 
-    image_sample = m_b.createOp(op, type_f32_v[4], params);
+    if (image_sample == spv::NoResult) // the browser's gather emulation built it already
+        image_sample = m_b.createOp(op, type_f32_v[4], params);
 
     if (get_data_type_size(dest_type) < 4 && dest_type != DataType::UINT16 && dest_type != DataType::INT16)
         m_b.setPrecision(image_sample, spv::DecorationRelaxedPrecision);
