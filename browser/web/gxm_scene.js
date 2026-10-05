@@ -766,14 +766,17 @@ function encodeScene(words, data) {
       ++stats.draws;
       break;
     }
-    case 3: { // TEXTURE: id, width, height, levels, then per level offset,size
-      const id = word(), width = word(), height = word(), levels = word();
+    case 3: { // TEXTURE: id, width, height, levels (bit 16: RGBA float16 texels), then per level offset,size
+      const id = word(), width = word(), height = word(), levelsWord = word();
+      const levels = levelsWord & 0xffff;
+      const format = levelsWord & 0x10000 ? 'rgba16float' : 'rgba8unorm';
+      const texelBytes = format === 'rgba16float' ? 8 : 4;
       let entry = textures.get(id);
-      if (!entry || entry.width !== width || entry.height !== height || entry.levels !== levels) {
+      if (!entry || entry.width !== width || entry.height !== height || entry.levels !== levels || entry.format !== format) {
         entry?.texture.destroy();
-        const texture = device.createTexture({ size: [width, height], format: 'rgba8unorm', mipLevelCount: levels,
+        const texture = device.createTexture({ size: [width, height], format, mipLevelCount: levels,
           usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-        entry = { texture, view: texture.createView(), width, height, levels };
+        entry = { texture, view: texture.createView(), width, height, levels, format };
         textures.set(id, entry);
         // Texture groups referencing a destroyed texture must be rebuilt.
         textureGroups.clear();
@@ -782,7 +785,7 @@ function encodeScene(words, data) {
         const offset = word(), size = word();
         const w = Math.max(1, width >> level), h = Math.max(1, height >> level);
         device.queue.writeTexture({ texture: entry.texture, mipLevel: level },
-          data.subarray(offset, offset + size), { bytesPerRow: w * 4 }, [w, h]);
+          data.subarray(offset, offset + size), { bytesPerRow: w * texelBytes }, [w, h]);
       }
       ++stats.textureUploads;
       break;

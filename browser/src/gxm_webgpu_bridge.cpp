@@ -913,6 +913,10 @@ static bool swizzle_map(SceGxmTextureBaseFormat base, uint32_t swizzle, ChannelM
         map = two[mode];
         return true;
     }
+    case SCE_GXM_TEXTURE_BASE_FORMAT_F32:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_F32M:
+        // One float component (decoded to float16), swizzled like U8.
+        return swizzle_map(SCE_GXM_TEXTURE_BASE_FORMAT_U8, swizzle, map);
     case SCE_GXM_TEXTURE_BASE_FORMAT_UBC4:
     case SCE_GXM_TEXTURE_BASE_FORMAT_SBC4:
         // One decompressed component, swizzled like U8.
@@ -1018,8 +1022,27 @@ struct DecodedTexture {
     Address source = 0;     // guest bytes the chain is decoded from
     uint32_t footprint = 0;
     uint32_t width = 0, height = 0, levels = 0;
+    bool half_float = false; // levels hold RGBA float16 (F32, F32M), not RGBA unorm8
     std::array<std::pair<uint32_t, uint32_t>, 13> level_bytes; // offset, size in the scene data (4096 = 13 levels)
 };
+// IEEE half from float: rounds to nearest, flushes values too small for a
+// normal half to 0 and clamps large ones to the largest finite half.
+static uint16_t float_to_half(float value) {
+    const uint32_t bits = std::bit_cast<uint32_t>(value);
+    const uint16_t sign = uint16_t((bits >> 16) & 0x8000);
+    const int32_t exponent = int32_t((bits >> 23) & 0xff) - 127 + 15;
+    if (((bits >> 23) & 0xff) == 0xff)
+        return uint16_t(sign | 0x7c00 | ((bits & 0x7fffff) ? 0x200 : 0)); // inf, NaN
+    if (exponent <= 0)
+        return sign;
+    if (exponent >= 31)
+        return uint16_t(sign | 0x7bff);
+    const uint32_t mantissa = bits & 0x7fffff;
+    uint32_t half = (uint32_t(exponent) << 10) | (mantissa >> 13);
+    if ((mantissa & 0x1fff) > 0x1000 || ((mantissa & 0x1fff) == 0x1000 && (half & 1)))
+        ++half; // may carry into the exponent, which is still correct
+    return uint16_t(sign | std::min<uint32_t>(half, 0x7bff));
+}
 // `known_hash`: source hash of the copy the GPU already has; when the guest
 // bytes still hash to it, nothing is decoded and `decoded.levels` stays 0.
 // Video frames (libscemp4/avplayer): two-plane (Y, interleaved UV) or
@@ -1240,6 +1263,30 @@ static bool decode_texture(MemState &mem, const SceGxmTexture &t, scene::Writer 
         }
         const uint32_t bytes_per_pixel = texel_bytes ? texel_bytes : bpp / 8;
         uint32_t offset = 0;
+        if (base == SCE_GXM_TEXTURE_BASE_FORMAT_F32 || base == SCE_GXM_TEXTURE_BASE_FORMAT_F32M) {
+            // Float texels as RGBA float16 (WebGPU filters rgba16float; F32 is
+            // not filterable without an optional feature). F32M is a float with
+            // the sign bit ignored (renderer/src/texture/format.cpp).
+            const uint32_t sign_mask = base == SCE_GXM_TEXTURE_BASE_FORMAT_F32M ? 0x7fffffffu : 0xffffffffu;
+            uint8_t *dest = out.reserve(size_t(w) * h * 8, 4, offset);
+            for (uint32_t y = 0; y < h; ++y) {
+                const uint8_t *row = pixels + size_t(y) * stride * 4;
+                for (uint32_t x = 0; x < w; ++x) {
+                    uint32_t bits;
+                    std::memcpy(&bits, row + size_t(x) * 4, 4);
+                    const uint16_t value = float_to_half(std::bit_cast<float>(bits & sign_mask));
+                    uint16_t texel[4];
+                    for (int i = 0; i < 4; ++i)
+                        texel[i] = map[i] == Z ? 0 : map[i] == O ? 0x3c00 : value;
+                    std::memcpy(dest + (size_t(y) * w + x) * 8, texel, 8);
+                }
+            }
+            decoded.half_float = true;
+            decoded.level_bytes[level] = {offset, w * h * 8};
+            level_source += level_size(lw, lh);
+            lw = std::max(lw / 2, 1u); lh = std::max(lh / 2, 1u); w = std::max(w / 2, 1u); h = std::max(h / 2, 1u);
+            continue;
+        }
         uint8_t *dest = out.reserve(size_t(w) * h * 4, 4, offset);
         for (uint32_t y = 0; y < h; ++y) {
             const uint8_t *row = pixels + size_t(y) * stride * bytes_per_pixel;
@@ -1393,6 +1440,22 @@ static bool texels_in_target(const MemState &mem, const SceGxmTexture &t, Target
 // the whole surface (bit 31; bit 30 selects the pre-pass snapshot of the open
 // pass's own target), else a copy of its rectangle taken before the open
 // pass: what a tile-based GPU reads from memory during the scene.
+// Which texture a draw was skipped for: the reason alone does not say. Out of
+// line: the draw path must hold no container (invoke_* wrappers).
+[[gnu::noinline]] static void report_skipped_texture(const MemState &mem, const SceGxmTexture &t, const char *why) {
+    static std::array<Address, 20> reported{};
+    static size_t count = 0;
+    const Address address = t.data_addr << 2;
+    if (count == reported.size() || std::find(reported.begin(), reported.begin() + count, address) != reported.begin() + count)
+        return;
+    reported[count++] = address;
+    uint32_t mapped = 0; // bytes from the start that are valid guest memory
+    while (mapped < (64u << 20) && is_valid_addr(mem, address + mapped))
+        mapped += 4096;
+    std::printf("[gxm-skip] texture %08x format=%08x type=%08x %ux%u mips=%u mapped=%uKiB: %s\n", address,
+        uint32_t(gxm::get_format(t)), uint32_t(t.texture_type()), gxm::get_width(t), gxm::get_height(t),
+        uint32_t(t.mip_count), mapped / 1024, why);
+}
 static void bind_target_texels(const SceGxmTexture &t, const TargetTexels &at, scene::Writer &out, BoundTexture &bound) {
     bound.lod_max = 0;
     if (at.whole) {
@@ -1489,7 +1552,8 @@ static bool bind_texture(MemState &mem, const SceGxmTexture &t, scene::Writer &o
     out.word(entry.id);
     out.word(decoded.width);
     out.word(decoded.height);
-    out.word(decoded.levels);
+    // Bit 16: the levels are RGBA float16 (gxm_scene.js TEXTURE).
+    out.word(decoded.levels | (decoded.half_float ? 0x10000u : 0u));
     for (uint32_t level = 0; level < decoded.levels; ++level) {
         const auto [offset, size] = decoded.level_bytes[level];
         out.word(out.bytes(scratch.data.data() + offset, size, 4));
@@ -1665,8 +1729,9 @@ static void end_pass(scene::Writer &out) {
 static void begin_pass(WebContext &ctx, scene::Writer &out) {
     end_pass(out);
     const auto &color = ctx.record.color_surface;
-    GXM_TRACE("pass target=%08x format=%08x %ux%u stride=%u type=%d downscale=%d\n", color.data.address(),
-        uint32_t(color.colorFormat), color.width, color.height, color.strideInPixels, int(color.surfaceType), int(color.downscale));
+    GXM_TRACE("pass target=%08x format=%08x %ux%u stride=%u type=%d downscale=%d depth=%08x store=%u\n", color.data.address(),
+        uint32_t(color.colorFormat), color.width, color.height, color.strideInPixels, int(color.surfaceType), int(color.downscale),
+        ctx.has_depth_surface ? ctx.depth.depth_data.address() : 0u, ctx.has_depth_surface ? uint32_t(ctx.depth.force_store) : 0u);
     out.pass_begin_word = out.words.size();
     out.pass_regions.clear();
     out.word(scene::BeginPass);
@@ -1764,8 +1829,10 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
                 return skip_draw("sampled texture unit without a texture");
             BoundTexture bound;
             const char *why = "";
-            if (!bind_texture(mem, bound_units[unit].texture, out, bound, why))
+            if (!bind_texture(mem, bound_units[unit].texture, out, bound, why)) {
+                report_skipped_texture(mem, bound_units[unit].texture, why);
                 return skip_draw("texture: ", why);
+            }
             units[unit_count++] = {unit | (stage == 1 ? 16u : 0u), bound};
         }
     }
