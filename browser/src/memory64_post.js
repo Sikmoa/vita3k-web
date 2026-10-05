@@ -40,7 +40,17 @@ if (ENVIRONMENT_IS_PTHREAD) {
     Module['vita3kAotModule'] = new WebAssembly.Module(require('fs').readFileSync(process.env.VITA3K_AOT));
   }
   const vita3kLoadWorker = PThread.loadWasmModuleToWorker;
+  // An AOT image built at launch on a pthread (vita_app.cpp) comes back
+  // here for the whole pool. Emscripten ignores messages without a cmd. The
+  // initial pool loaded before this file ran, so it is listened to here.
+  const vita3kListen = (worker) => worker.addEventListener('message', (event) => {
+    if (!(event.data?.vita3kAotModule instanceof WebAssembly.Module)) return;
+    Module['vita3kAotModule'] = event.data.vita3kAotModule;
+    Module['vita3kConfigureWorkers']();
+  });
+  PThread.unusedWorkers.forEach(vita3kListen);
   PThread.loadWasmModuleToWorker = (worker) => {
+    vita3kListen(worker);
     worker.postMessage({vita3kWorkerConfig: vita3kWorkerConfig()});
     return vita3kLoadWorker(worker);
   };
@@ -68,9 +78,12 @@ if (ENVIRONMENT_IS_PTHREAD) {
     }, 50);
     return () => clearInterval(timer);
   };
+  // Idle Workers and running ones: a running thread's Worker keeps the
+  // vita3kMessage wrapper, and the AOT module is only read when a thread
+  // first enters guest code (an AOT image built at launch arrives late).
   Module['vita3kConfigureWorkers'] = () => {
     const config = vita3kWorkerConfig();
-    for (const worker of PThread.unusedWorkers)
+    for (const worker of [...PThread.unusedWorkers, ...Object.values(PThread.pthreads)])
       worker.postMessage({vita3kWorkerConfig: config});
   };
 }

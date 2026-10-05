@@ -398,6 +398,14 @@ EM_JS(bool, vita3k_aot_install_bytes, (const uint8_t *data, uint32_t size), {
     try {
         const bytes = Module['vita3kHostBytes'](data, size).slice();
         Module['vita3kAotModule'] = new WebAssembly.Module(bytes);
+        // Threaded build: guest threads instantiate the module in their own
+        // Workers, which were configured before this image existed. A pthread
+        // (where launch runs) hands it to the main runtime thread, which
+        // owns the pool (memory64_post.js).
+        if (typeof ENVIRONMENT_IS_PTHREAD !== 'undefined' && ENVIRONMENT_IS_PTHREAD)
+            postMessage({vita3kAotModule: Module['vita3kAotModule']});
+        else
+            Module['vita3kConfigureWorkers']?.();
         return true;
     } catch (error) {
         err('[vita3k-web] AOT build-at-load install failed: ' + error);

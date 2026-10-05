@@ -117,8 +117,9 @@ Busy Workers are counted from `PThread.pthreads` (Emscripten 6 has no
 `runningWorkers`). `Module.vita3kPoolStats()` reports idle, busy and misses.
 Every Worker receives the compiled AOT `WebAssembly.Module` and the `VITA3K_*`
 options in a message posted before Emscripten's load message;
-`vita3kConfigureWorkers()` updates idle Workers once staging has compiled the
-AOT image. A Worker instantiates the AOT image on its first guest entry, not
+`vita3kConfigureWorkers()` updates idle and running Workers once staging has
+compiled the AOT image, and again when an uploaded game builds its image at
+launch (`?buildAot=1`). A Worker instantiates the AOT image on its first guest entry, not
 when it joins the pool.
 
 Memory per pooled Worker (JS heap, instance, region cache) is estimated at
