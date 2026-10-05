@@ -330,6 +330,27 @@ foreach(_module IN LISTS _wasi_shim_modules)
 endforeach()
 vita3k_web_dist_copy(shaders/gxp_compiler.mjs "${_gxp_compiler_dir}/gxp_compiler.mjs")
 vita3k_web_dist_copy(shaders/gxp_compiler.wasm "${_gxp_compiler_dir}/gxp_compiler.wasm")
+# dist/decrypt/: the game decryptor (browser/decrypt) that decrypt_worker.js
+# runs on uploaded encrypted dumps, its own wasm32 project like the GXP
+# compiler. Both memory models stage into one dist: the single-threaded
+# build builds it. It fetches the OpenSSL source tarball once.
+if(NOT VITA3K_WEB_THREADS)
+    set(_decrypt_dir "${CMAKE_CURRENT_BINARY_DIR}/decrypt")
+    set(_decrypt_args "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}" -DCMAKE_BUILD_TYPE=Release -G Ninja)
+    if(DEFINED VITA3K_DECRYPT_OPENSSL_URL)
+        list(APPEND _decrypt_args "-DVITA3K_DECRYPT_OPENSSL_URL=${VITA3K_DECRYPT_OPENSSL_URL}")
+    endif()
+    ExternalProject_Add(vita3k_decrypt
+        SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/decrypt"
+        BINARY_DIR "${_decrypt_dir}"
+        CMAKE_ARGS ${_decrypt_args}
+        INSTALL_COMMAND ""
+        BUILD_ALWAYS ON # the inner build tracks its sources itself
+        BUILD_BYPRODUCTS "${_decrypt_dir}/vita3k_decrypt.mjs" "${_decrypt_dir}/vita3k_decrypt.wasm"
+    )
+    vita3k_web_dist_copy(decrypt/vita3k_decrypt.mjs "${_decrypt_dir}/vita3k_decrypt.mjs")
+    vita3k_web_dist_copy(decrypt/vita3k_decrypt.wasm "${_decrypt_dir}/vita3k_decrypt.wasm")
+endif()
 vita3k_web_dist_copy(shaders/naga.wasm "${_naga}/wasi/naga.wasm")
 vita3k_web_dist_copy(shaders/naga-LICENSE-MIT "${_naga}/LICENSE-MIT")
 vita3k_web_dist_copy(shaders/naga-LICENSE-APACHE "${_naga}/LICENSE-APACHE")
@@ -402,6 +423,9 @@ if(VITA3K_WEB_JIT_TARGET)
 endif()
 add_custom_target(vita3k_web_dist ALL DEPENDS ${_dist_outputs})
 add_dependencies(vita3k_web_dist vita3k_gxp_compiler)
+if(TARGET vita3k_decrypt)
+    add_dependencies(vita3k_web_dist vita3k_decrypt)
+endif()
 if(TARGET vita3k_threads_probe)
     add_dependencies(vita3k_web_dist vita3k_threads_probe)
 endif()

@@ -85,6 +85,36 @@ export async function cacheWriteFile(key, relPath, bytes) {
   }
 }
 
+// A file of a title's content written from a ReadableStream (bounded memory).
+export async function cacheWriteStream(key, relPath, stream) {
+  const segments = relPath.split('/');
+  const dir = await openDir(true, ...contentParts(key), ...segments.slice(0, -1));
+  const handle = await dir.getFileHandle(segments[segments.length - 1], { create: true });
+  const writable = await handle.createWritable();
+  await stream.pipeTo(writable);
+  return (await handle.getFile()).size;
+}
+// A stored file as a File (a Blob read lazily), or null.
+export async function cacheGetFile(key, relPath) {
+  try {
+    const segments = relPath.split('/');
+    const dir = await openDir(false, ...contentParts(key), ...segments.slice(0, -1));
+    return await (await dir.getFileHandle(segments[segments.length - 1])).getFile();
+  } catch {
+    return null;
+  }
+}
+// A synchronous access handle on a new, empty file of a title's content:
+// dedicated Workers only (decrypt_worker.js writes decrypted files through it).
+export async function cacheOpenSync(key, relPath) {
+  const segments = relPath.split('/');
+  const dir = await openDir(true, ...contentParts(key), ...segments.slice(0, -1));
+  const handle = await dir.getFileHandle(segments[segments.length - 1], { create: true });
+  const access = await handle.createSyncAccessHandle();
+  access.truncate(0);
+  return access;
+}
+
 export async function cacheClear(key) {
   for (const parts of [contentParts(key), metaParts(key)]) {
     try {

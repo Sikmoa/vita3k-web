@@ -119,10 +119,22 @@ Enable it under Settings → Pages → Source: GitHub Actions.
 
 A static site ships no game, firmware or AOT image. Visitors upload the
 firmware and then a game; the first game reloads the page into
-`?title=<id>`, and later visits open the first stored title. Content must be
-decrypted already (the browser has no PUP/PKG/NoNpDrm decryption): a
-firmware installed by desktop Vita3K and a decrypted dump or a game folder
-installed by it. Uploaded games build their AOT image at launch.
+`?title=<id>`, and later visits open the first stored title. Uploaded games
+build their AOT image at launch. The firmware must be installed already (a
+desktop Vita3K install's `os0`/`vs0`); games may be encrypted dumps (below).
+
+## Encrypted games
+
+An upload holding a NoNpDrm dump — its app folder with `sce_pfs/` and the
+license `sce_sys/package/work.bin`, as dumping tools and PSN downloads
+unpack — is decrypted as it is stored, the way desktop Vita3K installs one:
+`decrypt_worker.js` runs `dist/decrypt/vita3k_decrypt` (browser/decrypt:
+psvpfstools' PFS parser and Vita3K's SELF decryption over OpenSSL's
+libcrypto, built from the release tarball with Emscripten). It decrypts one
+file per call and streams each into storage through a synchronous access
+handle, so memory holds one SELF at most, whatever the game's size. Stored
+zip entries are read in place; deflated ones are inflated into storage first.
+`.pkg` files with a zRIF, and the firmware's `PSVUPDAT.PUP`, are not read.
 
 GitHub Pages sends no headers, so `coi.js` registers `coi_sw.js`, a service
 worker that adds the cross-origin isolation headers to every same-origin

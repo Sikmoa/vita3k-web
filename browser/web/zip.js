@@ -86,8 +86,8 @@ export async function listZipEntries(blob) {
   return out;
 }
 
-// Raw bytes of one entry, CRC-checked. Only stored (0) and deflated (8).
-export async function extractZipEntry(blob, entry) {
+// Where one entry's (possibly compressed) data starts in the archive.
+export async function zipEntryDataOffset(blob, entry) {
   if (entry.dir) throw new Error(`cannot extract directory: ${entry.name}`);
   if (entry.method !== 0 && entry.method !== 8)
     throw new Error(`unsupported zip method ${entry.method}: ${entry.name}`);
@@ -96,7 +96,20 @@ export async function extractZipEntry(blob, entry) {
   const headView = new DataView(head.buffer, head.byteOffset, head.byteLength);
   if (headView.getUint32(0, true) !== LF_SIG)
     throw new Error(`zip local header missing for ${entry.name}`);
-  const dataOffset = entry.localOffset + 30 + headView.getUint16(26, true) + headView.getUint16(28, true);
+  return entry.localOffset + 30 + headView.getUint16(26, true) + headView.getUint16(28, true);
+}
+
+// One entry's bytes without reading them: a Blob slice of the archive for a
+// stored entry, an inflating ReadableStream for a deflated one (no CRC check).
+export async function zipEntrySource(blob, entry) {
+  const dataOffset = await zipEntryDataOffset(blob, entry);
+  const raw = blob.slice(dataOffset, dataOffset + entry.compSize);
+  return entry.method === 0 ? raw : raw.stream().pipeThrough(new DecompressionStream('deflate-raw'));
+}
+
+// Raw bytes of one entry, CRC-checked. Only stored (0) and deflated (8).
+export async function extractZipEntry(blob, entry) {
+  const dataOffset = await zipEntryDataOffset(blob, entry);
   const raw = new Uint8Array(await blob.slice(dataOffset, dataOffset + entry.compSize).arrayBuffer());
   if (raw.byteLength !== entry.compSize)
     throw new Error(`zip archive is truncated at ${entry.name}`);

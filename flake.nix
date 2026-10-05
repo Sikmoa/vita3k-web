@@ -20,6 +20,7 @@
           ninja
           pkg-config
           python3
+          perl # OpenSSL's Configure (browser/decrypt)
 
           # Native compiler/toolchain
           clang

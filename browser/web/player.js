@@ -560,13 +560,25 @@ async function uploadPackage(file, firmware) {
     const packageKey = `${sanitizeSegment(contents.title)}/${sanitizeSegment(contents.app)}`;
     const totalBytes = contents.files.reduce((sum, entry) => sum + entry.size, 0);
     let lastNotice = 0;
-    const result = await cache.unpackPackageToCache(file, packageKey,
-      (done, total, path, doneBytes) => {
+    // An encrypted dump (NoNpDrm: a PFS image and its license) is decrypted
+    // into storage as it unpacks (decrypt_worker.js).
+    const appRoot = `ux0/app/${contents.app}/`;
+    const encrypted = !contents.firmware && contents.files.some((entry) => entry.path === appRoot + 'sce_pfs/files.db')
+      && contents.files.some((entry) => entry.path === appRoot + 'sce_sys/package/work.bin');
+    const result = encrypted
+      ? await decryptPackage(file, contents, packageKey, appRoot, (done, path) => {
         const now = performance.now();
-        if (now - lastNotice < 200 && done < total) return;
+        if (now - lastNotice < 200) return;
         lastNotice = now;
-        notice(`Unpacking ${path} — ${done}/${total} files · ${mib(doneBytes)}/${mib(totalBytes)} MiB`);
-      });
+        notice(`Decrypting ${path} — ${mib(done)}/${mib(totalBytes)} MiB`);
+      })
+      : await cache.unpackPackageToCache(file, packageKey,
+        (done, total, path, doneBytes) => {
+          const now = performance.now();
+          if (now - lastNotice < 200 && done < total) return;
+          lastNotice = now;
+          notice(`Unpacking ${path} — ${done}/${total} files · ${mib(doneBytes)}/${mib(totalBytes)} MiB`);
+        });
     try { await navigator.storage.persist?.(); } catch {}
     const secs = Math.round((performance.now() - started) / 1000);
     log(`package stored: ${result.title} — ${result.files} files · ${mib(result.bytes)} MiB` +
@@ -589,6 +601,27 @@ async function uploadPackage(file, firmware) {
   } finally {
     runButton.disabled = wasDisabled; uploadButton.disabled = false; firmwareButton.disabled = false;
   }
+}
+// Runs decrypt_worker.js on an encrypted dump; resolves like
+// unpackPackageToCache: { title, app, files, bytes }.
+function decryptPackage(archive, contents, key, appRoot, onProgress) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker('./decrypt_worker.js', { type: 'module' });
+    worker.onerror = (event) => { worker.terminate(); reject(new Error('decryption worker: ' + event.message)); };
+    worker.onmessage = ({ data }) => {
+      if (data.type === 'progress') onProgress(data.done, data.path);
+      else {
+        worker.terminate();
+        if (data.type === 'error') reject(new Error('decryption failed: ' + data.message));
+        else {
+          log(`decrypted ${contents.title}: ${data.decrypted} PFS files, ${data.selfs} SELFs`);
+          resolve({ title: contents.title, app: contents.app, files: data.files.length, bytes: data.bytes });
+        }
+      }
+    };
+    worker.postMessage({ type: 'decrypt', archive, key, appRoot,
+      files: contents.files.map(({ path, size, entry }) => ({ path, size, entry })) });
+  });
 }
 // Whether this browser holds firmware: shown next to its upload button.
 async function refreshFirmwareStatus() {

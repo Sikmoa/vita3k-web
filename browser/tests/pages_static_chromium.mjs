@@ -9,7 +9,9 @@
 // PAGES_PARAMS (default threads=1) adds query parameters; PAGES_FRAMES (60)
 // is how many frames count as a boot; PAGES_DEADLINE_MS (240000) bounds it.
 // PLAYWRIGHT_MODULE_URL / PLAYWRIGHT_CHROMIUM_EXECUTABLE select local
-// installs; PAGES_GPU=1 uses the hardware adapter; PAGES_LOG=<file> keeps the
+// installs; PAGES_GPU=1 uses the hardware adapter. An encrypted (NoNpDrm) game
+// package is decrypted on upload: the stored title must hold no sce_pfs/.
+// PAGES_LOG=<file> keeps the
 // page and worker console.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -84,6 +86,14 @@ try {
   const title = new URL(page.url()).searchParams.get('title');
   console.log('game:', title);
   assert.equal(await page.locator('#game-title').textContent() !== 'No game yet', true);
+  const stored = await page.evaluate(async (title) => {
+    let dir = await navigator.storage.getDirectory();
+    for (const part of ['vita3k-meta', title, title]) dir = await dir.getDirectoryHandle(part);
+    return JSON.parse(await (await (await dir.getFileHandle('manifest.json')).getFile()).text()).files.map((file) => file.path);
+  }, title);
+  assert.ok(stored.some((path) => path.endsWith('/eboot.bin')), 'the game is stored');
+  assert.ok(!stored.some((path) => path.includes('/sce_pfs/')), 'an encrypted game is stored decrypted');
+  console.log('stored:', stored.length, 'files');
 
   await page.locator('#run').click();
   let frames = 0;
