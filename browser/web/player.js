@@ -73,6 +73,22 @@ const status = document.querySelector('#status'), stats = document.querySelector
 const logBox = document.querySelector('#log'), runButton = document.querySelector('#run');
 const stopButton = document.querySelector('#stop'), warningBox = document.querySelector('#warning');
 const beepButton = document.querySelector('#beep');
+// Saves of the selected title as a .zip laid out like the Vita filesystem
+// (ux0/user/00/savedata/<title>/...), for backups or moving them elsewhere.
+document.querySelector('#download-saves').onclick = async () => {
+  const saveAPI = storageSupported() ? await cacheAPI() : null;
+  if (!saveAPI) { notice('This browser has no persistent storage, so there are no saves to download.'); return; }
+  const saves = await saveAPI.readSaves(TITLE).catch(() => []);
+  if (!saves.length) { notice(`No saves for ${TITLE} in this browser yet.`); return; }
+  const { createZip } = await import('./zip.js');
+  const zip = createZip(saves.map(({ path, bytes }) => ({ path: `ux0/user/00/savedata/${TITLE}/${path}`, bytes })));
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(zip);
+  link.download = `${TITLE}-saves.zip`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+  log(`saves: downloaded ${saves.length} file(s) for ${TITLE}`);
+};
 const display = document.querySelector('#display'), shell = document.querySelector('#player-shell');
 const welcome = document.querySelector('#welcome'), fpsLabel = document.querySelector('#fps');
 // Launch status under the "Starting your game…" overlay: the phase, a

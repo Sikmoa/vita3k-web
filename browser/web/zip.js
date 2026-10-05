@@ -113,3 +113,31 @@ export async function extractZipEntry(blob, entry) {
     throw new Error(`CRC mismatch unpacking ${entry.name}: file is corrupt`);
   return bytes;
 }
+
+// A store-only (uncompressed) zip of [{ path, bytes }], for downloads such as
+// exported saves. Paths use '/' and no leading slash.
+export function createZip(files) {
+  const encoder = new TextEncoder();
+  const parts = [], central = [];
+  let offset = 0;
+  for (const { path, bytes } of files) {
+    const name = encoder.encode(path);
+    const crc = crc32(bytes);
+    const local = new DataView(new ArrayBuffer(30));
+    local.setUint32(0, 0x04034b50, true); local.setUint16(4, 20, true);
+    local.setUint32(14, crc, true); local.setUint32(18, bytes.length, true); local.setUint32(22, bytes.length, true);
+    local.setUint16(26, name.length, true);
+    parts.push(local, name, bytes);
+    const entry = new DataView(new ArrayBuffer(46));
+    entry.setUint32(0, 0x02014b50, true); entry.setUint16(4, 20, true); entry.setUint16(6, 20, true);
+    entry.setUint32(16, crc, true); entry.setUint32(20, bytes.length, true); entry.setUint32(24, bytes.length, true);
+    entry.setUint16(28, name.length, true); entry.setUint32(42, offset, true);
+    central.push(entry, name);
+    offset += 30 + name.length + bytes.length;
+  }
+  const centralSize = central.reduce((sum, part) => sum + part.byteLength, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+  end.setUint32(12, centralSize, true); end.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, end], { type: 'application/zip' });
+}
