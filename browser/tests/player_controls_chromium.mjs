@@ -8,6 +8,7 @@ import { createServer } from 'node:http';
 import { readFile, mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
+import { createZip } from '../web/zip.js';
 
 const web = fileURLToPath(new URL('../web/', import.meta.url));
 const fixture = `
@@ -139,6 +140,36 @@ try {
   await expectPad(desktop, 0, [0, 0, 0, 0]);
   await desktop.locator('#stop').click();
   assert.equal(await desktop.locator('#run').isEnabled(), true);
+
+  // Saves upload: the Download button's zip restores, a second one replaces it.
+  const savesZip = async (files) => ({ name: 'saves.zip', mimeType: 'application/zip',
+    buffer: Buffer.from(await createZip(files.map(([path, text]) => ({ path, bytes: new TextEncoder().encode(text) }))).arrayBuffer()) });
+  const storedSaves = () => desktop.evaluate(async () => {
+    const out = {};
+    const walk = async (dir, prefix) => {
+      for await (const [name, handle] of dir.entries()) {
+        if (handle.kind === 'directory') await walk(handle, prefix + name + '/');
+        else out[prefix + name] = await (await handle.getFile()).text();
+      }
+    };
+    try {
+      let dir = await navigator.storage.getDirectory();
+      for (const part of ['vita3k-saves', 'PCSE00268']) dir = await dir.getDirectoryHandle(part);
+      await walk(dir, '');
+    } catch {}
+    return out;
+  });
+  await desktop.locator('#saves-file').setInputFiles(await savesZip([
+    ['ux0/user/00/savedata/PCSE00268/system.bin', 'one'], ['ux0/user/00/savedata/PCSE00268/slot/data.bin', 'two']]));
+  await desktop.waitForFunction(() => /Restored 2 save file/.test(document.body.innerText));
+  assert.deepEqual(await storedSaves(), { 'system.bin': 'one', 'slot/data.bin': 'two' });
+  desktop.once('dialog', (dialog) => dialog.accept());
+  await desktop.locator('#saves-file').setInputFiles(await savesZip([['PCSE00268/system.bin', 'three']]));
+  await desktop.waitForFunction(() => /Restored 1 save file/.test(document.body.innerText));
+  assert.deepEqual(await storedSaves(), { 'system.bin': 'three' });
+  await desktop.locator('#saves-file').setInputFiles(await savesZip([['ux0/user/00/savedata/PCSE00120/system.bin', 'x']]));
+  await desktop.waitForFunction(() => /holds saves for PCSE00120, not PCSE00268/.test(document.body.innerText));
+  assert.deepEqual(await storedSaves(), { 'system.bin': 'three' });
 
   const phone = await open({ viewport: { width: 844, height: 390 }, hasTouch: true, isMobile: true });
   assert.equal(await phone.locator('#title-picker').isVisible(), true, 'landscape keeps title selection accessible');
@@ -274,7 +305,7 @@ try {
     }
   }
   assert.deepEqual(errors, []);
-  console.log('PASS: keyboard, gamepads, multitouch sticks/buttons, D-pad diagonals, cancellation, dialogs/IME, restart, fullscreen fallback, and five phone layouts at three control sizes; zero page errors.');
+  console.log('PASS: keyboard, gamepads, saves upload, multitouch sticks/buttons, D-pad diagonals, cancellation, dialogs/IME, restart, fullscreen fallback, and five phone layouts at three control sizes; zero page errors.');
 } finally {
   await browser?.close();
   await new Promise((done) => server.close(done));

@@ -5,7 +5,7 @@
 // package lacks (firmware above all) come from the server and are cached the
 // same way on first use. Runs on the page and in the worker; every read
 // degrades to a miss and every call reports failure with a message.
-import { listZipEntries, extractZipEntry, normalizeEntryPath } from './zip.js';
+import { listZipEntries, extractZipEntry, normalizeEntryPath, zipEntryStream } from './zip.js';
 
 export function contentCacheSupported() {
   try {
@@ -24,7 +24,8 @@ export function cacheKeyFor(title, app) {
 // shared by every title; it is not a title (no title id has a leading _).
 export const FIRMWARE_TITLE = '_firmware';
 export const FIRMWARE_KEY = cacheKeyFor(FIRMWARE_TITLE, FIRMWARE_TITLE);
-const FIRMWARE_ROOTS = new Set(['os0', 'vs0']);
+// System software (os0 + vs0) and the font package (sa0).
+const FIRMWARE_ROOTS = new Set(['os0', 'vs0', 'sa0']);
 
 const contentParts = (key) => ['vita3k-content', ...key.split('/')];
 const metaParts = (key) => ['vita3k-meta', ...key.split('/')];
@@ -94,6 +95,11 @@ export async function cacheWriteStream(key, relPath, stream) {
   await stream.pipeTo(writable);
   return (await handle.getFile()).size;
 }
+// One zip entry into a title's content, streamed (memory stays bounded
+// whatever the file's size) and checked; returns its size. onBytes(n) as it goes.
+export async function cacheWriteZipEntry(key, relPath, archive, entry, onBytes) {
+  return cacheWriteStream(key, relPath, await zipEntryStream(archive, entry, onBytes));
+}
 // A stored file as a File (a Blob read lazily), or null.
 export async function cacheGetFile(key, relPath) {
   try {
@@ -113,6 +119,15 @@ export async function cacheOpenSync(key, relPath) {
   const access = await handle.createSyncAccessHandle();
   access.truncate(0);
   return access;
+}
+
+// One file or folder of a title's content (its manifest is the caller's).
+export async function cacheRemovePath(key, relPath) {
+  const segments = relPath.split('/');
+  try {
+    const dir = await openDir(false, ...contentParts(key), ...segments.slice(0, -1));
+    await dir.removeEntry(segments[segments.length - 1], { recursive: true });
+  } catch {}
 }
 
 export async function cacheClear(key) {
@@ -246,9 +261,10 @@ export async function packageContents(blob) {
   return { title: best.title, app: best.title, files: shipped };
 }
 
-// An archive of firmware alone: os0/ and vs0/ (an installed firmware's
-// folders, e.g. from desktop Vita3K's data directory), optionally under
-// wrapper folders. Returns null when it holds no firmware.
+// An archive of firmware alone: os0/ and vs0/ and/or the font package's
+// sa0/ (an installed firmware's folders, e.g. from desktop Vita3K's data
+// directory), optionally under wrapper folders. Returns null when it holds
+// no firmware.
 function firmwareContents(files) {
   let depth = -1;
   for (const file of files) {
@@ -262,8 +278,8 @@ function firmwareContents(files) {
     if (segments.length <= depth + 1 || !FIRMWARE_ROOTS.has(segments[depth])) continue;
     shipped.push({ path: segments.slice(depth).join('/'), size: file.entry.size, entry: file.entry });
   }
-  if (!shipped.some((file) => file.path.startsWith('vs0/')) || !shipped.some((file) => file.path.startsWith('os0/')))
-    throw new Error('firmware needs both its os0/ and vs0/ folders');
+  if (shipped.some((file) => file.path.startsWith('vs0/')) !== shipped.some((file) => file.path.startsWith('os0/')))
+    throw new Error('the system software needs both its os0/ and vs0/ folders');
   return { title: FIRMWARE_TITLE, app: FIRMWARE_TITLE, firmware: true, files: shipped };
 }
 
@@ -334,33 +350,42 @@ async function barePackageContents(blob, files) {
 }
 
 // Store a package under its own title's key. onProgress(done, total, path,
-// doneBytes, totalBytes). Returns { title, app, files, bytes }.
+// doneBytes, totalBytes). Returns { title, app, files, bytes }. Firmware
+// replaces only the folders it holds (os0/vs0, sa0) and keeps the others.
 export async function unpackPackageToCache(blob, key, onProgress) {
   const contents = await packageContents(blob);
   const totalBytes = contents.files.reduce((sum, file) => sum + file.size, 0);
-  await cacheClear(key);
+  let kept = [];
+  if (contents.firmware) {
+    const roots = new Set(contents.files.map((file) => file.path.split('/')[0]));
+    kept = ((await cacheReadManifest(key))?.files ?? []).filter((file) => !roots.has(file.path.split('/')[0]));
+    for (const root of roots) await cacheRemovePath(key, root);
+  } else {
+    await cacheClear(key);
+  }
   const stored = [];
   let bytes = 0;
   try {
     for (const file of contents.files) {
-      const payload = await extractZipEntry(blob, file.entry);
-      if (payload.byteLength !== file.size)
-        throw new Error(`size mismatch in ${file.path}: ${payload.byteLength} != ${file.size}`);
-      await cacheWriteFile(key, file.path, payload);
+      // Streamed: one entry can be larger than a page may hold (Persona 4
+      // Golden's data.cpk is 1.8 GiB).
+      await cacheWriteZipEntry(key, file.path, blob, file.entry, (chunk) => {
+        bytes += chunk;
+        onProgress?.(stored.length, contents.files.length, file.path, bytes, totalBytes);
+      });
       stored.push({ path: file.path, size: file.size });
-      bytes += payload.byteLength;
       onProgress?.(stored.length, contents.files.length, file.path, bytes, totalBytes);
     }
   } catch (error) {
     // Keep what unpacked cleanly so a re-upload only has to finish the tail.
-    if (stored.length) {
-      try { await cacheWriteManifest(key, stored); } catch {}
+    if (stored.length || kept.length) {
+      try { await cacheWriteManifest(key, [...kept, ...stored]); } catch {}
     } else {
       try { await cacheClear(key); } catch {}
     }
     throw error;
   }
-  await cacheWriteManifest(key, stored);
+  await cacheWriteManifest(key, [...kept, ...stored]);
   return { title: contents.title, app: contents.app, files: stored.length, bytes };
 }
 
@@ -394,6 +419,43 @@ export async function writeSave(title, relPath, bytes) {
   } finally {
     await writable.close();
   }
+}
+
+// Every save of a title (before a restore replaces them).
+export async function clearSaves(title) {
+  const parts = saveParts(title);
+  try {
+    const parent = await openDir(false, ...parts.slice(0, -1));
+    await parent.removeEntry(parts[parts.length - 1], { recursive: true });
+  } catch {}
+}
+
+// Which files of a saves archive are a title's saves: [{ entry, path }] with
+// paths relative to its savedata folder. Accepts the Download button's zip
+// (ux0/user/00/savedata/<title>/…), any archive holding a savedata/<title>/ or
+// <title>/ folder (desktop Vita3K's, zipped), or a save folder's bare contents.
+// Throws when the archive holds another title's saves or looks like a game.
+export function savesInArchive(entries, title) {
+  const files = entries.filter((entry) => !entry.dir)
+    .map((entry) => ({ entry, segments: normalizeEntryPath(entry.name)?.split('/') }))
+    .filter((file) => file.segments);
+  const under = (match) => files.flatMap(({ entry, segments }) => {
+    const at = segments.findIndex(match);
+    return at < 0 ? [] : [{ entry, path: segments.slice(at + 1).join('/') }];
+  }).filter((file) => file.path);
+  let saves = under((segment, i, all) => segment === title && all[i - 1] === 'savedata');
+  if (!saves.length) saves = under((segment) => segment === title);
+  if (saves.length) return saves;
+  const others = new Set(files.flatMap(({ segments }) => {
+    const at = segments.indexOf('savedata');
+    return at >= 0 && segments[at + 1] ? [segments[at + 1]] : [];
+  }));
+  if (others.size) throw new Error(`this archive holds saves for ${[...others].join(', ')}, not ${title}`);
+  if (files.some(({ segments }) => /^(eboot\.bin|sce_pfs|sce_module|os0|vs0|app)$/i.test(segments[0])))
+    throw new Error('this looks like a game or firmware archive, not saves');
+  const bytes = files.reduce((sum, { entry }) => sum + entry.size, 0);
+  if (bytes > 256 * 1048576) throw new Error('too large for saves (over 256 MiB)');
+  return files.map(({ entry, segments }) => ({ entry, path: segments.join('/') }));
 }
 
 export async function removeSave(title, relPath) {

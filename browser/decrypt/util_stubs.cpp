@@ -1,10 +1,21 @@
-// The two Vita3K util functions sce_utils.cpp calls, without the rest of
+// The Vita3K util functions sce_utils.cpp and pup.cpp call, without the rest of
 // vita3k/util (SDL, the config and log setup the decryptor has no use for).
 #include <util/fs.h>
 #include <util/string_utils.h>
 
+#include <fstream>
+#include <iterator>
+
 namespace fs_utils {
 std::string path_to_utf8(const fs::path &path) { return path.string(); }
+fs::path path_concat(const fs::path &path, const fs::path &suffix) { return fs::path(path.string() + suffix.string()); }
+bool read_data(const fs::path &path, std::vector<char> &data) {
+    std::ifstream file(path.string(), std::ios::binary);
+    if (!file)
+        return false;
+    data.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    return true;
+}
 } // namespace fs_utils
 
 namespace string_utils {

@@ -95,13 +95,20 @@ never seen. Accepted layouts: `ux0/…`, `app/<id>/…` and either of those unde
 wrapper folders; anything outside the title's own directory (firmware the
 package happens to carry, for instance) is kept at its device root.
 
-**Firmware comes from the server or its own upload** (`os0`/`vs0`): it is
-console system software, not part of any game package. From the server it
-downloads on a title's first boot and is cached like everything else. The
-**Firmware** upload takes a `.zip` holding the `os0` and `vs0` folders of
-an installed firmware (desktop Vita3K keeps them in its data directory),
-stores it once and lends it to every title; the server's or a package's own
-copy of a file wins over it. Each
+**Firmware comes from the server or its own upload**: the system software
+(`os0`/`vs0`) and the font package (`sa0`, which games that draw text with
+the system fonts read), console software rather than part of any game. From
+the server it downloads on a title's first boot and is cached like
+everything else. The **Firmware** upload takes Sony's files as desktop
+Vita3K does — the system software `.PUP` (`PSVUPDAT.PUP` /
+`PSP2UPDAT.PUP`, 3.74 recommended) and the font package `.PUP` — or a
+`.zip` of an installed firmware's `os0`/`vs0` and/or `sa0` folders. A
+`.PUP` is installed and its modules decrypted in decrypt_worker.js
+(Vita3K's install_pup); the pre-install package (`pd0`) is skipped, as no
+game loads it. Each upload replaces only the folders it holds, so the system
+software and the fonts can come one after the other. The firmware is stored
+once and lent to every title; the server's or a package's own copy of a file
+wins over it. Each
 boot merges two sources — the server's manifest and the stored files for that
 title — and the staging line says which is which (`Reading <path> from
 storage` vs `Downloading <path>`, with read/download counters). A file the
@@ -109,6 +116,17 @@ server has and the package does not is downloaded; a file only the package
 has comes from storage, and a miss there is an error rather than a doomed
 fetch. Patches always come from the server. An unreadable or empty archive is
 rejected before anything stored is touched.
+Each file streams from the archive into storage, CRC-checked, so memory stays
+small whatever a file's size (Persona 4 Golden's 2.9 GiB archive holds a
+1.8 GiB file).
+
+**Saves** stay in this browser per title and reach the game at launch.
+**Download** exports them as a `.zip` (`ux0/user/00/savedata/<title>/…`);
+**Upload** restores one into the current title, replacing its saves after a
+confirmation. It takes the Download zip, any archive with a
+`savedata/<title>/` or `<title>/` folder (desktop Vita3K's save folder,
+zipped), or a save folder's bare contents; another title's saves, or what
+looks like a game, are refused.
 
 **Sound on/off** mutes output without suspending guest audio. **Fullscreen**
 keeps the toolbar and controls with the display; browsers without element
@@ -127,8 +145,9 @@ Enable it under Settings → Pages → Source: GitHub Actions.
 A static site ships no game, firmware or AOT image. Visitors upload the
 firmware and then a game; the first game reloads the page into
 `?title=<id>`, and later visits open the first stored title. Uploaded games
-build their AOT image at launch. The firmware must be installed already (a
-desktop Vita3K install's `os0`/`vs0`); games may be encrypted dumps (below).
+build their AOT image at launch. Firmware comes as Sony's `.PUP` files or
+an installed firmware's folders; games as decrypted folders, encrypted dumps
+or `.pkg` files (below).
 
 ## Encrypted games
 
@@ -141,7 +160,12 @@ libcrypto, built from the release tarball with Emscripten). It decrypts one
 file per call and streams each into storage through a synchronous access
 handle, so memory holds one SELF at most, whatever the game's size. Stored
 zip entries are read in place; deflated ones are inflated into storage first.
-`.pkg` files with a zRIF, and the firmware's `PSVUPDAT.PUP`, are not read.
+
+A `.pkg` (a PSN download) asks for its license as a zRIF string, as
+NoPayStation lists it. Its outer AES layer is removed into temporary
+storage (the layout and keys of Vita3K's pkg.h, after pkg2zip), the zRIF
+becomes the dump's `work.bin`, and the result is decrypted as above. Games
+only for now: updates, DLC and themes are refused with a message.
 
 GitHub Pages sends no headers, so `coi.js` registers `coi_sw.js`, a service
 worker that adds the cross-origin isolation headers to every same-origin

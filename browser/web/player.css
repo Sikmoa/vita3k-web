@@ -42,8 +42,8 @@ h1 { font-size: 32px; margin: 0; font-weight: 550; letter-spacing: -.8px; }
 .play-hint { margin: 0; }
 .title-picker { font-size: 12px; }
 .title-picker select { font-size: 11px; min-height: 0; padding: 6px 8px; margin-left: 6px; max-width: 46vw; }
-.package-upload { font-size: 12px; }
-.package-upload button { font-size: 11px; min-height: 0; padding: 6px 10px; margin-left: 6px; }
+.package-upload, .save-export { font-size: 12px; }
+.package-upload button, .save-export button { font-size: 11px; min-height: 0; padding: 6px 10px; margin-left: 6px; }
 .play-hint strong { font-weight: 500; color: #cad2db; }
 .rotate-hint { display: none; }
 kbd { font: 11px ui-monospace, monospace; color: #d2dae3; }

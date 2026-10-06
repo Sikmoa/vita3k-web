@@ -119,6 +119,36 @@ document.querySelector('#download-saves').onclick = async () => {
   setTimeout(() => URL.revokeObjectURL(link.href), 10000);
   log(`saves: downloaded ${saves.length} file(s) for ${TITLE}`);
 };
+// Restores a title's saves from a .zip (the Download button's, or a save
+// folder zipped); they replace the ones this browser holds and reach the
+// game at its next launch.
+const savesInput = document.querySelector('#saves-file');
+document.querySelector('#upload-saves').onclick = () => {
+  if (!TITLE) { notice('Upload a game first: saves belong to a title.'); return; }
+  if (running || !stopButton.disabled) { notice('Stop the game before restoring saves.'); return; }
+  if (!storageSupported()) { notice('This browser has no persistent storage for saves.'); return; }
+  savesInput.click();
+};
+savesInput.onchange = async () => {
+  const file = savesInput.files?.[0];
+  savesInput.value = '';
+  if (!file) return;
+  try {
+    const saveAPI = await cacheAPI();
+    const { listZipEntries, extractZipEntry } = await import('./zip.js');
+    const saves = saveAPI.savesInArchive(await listZipEntries(file), TITLE);
+    const existing = await saveAPI.readSaves(TITLE).catch(() => []);
+    if (existing.length && !confirm(`Replace the ${existing.length} save file(s) of ${TITLE} in this browser with ${saves.length} from ${file.name}?`))
+      return;
+    await saveAPI.clearSaves(TITLE);
+    for (const save of saves) await saveAPI.writeSave(TITLE, save.path, await extractZipEntry(file, save.entry));
+    log(`saves: restored ${saves.length} file(s) for ${TITLE} from ${file.name}`);
+    notice(`Restored ${saves.length} save file(s) for ${TITLE}. Press Play.`);
+  } catch (error) {
+    log('saves upload failed: ' + (error?.message ?? error));
+    notice('Saves upload failed: ' + (error?.message ?? error));
+  }
+};
 const display = document.querySelector('#display'), shell = document.querySelector('#player-shell');
 const welcome = document.querySelector('#welcome'), fpsLabel = document.querySelector('#fps');
 // Launch status under the "Starting your game…" overlay: the phase, a
@@ -561,46 +591,78 @@ async function uploadPackage(file, firmware) {
   const wasDisabled = runButton.disabled;
   runButton.disabled = true; uploadButton.disabled = true; firmwareButton.disabled = true;
   const started = performance.now();
+  let lastNotice = 0;
+  const throttled = (text) => {
+    const now = performance.now();
+    if (now - lastNotice < 200) return;
+    lastNotice = now;
+    notice(text);
+  };
   try {
     // A .vpk is a zip under another name; the reader only cares about the container.
-    if (!/\.(zip|vpk)$/i.test(file.name)) throw new Error('only .zip/.vpk packages are supported');
+    const kind = /\.pup$/i.test(file.name) ? 'pup' : /\.pkg$/i.test(file.name) ? 'pkg'
+      : /\.(zip|vpk)$/i.test(file.name) ? 'zip' : null;
+    if (!kind || (firmware && kind === 'pkg'))
+      throw new Error(firmware ? 'firmware comes as a .PUP or a .zip of its folders' : 'games come as a .zip/.vpk, or a .pkg with its zRIF');
+    if (!firmware && kind === 'pup') throw new Error('this is firmware: use the Firmware Upload button');
     const cache = await cacheAPI();
     if (!cache) throw new Error('content cache module unavailable');
-    // The package names its own title (its ux0/app/<id> directory), so an
-    // upload is all a game needs to become bootable besides firmware (the
-    // server's or its own upload). Files are stored under that title's own cache.
-    const contents = await cache.packageContents(file);
-    if (firmware && !contents.firmware)
-      throw new Error(`this is a game package (${contents.title}), not firmware: use the game Upload button`);
-    if (!firmware && contents.firmware)
-      throw new Error('this archive holds firmware only: use the Firmware Upload button');
-    const packageKey = `${sanitizeSegment(contents.title)}/${sanitizeSegment(contents.app)}`;
-    const totalBytes = contents.files.reduce((sum, entry) => sum + entry.size, 0);
-    let lastNotice = 0;
-    // An encrypted dump (NoNpDrm: a PFS image and its license) is decrypted
-    // into storage as it unpacks (decrypt_worker.js).
-    const appRoot = `ux0/app/${contents.app}/`;
-    const encrypted = !contents.firmware && contents.files.some((entry) => entry.path === appRoot + 'sce_pfs/files.db')
-      && contents.files.some((entry) => entry.path === appRoot + 'sce_sys/package/work.bin');
-    const result = encrypted
-      ? await decryptPackage(file, contents, packageKey, appRoot, (done, path) => {
-        const now = performance.now();
-        if (now - lastNotice < 200) return;
-        lastNotice = now;
-        notice(`Decrypting ${path} — ${mib(done)}/${mib(totalBytes)} MiB`);
-      })
-      : await cache.unpackPackageToCache(file, packageKey,
-        (done, total, path, doneBytes) => {
-          const now = performance.now();
-          if (now - lastNotice < 200 && done < total) return;
-          lastNotice = now;
-          notice(`Unpacking ${path} — ${done}/${total} files · ${mib(doneBytes)}/${mib(totalBytes)} MiB`);
-        });
+    if (kind === 'pup') {
+      // Sony's firmware files (system software, font package): installed and
+      // decrypted here, as desktop Vita3K does (decrypt_worker.js).
+      const done = await runDecryptWorker({ type: 'pup', archive: file },
+        (bytes, path) => throttled(`Installing ${file.name}: ${path} — ${mib(bytes)} MiB stored`));
+      try { await navigator.storage.persist?.(); } catch {}
+      log(`firmware ${done.version} installed from ${file.name}: ${done.roots.join(', ')}` +
+        (done.skipped.length ? ` (skipped ${done.skipped.join(', ')}: not needed by games)` : '') +
+        ` — ${done.files} files in storage, ${Math.round((performance.now() - started) / 1000)}s`);
+      notice(`Firmware ${done.version}: ${done.roots.join(', ')} installed.` + (TITLE ? ' Press Play.' : ' Now upload a game.'));
+      await refreshFirmwareStatus();
+      return;
+    }
+    let result, packageKey, isFirmware = false;
+    if (kind === 'pkg') {
+      // A PSN download: its license comes separately, as a zRIF string.
+      const zrif = prompt(`${file.name} needs its license: paste its zRIF (a long string that starts with KO5i, as NoPayStation lists it).`);
+      if (!zrif?.trim()) throw new Error('a .pkg needs its zRIF license');
+      const done = await runDecryptWorker({ type: 'pkg', archive: file, zrif },
+        (bytes, path) => throttled(`${path} — ${mib(bytes)} MiB`));
+      log(`decrypted ${done.title} (${done.contentId}): ${done.decrypted} PFS files, ${done.selfs} SELFs`);
+      result = { title: done.title, app: done.app, files: done.files.length, bytes: done.bytes };
+      packageKey = `${sanitizeSegment(done.title)}/${sanitizeSegment(done.app)}`;
+    } else {
+      // The package names its own title (its ux0/app/<id> directory), so an
+      // upload is all a game needs to become bootable besides firmware (the
+      // server's or its own upload). Files are stored under that title's own cache.
+      const contents = await cache.packageContents(file);
+      if (firmware && !contents.firmware)
+        throw new Error(`this is a game package (${contents.title}), not firmware: use the game Upload button`);
+      if (!firmware && contents.firmware)
+        throw new Error('this archive holds firmware only: use the Firmware Upload button');
+      isFirmware = Boolean(contents.firmware);
+      packageKey = `${sanitizeSegment(contents.title)}/${sanitizeSegment(contents.app)}`;
+      const totalBytes = contents.files.reduce((sum, entry) => sum + entry.size, 0);
+      // An encrypted dump (NoNpDrm: a PFS image and its license) is decrypted
+      // into storage as it unpacks (decrypt_worker.js).
+      const appRoot = `ux0/app/${contents.app}/`;
+      const encrypted = !contents.firmware && contents.files.some((entry) => entry.path === appRoot + 'sce_pfs/files.db')
+        && contents.files.some((entry) => entry.path === appRoot + 'sce_sys/package/work.bin');
+      if (encrypted) {
+        const done = await runDecryptWorker({ type: 'decrypt', archive: file, key: packageKey, appRoot,
+          files: contents.files.map(({ path, size, entry }) => ({ path, size, entry })) },
+        (bytes, path) => throttled(`Decrypting ${path} — ${mib(bytes)}/${mib(totalBytes)} MiB`));
+        log(`decrypted ${contents.title}: ${done.decrypted} PFS files, ${done.selfs} SELFs`);
+        result = { title: contents.title, app: contents.app, files: done.files.length, bytes: done.bytes };
+      } else {
+        result = await cache.unpackPackageToCache(file, packageKey, (done, total, path, doneBytes) =>
+          (done < total ? throttled : notice)(`Unpacking ${path} — ${done}/${total} files · ${mib(doneBytes)}/${mib(totalBytes)} MiB`));
+      }
+    }
     try { await navigator.storage.persist?.(); } catch {}
     const secs = Math.round((performance.now() - started) / 1000);
     log(`package stored: ${result.title} — ${result.files} files · ${mib(result.bytes)} MiB` +
       ` in ${secs}s (persistent storage, key ${packageKey})`);
-    if (contents.firmware) {
+    if (isFirmware) {
       notice(`Firmware ready: ${result.files} files · ${mib(result.bytes)} MiB.` + (TITLE ? ' Press Play.' : ' Now upload a game.'));
       await refreshFirmwareStatus();
       return;
@@ -619,33 +681,30 @@ async function uploadPackage(file, firmware) {
     runButton.disabled = wasDisabled; uploadButton.disabled = false; firmwareButton.disabled = false;
   }
 }
-// Runs decrypt_worker.js on an encrypted dump; resolves like
-// unpackPackageToCache: { title, app, files, bytes }.
-function decryptPackage(archive, contents, key, appRoot, onProgress) {
+// One job of decrypt_worker.js (an encrypted dump, a .pkg or a firmware
+// .PUP); resolves with its result. onProgress(bytes done, path).
+function runDecryptWorker(message, onProgress) {
   return new Promise((resolve, reject) => {
     const worker = new Worker('./decrypt_worker.js', { type: 'module' });
     worker.onerror = (event) => { worker.terminate(); reject(new Error('decryption worker: ' + event.message)); };
     worker.onmessage = ({ data }) => {
-      if (data.type === 'progress') onProgress(data.done, data.path);
-      else {
-        worker.terminate();
-        if (data.type === 'error') reject(new Error('decryption failed: ' + data.message));
-        else {
-          log(`decrypted ${contents.title}: ${data.decrypted} PFS files, ${data.selfs} SELFs`);
-          resolve({ title: contents.title, app: contents.app, files: data.files.length, bytes: data.bytes });
-        }
-      }
+      if (data.type === 'progress') { onProgress(data.done, data.path); return; }
+      worker.terminate();
+      if (data.type === 'error') reject(new Error(data.message));
+      else resolve(data);
     };
-    worker.postMessage({ type: 'decrypt', archive, key, appRoot,
-      files: contents.files.map(({ path, size, entry }) => ({ path, size, entry })) });
+    worker.postMessage(message);
   });
 }
-// Whether this browser holds firmware: shown next to its upload button.
+// What firmware this browser holds: shown next to its upload button.
 async function refreshFirmwareStatus() {
   const cache = storageSupported() ? await cacheAPI() : null;
-  const manifest = cache ? await cache.cacheReadManifest(cache.FIRMWARE_KEY) : null;
-  document.querySelector('#firmware-state').textContent = manifest?.files?.length
-    ? `stored (${manifest.files.length} files)` : config.static ? 'needed' : 'from the server';
+  const files = (cache ? await cache.cacheReadManifest(cache.FIRMWARE_KEY) : null)?.files ?? [];
+  const roots = new Set(files.map((file) => file.path.split('/')[0]));
+  const parts = [roots.has('vs0') ? 'system software' : null, roots.has('sa0') ? 'fonts' : null].filter(Boolean);
+  document.querySelector('#firmware-state').textContent = files.length
+    ? `stored: ${parts.join(' + ')} (${files.length} files)${roots.has('vs0') && !roots.has('sa0') ? ' · font package missing' : ''}`
+    : config.static ? 'needed' : 'from the server';
 }
 refreshFirmwareStatus();
 // Title picker: everything bootable — the server's staged titles plus the

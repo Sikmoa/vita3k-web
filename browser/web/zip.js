@@ -6,6 +6,10 @@ const CD_SIG = 0x02014b50;
 const LF_SIG = 0x04034b50;
 
 function crc32(bytes) {
+  return (crc32Update(0xffffffff, bytes) ^ 0xffffffff) >>> 0;
+}
+// Running CRC-32: start from 0xffffffff, finish with ^ 0xffffffff.
+function crc32Update(crc, bytes) {
   let table = crc32.table;
   if (!table) {
     table = crc32.table = new Uint32Array(256);
@@ -15,9 +19,8 @@ function crc32(bytes) {
       table[n] = c >>> 0;
     }
   }
-  let crc = 0xffffffff;
   for (let i = 0; i < bytes.length; i++) crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
-  return (crc ^ 0xffffffff) >>> 0;
+  return crc;
 }
 export function zipCrc32(bytes) { return crc32(bytes); }
 
@@ -105,6 +108,27 @@ export async function zipEntrySource(blob, entry) {
   const dataOffset = await zipEntryDataOffset(blob, entry);
   const raw = blob.slice(dataOffset, dataOffset + entry.compSize);
   return entry.method === 0 ? raw : raw.stream().pipeThrough(new DecompressionStream('deflate-raw'));
+}
+
+// One entry's bytes as a ReadableStream, inflated and checked: the stream
+// errors at its end on a size or CRC mismatch. onBytes(n) sees each chunk.
+export async function zipEntryStream(blob, entry, onBytes) {
+  const source = await zipEntrySource(blob, entry);
+  let crc = 0xffffffff, size = 0;
+  return (source instanceof Blob ? source.stream() : source).pipeThrough(new TransformStream({
+    transform(chunk, controller) {
+      crc = crc32Update(crc, chunk);
+      size += chunk.byteLength;
+      onBytes?.(chunk.byteLength);
+      controller.enqueue(chunk);
+    },
+    flush(controller) {
+      if (size !== entry.size)
+        controller.error(new Error(`size mismatch unpacking ${entry.name}: ${size} != ${entry.size}`));
+      else if (((crc ^ 0xffffffff) >>> 0) !== entry.crc)
+        controller.error(new Error(`CRC mismatch unpacking ${entry.name}: file is corrupt`));
+    },
+  }));
 }
 
 // Raw bytes of one entry, CRC-checked. Only stored (0) and deflated (8).

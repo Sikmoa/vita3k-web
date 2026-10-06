@@ -11,11 +11,14 @@
 // PLAYWRIGHT_MODULE_URL / PLAYWRIGHT_CHROMIUM_EXECUTABLE select local
 // installs; PAGES_GPU=1 uses the hardware adapter. An encrypted (NoNpDrm) game
 // package is decrypted on upload: the stored title must hold no sce_pfs/.
-// PAGES_LOG=<file> keeps the
-// page and worker console.
+// PAGES_LOG=<file> keeps the page and worker console. PAGES_SAVES_ZIP=<zip>
+// restores saves before the boot. PAGES_FIRMWARE_ZIP may list several files
+// (comma-separated: .PUPs or zips, uploaded in order); a .pkg game reads its
+// zRIF from PAGES_ZRIF (the string, or a file holding it). PAGES_PROFILE=<dir> uses an on-disk browser
+// profile: storage of a default context lives in memory (large games).
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { createReadStream, appendFileSync, writeFileSync } from 'node:fs';
+import { createReadStream, appendFileSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { extname, join, resolve } from 'node:path';
 
@@ -41,15 +44,18 @@ const url = `http://127.0.0.1:${server.address().port}${prefix}?${process.env.PA
 const wantFrames = Number(process.env.PAGES_FRAMES || 60);
 const deadline = Date.now() + Number(process.env.PAGES_DEADLINE_MS || 240000);
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE_URL || 'playwright');
-const browser = await chromium.launch({ headless: true,
+const launchOptions = { headless: true,
   args: process.env.PAGES_GPU === '1' ? ['--enable-unsafe-webgpu', '--enable-gpu', '--enable-features=Vulkan']
     : ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--enable-features=Vulkan', '--disable-vulkan-surface'],
-  ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}) });
+  ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}) };
+const browser = process.env.PAGES_PROFILE
+  ? await chromium.launchPersistentContext(process.env.PAGES_PROFILE, launchOptions)
+  : await chromium.launch(launchOptions);
 const errors = [];
 const logTail = async (page) => page.locator('#log').textContent().then((text) => text.split('\n').slice(-25).join('\n'), () => '');
 let page;
 try {
-  page = await (await browser.newContext()).newPage();
+  page = await (process.env.PAGES_PROFILE ? browser : await browser.newContext()).newPage();
   page.on('pageerror', (error) => errors.push(String(error)));
   if (process.env.PAGES_LOG) {
     writeFileSync(process.env.PAGES_LOG, '');
@@ -75,16 +81,23 @@ try {
   await page.waitForFunction(() => /Upload the firmware/.test(document.querySelector('#warning')?.textContent ?? '')
     || /Upload the firmware/.test(document.body.innerText));
 
-  await page.locator('#firmware-file').setInputFiles(firmwareZip);
-  await page.waitForFunction(() => /^stored/.test(document.querySelector('#firmware-state')?.textContent ?? ''),
-    null, { timeout: 300000 });
+  for (const firmware of firmwareZip.split(',')) {
+    await page.locator('#firmware-file').setInputFiles(firmware);
+    await page.waitForFunction(() => !document.querySelector('#upload-firmware').disabled, null, { timeout: 300000 });
+    assert.match(await page.locator('#firmware-state').textContent(), /^stored/, `${firmware}: ${await page.evaluate(() => document.body.innerText.match(/Upload failed[^\n]*/)?.[0])}`);
+  }
   console.log('firmware:', await page.locator('#firmware-state').textContent());
 
   // The first game reloads the page into ?title=<id>.
+  const uploadStarted = Date.now();
+  if (process.env.PAGES_ZRIF) {
+    const zrif = existsSync(process.env.PAGES_ZRIF) ? readFileSync(process.env.PAGES_ZRIF, 'utf8').trim() : process.env.PAGES_ZRIF;
+    page.on('dialog', (dialog) => dialog.type() === 'prompt' ? dialog.accept(zrif) : dialog.accept());
+  }
   await Promise.all([page.waitForURL(/[?&]title=/, { timeout: 300000 }), page.locator('#upload-file').setInputFiles(gameZip)]);
   await page.waitForFunction(() => self.crossOriginIsolated);
   const title = new URL(page.url()).searchParams.get('title');
-  console.log('game:', title);
+  console.log('game:', title, `stored in ${((Date.now() - uploadStarted) / 1000).toFixed(0)}s`);
   assert.equal(await page.locator('#game-title').textContent() !== 'No game yet', true);
   const stored = await page.evaluate(async (title) => {
     let dir = await navigator.storage.getDirectory();
@@ -94,6 +107,11 @@ try {
   assert.ok(stored.some((path) => path.endsWith('/eboot.bin')), 'the game is stored');
   assert.ok(!stored.some((path) => path.includes('/sce_pfs/')), 'an encrypted game is stored decrypted');
   console.log('stored:', stored.length, 'files');
+  if (process.env.PAGES_SAVES_ZIP) {
+    await page.locator('#saves-file').setInputFiles(process.env.PAGES_SAVES_ZIP);
+    await page.waitForFunction(() => /Restored \d+ save file/.test(document.body.innerText));
+    console.log('saves:', await page.evaluate(() => /Restored \d+ save file\(s\)/.exec(document.body.innerText)?.[0]));
+  }
 
   await page.locator('#run').click();
   let frames = 0;

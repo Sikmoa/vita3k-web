@@ -1,5 +1,6 @@
-# Game decryption for the browser player: a NoNpDrm dump's PFS layer
-# (psvpfstools' psvpfsparser) and its SELFs (Vita3K's decrypt_fself), as the
+# Game and firmware decryption for the browser player: a NoNpDrm dump's PFS
+# layer (psvpfstools' psvpfsparser) and its SELFs (Vita3K's decrypt_fself), a
+# .pkg's outer layer, and firmware .PUPs (Vita3K's install_pup), as the
 # module decrypt_worker.js drives (vita3k_decrypt.mjs/.wasm in dist/decrypt/).
 #
 # The browser build (browser/CMakeLists.txt) builds it as its own wasm32
@@ -42,7 +43,13 @@ target_include_directories(decrypt_openssl INTERFACE "${_openssl_source}/include
 target_link_libraries(decrypt_openssl INTERFACE "${_openssl_source}/libcrypto.a")
 
 file(GLOB _pfs_sources "${_ext}/psvpfstools/psvpfsparser/*.cpp")
+# Boost.Filesystem as the runtime builds it (browser/runtime_core.cmake).
 file(GLOB _boost_filesystem_sources "${_ext}/boost/libs/filesystem/src/*.cpp")
+add_library(decrypt_boost_filesystem STATIC ${_boost_filesystem_sources})
+target_include_directories(decrypt_boost_filesystem PUBLIC "${_ext}/boost")
+target_compile_definitions(decrypt_boost_filesystem PRIVATE BOOST_FILESYSTEM_SOURCE BOOST_FILESYSTEM_STATIC_LINK
+    BOOST_FILESYSTEM_SINGLE_THREADED)
+target_compile_options(decrypt_boost_filesystem PRIVATE -O2 -fexceptions)
 add_executable(vita3k_decrypt
     decrypt.cpp
     util_stubs.cpp
@@ -52,19 +59,20 @@ add_executable(vita3k_decrypt
     "${_ext}/psvpfstools/libb64/src/cencode.c"
     "${_ext}/psvpfstools/libb64/src/cdecode.c"
     "${_repo}/vita3k/packages/src/sce_utils.cpp"
+    "${_repo}/vita3k/packages/src/pup.cpp"
+    "${_repo}/vita3k/packages/src/exfat.cpp"
     "${_ext}/miniz/miniz.c"
     "${_ext}/fmt/src/format.cc"
-    ${_boost_filesystem_sources}
 )
 file(GLOB _fat16_sources "${_ext}/libfat16/src/*.c" "${_ext}/libfat16/src/*.cpp")
 target_sources(vita3k_decrypt PRIVATE ${_fat16_sources})
 target_include_directories(vita3k_decrypt PRIVATE
     "${_ext}/psvpfstools/psvpfsparser" "${_ext}/psvpfstools/libzrif/include" "${_ext}/psvpfstools/libb64/include"
     "${_repo}/vita3k/packages/include" "${_repo}/vita3k/util/include" "${_ext}/vita-toolchain/src"
-    "${_ext}/libfat16/include" "${_ext}/miniz" "${_ext}/fmt/include" "${_ext}/spdlog/include" "${_ext}/boost")
+    "${_ext}/libfat16/include" "${_ext}/miniz" "${_ext}/fmt/include" "${_ext}/spdlog/include")
 target_compile_definitions(vita3k_decrypt PRIVATE SPDLOG_FMT_EXTERNAL SPDLOG_NO_THREAD_ID SPDLOG_NO_TLS
-    BOOST_FILESYSTEM_SOURCE BOOST_FILESYSTEM_STATIC_LINK BOOST_FILESYSTEM_SINGLE_THREADED)
-target_link_libraries(vita3k_decrypt PRIVATE decrypt_openssl)
+    BOOST_FILESYSTEM_STATIC_LINK)
+target_link_libraries(vita3k_decrypt PRIVATE decrypt_openssl decrypt_boost_filesystem)
 target_compile_options(vita3k_decrypt PRIVATE -O2 -fexceptions -sUSE_ZLIB=1 -Wno-deprecated-declarations)
 if(EMSCRIPTEN)
     target_link_options(vita3k_decrypt PRIVATE
@@ -72,7 +80,7 @@ if(EMSCRIPTEN)
         -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=createDecryptModule -sENVIRONMENT=worker,node
         -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=1MB
         -sFORCE_FILESYSTEM=1 -lworkerfs.js -lnodefs.js --no-entry
-        "-sEXPORTED_FUNCTIONS=['_vd_open','_vd_count','_vd_entry','_vd_run','_vd_decrypt_self','_vd_error','_vd_close']"
+        "-sEXPORTED_FUNCTIONS=['_vd_open','_vd_count','_vd_entry','_vd_run','_vd_decrypt_self','_vd_error','_vd_close','_vd_pkg_open','_vd_pkg_info','_vd_pkg_entry','_vd_pkg_extract','_vd_zrif_to_rif','_vd_pkg_close','_vd_install_pup','_vd_result']"
         "-sEXPORTED_RUNTIME_METHODS=['FS','WORKERFS','NODEFS','MEMFS','ccall','UTF8ToString']")
     set_target_properties(vita3k_decrypt PROPERTIES SUFFIX ".mjs")
 endif()
