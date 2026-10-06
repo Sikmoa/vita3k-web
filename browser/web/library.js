@@ -71,7 +71,8 @@ export function fileKind(name) {
 // Imports a game or firmware file into storage.
 //   expect: 'game' | 'firmware' | undefined (either)
 //   zrif(fileName): resolves to a .pkg's zRIF license (asked when needed)
-//   onProgress({ phase, path, bytes, total })
+//   onProgress({ phase, path, bytes, total }): phase 'inflate', 'unpack',
+//   'decrypt', 'install' or 'store' (what happens to path)
 // Resolves { kind: 'firmware', version?, roots?, files, bytes } or
 // { kind: 'game', title, app, files, bytes, decrypted? }.
 export async function importFile(file, { expect, zrif, onProgress = () => {} } = {}) {
@@ -85,14 +86,14 @@ export async function importFile(file, { expect, zrif, onProgress = () => {} } =
     // Sony's firmware files (system software, font package): installed and
     // decrypted here, as desktop Vita3K does.
     const done = await runDecryptWorker({ type: 'pup', archive: file },
-      (bytes, path) => onProgress({ phase: 'install', path, bytes, total: 0 }));
+      (bytes, path, phase) => onProgress({ phase, path, bytes, total: 0 }));
     result = { kind: 'firmware', version: done.version, roots: done.roots, skipped: done.skipped, files: done.files, bytes: done.bytes };
   } else if (kind === 'pkg') {
     // A PSN download: its license comes separately, as a zRIF string.
     const license = (await zrif?.(file.name))?.trim();
     if (!license) throw new Error('a .pkg needs its zRIF license');
     const done = await runDecryptWorker({ type: 'pkg', archive: file, zrif: license },
-      (bytes, path) => onProgress({ phase: 'decrypt', path, bytes, total: 0 }));
+      (bytes, path, phase) => onProgress({ phase, path, bytes, total: 0 }));
     result = { kind: 'game', title: done.title, app: done.app, files: done.files.length, bytes: done.bytes, decrypted: true };
   } else {
     // The package names its own title (its ux0/app/<id> directory), so an
@@ -111,7 +112,7 @@ export async function importFile(file, { expect, zrif, onProgress = () => {} } =
     if (encrypted) {
       const done = await runDecryptWorker({ type: 'decrypt', archive: file, key, appRoot,
         files: contents.files.map(({ path, size, entry }) => ({ path, size, entry })) },
-      (bytes, path) => onProgress({ phase: 'decrypt', path, bytes, total }));
+      (bytes, path, phase) => onProgress({ phase, path, bytes, total }));
       result = { kind: 'game', title: contents.title, app: contents.app, files: done.files.length, bytes: done.bytes, decrypted: true };
     } else {
       const done = await cache.unpackPackageToCache(file, key, (count, files, path, bytes) =>
@@ -126,13 +127,13 @@ export async function importFile(file, { expect, zrif, onProgress = () => {} } =
 }
 
 // One job of decrypt_worker.js (an encrypted dump, a .pkg or a firmware
-// .PUP); resolves with its result. onProgress(bytes done, path).
+// .PUP); resolves with its result. onProgress(bytes done, path, phase).
 export function runDecryptWorker(message, onProgress) {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./decrypt_worker.js', import.meta.url), { type: 'module' });
     worker.onerror = (event) => { worker.terminate(); reject(new Error('decryption worker: ' + event.message)); };
     worker.onmessage = ({ data }) => {
-      if (data.type === 'progress') { onProgress(data.done, data.path); return; }
+      if (data.type === 'progress') { onProgress(data.done, data.path, data.phase); return; }
       worker.terminate();
       if (data.type === 'error') reject(new Error(data.message));
       else resolve(data);

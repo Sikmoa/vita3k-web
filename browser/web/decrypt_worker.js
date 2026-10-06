@@ -9,7 +9,8 @@
 //       files: [{ path, size, entry }] }  an encrypted (NoNpDrm) dump in a zip
 //     { type: 'pkg', archive: File, zrif }  a .pkg (PSN download) and its license
 //     { type: 'pup', archive: File }        a firmware .PUP
-// Out: { type: 'progress', done, total, path } … then
+// Out: { type: 'progress', done, total, phase, path } … then (phase: 'inflate',
+//      'unpack', 'decrypt', 'install' or 'store'; path a file, or the .PUP's name)
 //      { type: 'done', title, app, files: [{ path, size }], bytes, decrypted, selfs }
 //      ('pup': { type: 'done', version, roots, files, bytes, skipped }) or
 //      { type: 'error', message }
@@ -62,7 +63,7 @@ function moduleTools(M) {
   let done = 0, total = 0;
   const progress = {
     reset(bytes) { done = 0; total = bytes; },
-    report(path, bytes = 0) { done += bytes; postMessage({ type: 'progress', done, total, path }); },
+    report(path, bytes = 0, phase = 'decrypt') { done += bytes; postMessage({ type: 'progress', done, total, phase, path }); },
   };
   return { M, FS: M.FS, call, text, check, remount, progress };
 }
@@ -159,7 +160,7 @@ async function decryptZip(tools, { archive, key, appRoot, files }) {
     const relative = file.path.slice(appRoot.length);
     let source = await zipEntrySource(archive, file.entry);
     if (!(source instanceof Blob)) {
-      tools.progress.report(`Inflating ${relative}`);
+      tools.progress.report(relative, 0, 'inflate');
       await cacheWriteStream(TEMP_KEY, relative, source);
       source = await cacheGetFile(TEMP_KEY, relative);
     }
@@ -168,11 +169,11 @@ async function decryptZip(tools, { archive, key, appRoot, files }) {
   const app = await decryptApp(tools, inputs, key, appRoot);
   // The archive's other files (trophy data, firmware it carries) as they are.
   for (const file of files.filter((file) => !file.path.startsWith(appRoot))) {
-    tools.progress.report(file.path);
+    tools.progress.report(file.path, 0, 'store');
     const size = await cacheWriteZipEntry(key, file.path, archive, file.entry);
     app.stored.push({ path: file.path, size });
     app.bytes += size;
-    tools.progress.report(file.path, file.size);
+    tools.progress.report(file.path, file.size, 'store');
   }
   await cacheWriteManifest(key, app.stored);
   return { files: app.stored, bytes: app.bytes, decrypted: app.decrypted, selfs: app.selfs };
@@ -200,11 +201,11 @@ async function installPkg(tools, { archive, zrif }, useKey) {
     await cacheClear(TEMP_KEY);
     const inputs = new Map();
     for (const entry of entries.filter((entry) => entry.kind === 'file')) {
-      progress.report(`Unpacking ${entry.name}`);
+      progress.report(entry.name, 0, 'unpack');
       await writeToStorage(tools, '/pkgout/' + entry.name, TEMP_KEY, entry.name,
         (path) => check(call('vd_pkg_extract', entry.index, path)));
       inputs.set(entry.name, await cacheGetFile(TEMP_KEY, entry.name));
-      progress.report(`Unpacked ${entry.name}`, entry.size);
+      progress.report(entry.name, entry.size, 'unpack');
     }
     // The license the dump would carry as sce_sys/package/work.bin.
     remount('/license');
@@ -228,7 +229,7 @@ async function installPup(tools, { archive }) {
   remount('/pup', tools.M.WORKERFS, { blobs: [{ name: 'firmware.PUP', data: archive }] });
   remount('/fw');
   progress.reset(archive.size);
-  progress.report('Installing the firmware');
+  progress.report(archive.name || 'the firmware', 0, 'install');
   try {
     check(call('vd_install_pup', '/pup/firmware.PUP', '/fw'));
     const version = text('vd_result');
@@ -260,7 +261,7 @@ async function installPup(tools, { archive }) {
       FS.unlink('/fw/' + path);
       stored.push({ path, size: contents.byteLength });
       bytes += contents.byteLength;
-      progress.report(path, contents.byteLength);
+      progress.report(path, contents.byteLength, 'store');
     }
     await cacheWriteManifest(FIRMWARE_KEY, stored);
     return { version, roots, files: stored.length, bytes, skipped };
