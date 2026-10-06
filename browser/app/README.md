@@ -7,14 +7,17 @@ remove), Settings and About, and a full-window player. Vue 3, UnoCSS (`presetWin
 
 ```sh
 bun install
-bun run dev        # http://localhost:5173, the runtime proxied from the dev server
+bun run dev        # http://localhost:5173
 bun run build      # dist/, which browser/pages/assemble.sh puts at the site's root
 bun run typecheck
 ```
 
-`bun run dev` needs the dev server running (`browser/tests/limbo_serve.mjs`,
-`http://localhost:8080` unless `VITA3K_RUNTIME` says otherwise): it serves the
-runtime the app loads.
+`bun run dev` serves the runtime the app loads as a static host does (games
+and firmware come from what you import, as on GitHub Pages): `browser/web`'s
+files from the source, so edits show at once, and the compiled ones from the
+browser build (`build/web64/dist`, or `VITA3K_DIST`; build `vita3k_web_dist`
+first). With `VITA3K_RUNTIME=http://localhost:8080` it proxies a dev server
+(`browser/tests/limbo_serve.mjs`) instead, with the games that server stages.
 
 ## How it fits
 
