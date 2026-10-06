@@ -16,9 +16,12 @@
 // (comma-separated: .PUPs or zips, uploaded in order); a .pkg game reads its
 // zRIF from PAGES_ZRIF (the string, or a file holding it). PAGES_PROFILE=<dir> uses an on-disk browser
 // profile: storage of a default context lives in memory (large games).
+// After the first boot the page reloads and boots again from storage;
+// PAGES_RELOAD_PLAYER=<player.js> replaces the site's player before that
+// reload (a site update between two visits).
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { createReadStream, appendFileSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { createReadStream, appendFileSync, writeFileSync, existsSync, readFileSync, copyFileSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { extname, join, resolve } from 'node:path';
 
@@ -113,17 +116,27 @@ try {
     console.log('saves:', await page.evaluate(() => /Restored \d+ save file\(s\)/.exec(document.body.innerText)?.[0]));
   }
 
-  await page.locator('#run').click();
-  let frames = 0;
-  while (Date.now() < deadline) {
-    const stats = await page.locator('#stats').textContent();
-    frames = Number(/frames=(\d+)/.exec(stats ?? '')?.[1] ?? 0);
-    if (frames >= wantFrames) break;
-    if (/failed|error/i.test(await page.locator('#status').textContent())) break;
-    await page.waitForTimeout(1000);
-  }
-  console.log('status:', await page.locator('#status').textContent(), '| stats:', await page.locator('#stats').textContent());
-  assert.ok(frames >= wantFrames, `only ${frames} frames presented\n${await logTail(page)}`);
+  const boot = async (label) => {
+    await page.locator('#run').click();
+    let frames = 0;
+    while (Date.now() < deadline) {
+      const stats = await page.locator('#stats').textContent();
+      frames = Number(/frames=(\d+)/.exec(stats ?? '')?.[1] ?? 0);
+      if (frames >= wantFrames) break;
+      if (/failed|error/i.test(await page.locator('#status').textContent())) break;
+      await page.waitForTimeout(1000);
+    }
+    console.log(`${label}:`, await page.locator('#status').textContent(), '| stats:', await page.locator('#stats').textContent());
+    assert.ok(frames >= wantFrames, `${label}: only ${frames} frames presented\n${await logTail(page)}`);
+    return frames;
+  };
+  await boot('first boot');
+  // Everything comes from storage the second time: a reload must boot again.
+  await page.locator('#stop').click();
+  if (process.env.PAGES_RELOAD_PLAYER) copyFileSync(process.env.PAGES_RELOAD_PLAYER, join(site, 'player.js'));
+  await page.reload();
+  await page.waitForFunction(() => self.crossOriginIsolated && !document.querySelector('#run').disabled);
+  const frames = await boot('after a reload');
   assert.deepEqual(errors, []);
   console.log(`PASS: static site under ${prefix}, isolated by its service worker, firmware and ${title} uploaded, ${frames} frames.`);
 } catch (error) {

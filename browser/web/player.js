@@ -843,11 +843,16 @@ async function run() {
             && !(serverHasApp && file.path.startsWith(appPrefix)));
           // Firmware uploaded on its own fills what neither the server nor
           // the package has (os0/vs0), read from its shared key.
-          const firmwareManifest = cache ? await cache.cacheReadManifest(cache.FIRMWARE_KEY) : null;
-          const known = new Set([...serverPaths, ...storedOnly.map((file) => file.path)]);
-          const firmwareOnly = (firmwareManifest?.files ?? []).filter((file) => !known.has(file.path));
+          // A title's manifest written before that was fixed also lists the
+          // firmware files it borrowed: the same path and size as the
+          // firmware's own come from the firmware's key.
+          const firmwareFiles = (cache ? await cache.cacheReadManifest(cache.FIRMWARE_KEY) : null)?.files ?? [];
+          const firmwareSizes = new Map(firmwareFiles.map((file) => [file.path, file.size]));
+          const ownFiles = storedOnly.filter((file) => firmwareSizes.get(file.path) !== file.size);
+          const known = new Set([...serverPaths, ...ownFiles.map((file) => file.path)]);
+          const firmwareOnly = firmwareFiles.filter((file) => !known.has(file.path));
           stageKeys = new Map(firmwareOnly.map((file) => [file.path, cache.FIRMWARE_KEY]));
-          const staged = [...serverFiles, ...storedOnly, ...firmwareOnly];
+          const staged = [...serverFiles, ...ownFiles, ...firmwareOnly];
           if (!staged.some((file) => file.path.startsWith('os0/')))
             notice('No firmware: upload it (a .zip of its os0 and vs0 folders) below the player.');
           // An empty manifest is allowed (a fixture, or a title with nothing
@@ -863,9 +868,9 @@ async function run() {
           const useContentCache = (stageCacheIndex?.size ?? 0) > 0;
           document.body.dataset.cacheVerdict = stageCacheActive
             ? `${stageCacheIndex.size} of ${stageNeeded.length} files in storage`
-              + (storedOnly.length ? `, ${storedOnly.length} package-only` : '')
+              + (ownFiles.length ? `, ${ownFiles.length} package-only` : '')
             : 'unsupported';
-          log(`[vita3k-web] ${staged.length} files to stage (${storedOnly.length} from the package, ` +
+          log(`[vita3k-web] ${staged.length} files to stage (${ownFiles.length} from the package, ${firmwareOnly.length} firmware, ` +
             `${stageCacheIndex?.size ?? 0} in storage)`);
           stageSources.storage = 0;
           stageSources.downloaded = 0;
@@ -954,7 +959,8 @@ async function run() {
           (data.cachedFiles ? ` (${data.cachedFiles} from storage)` : '') +
           ` · ${mib(data.bytes)} MiB staged · ${elapsed()}`, 1);
         if (stageCacheActive && stageNeeded && cacheNS)
-          cacheNS.cacheWriteManifest(cacheKey, stageNeeded).catch(() => {});
+          // What this title's key holds: not the firmware read from its own key.
+          cacheNS.cacheWriteManifest(cacheKey, stageNeeded.filter((file) => !stageKeys.has(file.path))).catch(() => {});
         log(`staged ${data.files} files (${(data.bytes / 1048576).toFixed(1)} MiB) — launching`);
         // Saves this browser kept for the title replace the staged ones.
         const saveAPI = storageSupported() ? await cacheAPI() : null;
