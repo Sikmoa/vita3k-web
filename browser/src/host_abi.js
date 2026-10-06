@@ -65,3 +65,13 @@ Module['vita3kNativeFunction'] = (pointer) => {
     throw new RangeError('invalid native function table index');
   return getWasmTableEntry(index);
 };
+
+// A trap on a guest or pool thread reaches the page only as "worker sent an
+// error!" with a byte offset; print its Wasm stack to the log first (err
+// forwards to the main worker's printErr), where the build's symbol map
+// names the frames.
+if (typeof ENVIRONMENT_IS_PTHREAD !== 'undefined' && ENVIRONMENT_IS_PTHREAD) {
+  self.addEventListener('error', (event) => {
+    err(`[vita3k-web] thread crash: ${event.error?.stack ?? event.message}`);
+  });
+}

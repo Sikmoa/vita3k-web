@@ -157,6 +157,7 @@ try {
     await page.getByRole('button', { name: 'Exit fullscreen' }).click();
     await page.waitForTimeout(500);
   }
+  let swipeFrames = null;
   if (process.env.APP_SWIPE) {
     const box = await page.locator('canvas.game-canvas').boundingBox();
     const scale = Math.min(box.width / 960, box.height / 544);
@@ -177,8 +178,8 @@ try {
     const before = Number(await page.locator('.stage').getAttribute('data-frames'));
     await page.waitForTimeout(3000);
     const after = Number(await page.locator('.stage').getAttribute('data-frames'));
-    console.log('swiped', process.env.APP_SWIPE, '; frames in 3 s afterwards:', after - before);
-    assert.ok(after > before, 'the game still presents frames after the swipes');
+    swipeFrames = after - before;
+    console.log('swiped', process.env.APP_SWIPE.split(';').length, 'times; frames in 3 s afterwards:', swipeFrames);
   }
   const phase = await page.locator('.stage').getAttribute('data-phase');
   // A run that did not reach its frames (or APP_LOG_TAIL=<lines>): the end of its saved log.
@@ -189,6 +190,7 @@ try {
     return last ? (await last.getFile()).text().then((text) => text.split('\n').slice(-lines).join('\n')) : 'no log';
   }, Number(process.env.APP_LOG_TAIL) || 60).catch((error) => 'no log: ' + error));
   assert.equal(phase, 'running', 'the player shows the running game');
+  if (swipeFrames !== null) assert.ok(swipeFrames > 0, 'the game still presents frames after the swipes');
   assert.ok(frames >= wantFrames, `only ${frames} frames (phase ${phase}): ${await page.locator('.stage').innerText()}`);
   console.log('played:', frames, 'frames, phase', phase);
 

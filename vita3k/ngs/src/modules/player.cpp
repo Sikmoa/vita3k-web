@@ -137,6 +137,8 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID 
 
             voice_lock.unlock();
             scheduler_lock.unlock();
+            // false once a callback released this voice's rack: return without it
+            bool alive = true;
 
             // Enable looping over the buffer if needed
             if (params->buffer_params[state->current_buffer].loop_count != -1
@@ -147,23 +149,27 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID 
                 if ((state->current_buffer == -1)
                     || !params->buffer_params[state->current_buffer].buffer
                     || (params->buffer_params[state->current_buffer].bytes_count == 0)) {
-                    data.invoke_callback(kern, mem, thread_id, SCE_NGS_PLAYER_END_OF_DATA, 0, 0);
+                    alive = data.invoke_callback(kern, mem, thread_id, SCE_NGS_PLAYER_END_OF_DATA, 0, 0);
 
                     // we are done
                     finished = true;
                     scheduler_lock.lock();
+                    if (!alive)
+                        return true;
                     voice_lock.lock();
                     break;
                 } else {
-                    data.invoke_callback(kern, mem, thread_id, SCE_NGS_PLAYER_SWAPPED_BUFFER, prev_index,
+                    alive = data.invoke_callback(kern, mem, thread_id, SCE_NGS_PLAYER_SWAPPED_BUFFER, prev_index,
                         params->buffer_params[state->current_buffer].buffer.address());
                 }
             } else {
-                data.invoke_callback(kern, mem, thread_id, SCE_NGS_PLAYER_LOOPED_BUFFER, logical->current_loop_count,
+                alive = data.invoke_callback(kern, mem, thread_id, SCE_NGS_PLAYER_LOOPED_BUFFER, logical->current_loop_count,
                     params->buffer_params[state->current_buffer].buffer.address());
             }
 
             scheduler_lock.lock();
+            if (!alive)
+                return true;
             voice_lock.lock();
         }
 

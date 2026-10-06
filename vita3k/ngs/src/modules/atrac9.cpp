@@ -94,6 +94,8 @@ bool Atrac9Module::decode_more_data(KernelState &kern, const MemState &mem, cons
 
         voice_lock.unlock();
         scheduler_lock.unlock();
+        // false once a callback released this voice's rack: return without it
+        bool alive = true;
 
         logical->current_loop_count++;
         state->current_byte_position_in_buffer = 0;
@@ -105,22 +107,25 @@ bool Atrac9Module::decode_more_data(KernelState &kern, const MemState &mem, cons
             if ((state->current_buffer == -1)
                 || !params->buffer_params[state->current_buffer].buffer
                 || (params->buffer_params[state->current_buffer].bytes_count == 0)) {
-                data.invoke_callback(kern, mem, thread_id, SCE_NGS_AT9_END_OF_DATA, 0, 0);
+                alive = data.invoke_callback(kern, mem, thread_id, SCE_NGS_AT9_END_OF_DATA, 0, 0);
 
                 // we are done
                 scheduler_lock.lock();
-                voice_lock.lock();
+                if (alive)
+                    voice_lock.lock();
                 return false;
             } else {
-                data.invoke_callback(kern, mem, thread_id, SCE_NGS_AT9_SWAPPED_BUFFER, prev_index,
+                alive = data.invoke_callback(kern, mem, thread_id, SCE_NGS_AT9_SWAPPED_BUFFER, prev_index,
                     params->buffer_params[state->current_buffer].buffer.address());
             }
         } else {
-            data.invoke_callback(kern, mem, thread_id, SCE_NGS_AT9_LOOPED_BUFFER, logical->current_loop_count,
+            alive = data.invoke_callback(kern, mem, thread_id, SCE_NGS_AT9_LOOPED_BUFFER, logical->current_loop_count,
                 params->buffer_params[state->current_buffer].buffer.address());
         }
 
         scheduler_lock.lock();
+        if (!alive)
+            return false;
         voice_lock.lock();
 
         // re-call this function
@@ -272,10 +277,13 @@ bool Atrac9Module::decode_more_data(KernelState &kern, const MemState &mem, cons
         voice_lock.unlock();
         scheduler_lock.unlock();
 
-        data.invoke_callback(kern, mem, thread_id, SCE_NGS_AT9_DECODE_ERROR, state->current_byte_position_in_buffer,
+        const bool alive = data.invoke_callback(kern, mem, thread_id, SCE_NGS_AT9_DECODE_ERROR, state->current_byte_position_in_buffer,
             params->buffer_params[state->current_buffer].buffer.address());
 
         scheduler_lock.lock();
+        // the callback released this voice's rack: process() returns at once
+        if (!alive)
+            return false;
         voice_lock.lock();
 
         // flush or we'll get an error next time we want to decode
@@ -308,9 +316,14 @@ bool Atrac9Module::process(KernelState &kern, const MemState &mem, const SceUID 
     logical->decoded_pcm.compact();
 
     bool is_finished = false;
+    // A callback inside decode_more_data may release this voice's rack.
+    Voice *const voice = data.parent;
+    const VoiceScheduler &scheduler = voice->rack->system->voice_scheduler;
     // call decode more data until we either have an error or reached end of data
     while (static_cast<int32_t>(logical->decoded_pcm.available_frames()) < data.parent->rack->system->granularity) {
         if (!decode_more_data(kern, mem, thread_id, data, params, state, logical, runtime, scheduler_lock, voice_lock)) {
+            if (scheduler.was_released(voice))
+                return true;
             is_finished = true;
             break;
         }

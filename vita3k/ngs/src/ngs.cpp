@@ -144,7 +144,7 @@ bool ModuleData::unlock_params(const MemState &mem) {
     return false;
 }
 
-void ModuleData::invoke_callback(KernelState &kernel, const MemState &mem, const SceUID thread_id, const uint32_t reason1,
+bool ModuleData::invoke_callback(KernelState &kernel, const MemState &mem, const SceUID thread_id, const uint32_t reason1,
     const uint32_t reason2, Address reason_ptr) {
     return parent->invoke_callback(kernel, mem, thread_id, callback, user_data, parent->rack->modules[index]->module_id(),
         reason1, reason2, reason_ptr);
@@ -316,11 +316,13 @@ bool Voice::set_preset(const MemState &mem, const SceNgsVoicePreset *preset) {
     return true;
 }
 
-void Voice::invoke_callback(KernelState &kernel, const MemState &mem, const SceUID thread_id, Ptr<void> callback, Ptr<void> user_data,
+bool Voice::invoke_callback(KernelState &kernel, const MemState &mem, const SceUID thread_id, Ptr<void> callback, Ptr<void> user_data,
     const uint32_t module_id, const uint32_t reason1, const uint32_t reason2, Address reason_ptr) {
     if (!callback) {
-        return;
+        return true;
     }
+    // The system outlives the rack; after the callback only pointers compare.
+    const VoiceScheduler &scheduler = rack->system->voice_scheduler;
 
     const ThreadStatePtr thread = kernel.get_thread(thread_id);
     const Address callback_info_addr = stack_alloc(*thread->cpu, sizeof(SceNgsCallbackInfo));
@@ -336,6 +338,7 @@ void Voice::invoke_callback(KernelState &kernel, const MemState &mem, const SceU
 
     thread->run_callback(callback.address(), { callback_info_addr });
     stack_free(*thread->cpu, sizeof(SceNgsCallbackInfo));
+    return !scheduler.was_released(this);
 }
 
 uint32_t System::get_required_memspace_size(SceNgsSystemInitParams *parameters) {
@@ -473,6 +476,8 @@ void release_rack(State &ngs, const MemState &mem, System *system, Rack *rack) {
                 rack->modules[i]->cleanup_voice_state(v->datas[i]);
         }
         // no need to free the voice from the rack
+        if (system->voice_scheduler.is_updating)
+            system->voice_scheduler.released_in_update.push_back(v);
         v->~Voice();
     }
 

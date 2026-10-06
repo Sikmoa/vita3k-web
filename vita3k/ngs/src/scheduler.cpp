@@ -124,6 +124,7 @@ void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID
     std::unique_lock<std::recursive_mutex> scheduler_lock(mutex);
     is_updating = true;
     updating_thread = thread_id;
+    released_in_update.clear();
 
     // make a copy of the queue, this way we have no issue if it is modified in a callback
     std::vector<ngs::Voice *> queue_copy = queue;
@@ -133,7 +134,18 @@ void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID
         voice->inputs.reset_inputs();
     }
 
-    for (ngs::Voice *voice : queue_copy) {
+    // A callback may release racks (sceNgsRackRelease): their voices leave
+    // the copy, and one released under its own processing is left alone,
+    // its mutex unlocked and gone.
+    const auto drop_released = [&] {
+        for (auto &queued : queue_copy)
+            if (queued && was_released(queued))
+                queued = nullptr;
+    };
+    for (size_t n = 0; n < queue_copy.size(); n++) {
+        ngs::Voice *voice = queue_copy[n];
+        if (!voice)
+            continue;
         // Modify the state, in peace....
         std::unique_lock<std::mutex> voice_lock(*voice->voice_mutex);
         memset(voice->products, 0, sizeof(voice->products));
@@ -143,20 +155,34 @@ void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID
 
         for (size_t i = 0; i < voice->rack->modules.size(); i++) {
             if (voice->rack->modules[i]) {
+                const uint32_t module_id = voice->rack->modules[i]->module_id();
                 if (voice->rack->modules[i]->process(kern, mem, thread_id, voice->datas[i], scheduler_lock, voice_lock)) {
                     finished = true;
-                    finished_module = voice->rack->modules[i]->module_id();
+                    finished_module = module_id;
                 }
+                if (was_released(voice))
+                    break;
             }
         }
+        if (was_released(voice)) {
+            voice_lock.release();
+            drop_released();
+            continue;
+        }
+        drop_released();
         if (finished) {
             voice->is_keyed_off = true;
             voice->transition(mem, VOICE_STATE_FINALIZING);
             if (voice->finished_callback) {
                 voice_lock.unlock();
                 scheduler_lock.unlock();
-                voice->invoke_callback(kern, mem, thread_id, voice->finished_callback, voice->finished_callback_user_data, finished_module);
+                const bool alive = voice->invoke_callback(kern, mem, thread_id, voice->finished_callback, voice->finished_callback_user_data, finished_module);
                 scheduler_lock.lock();
+                drop_released();
+                if (!alive) {
+                    voice_lock.release();
+                    continue;
+                }
                 voice_lock.lock();
             }
             voice->is_keyed_off = false;
@@ -178,9 +204,8 @@ void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID
         switch (op.type) {
         case PendingType::ReleaseRack:
             release_rack(*op.release_data.state, mem, op.system, op.release_data.rack);
-            // a synchronous release deferred from a voice callback has none
-            if (op.release_data.callback)
-                kern.get_thread(thread_id)->run_callback(op.release_data.callback, { Ptr<void>(op.release_data.rack, mem).address() });
+            // run callback (we know it is defined)
+            kern.get_thread(thread_id)->run_callback(op.release_data.callback, { Ptr<void>(op.release_data.rack, mem).address() });
             break;
         }
 
@@ -189,6 +214,7 @@ void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID
 
     is_updating = false;
     updating_thread = -1;
+    released_in_update.clear();
     condvar.notify_all();
 }
 

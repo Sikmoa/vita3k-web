@@ -21,6 +21,7 @@
 
 #include <mem/ptr.h>
 
+#include <algorithm>
 #include <condition_variable>
 #include <queue>
 #include <vector>
@@ -64,8 +65,16 @@ struct VoiceScheduler {
     std::condition_variable_any condvar;
     bool is_updating = false;
     // The guest thread running update(): its voice callbacks run on it, so a
-    // release from one must not wait for the update to end.
+    // release from one must not wait for the update to end. Such a release
+    // happens at once, as on hardware (the game may reuse the rack's memory
+    // as soon as it returns), and the voices it destroyed are listed here so
+    // the update never touches them again.
     std::int32_t updating_thread = -1;
+    std::vector<Voice *> released_in_update;
+
+    bool was_released(const Voice *voice) const {
+        return std::find(released_in_update.begin(), released_in_update.end(), voice) != released_in_update.end();
+    }
 
 protected:
     void deque_insert(const MemState &mem, Voice *voice);

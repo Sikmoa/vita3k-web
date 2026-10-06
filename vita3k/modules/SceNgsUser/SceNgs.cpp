@@ -359,16 +359,17 @@ EXPORT(SceInt32, sceNgsRackRelease, ngs::Rack *rack, Ptr<void> callback) {
 
     auto &scheduler = rack->system->voice_scheduler;
     std::unique_lock<std::recursive_mutex> lock(scheduler.mutex);
-    if (!scheduler.is_updating) {
+    if (!scheduler.is_updating || (!callback && scheduler.updating_thread == thread_id)) {
+        // Also from a voice callback on the updating thread (Fruit Ninja),
+        // where waiting for the update would never end: released at once, as
+        // the game may reuse the memory on return; the update drops the
+        // voices (VoiceScheduler::released_in_update).
         ngs::release_rack(emuenv.ngs, emuenv.mem, rack->system, rack);
-    } else if (!callback && scheduler.updating_thread != thread_id) {
+    } else if (!callback) {
         // wait for the update to finish
         scheduler.condvar.wait(lock, [&] { return !scheduler.is_updating; });
         ngs::release_rack(emuenv.ngs, emuenv.mem, rack->system, rack);
     } else {
-        // From a voice callback on the updating thread (Fruit Ninja's
-        // finished-voice handler), waiting would never end: the release runs
-        // when this update finishes, before its voices could be used again.
         // destroy rack asynchronously
         ngs::OperationPending op;
         op.type = ngs::PendingType::ReleaseRack;
