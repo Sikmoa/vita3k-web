@@ -83,4 +83,4 @@
 	url = https://github.com/Vita3K/substitute.git
 [submodule "external/printf"]
    	path = external/printf
-   	url = https://github.com/eyalroz/printf
+   	url = https://github.com/Vita3K/printf
