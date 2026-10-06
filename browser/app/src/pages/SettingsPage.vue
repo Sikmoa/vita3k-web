@@ -60,27 +60,23 @@ async function removeEverything() {
       <SettingRow title="Start muted" description="Games start without sound; the player's sound button turns it on.">
         <ToggleSwitch v-model="settings.startMuted" label="Start muted" />
       </SettingRow>
+      <SettingRow title="Frame rate hack" description="Lets some games run faster than they were made to. May break timing.">
+        <ToggleSwitch v-model="settings.fpsHack" label="Frame rate hack" />
+      </SettingRow>
     </div>
 
     <h2 class="section-title">Performance</h2>
     <div class="card divide-y divide-surface">
-      <SettingRow title="Multithreaded runtime" stack>
+      <SettingRow title="Multithreaded runtime" stack :disabled="!threadsAvailable">
         <template #description>
           Runs the game's threads in parallel: much faster on most devices.
           <span v-if="!threadsAvailable" class="block text-error mt-1">Unavailable: this page is not cross-origin isolated.</span>
         </template>
         <ToggleSwitch v-model="settings.threads" label="Multithreaded runtime" :disabled="!threadsAvailable" />
       </SettingRow>
-      <SettingRow title="Background scene building" description="Prepares graphics on its own thread (multithreaded runtime only).">
+      <SettingRow title="Background scene building" description="Prepares graphics on its own thread (multithreaded runtime only)." :disabled="!settings.threads || !threadsAvailable">
         <ToggleSwitch v-model="settings.asyncScene" label="Background scene building" :disabled="!settings.threads || !threadsAvailable" />
       </SettingRow>
-      <SettingRow title="Frame rate hack" description="Lets some games run faster than they were made to. May break timing.">
-        <ToggleSwitch v-model="settings.fpsHack" label="Frame rate hack" />
-      </SettingRow>
-    </div>
-
-    <h2 class="section-title">Advanced</h2>
-    <div class="card divide-y divide-surface">
       <SettingRow title="CPU backend" description="The interpreter is much slower; it is for troubleshooting." stack>
         <SegmentedControl v-model="settings.backend" label="CPU backend" :options="[{ value: 'jit', label: 'JIT' }, { value: 'interp', label: 'Interpreter' }]" />
       </SettingRow>
@@ -93,9 +89,6 @@ async function removeEverything() {
       </SettingRow>
       <SettingRow title="Fast system calls" description="Handles the most frequent system calls without leaving compiled code.">
         <ToggleSwitch v-model="settings.hleIntrinsics" label="Fast system calls" />
-      </SettingRow>
-      <SettingRow title="Reset settings" description="Back to the defaults; games and saves stay.">
-        <button class="btn-tonal" @click="resetSettings">Reset</button>
       </SettingRow>
     </div>
 
@@ -120,6 +113,13 @@ async function removeEverything() {
       </SettingRow>
       <SettingRow title="Remove everything" description="Every imported game, its saves and the firmware.">
         <button class="btn-danger" @click="confirming = 'everything'">Remove</button>
+      </SettingRow>
+    </div>
+
+    <h2 class="section-title">Others</h2>
+    <div class="card divide-y divide-surface">
+      <SettingRow title="Reset settings" description="Back to the defaults; games and saves stay.">
+        <button class="btn-tonal" @click="resetSettings">Reset</button>
       </SettingRow>
     </div>
 

@@ -1,4 +1,4 @@
-import { defineConfig } from 'unocss';
+import { defineConfig, transformerVariantGroup } from 'unocss';
 import presetWind3 from '@unocss/preset-wind3';
 import presetIcons from '@unocss/preset-icons';
 
@@ -33,6 +33,8 @@ const colors = {
 };
 
 export default defineConfig({
+  // Grouped variants in class attributes: disabled:(opacity-60 cursor-not-allowed).
+  transformers: [transformerVariantGroup()],
   presets: [
     presetWind3(),
     presetIcons({ scale: 1.2, extraProperties: { 'display': 'inline-block', 'vertical-align': 'middle', 'flex-shrink': '0' } }),
@@ -43,12 +45,12 @@ export default defineConfig({
     fontFamily: { sans: 'Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif', mono: 'ui-monospace, SFMono-Regular, Menlo, monospace' },
   },
   shortcuts: {
-    'btn': 'inline-flex items-center justify-center gap-2 h-10 px-5 rounded-full border-0 font-medium text-sm cursor-pointer select-none transition-colors duration-150 disabled:(opacity-40 cursor-not-allowed)',
+    'btn': 'inline-flex items-center justify-center gap-2 h-10 px-5 rounded-full border-0 font-medium text-sm cursor-pointer select-none transition-colors duration-150 disabled:(opacity-60 cursor-not-allowed)',
     'btn-filled': 'btn bg-primary text-on-primary hover:bg-[#c3e4fc]',
     'btn-tonal': 'btn bg-secondary-container text-on-secondary-container hover:bg-[#40566a]',
     'btn-text': 'btn bg-transparent text-primary hover:bg-[#afdafb14] px-3',
     'btn-danger': 'btn bg-error-container text-on-error-container hover:bg-[#a0241e]',
-    'icon-btn': 'inline-flex items-center justify-center w-10 h-10 rounded-full border-0 bg-transparent text-on-surface-variant cursor-pointer hover:bg-[#dee3e814] transition-colors duration-150 disabled:(opacity-40 cursor-not-allowed)',
+    'icon-btn': 'inline-flex items-center justify-center w-10 h-10 rounded-full border-0 bg-transparent text-on-surface-variant cursor-pointer hover:bg-[#dee3e814] transition-colors duration-150 disabled:(opacity-60 cursor-not-allowed)',
     'card': 'bg-surface-container rounded-card',
     'field': 'h-12 w-full rounded-full border-0 bg-surface-high text-on-surface px-5 text-sm outline-none focus:(ring-2 ring-primary) placeholder:text-outline-variant',
     'chip': 'inline-flex items-center gap-1 h-6 px-2.5 rounded-full text-xs font-medium',
