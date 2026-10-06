@@ -100,6 +100,8 @@ export function createSession({ settings = {}, canvas, pixels = null } = {}) {
   let stageTotals = { files: 0, bytes: 0 };
   const stageSources = { storage: 0, downloaded: 0 };
   let saveChain = Promise.resolve();
+  // The graphics queue backing up is said once per run; later ones are logged.
+  let throttleNoticed = false;
   const elapsed = () => (launchStartedAt ? Math.max(0, Math.round((performance.now() - launchStartedAt) / 1000)) : 0) + 's';
 
   // --- Audio --------------------------------------------------------------
@@ -241,7 +243,7 @@ export function createSession({ settings = {}, canvas, pixels = null } = {}) {
     stop(null);
     target = chosen;
     frames = 0; gpuFrames = 0; pixelFrames = 0; fps = 0; firstFrameAt = 0;
-    lastPresentAt = 0; presentedOnce = false; watchdogWarned = false;
+    lastPresentAt = 0; presentedOnce = false; watchdogWarned = false; throttleNoticed = false;
     startedAt = launchStartedAt = performance.now();
     stageTotals = { files: 0, bytes: 0 };
     Object.assign(audio, { chunks: 0, bytes: 0, peak: 0, logged: false });
@@ -475,7 +477,8 @@ export function createSession({ settings = {}, canvas, pixels = null } = {}) {
       case 'vita-gxm-throttle': {
         const info = data.throttle ?? {};
         log(`[gxm-throttle] Waiting: ${info.inFlight} submissions queued (max ${info.maxInFlight}); ${info.throttledScenes} scene retries`);
-        notice('Rendering is waiting for graphics work to finish. A lower resolution may help.');
+        if (!throttleNoticed) notice('Rendering is waiting for graphics work to finish. A lower resolution may help.');
+        throttleNoticed = true;
         break;
       }
       case 'vita-gxm-device': {

@@ -294,7 +294,7 @@ const dialogHint = computed(() => dialog.value?.enterButton === 'circle' ? '○ 
       <!-- Fullscreen: only the way out, on the right edge -->
       <button
         v-if="immersive"
-        class="absolute right-0 top-1/2 -translate-y-1/2 z-5 flex items-center justify-start pl-1 w-7 h-10 border-0 rounded-l-full bg-secondary-container text-on-secondary-container opacity-50 hover:opacity-90 cursor-pointer transition-opacity duration-150"
+        class="absolute right-0 top-1/2 -translate-y-1/2 z-5 flex items-center justify-start pl-1 w-7 h-10 border-0 rounded-l-full bg-secondary-container text-on-secondary-container opacity-15 hover:opacity-90 cursor-pointer transition-opacity duration-150"
         aria-label="Exit fullscreen"
         @click="toggleFullscreen"
       >
