@@ -43,7 +43,8 @@ const server = createServer(async (req, res) => {
   } catch { res.writeHead(404); res.end(); }
 });
 await new Promise((done) => server.listen(0, '127.0.0.1', done));
-const url = `http://127.0.0.1:${server.address().port}${prefix}?${process.env.PAGES_PARAMS ?? 'threads=1'}`;
+// The player page; the app at the site's root has its own test (app_chromium.mjs).
+const url = `http://127.0.0.1:${server.address().port}${prefix}player.html?${process.env.PAGES_PARAMS ?? 'threads=1'}`;
 const wantFrames = Number(process.env.PAGES_FRAMES || 60);
 const deadline = Date.now() + Number(process.env.PAGES_DEADLINE_MS || 240000);
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE_URL || 'playwright');

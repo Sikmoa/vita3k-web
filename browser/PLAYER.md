@@ -1,5 +1,10 @@
 # Browser player and touch controls
 
+The site's front page is the app (`browser/app`, Vue: Library, Settings,
+About and a full-window player; see its README). This page, `player.html`,
+is the single-game player the tests drive; both run games through
+`vita_session.js` and manage content through `library.js`.
+
 The interactive launcher (`browser/tests/limbo_serve.mjs`) serves the player
 from `browser/web/player.html`, `player.css`, `player.js`, and `pad_input.js`.
 Changes to these files are served from source without rebuilding Wasm. The

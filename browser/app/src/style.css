@@ -1,0 +1,17 @@
+/* Base: the dark palette (uno.config.ts) on every surface. */
+html, body, #app { height: 100%; }
+body {
+  margin: 0;
+  background: #0F1417;
+  color: #DEE3E8;
+  font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+}
+* { box-sizing: border-box; }
+button, input, select, textarea { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid #AFDAFB; outline-offset: 2px; }
+::selection { background: #094C6B; color: #E5F3FF; }
+/* Thin, quiet scrollbars. */
+* { scrollbar-width: thin; scrollbar-color: #313539 transparent; }
+input[type='range'] { accent-color: #AFDAFB; }

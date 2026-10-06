@@ -40,6 +40,7 @@
           # Web / Wasm
           emscripten
           nodejs_24
+          bun # the app (browser/app)
 
           # Wasm inspection/debugging
           binaryen
