@@ -38,7 +38,7 @@ export function installThreadBridge(module, logger = console.error) {
       if (!gxm) return 0;
       while (!gxm.trySubmitScene(words, data)) await gxm.waitForCapacity();
       return 0;
-    }).catch((error) => { logger(`[thread-bridge] posted scene rejected: ${error?.stack || error}`); return -1; });
+    }).catch((error) => { logger(`[thread-bridge] posted scene rejected: ${error?.name ?? 'Error'}: ${error?.message ?? error}\n${error?.stack ?? ''}`); return -1; });
   };
   module.vita3kThreadCall = async (operation, a) => {
     const id = ++nextCall;

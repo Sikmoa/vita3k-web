@@ -2171,6 +2171,10 @@ static bool post_scene(scene::Writer &out) {
 static bool submit_scene(scene::Writer &out, MemState &mem) {
     end_pass(out);
     out.copy_streams(mem);
+    // WebGPU writes whole words (writeBuffer throws otherwise and the scene
+    // is lost); the last append, an index list or a stream copy, may end
+    // mid-word.
+    out.data.extend(align(out.data.size(), 4), 0);
 #ifdef __EMSCRIPTEN_SHARED_MEMORY__
     // A rejected stream is logged by the coordinator; it cannot answer here.
     const bool posted = out.words.size() <= 1 || post_scene(out);

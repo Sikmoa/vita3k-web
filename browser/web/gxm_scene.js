@@ -418,8 +418,11 @@ function createPipeline(d, target, depth) {
 
 function ensureSceneBuffer(size) {
   if (size <= sceneBufferSize) return;
+  // Powers of two, up to the device's buffer limit (256 MiB by default).
+  const limit = device.limits.maxBufferSize;
+  if (size > limit) throw new RangeError(`scene of ${size} bytes exceeds the GPU buffer limit (${limit})`);
   sceneBuffer?.destroy();
-  sceneBufferSize = Math.max(1 << 20, 2 ** Math.ceil(Math.log2(size)));
+  sceneBufferSize = Math.min(limit, Math.max(1 << 20, 2 ** Math.ceil(Math.log2(size))));
   sceneBuffer = device.createBuffer({ size: sceneBufferSize, usage: GPUBufferUsage.VERTEX
     | GPUBufferUsage.INDEX | GPUBufferUsage.UNIFORM | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   bufferGroups.clear();
