@@ -283,39 +283,47 @@ function firmwareContents(files) {
   return { title: FIRMWARE_TITLE, app: FIRMWARE_TITLE, firmware: true, files: shipped };
 }
 
-// Vita param.sfo: {'magic': 'PSF\0', ...}. Reads the TITLE_ID for archives
-// that hold the app directory itself (the bare .vpk layout: eboot.bin and
-// sce_sys/param.sfo at the root, no app/<id> folder). Returns null when the
-// data is not a readable SFO.
-function readSfoTitleId(bytes) {
+// Vita param.sfo ('PSF\0'): its string parameters (TITLE, TITLE_ID,
+// CATEGORY, …) as an object, or null when the data is not a readable SFO.
+export function readSfo(bytes) {
   try {
     if (bytes.length < 20) return null;
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    if (view.getUint32(0, true) !== 0x00465350) return null; // 'PSF\0'
+    if (view.getUint32(0, true) !== 0x46535000) return null; // '\0PSF'
     const keyStart = view.getUint32(8, true);
     const dataStart = view.getUint32(12, true);
     const count = view.getUint32(16, true);
     if (count > 256 || keyStart >= bytes.length || dataStart >= bytes.length) return null;
+    const decoder = new TextDecoder();
+    const params = {};
     for (let i = 0; i < count; i++) {
       const at = 20 + i * 16;
       if (at + 16 > bytes.length) return null;
       const keyOffset = view.getUint16(at, true);
+      const format = view.getUint16(at + 2, true);
       const length = view.getUint32(at + 4, true);
       const dataOffset = view.getUint32(at + 12, true);
       let end = keyStart + keyOffset;
       while (end < bytes.length && bytes[end] !== 0) end++;
-      const key = new TextDecoder().decode(bytes.subarray(keyStart + keyOffset, end));
-      if (key !== 'TITLE_ID') continue;
+      const key = decoder.decode(bytes.subarray(keyStart + keyOffset, end));
       if (dataStart + dataOffset + length > bytes.length) return null;
       const raw = bytes.subarray(dataStart + dataOffset, dataStart + dataOffset + length);
-      const zero = raw.indexOf(0);
-      const id = new TextDecoder().decode(zero < 0 ? raw : raw.subarray(0, zero));
-      return /^[A-Za-z0-9_-]{3,24}$/.test(id) ? id : null;
+      if (format === 0x0404) params[key] = new DataView(raw.buffer, raw.byteOffset, raw.byteLength).getUint32(0, true);
+      else {
+        const zero = raw.indexOf(0);
+        params[key] = decoder.decode(zero < 0 ? raw : raw.subarray(0, zero));
+      }
     }
-    return null;
+    return params;
   } catch {
     return null;
   }
+}
+// The TITLE_ID of archives that hold the app directory itself (the bare .vpk
+// layout: eboot.bin and sce_sys/param.sfo at the root, no app/<id> folder).
+function readSfoTitleId(bytes) {
+  const id = readSfo(bytes)?.TITLE_ID;
+  return typeof id === 'string' && /^[A-Za-z0-9_-]{3,24}$/.test(id) ? id : null;
 }
 
 // Fallback for archives with no app/<id> directory: the root (or a wrapper
