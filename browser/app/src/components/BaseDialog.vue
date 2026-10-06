@@ -4,7 +4,7 @@ import { onKeyStroke } from '@vueuse/core';
 
 // A modal dialog: a scrim, then the panel (28 px corners); Escape and the
 // scrim close it unless `locked` (work in progress).
-const props = defineProps<{ open: boolean; title: string; locked?: boolean; wide?: boolean }>();
+const props = defineProps<{ open: boolean; title: string; locked?: boolean; wide?: boolean; large?: boolean }>();
 const emit = defineEmits<{ close: [] }>();
 const panel = ref<HTMLElement | null>(null);
 
@@ -27,7 +27,7 @@ watch(() => props.open, async (open) => {
           aria-modal="true"
           :aria-label="title"
           class="w-full max-h-[92dvh] overflow-auto bg-surface-high text-on-surface rounded-t-dialog sm:rounded-dialog p-6 pb-[max(24px,env(safe-area-inset-bottom))]"
-          :class="wide ? 'sm:max-w-xl' : 'sm:max-w-md'"
+          :class="large ? 'sm:max-w-4xl' : wide ? 'sm:max-w-xl' : 'sm:max-w-md'"
         >
           <header class="flex items-start gap-3 mb-4">
             <h2 class="flex-1 m-0 text-2xl font-normal">{{ title }}</h2>

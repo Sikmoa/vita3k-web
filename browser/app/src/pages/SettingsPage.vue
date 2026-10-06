@@ -118,6 +118,9 @@ async function removeEverything() {
 
     <h2 class="section-title">Others</h2>
     <div class="card divide-y divide-surface">
+      <SettingRow title="Save logs to files" description="Every run of a game writes its log to vita3k-logs on the Files page, for bug reports. The newest 20 stay.">
+        <ToggleSwitch v-model="settings.saveLogs" label="Save logs to files" />
+      </SettingRow>
       <SettingRow title="Reset settings" description="Back to the defaults; games and saves stay.">
         <button class="btn-tonal" @click="resetSettings">Reset</button>
       </SettingRow>

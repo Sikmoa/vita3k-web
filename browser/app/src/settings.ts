@@ -16,6 +16,7 @@ export interface Settings {
   buildAot: 'auto' | 'on' | 'off';
   asyncScene: boolean;
   hleIntrinsics: boolean;
+  saveLogs: boolean;
 }
 
 export const defaults: Settings = {
@@ -33,6 +34,7 @@ export const defaults: Settings = {
   buildAot: 'auto',
   asyncScene: true,
   hleIntrinsics: true,
+  saveLogs: false,
 };
 
 export const settings = useStorage<Settings>('vita3k.app.settings', { ...defaults }, localStorage, { mergeDefaults: true });

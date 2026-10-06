@@ -90,6 +90,8 @@ try {
   await shot(page, 'settings');
   // Screenshots show the touch controls too.
   if (shots) await page.getByRole('radio', { name: 'Always' }).click();
+  // The game's log goes to a file too.
+  await page.getByRole('switch', { name: 'Save logs to files' }).click();
   await page.getByRole('link', { name: 'About' }).click();
   await page.getByText('This device').waitFor();
   await page.waitForFunction(() => !document.body.innerText.includes('Checking…'));
@@ -169,7 +171,29 @@ try {
     await phone.close();
   }
 
+  // The logs dialog shows the run's log and where it is saved.
+  await page.getByRole('button', { name: 'Logs' }).click();
+  const logs = page.getByRole('dialog', { name: 'Logs' });
+  await logs.getByText(/saved to vita3k-logs\//).waitFor();
+  assert.ok((await logs.locator('pre').innerText()).split('\n').length > 5, 'the log has lines');
+  await shot(page, 'logs');
+  await logs.getByRole('button', { name: 'Close dialog' }).click();
+
+  // Leaving a running game asks first: Cancel keeps it running.
   await page.getByRole('link', { name: 'Back to the library' }).click();
+  const leave = page.getByRole('dialog', { name: 'Leave the game?' });
+  await shot(page, 'leave-confirm');
+  await leave.getByRole('button', { name: 'Cancel' }).click();
+  assert.equal(await page.locator('.stage').getAttribute('data-phase'), 'running');
+  await page.getByRole('link', { name: 'Back to the library' }).click();
+  await leave.getByRole('button', { name: 'Leave' }).click();
+  await page.getByRole('heading', { name: 'Library' }).waitFor();
+
+  // The saved log, on the Files page.
+  await page.getByRole('link', { name: 'Files' }).click();
+  await page.getByText('vita3k-logs').click();
+  await page.getByText(/\.log$/).first().waitFor();
+  await page.goto(root + '#/library');
   await page.getByRole('heading', { name: 'Library' }).waitFor();
   assert.deepEqual(errors, []);
   console.log(`PASS: the app under ${prefix}: firmware and ${name} imported through the dialog, ${frames} frames played.`);

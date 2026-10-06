@@ -6,7 +6,10 @@ import { loadLibrary, loadPadInput, loadSession, type GuestDialog as Dialog, typ
 import { settings, sessionSettings } from '../settings';
 import { refreshLibrary } from '../library';
 import { href, navigate } from '../router';
+import { openLogFile, type LogFile } from '../logfile';
+import BaseDialog from '../components/BaseDialog.vue';
 import ProgressBar from '../components/ProgressBar.vue';
+import LogsDialog from '../player/LogsDialog.vue';
 import TouchControls from '../player/TouchControls.vue';
 import GuestDialog from '../player/GuestDialog.vue';
 import GuestKeyboard from '../player/GuestKeyboard.vue';
@@ -34,7 +37,32 @@ const ime = ref<GuestIme | null>(null);
 const notice = ref('');
 const { start: hideNoticeLater } = useTimeoutFn(() => { notice.value = ''; }, 6000, { immediate: false });
 const showNotice = (text: string) => { notice.value = text; if (text) hideNoticeLater(); };
+// The log: the latest LOG_LINES lines, for the logs dialog; with Settings →
+// Save logs to files, each run also goes to a file.
+const LOG_LINES = 5000;
 const logLines: string[] = [];
+const logVersion = ref(0);
+const logsOpen = ref(false);
+let logFile: LogFile | null = null;
+const logFileName = ref<string | null>(null);
+function closeLogFile() { logFile?.close(); logFile = null; }
+async function openRunLog() {
+  closeLogFile();
+  logFileName.value = null;
+  if (!settings.value.saveLogs) return;
+  try {
+    logFile = await openLogFile(props.title, [
+      `Vita3K Web ${__APP_COMMIT__} · ${game.name} (${props.title})${props.source ? ' from ' + props.source : ''}`,
+      `Started ${new Date().toISOString()}`,
+      `Browser: ${navigator.userAgent}`,
+      `Settings: ${JSON.stringify(sessionSettings.value)}`,
+    ]);
+    logFileName.value = logFile?.name ?? null;
+  } catch { /* no file this run: the dialog still has the log */ }
+}
+// Leaving or stopping a running game asks first.
+const confirming = ref<'leave' | 'stop' | null>(null);
+const live = computed(() => state.phase === 'running' || state.phase === 'loading');
 // start() first stops the previous run: that stop is not the player's.
 let starting = false;
 
@@ -91,12 +119,18 @@ async function boot() {
   s.on('launch', (launch) => { state.launch = launch; });
   s.on('status', (text) => { state.status = text; });
   s.on('notice', showNotice);
-  s.on('log', (text) => { logLines.push(text); if (logLines.length > 400) logLines.splice(0, logLines.length - 400); });
+  s.on('log', (text) => {
+    logLines.push(text);
+    if (logLines.length > LOG_LINES) logLines.splice(0, logLines.length - LOG_LINES);
+    logVersion.value++;
+    logFile?.add(text);
+  });
   s.on('frame', (stats) => { state.frames = stats.frames; state.fps = stats.fps; if (state.phase !== 'error') state.phase = 'running'; });
   s.on('saved', () => { refreshLibrary(); });
   s.on('stopped', () => {
     dialog.value = null; ime.value = null;
     if (!starting && state.phase !== 'error') state.phase = 'stopped';
+    if (!starting) closeLogFile();
   });
   s.on('dialog', onDialog);
   s.on('ime', (message) => {
@@ -124,14 +158,26 @@ async function run() {
     if (!target.title) throw new Error('This game is not in this browser: import it from the Library.');
     const problem = sessions.webgpuProblem();
     if (problem) throw new Error(problem);
+    await openRunLog();
     starting = true;
     try { await s.start(target); } finally { starting = false; }
     s.setMuted(state.muted);
   } catch (error) {
-    Object.assign(state, { phase: 'error', error: error instanceof Error ? error.message : String(error) });
+    const message = error instanceof Error ? error.message : String(error);
+    Object.assign(state, { phase: 'error', error: message });
+    logFile?.add('Could not start: ' + message);
+    closeLogFile();
   }
 }
 function stopGame() { session.value?.stop('Stopped'); }
+function askStop() { if (live.value) confirming.value = 'stop'; else stopGame(); }
+function askBack() { if (live.value) confirming.value = 'leave'; else back(); }
+function confirmed() {
+  const action = confirming.value;
+  confirming.value = null;
+  if (action === 'leave') back();
+  else if (action === 'stop') stopGame();
+}
 
 // --- Guest dialogs ------------------------------------------------------------
 function onDialog(message: Dialog) {
@@ -190,6 +236,7 @@ onMounted(boot);
 onBeforeUnmount(() => {
   gamepads?.clear();
   session.value?.dispose();
+  closeLogFile();
   if (game.icon) URL.revokeObjectURL(game.icon);
   document.title = 'Vita3K Web';
 });
@@ -204,17 +251,17 @@ const dialogHint = computed(() => dialog.value?.enterButton === 'circle' ? '○ 
   >
     <!-- Top bar -->
     <header v-if="!immersive" class="top-bar flex items-center gap-1 sm:gap-2 h-16 px-2 sm:px-4 shrink-0 pt-[env(safe-area-inset-top)]">
-      <a :href="href('library')" class="icon-btn" aria-label="Back to the library" @click.prevent="back"><span class="i-lucide-arrow-left text-xl" /></a>
+      <a :href="href('library')" class="icon-btn" aria-label="Back to the library" @click.prevent="askBack"><span class="i-lucide-arrow-left text-xl" /></a>
       <img v-if="game.icon" :src="game.icon" alt="" class="w-9 h-9 rounded-xl hidden sm:block">
       <div class="flex-1 min-w-0 px-1">
         <div class="font-medium truncate">{{ game.name }}</div>
         <div class="text-xs text-outline truncate">{{ title }}{{ state.phase === 'running' ? '' : ` · ${state.phase === 'loading' ? 'starting' : state.phase}` }}</div>
       </div>
-      <span v-if="settings.showFps && state.phase === 'running'" class="chip bg-surface-high text-on-surface-variant font-mono tabular-nums">{{ state.fps.toFixed(0) }} FPS</span>
+      <button class="icon-btn" aria-label="Logs" @click="logsOpen = true"><span class="i-lucide-bug text-xl" /></button>
       <button class="icon-btn" :aria-label="state.muted ? 'Turn sound on' : 'Mute'" :aria-pressed="state.muted" @click="toggleMute">
         <span :class="state.muted ? 'i-lucide-volume-x' : 'i-lucide-volume-2'" class="text-xl" />
       </button>
-      <button v-if="state.phase === 'running' || state.phase === 'loading'" class="icon-btn" aria-label="Stop the game" @click="stopGame">
+      <button v-if="state.phase === 'running' || state.phase === 'loading'" class="icon-btn" aria-label="Stop the game" @click="askStop">
         <span class="i-lucide-square text-lg" />
       </button>
       <button v-else class="icon-btn" aria-label="Start again" @click="run"><span class="i-lucide-rotate-ccw text-xl" /></button>
@@ -291,6 +338,16 @@ const dialogHint = computed(() => dialog.value?.enterButton === 'circle' ? '○ 
         @close="session?.sendIme(ime!.id, 2, ime!.text, 0)"
       />
 
+      <!-- Frame rate, over the game's top right corner -->
+      <!-- (below the R button when the touch controls cover the corner) -->
+      <div
+        v-if="settings.showFps && state.phase === 'running'"
+        class="fps absolute right-3 z-4 pointer-events-none select-none font-mono text-sm font-bold tabular-nums text-white"
+        :class="touchVisible && !portrait ? 'top-16' : 'top-2'"
+      >
+        {{ state.fps.toFixed(0) }} FPS
+      </div>
+
       <!-- Fullscreen: only the way out, on the right edge -->
       <button
         v-if="immersive"
@@ -312,6 +369,18 @@ const dialogHint = computed(() => dialog.value?.enterButton === 'circle' ? '○ 
         </div>
       </Transition>
     </div>
+
+    <LogsDialog :open="logsOpen" :lines="logLines" :version="logVersion" :title="title" :saved-to="logFileName" @close="logsOpen = false" />
+    <BaseDialog :open="confirming !== null" :title="confirming === 'leave' ? 'Leave the game?' : 'Stop the game?'" @close="confirming = null">
+      <p class="m-0 text-on-surface-variant leading-relaxed">
+        {{ confirming === 'leave' ? 'The game stops and you go back to the library.' : 'The game stops; you can start it again.' }}
+        Progress since the last in-game save is lost.
+      </p>
+      <template #actions>
+        <button class="btn-text" @click="confirming = null">Cancel</button>
+        <button class="btn-danger" autofocus @click="confirmed">{{ confirming === 'leave' ? 'Leave' : 'Stop' }}</button>
+      </template>
+    </BaseDialog>
   </div>
 </template>
 
@@ -327,6 +396,11 @@ const dialogHint = computed(() => dialog.value?.enterButton === 'circle' ? '○ 
 }
 /* Phones held upright with touch controls: the game at the top. */
 .touch-portrait :deep(canvas.game-canvas) { object-position: center top; }
+/* White with a black outline: readable over any frame. */
+.fps {
+  -webkit-text-stroke: 3px #000; paint-order: stroke fill;
+  text-shadow: 0 0 2px #000;
+}
 .fade-enter-active, .fade-leave-active { transition: opacity 0.18s ease; }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
 </style>

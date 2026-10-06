@@ -41,6 +41,7 @@ const known: Record<string, { label: string; icon: string }> = {
   'vita3k-content': { label: 'Games and firmware', icon: 'i-lucide-hard-drive' },
   'vita3k-meta': { label: 'File lists of games and firmware', icon: 'i-lucide-list' },
   'vita3k-saves': { label: 'Saves', icon: 'i-lucide-save' },
+  'vita3k-logs': { label: 'Logs (Settings → Save logs to files)', icon: 'i-lucide-bug' },
   '_firmware': { label: 'Firmware', icon: 'i-lucide-cpu' },
   '_decrypt': { label: 'Temporary files of an import', icon: 'i-lucide-hourglass' },
 };
