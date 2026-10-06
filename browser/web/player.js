@@ -20,10 +20,10 @@ try {
   throw error;
 }
 const { title: TITLE, app: APP, fromServer, stagedTitles } = target;
-// Session settings from the query: the backend, memory model and the
+// Session settings from the query: the memory model and the
 // worker.js switches (WORKER_OPTIONS).
 const settings = {
-  backend: params.get('backend') === 'interp' ? 'interp' : 'jit',
+  backend: 'jit',
   memory: ['w64', 'w32'].includes(params.get('memory')) ? params.get('memory') : 'auto',
   inlineMutex: params.get('inlineMutex') === '0' ? '0' : '1',
   present: params.get('present') === 'readback' ? 'readback' : 'canvas',

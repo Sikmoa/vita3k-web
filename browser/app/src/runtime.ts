@@ -36,6 +36,8 @@ export interface Session {
   dispose(): void;
   stats(): SessionStats;
   pad: PadState;
+  /** A front touchscreen finger: phase 0 down, 1 move, 2 up; x, y in [0, 1] over the picture. */
+  touch(finger: number, phase: 0 | 1 | 2, x: number, y: number): void;
   ensureAudio(): void;
   setMuted(muted: boolean): void;
   readonly running: boolean;

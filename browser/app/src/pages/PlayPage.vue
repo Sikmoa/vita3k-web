@@ -84,7 +84,54 @@ const touchVisible = computed(() => !dialog.value && !ime.value && state.phase !
 const touch = ref<InstanceType<typeof TouchControls> | null>(null);
 let gamepads: { connected(): boolean; clear(): void } | null = null;
 
-function clearInputs() { touch.value?.clear(); gamepads?.clear(); session.value?.pad.clear(); }
+function clearInputs() { touch.value?.clear(); gamepads?.clear(); session.value?.pad.clear(); releaseFingers(); }
+
+// --- Front touchscreen ----------------------------------------------------------
+// Pointers on the game picture (mouse, pen, fingers) are the Vita's front
+// touchscreen; the touch controls keep their own. Up to six at once.
+const fingers = new Map<number, number>(); // pointerId → finger slot
+function picturePoint(event: PointerEvent, canvas: HTMLElement) {
+  // The canvas letterboxes 960×544 (object-fit: contain), at the top when
+  // held upright with touch controls.
+  const r = canvas.getBoundingClientRect();
+  const scale = Math.min(r.width / 960, r.height / 544);
+  const width = 960 * scale, height = 544 * scale;
+  const left = r.left + (r.width - width) / 2;
+  const top = r.top + (stage.value?.classList.contains('touch-portrait') ? 0 : (r.height - height) / 2);
+  return { x: (event.clientX - left) / width, y: (event.clientY - top) / height };
+}
+function onPointer(event: PointerEvent) {
+  const s = session.value, canvas = event.target as HTMLElement | null;
+  if (!s || !canvas?.matches?.('canvas.game-canvas')) return;
+  const slot = fingers.get(event.pointerId);
+  if (event.type === 'pointerdown') {
+    if (!s.running || dialog.value || ime.value || (event.pointerType === 'mouse' && event.button !== 0)) return;
+    const { x, y } = picturePoint(event, canvas);
+    if (x < 0 || y < 0 || x >= 1 || y >= 1 || fingers.size >= 6) return;
+    let free = 0;
+    while ([...fingers.values()].includes(free)) ++free;
+    fingers.set(event.pointerId, free);
+    canvas.setPointerCapture(event.pointerId);
+    event.preventDefault();
+    s.ensureAudio();
+    s.touch(free, 0, x, y);
+  } else if (slot === undefined) {
+    return;
+  } else if (event.type === 'pointermove') {
+    const { x, y } = picturePoint(event, canvas);
+    s.touch(slot, 1, x, y);
+  } else {
+    fingers.delete(event.pointerId);
+    const { x, y } = picturePoint(event, canvas);
+    s.touch(slot, 2, x, y);
+  }
+}
+function releaseFingers() {
+  for (const slot of fingers.values()) session.value?.touch(slot, 2, 0, 0);
+  fingers.clear();
+}
+for (const type of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel'] as const)
+  useEventListener(stage, type, onPointer);
 
 async function boot() {
   const [sessions, pads, lib] = await Promise.all([loadSession(), loadPadInput(), loadLibrary()]);
@@ -128,7 +175,7 @@ async function boot() {
   s.on('frame', (stats) => { state.frames = stats.frames; state.fps = stats.fps; if (state.phase !== 'error') state.phase = 'running'; });
   s.on('saved', () => { refreshLibrary(); });
   s.on('stopped', () => {
-    dialog.value = null; ime.value = null;
+    dialog.value = null; ime.value = null; fingers.clear();
     if (!starting && state.phase !== 'error') state.phase = 'stopped';
     if (!starting) closeLogFile();
   });
@@ -386,7 +433,7 @@ const dialogHint = computed(() => dialog.value?.enterButton === 'circle' ? '○ 
 
 <style scoped>
 .stage :deep(canvas.game-canvas) {
-  position: absolute; inset: 0; width: 100%; height: 100%;
+  position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none;
   object-fit: contain; image-rendering: auto; display: block;
 }
 /* Phones held sideways: a compact bar, the game edge to edge. */

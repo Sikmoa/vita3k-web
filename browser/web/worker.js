@@ -182,6 +182,9 @@ try {
         // (threaded runtime; THREADS.md). ?hleIntrinsics=0: plain HLE stubs.
         VITA3K_ASYNC_SCENES: workerParams.get('asyncScene') === '0' ? '0' : undefined,
         VITA3K_HLE_INTRINSICS: workerParams.get('hleIntrinsics') === '0' ? '0' : undefined,
+        // ?strictImports=1: a call into a system function this build lacks
+        // ends the run; otherwise it returns 0, as on desktop (vita_app.cpp).
+        VITA3K_STRICT_IMPORTS: workerParams.get('strictImports') === '1' ? '1' : undefined,
         // Internal render resolution multiplier (gxm_webgpu_bridge.cpp); unset = 2.
         VITA3K_RESOLUTION_SCALE: workerParams.get('scale') ?? undefined,
         // Check cached textures and vertex streams against guest memory and
@@ -487,6 +490,10 @@ self.onmessage = async ({ data }) => {
   case 'input':
     // SCE_CTRL_* button mask and stick axes in [-1, 1] (vita_app.cpp vita3k_web_set_pad).
     module?._vita3k_web_set_pad?.(data.buttons >>> 0, ...(data.axes ?? [0, 0, 0, 0]));
+    break;
+  case 'touch':
+    // A front touchscreen finger (vita_app.cpp vita3k_web_touch).
+    module?._vita3k_web_touch?.(data.finger | 0, data.phase | 0, +data.x, +data.y);
     break;
   case 'dialog-press':
     // SCE_CTRL_CROSS / SCE_CTRL_CIRCLE pressed on dialog `id` with button

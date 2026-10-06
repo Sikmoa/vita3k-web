@@ -947,6 +947,10 @@ static bool swizzle_map(SceGxmTextureBaseFormat base, uint32_t swizzle, ChannelM
         map = four[(swizzle >> 12) & 7];
         return true;
     }
+    // Three components in memory order R(low) G B; desktop uploads U8U8U8 as
+    // GL_RGB8 under the same BGR/RGB swizzles (gl/texture_formats.cpp).
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8:
     case SCE_GXM_TEXTURE_BASE_FORMAT_U5U6U5: {
         static constexpr ChannelMap three[2] = {{0, 1, 2, O}, {2, 1, 0, O}}; // BGR RGB
         const uint32_t mode = (swizzle >> 12) & 7;
@@ -967,6 +971,10 @@ static void decode_texel(SceGxmTextureBaseFormat base, const uint8_t *src, uint8
     case SCE_GXM_TEXTURE_BASE_FORMAT_U8U8: out[0] = src[0]; out[1] = src[1]; break;
     case SCE_GXM_TEXTURE_BASE_FORMAT_S8S8: out[0] = uint8_t(int8_t(src[0]) + 128); out[1] = uint8_t(int8_t(src[1]) + 128); break;
     case SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8: std::memcpy(out, src, 4); break;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8: std::memcpy(out, src, 3); break;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8:
+        for (int i = 0; i < 3; ++i) out[i] = uint8_t(int8_t(src[i]) + 128);
+        break;
     case SCE_GXM_TEXTURE_BASE_FORMAT_U4U4U4U4: {
         const uint16_t v = uint16_t(src[0] | (src[1] << 8));
         for (int i = 0; i < 4; ++i) out[i] = uint8_t(((v >> (4 * i)) & 15) * 17);
@@ -1882,7 +1890,10 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
     // (desktop uses USCALED/SSCALED formats, which WebGPU lacks), and WebGPU
     // has no one- or three-component 8/16-bit formats. It also requires
     // four-byte-aligned stream strides, so every attribute in a packed
-    // stream must move. An invalid layout rejects the whole command buffer.
+    // stream must move, and an attribute to fit within its stride: GXM reads
+    // one that runs past it from the next vertex's bytes (Fruit Ninja: three
+    // floats at stride 8), which the copy reproduces. An invalid layout
+    // rejects the whole command buffer.
     struct Converted { uint32_t offset, size, format; float first[3]; };
     std::array<Converted, SCE_GXM_MAX_VERTEX_STREAMS> converted;
     uint32_t converted_count = 0, vertex_count = 0;
@@ -1890,8 +1901,11 @@ static void consume_draw(WebContext &ctx, CommandHelper &h, MemState &mem, scene
         auto &attr = attributes[k];
         const bool scaled = attr.format <= SCE_GXM_ATTRIBUTE_FORMAT_S16;
         const bool odd = attr.format <= SCE_GXM_ATTRIBUTE_FORMAT_F16 && attr.components != 2 && attr.components != 4;
-        const bool packed = vp->streams[attr.stream].stride % 4 != 0;
-        if (!scaled && !odd && !packed)
+        const uint32_t attr_stride = vp->streams[attr.stream].stride;
+        const bool packed = attr_stride % 4 != 0;
+        const bool overruns = attr_stride && attr.offset
+            + attr.components * gxm::attribute_format_size(static_cast<SceGxmAttributeFormat>(attr.format)) > attr_stride;
+        if (!scaled && !odd && !packed && !overruns)
             continue;
         if (stream_count + converted_count == SCE_GXM_MAX_VERTEX_STREAMS)
             return skip_draw("too many converted vertex attributes");

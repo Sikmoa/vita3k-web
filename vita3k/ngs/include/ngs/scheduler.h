@@ -63,6 +63,9 @@ struct VoiceScheduler {
     std::recursive_mutex mutex;
     std::condition_variable_any condvar;
     bool is_updating = false;
+    // The guest thread running update(): its voice callbacks run on it, so a
+    // release from one must not wait for the update to end.
+    std::int32_t updating_thread = -1;
 
 protected:
     void deque_insert(const MemState &mem, Voice *voice);

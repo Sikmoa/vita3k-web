@@ -77,9 +77,6 @@ async function removeEverything() {
       <SettingRow title="Background scene building" description="Prepares graphics on its own thread (multithreaded runtime only)." :disabled="!settings.threads || !threadsAvailable">
         <ToggleSwitch v-model="settings.asyncScene" label="Background scene building" :disabled="!settings.threads || !threadsAvailable" />
       </SettingRow>
-      <SettingRow title="CPU backend" description="The interpreter is much slower; it is for troubleshooting." stack>
-        <SegmentedControl v-model="settings.backend" label="CPU backend" :options="[{ value: 'jit', label: 'JIT' }, { value: 'interp', label: 'Interpreter' }]" />
-      </SettingRow>
       <SettingRow title="Ahead-of-time compilation" description="Compiles a game's code when it starts, for speed. Automatic does so for imported games." stack>
         <SegmentedControl
           v-model="settings.buildAot"
@@ -120,6 +117,9 @@ async function removeEverything() {
     <div class="card divide-y divide-surface">
       <SettingRow title="Save logs to files" description="Every run of a game writes its log to vita3k-logs on the Files page, for bug reports. The newest 20 stay.">
         <ToggleSwitch v-model="settings.saveLogs" label="Save logs to files" />
+      </SettingRow>
+      <SettingRow title="Stop on missing functions" description="A game that calls a system function this build lacks stops, naming it. Off, the call returns 0 and the game goes on, as in desktop Vita3K.">
+        <ToggleSwitch v-model="settings.strictImports" label="Stop on missing functions" />
       </SettingRow>
       <SettingRow title="Reset settings" description="Back to the defaults; games and saves stay.">
         <button class="btn-tonal" @click="resetSettings">Reset</button>

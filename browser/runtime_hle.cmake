@@ -495,6 +495,11 @@ set(_hle_exports
     sceNetResolverAbort sceNetResolverDestroy
     sceNetInetPton sceNetInternalInetPton
     sceNetCtlInetGetState sceNetCtlInetGetInfo
+    # Connection callbacks (Fruit Ninja's NP toolkit, exit -8 on eaee6185):
+    # register/unregister keep slots; the check runs each once with
+    # DISCONNECTED on the calling thread (run_callback, as sceImeUpdate).
+    sceNetCtlInetRegisterCallback sceNetCtlInetUnregisterCallback sceNetCtlCheckCallback
+    sceNetCtlInetGetResult
     # On-screen keyboard: production SceIme bodies; the page shows the text
     # field (ime_bridge.cpp) and sceImeUpdate runs the guest's event handler
     # on the calling thread (run_callback), as on desktop.
@@ -603,6 +608,10 @@ set(_hle_exports
     # over vita3k/codec and vita3k/ngs (runtime_codec.cmake).
     sceAudiodecCreateDecoderExternal sceAudiodecDecode sceAudiodecDeleteDecoder
     sceAudiodecDeleteDecoderExternal sceAudiodecGetContextSize
+    # Fruit Ninja: the library-managed decoders (init/term keep the codec's
+    # handle set) and AT9 section offsets for NGS voices, computed from the
+    # stream's config word.
+    sceAudiodecInitLibrary sceAudiodecTermLibrary sceNgsAT9GetSectionDetails
     sceAvcdecCreateDecoder sceAvcdecDecode sceAvcdecDecodeFlush sceAvcdecDecodeStop
     sceAvcdecDeleteDecoder sceAvcdecQueryDecoderMemSize
     sceCodecEngineAllocMemoryFromUnmapMemBlock sceCodecEngineCloseUnmapMemBlock

@@ -123,6 +123,7 @@ bool VoiceScheduler::off(const MemState &mem, Voice *voice) {
 void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID thread_id) {
     std::unique_lock<std::recursive_mutex> scheduler_lock(mutex);
     is_updating = true;
+    updating_thread = thread_id;
 
     // make a copy of the queue, this way we have no issue if it is modified in a callback
     std::vector<ngs::Voice *> queue_copy = queue;
@@ -177,8 +178,9 @@ void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID
         switch (op.type) {
         case PendingType::ReleaseRack:
             release_rack(*op.release_data.state, mem, op.system, op.release_data.rack);
-            // run callback (we know it is defined)
-            kern.get_thread(thread_id)->run_callback(op.release_data.callback, { Ptr<void>(op.release_data.rack, mem).address() });
+            // a synchronous release deferred from a voice callback has none
+            if (op.release_data.callback)
+                kern.get_thread(thread_id)->run_callback(op.release_data.callback, { Ptr<void>(op.release_data.rack, mem).address() });
             break;
         }
 
@@ -186,6 +188,7 @@ void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID
     }
 
     is_updating = false;
+    updating_thread = -1;
     condvar.notify_all();
 }
 

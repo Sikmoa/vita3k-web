@@ -10,7 +10,10 @@
 // (60) frames count as a boot; APP_SCREENSHOTS=<dir> keeps desktop and phone
 // screenshots of each page. PLAYWRIGHT_MODULE_URL /
 // PLAYWRIGHT_CHROMIUM_EXECUTABLE select local installs; APP_GPU=1 uses the
-// hardware adapter.
+// hardware adapter. APP_SWIPE=x1,y1,x2,y2[;…] (0-1 across the game picture)
+// drags the mouse over the game once it plays, as front-touchscreen swipes
+// APP_SWIPE_WAIT ms (4000) apart, keeps an after-swipe screenshot and checks
+// the game still presents frames afterwards.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createReadStream, existsSync, readFileSync, mkdirSync } from 'node:fs';
@@ -154,7 +157,37 @@ try {
     await page.getByRole('button', { name: 'Exit fullscreen' }).click();
     await page.waitForTimeout(500);
   }
+  if (process.env.APP_SWIPE) {
+    const box = await page.locator('canvas.game-canvas').boundingBox();
+    const scale = Math.min(box.width / 960, box.height / 544);
+    const left = box.x + (box.width - 960 * scale) / 2, top = box.y + (box.height - 544 * scale) / 2;
+    const at = (x, y) => [left + x * 960 * scale, top + y * 544 * scale];
+    for (const swipe of process.env.APP_SWIPE.split(';')) {
+      const [x1, y1, x2, y2] = swipe.split(',').map(Number);
+      await page.mouse.move(...at(x1, y1));
+      await page.mouse.down();
+      for (let step = 1; step <= 12; ++step) {
+        await page.mouse.move(...at(x1 + (x2 - x1) * step / 12, y1 + (y2 - y1) * step / 12));
+        await page.waitForTimeout(16);
+      }
+      await page.mouse.up();
+      await page.waitForTimeout(Number(process.env.APP_SWIPE_WAIT || 4000));
+    }
+    await shot(page, 'after-swipe');
+    const before = Number(await page.locator('.stage').getAttribute('data-frames'));
+    await page.waitForTimeout(3000);
+    const after = Number(await page.locator('.stage').getAttribute('data-frames'));
+    console.log('swiped', process.env.APP_SWIPE, '; frames in 3 s afterwards:', after - before);
+    assert.ok(after > before, 'the game still presents frames after the swipes');
+  }
   const phase = await page.locator('.stage').getAttribute('data-phase');
+  // A run that did not reach its frames (or APP_LOG_TAIL=<lines>): the end of its saved log.
+  if (phase !== 'running' || frames < wantFrames || process.env.APP_LOG_TAIL) console.log(await page.evaluate(async (lines) => {
+    const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle('vita3k-logs');
+    let last = null;
+    for await (const handle of dir.values()) if (!last || handle.name > last.name) last = handle;
+    return last ? (await last.getFile()).text().then((text) => text.split('\n').slice(-lines).join('\n')) : 'no log';
+  }, Number(process.env.APP_LOG_TAIL) || 60).catch((error) => 'no log: ' + error));
   assert.equal(phase, 'running', 'the player shows the running game');
   assert.ok(frames >= wantFrames, `only ${frames} frames (phase ${phase}): ${await page.locator('.stage').innerText()}`);
   console.log('played:', frames, 'frames, phase', phase);

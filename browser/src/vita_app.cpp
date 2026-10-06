@@ -54,6 +54,8 @@
 #include <ngs/state.h>
 #include <packages/license.h>
 #include <regmgr/functions.h>
+#include <touch/functions.h>
+#include <touch/state.h>
 #include <emscripten/emscripten.h>
 
 #include "gles_webgl_bridge.h"
@@ -73,6 +75,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <optional>
 #include <string>
 #include <thread>
@@ -101,6 +104,11 @@ static std::uint32_t g_host_buttons = 0;
 static std::array<float, 4> g_host_axes{};
 static std::atomic<bool> g_host_input_changed = false;
 static std::mutex g_host_input_mutex;
+// Front touchscreen fingers (worker.js 'touch'): down/move/up events in
+// coordinates normalized to the game picture, queued between event-loop turns
+// and handed to touch.cpp as SDL finger events by the run loop.
+struct HostTouch { std::int32_t finger, phase; float x, y; };
+static std::vector<HostTouch> g_host_touches;
 
 namespace {
 
@@ -479,6 +487,11 @@ static int run_app_impl() {
     // Same vblank headroom as run_vita: without it the guest spends real time
     // in frame pacing instead of executing.
     env->display.fast_vblank = vita3k_web_fast_vblank_enabled();
+    // Touches arrive normalized to the game picture (vita3k_web_touch): an
+    // identity viewport makes touch.cpp's window mapping a no-op.
+    env->display.viewport_drawable_w = env->display.viewport_drawable_h = 1;
+    env->display.viewport_x = env->display.viewport_y = 0;
+    env->display.viewport_w = env->display.viewport_h = 1;
     // Desktop Vita3K's fps-hack option: display waits of N vblanks wait one,
     // so titles that pace at 30 FPS through the display API present at 60.
     if (const char *fps_hack = std::getenv("VITA3K_FPS_HACK"))
@@ -542,6 +555,13 @@ static int run_app_impl() {
     auto last_report = std::chrono::steady_clock::now();
     const char *trace_option = std::getenv("VITA3K_TRACE_HLE");
     const bool trace_hle = trace_option && std::strcmp(trace_option, "1") == 0;
+    // A call into a system function this build has no HLE body for returns 0
+    // and the game goes on, as on desktop Vita3K (module_parent.cpp
+    // missing_import); each is reported once. VITA3K_STRICT_IMPORTS=1 ends
+    // the run at the first one instead, naming it.
+    const char *strict_option = std::getenv("VITA3K_STRICT_IMPORTS");
+    const bool strict_imports = strict_option && std::strcmp(strict_option, "1") == 0;
+    std::set<std::uint32_t> missing_reported;
 #ifdef VITA3K_USE_WASM_JIT
     // Guest-rate diagnosis. The retail rate is the product of JIT compilation
     // (emit/install) and execution (run_js_calls), so report instructions over
@@ -701,13 +721,19 @@ static int run_app_impl() {
 #endif
                     }
                 }
+                bool missing = false;
+                const auto dispatch = [&] {
+                    if (browser::gles::call_import(*env, cpu, nid))
+                        return;
+                    missing = !has_hle_implementation(nid);
+                    ::call_import(*env, cpu, nid, tid);
+                };
                 if (hle_profile) {
 #ifndef VITA3K_WEB_THREADS // the thread trace above records it there
                     last_import[tid] = { nid, read_pc(cpu) };
 #endif
                     const auto hle_started = std::chrono::steady_clock::now();
-                    if (!browser::gles::call_import(*env, cpu, nid))
-                        ::call_import(*env, cpu, nid, tid);
+                    dispatch();
                     const double hle_cost = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - hle_started).count();
                     const std::lock_guard<ReportMutex> guard(report_mutex);
@@ -715,8 +741,14 @@ static int run_app_impl() {
                     auto &hle_slot = hle_nids[nid];
                     ++hle_slot.first;
                     hle_slot.second += hle_cost;
-                } else if (!browser::gles::call_import(*env, cpu, nid)) {
-                    ::call_import(*env, cpu, nid, tid);
+                } else {
+                    dispatch();
+                }
+                if (missing && !strict_imports) {
+                    const std::lock_guard<ReportMutex> guard(report_mutex);
+                    if (missing_reported.insert(nid).second)
+                        std::printf("[vita3k-web] missing function %s (NID=%08x) called on thread %d: it returns 0, as on desktop Vita3K\n",
+                            app_import_name(nid), nid, tid);
                 }
 #ifdef VITA3K_WEB_THREADS
                 trace.phase.store(2, std::memory_order_relaxed);
@@ -743,7 +775,7 @@ static int run_app_impl() {
 #endif
                 // Module-start imports run before the main thread exists.
                 // Stop the importing thread, not a possibly-null main thread.
-                if (!env->missing_nids.empty()) {
+                if (strict_imports && !env->missing_nids.empty()) {
                     const auto active = env->kernel.threads.find(tid);
                     if (active != env->kernel.threads.end()) active->second->exit_delete(false);
                 }
@@ -813,7 +845,7 @@ static int run_app_impl() {
                 if (info.start_entry) {
                     const std::uint32_t result = start_module(*env, module);
                     std::printf("[vita3k-web] module_start %s returned %08x\n", info.module_name, result);
-                    if (!env->missing_nids.empty()) {
+                    if (strict_imports && !env->missing_nids.empty()) {
                         for (const auto nid : env->missing_nids)
                             std::printf("[vita3k-web] missing NID=%08x (%s)\n", nid, app_import_name(nid));
                         return -8;
@@ -996,12 +1028,30 @@ static int run_app_impl() {
                 break;
             }
             if (g_host_input_changed) {
-                const std::lock_guard<std::mutex> input_guard(g_host_input_mutex);
-                g_host_input_changed = false;
-                const std::lock_guard<std::mutex> guard(env->ctrl.mutex);
-                auto &pad = env->ctrl.keyboard_state;
-                pad.buttons = pad.buttons_ext = g_host_buttons;
-                std::copy(g_host_axes.begin(), g_host_axes.end(), pad.axes);
+                std::vector<HostTouch> touches;
+                {
+                    const std::lock_guard<std::mutex> input_guard(g_host_input_mutex);
+                    g_host_input_changed = false;
+                    touches.swap(g_host_touches);
+                    const std::lock_guard<std::mutex> guard(env->ctrl.mutex);
+                    auto &pad = env->ctrl.keyboard_state;
+                    pad.buttons = pad.buttons_ext = g_host_buttons;
+                    std::copy(g_host_axes.begin(), g_host_axes.end(), pad.axes);
+                }
+                if (!touches.empty()) {
+                    // advance_vblank samples the fingers under the same lock.
+                    const std::lock_guard<std::mutex> guard(env->display.mutex);
+                    for (const auto &touch : touches) {
+                        SDL_TouchFingerEvent finger{};
+                        finger.type = touch.phase == 0 ? SDL_EVENT_FINGER_DOWN
+                            : touch.phase == 1        ? SDL_EVENT_FINGER_MOTION
+                                                      : SDL_EVENT_FINGER_UP;
+                        finger.fingerID = static_cast<SDL_FingerID>(touch.finger) + 1;
+                        finger.x = std::clamp(touch.x, 0.0f, 0.9999f);
+                        finger.y = std::clamp(touch.y, 0.0f, 0.9999f);
+                        handle_touch_event(env->touch, finger);
+                    }
+                }
             }
             if (aot_until > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - jit_started).count() >= aot_until) {
                 WasmJitCPU::disable_aot();
@@ -1066,10 +1116,10 @@ static int run_app_impl() {
                 progress.idle = false;
             }
 #endif
-        // Unsupported imports remain fatal. A return-zero missing-import stub
-        // is not an implementation (PVRSRVConnect must provide a connection).
-        // The opt-in GLES adapter handles its APIs explicitly before this point.
-        } while (!exited && env->missing_nids.empty() && !progress.failed
+        // With VITA3K_STRICT_IMPORTS a missing import ends the run (a
+        // return-zero stub is not an implementation). The opt-in GLES adapter
+        // handles its APIs explicitly before this point.
+        } while (!exited && !(strict_imports && !env->missing_nids.empty()) && !progress.failed
             && !progress.idle);
         std::printf("[vita3k-web] Guest scheduler: dispatches=%zu runnable=%zu waiting=%zu dormant=%zu failed=%zu idle=%d\n",
             dispatched, progress.runnable, progress.waiting, progress.dormant, progress.failed, progress.idle);
@@ -1099,7 +1149,7 @@ static int run_app_impl() {
             exited.load(), exit_code.load(), imports.load(), env->missing_nids.size(), read_pc(*thread->cpu));
         for (const auto nid : env->missing_nids)
             std::printf("[vita3k-web] missing NID=%08x (%s)\n", nid, app_import_name(nid));
-        return exited && env->missing_nids.empty() ? exit_code.load() : -8;
+        return exited && !(strict_imports && !env->missing_nids.empty()) ? exit_code.load() : -8;
     } catch (const std::exception &error) {
         std::fprintf(stderr, "[vita3k-web] Vita app runtime error: %s\n", error.what());
         return -9;
@@ -1111,6 +1161,15 @@ void vita3k_web_set_pad(std::uint32_t buttons, float lx, float ly, float rx, flo
     const std::lock_guard<std::mutex> guard(g_host_input_mutex);
     g_host_buttons = buttons;
     g_host_axes = { lx, ly, rx, ry };
+    g_host_input_changed = true;
+}
+
+// One front-touchscreen finger event: phase 0 down, 1 move, 2 up (or
+// cancel); x and y in [0, 1] across the game picture.
+extern "C" EMSCRIPTEN_KEEPALIVE
+void vita3k_web_touch(std::int32_t finger, std::int32_t phase, float x, float y) {
+    const std::lock_guard<std::mutex> guard(g_host_input_mutex);
+    g_host_touches.push_back({ finger, phase, x, y });
     g_host_input_changed = true;
 }
 

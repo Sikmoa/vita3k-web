@@ -22,7 +22,7 @@ const siteUrl = (path) => new URL(path, import.meta.url).href;
 
 // Worker options a session passes through from its settings (worker.js).
 export const WORKER_OPTIONS = ['fpsHack', 'scale', 'surfaceSync', 'maxInFlight', 'cores', 'hleProfile', 'gles',
-  'readback', 'stampLru', 'writeObserver', 'regionCache', 'textureVerify', 'threads', 'asyncScene', 'hleIntrinsics'];
+  'readback', 'stampLru', 'writeObserver', 'regionCache', 'textureVerify', 'threads', 'asyncScene', 'hleIntrinsics', 'strictImports'];
 
 // What to boot: the server's configuration (player-config.json) for a title,
 // or, on a static host ({"static": true}), what this browser holds.
@@ -74,7 +74,7 @@ export async function webgpuAdapterProblem() {
   }
 }
 
-// settings: { backend: 'jit' | 'interp', memory: 'auto' | 'w64' | 'w32',
+// settings: { memory: 'auto' | 'w64' | 'w32',
 //   buildAot, present: 'canvas' | 'readback', fastVblank, patches,
 //   inlineMutex, and any of WORKER_OPTIONS } (strings or numbers).
 // canvas(): a fresh <canvas> in the page for the run's GPU frames (a canvas
@@ -88,7 +88,9 @@ export function createSession({ settings = {}, canvas, pixels = null } = {}) {
   const status = (text) => emit('status', text);
   const launch = (phase, detail, fraction) => emit('launch', phase ? { phase, detail: detail || '', fraction } : null);
 
-  const backend = settings.backend === 'interp' ? 'interp' : 'jit';
+  // Games run on the JIT: the interpreter module (vita3k_web) is for the
+  // development pages, and cannot boot the firmware's modules.
+  const backend = 'jit';
   const memory = ['w64', 'w32'].includes(settings.memory) ? settings.memory : 'auto';
   const presentToCanvas = settings.present !== 'readback';
 
@@ -102,6 +104,9 @@ export function createSession({ settings = {}, canvas, pixels = null } = {}) {
   let saveChain = Promise.resolve();
   // The graphics queue backing up is said once per run; later ones are logged.
   let throttleNoticed = false;
+  // So is the first call into a system function the build lacks (it returns
+  // 0, as on desktop); the log names every one.
+  let missingNoticed = false;
   const elapsed = () => (launchStartedAt ? Math.max(0, Math.round((performance.now() - launchStartedAt) / 1000)) : 0) + 's';
 
   // --- Audio --------------------------------------------------------------
@@ -192,6 +197,11 @@ export function createSession({ settings = {}, canvas, pixels = null } = {}) {
   // Sources (keys, touches, gamepads) share one pad state; it reaches the
   // guest only while it runs, and in full the moment it starts.
   const pad = createPadState((state) => { if (running && worker) worker.postMessage({ type: 'input', ...state }); });
+  // Front touchscreen: one finger event (phase 0 down, 1 move, 2 up), x and y
+  // in [0, 1] across the game picture.
+  function touch(finger, phase, x, y) {
+    if (running && worker) worker.postMessage({ type: 'touch', finger, phase, x, y });
+  }
 
   // --- Stats and watchdog --------------------------------------------------
   function stats() {
@@ -243,7 +253,7 @@ export function createSession({ settings = {}, canvas, pixels = null } = {}) {
     stop(null);
     target = chosen;
     frames = 0; gpuFrames = 0; pixelFrames = 0; fps = 0; firstFrameAt = 0;
-    lastPresentAt = 0; presentedOnce = false; watchdogWarned = false; throttleNoticed = false;
+    lastPresentAt = 0; presentedOnce = false; watchdogWarned = false; throttleNoticed = false; missingNoticed = false;
     startedAt = launchStartedAt = performance.now();
     stageTotals = { files: 0, bytes: 0 };
     Object.assign(audio, { chunks: 0, bytes: 0, peak: 0, logged: false });
@@ -499,6 +509,11 @@ export function createSession({ settings = {}, canvas, pixels = null } = {}) {
         // A rejected AOT image otherwise fails silently onto the JIT.
         if (typeof data.message === 'string' && data.message.includes('AOT REJECTED'))
           notice(`AOT module rejected (${data.message.replace(/^.*AOT REJECTED:\s*/, '')}). Running on the JIT fallback.`);
+        if (!missingNoticed && typeof data.message === 'string' && data.message.startsWith('[vita3k-web] missing function ')) {
+          missingNoticed = true;
+          const name = data.message.slice('[vita3k-web] missing function '.length).split(' ')[0];
+          notice(`This game uses system functions the web build lacks (first: ${name}); they return 0. If it misbehaves, the logs name each one.`);
+        }
         break;
       case 'error': log('ERROR ' + data.message); notice(data.message); stop('Runtime error'); break;
       default: break;
@@ -511,7 +526,7 @@ export function createSession({ settings = {}, canvas, pixels = null } = {}) {
       listeners.get(type).add(handler);
       return () => listeners.get(type)?.delete(handler);
     },
-    start, stop, dispose, stats, pad, ensureAudio, setMuted, beep,
+    start, stop, dispose, stats, pad, touch, ensureAudio, setMuted, beep,
     get running() { return running; },
     get active() { return worker !== null; },
     get target() { return target; },

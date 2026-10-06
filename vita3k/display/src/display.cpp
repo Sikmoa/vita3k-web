@@ -22,8 +22,8 @@
 #else
 #include <dialog/state.h>
 #include <motion/functions.h>
-#include <touch/functions.h>
 #endif
+#include <touch/functions.h>
 #include <display/state.h>
 #include <emuenv/state.h>
 #include <kernel/callback.h>
@@ -83,11 +83,12 @@ void advance_vblank(EmuEnvState &emuenv) {
 #endif
     }
 
-#ifndef __EMSCRIPTEN__
-    // Native-only per-vblank host input sampling; the browser Worker has no
-    // host touch/motion event sources to sample here.
+    // Per-vblank host input sampling. The browser feeds touch fingers
+    // (vita_app.cpp vita3k_web_touch) under display.mutex; it has no motion
+    // sensor source.
     // maybe we should also use a mutex for this part, but it shouldn't be an issue
     touch_vsync_update(emuenv);
+#ifndef __EMSCRIPTEN__
     refresh_motion(emuenv.motion, emuenv.ctrl);
 #endif
 

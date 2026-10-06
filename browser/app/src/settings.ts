@@ -12,11 +12,11 @@ export interface Settings {
   scale: 1 | 2;
   startMuted: boolean;
   fpsHack: boolean;
-  backend: 'jit' | 'interp';
   buildAot: 'auto' | 'on' | 'off';
   asyncScene: boolean;
   hleIntrinsics: boolean;
   saveLogs: boolean;
+  strictImports: boolean;
 }
 
 export const defaults: Settings = {
@@ -30,11 +30,11 @@ export const defaults: Settings = {
   scale: 1,
   startMuted: false,
   fpsHack: false,
-  backend: 'jit',
   buildAot: 'auto',
   asyncScene: true,
   hleIntrinsics: true,
   saveLogs: false,
+  strictImports: false,
 };
 
 export const settings = useStorage<Settings>('vita3k.app.settings', { ...defaults }, localStorage, { mergeDefaults: true });
@@ -49,12 +49,12 @@ export const threadsAvailable = globalThis.crossOriginIsolated === true && typeo
 export const sessionSettings = computed(() => {
   const s = settings.value;
   return {
-    backend: s.backend,
     scale: s.scale,
     muted: s.startMuted,
     ...(s.threads && threadsAvailable ? { threads: '1', asyncScene: s.asyncScene ? undefined : '0' } : {}),
     ...(s.fpsHack ? { fpsHack: '1' } : {}),
     ...(s.hleIntrinsics ? {} : { hleIntrinsics: '0' }),
+    ...(s.strictImports ? { strictImports: '1' } : {}),
     ...(s.buildAot === 'auto' ? {} : { buildAot: s.buildAot === 'on' ? '1' : '0' }),
   };
 });
