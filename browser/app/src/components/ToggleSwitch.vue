@@ -10,7 +10,7 @@ defineProps<{ label: string; disabled?: boolean }>();
     :aria-checked="model"
     :aria-label="label"
     :disabled="disabled"
-    class="relative shrink-0 w-13 h-8 rounded-full border-0 cursor-pointer transition-colors duration-150 disabled:(opacity-40 cursor-not-allowed)"
+    class="relative shrink-0 w-13 h-8 rounded-full border-0 cursor-pointer transition-colors duration-150 disabled:(opacity-60 cursor-not-allowed)"
     :class="model ? 'bg-primary' : 'bg-surface-highest'"
     @click="model = !model"
   >

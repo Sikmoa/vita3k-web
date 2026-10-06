@@ -54,13 +54,6 @@ async function removeEverything() {
 
     <h2 class="section-title">Player</h2>
     <div class="card divide-y divide-surface">
-      <SettingRow title="Multithreaded runtime" stack>
-        <template #description>
-          Runs the game's threads in parallel: much faster on most devices.
-          <span v-if="!threadsAvailable" class="block text-error mt-1">Unavailable: this page is not cross-origin isolated.</span>
-        </template>
-        <ToggleSwitch v-model="settings.threads" label="Multithreaded runtime" :disabled="!threadsAvailable" />
-      </SettingRow>
       <SettingRow title="Resolution" description="Internal rendering resolution. 2× is sharper and needs a faster GPU." stack>
         <SegmentedControl v-model="settings.scale" label="Resolution" :options="[{ value: 1, label: '1× (960×544)' }, { value: 2, label: '2×' }]" />
       </SettingRow>
@@ -71,11 +64,18 @@ async function removeEverything() {
 
     <h2 class="section-title">Performance</h2>
     <div class="card divide-y divide-surface">
-      <SettingRow title="Frame rate hack" description="Lets some games run faster than they were made to. May break timing.">
-        <ToggleSwitch v-model="settings.fpsHack" label="Frame rate hack" />
+      <SettingRow title="Multithreaded runtime" stack>
+        <template #description>
+          Runs the game's threads in parallel: much faster on most devices.
+          <span v-if="!threadsAvailable" class="block text-error mt-1">Unavailable: this page is not cross-origin isolated.</span>
+        </template>
+        <ToggleSwitch v-model="settings.threads" label="Multithreaded runtime" :disabled="!threadsAvailable" />
       </SettingRow>
       <SettingRow title="Background scene building" description="Prepares graphics on its own thread (multithreaded runtime only).">
         <ToggleSwitch v-model="settings.asyncScene" label="Background scene building" :disabled="!settings.threads || !threadsAvailable" />
+      </SettingRow>
+      <SettingRow title="Frame rate hack" description="Lets some games run faster than they were made to. May break timing.">
+        <ToggleSwitch v-model="settings.fpsHack" label="Frame rate hack" />
       </SettingRow>
     </div>
 
