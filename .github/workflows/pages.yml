@@ -43,7 +43,7 @@ jobs:
           key: emscripten-${{ hashFiles('flake.lock') }}
 
       - name: Build
-        run: nix develop --command browser/pages/build.sh
+        run: nix develop --command bash browser/pages/build.sh
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
